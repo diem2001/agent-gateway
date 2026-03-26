@@ -18,6 +18,9 @@ import {
   type SessionSettings,
 } from "./sessions.js";
 import { queryRouter } from "./query.js";
+import sshRoutes from "./routes/ssh.js";
+import authRoutes from "./routes/auth.js";
+import workspaceRoutes from "./routes/workspace.js";
 
 /* ------------------------------------------------------------------ */
 /*  Bootstrap                                                           */
@@ -25,6 +28,7 @@ import { queryRouter } from "./query.js";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
+app.use(express.text({ limit: "10mb", type: "text/*" }));
 
 // Load API keys from env
 loadApiKeys();
@@ -40,6 +44,11 @@ app.use(authMiddleware);
 
 // Query routes (POST /v1/query, GET /v1/query/:queryId/events)
 app.use(queryRouter);
+
+// Workspace routes: SSH keys, auth, memory/agents/skills CRUD
+app.use(sshRoutes);
+app.use(authRoutes);
+app.use(workspaceRoutes);
 
 /* ------------------------------------------------------------------ */
 /*  Routes: Health (unauthenticated)                                    */
