@@ -11,11 +11,15 @@ SSH_DST="/home/node/.ssh"
 # ------------------------------------------------------------------
 # 1. Create workspace directories (on volume, persists across restarts)
 # ------------------------------------------------------------------
-mkdir -p /home/node/.claude/memory \
-         /home/node/.claude/agents \
-         /home/node/.claude/skills \
-         /home/node/.ssh \
-         /data/ssh
+mkdir -p /data/claude/memory \
+         /data/claude/agents \
+         /data/claude/skills \
+         /data/ssh \
+         /home/node/.ssh
+
+# Symlink .claude to volume so OAuth credentials persist across restarts
+rm -rf /home/node/.claude
+ln -sf /data/claude /home/node/.claude
 
 # ------------------------------------------------------------------
 # 2. Write Claude settings with broad tool permissions
