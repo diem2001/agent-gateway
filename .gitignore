@@ -1,5 +1,6 @@
 node_modules/
 dist/
 data/
+agent_home/
 .env
 *.log

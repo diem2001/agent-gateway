@@ -3,19 +3,19 @@ import { execSync } from "node:child_process";
 import { log } from "../logging.js";
 
 const router = Router();
-const CLAUDE_CLI = process.env.CLAUDE_CLI || "/app/node_modules/@anthropic-ai/claude-agent-sdk/cli.js";
+const CLAUDE_CLI = process.env.CLAUDE_CLI || "/home/node/.local/bin/claude";
 const AUTH_TMUX_SESSION = "claude-auth";
 const HOME = process.env.HOME || "/home/node";
 function execEnv(): NodeJS.ProcessEnv { return { ...process.env, HOME }; }
 
 router.get("/v1/auth/status", (_req, res) => {
-  try { const result = execSync("node " + CLAUDE_CLI + " auth status", { timeout: 10_000, env: execEnv() }); res.json(JSON.parse(result.toString())); }
+  try { const result = execSync(CLAUDE_CLI + " auth status", { timeout: 10_000, env: execEnv() }); res.json(JSON.parse(result.toString())); }
   catch { res.json({ loggedIn: false }); }
 });
 
 router.post("/v1/auth/login", async (_req, res) => {
   try { execSync("tmux kill-session -t " + AUTH_TMUX_SESSION + " 2>/dev/null"); } catch { /* no session */ }
-  const claudeHost = process.env.CLAUDE_CLI_HOST || "/usr/local/bin/claude-host";
+  const claudeHost = process.env.CLAUDE_CLI_HOST || "/home/node/.local/bin/claude";
   execSync("tmux new-session -d -s " + AUTH_TMUX_SESSION + " -x 500 -y 40 \"" + claudeHost + " --dangerously-skip-permissions\"", { env: execEnv() });
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   await sleep(3000); execSync("tmux send-keys -t " + AUTH_TMUX_SESSION + " Enter");
@@ -45,7 +45,7 @@ router.post("/v1/auth/submit-code", (req, res) => {
   const interval = setInterval(() => {
     attempts++;
     try {
-      const result = execSync("node " + CLAUDE_CLI + " auth status", { timeout: 5000, env: execEnv() });
+      const result = execSync(CLAUDE_CLI + " auth status", { timeout: 5000, env: execEnv() });
       const status = JSON.parse(result.toString()) as { loggedIn?: boolean; email?: string };
       if (status.loggedIn) { clearInterval(interval); try { execSync("tmux kill-session -t " + AUTH_TMUX_SESSION + " 2>/dev/null"); } catch { /* ignore */ } log("auth", "Login successful: " + status.email); res.json({ success: true, ...status }); return; }
     } catch { /* keep polling */ }
