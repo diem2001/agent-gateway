@@ -17,6 +17,7 @@ import {
   updateSettings,
   type SessionSettings,
 } from "./sessions.js";
+import { queryRouter } from "./query.js";
 
 /* ------------------------------------------------------------------ */
 /*  Bootstrap                                                           */
@@ -36,6 +37,9 @@ app.use(requestLoggingMiddleware);
 
 // Auth middleware (skips /health internally)
 app.use(authMiddleware);
+
+// Query routes (POST /v1/query, GET /v1/query/:queryId/events)
+app.use(queryRouter);
 
 /* ------------------------------------------------------------------ */
 /*  Routes: Health (unauthenticated)                                    */
