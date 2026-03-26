@@ -41,7 +41,7 @@ curl http://localhost:3001/v1/auth/status \
   -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
-OAuth credentials persist in the gateway_data volume. Re-authentication only needed if the token expires.
+OAuth credentials persist in the `./agent_home` bind-mount. Re-authentication only needed if the token expires.
 
 **Option B: API Key** — Set `ANTHROPIC_API_KEY` in `.env`. Simpler but requires a paid API key.
 
@@ -101,7 +101,7 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | -- | Required. Anthropic API key for Claude. |
+| `ANTHROPIC_API_KEY` | -- | Anthropic API key (or use OAuth via `/v1/auth/login`) |
 | `API_KEYS` | `default:changeme` | Client authentication keys |
 | `PORT` | `3001` | HTTP listen port |
 | `LOG_LEVEL` | `info` | `off`, `info`, or `debug` |

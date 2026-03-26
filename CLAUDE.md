@@ -24,7 +24,7 @@ npm start           # Production start (node dist/server.js)
 | `HOST` | No | `0.0.0.0` | Bind address |
 | `LOG_LEVEL` | No | `info` | `off`, `info`, or `debug` |
 | `SESSION_IDLE_TIMEOUT_MS` | No | `0` (disabled) | Auto-cleanup idle sessions after N ms |
-| `SESSION_PERSIST_PATH` | No | `./data/sessions.json` | File path for session persistence |
+| `SESSION_PERSIST_PATH` | No | `./data/sessions.json` (Docker: `/home/node/.claude/sessions.json`) | File path for session persistence |
 | `EVENT_CACHE_TTL_MS` | No | `1800000` (30 min) | TTL for completed query event caches |
 | `WORKSPACE_ROOT` | No | `$HOME/.claude` | Root for memory/agents/skills workspace |
 
