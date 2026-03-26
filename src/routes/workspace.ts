@@ -23,7 +23,7 @@ for (const section of SECTIONS) {
     catch (e) { res.status(500).json({ error: e instanceof Error ? e.message : String(e) }); }
   });
 
-  router.get("/v1/" + section + "/*", (req: Request, res: Response) => {
+  router.get("/v1/" + section + "/{*subpath}", (req: Request, res: Response) => {
     const subPath = extractSubPath(req, section);
     if (!subPath) { res.json({ files: listFiles(baseDir) }); return; }
     const filePath = safePath(baseDir, subPath);
@@ -33,7 +33,7 @@ for (const section of SECTIONS) {
     catch (e) { res.status(500).json({ error: e instanceof Error ? e.message : String(e) }); }
   });
 
-  router.put("/v1/" + section + "/*", (req: Request, res: Response) => {
+  router.put("/v1/" + section + "/{*subpath}", (req: Request, res: Response) => {
     const subPath = extractSubPath(req, section);
     if (!subPath) { res.status(400).json({ error: "Path is required" }); return; }
     const filePath = safePath(baseDir, subPath);
@@ -42,7 +42,7 @@ for (const section of SECTIONS) {
     catch (e) { res.status(500).json({ error: e instanceof Error ? e.message : String(e) }); }
   });
 
-  router.delete("/v1/" + section + "/*", (req: Request, res: Response) => {
+  router.delete("/v1/" + section + "/{*subpath}", (req: Request, res: Response) => {
     const subPath = extractSubPath(req, section);
     if (!subPath) { res.status(400).json({ error: "Path is required" }); return; }
     const filePath = safePath(baseDir, subPath);

@@ -1,0 +1,24 @@
+services:
+  agent-gateway:
+    build: .
+    container_name: agent-gateway
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - gateway_data:/data
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - API_KEYS=${API_KEYS:-default:changeme}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - SESSION_PERSIST_PATH=/data/sessions.json
+      - SESSION_IDLE_TIMEOUT_MS=${SESSION_IDLE_TIMEOUT_MS:-0}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  gateway_data:
