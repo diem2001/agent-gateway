@@ -366,7 +366,32 @@ curl -N "http://localhost:3001/v1/query/q-001/events?after=5" \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Updates session settings. Currently supports <code>sessionIdleTimeoutMs</code> (set to <code>0</code> to disable auto-cleanup).</p>
+    <p>Updates session settings. Currently supports <code>sessionIdleTimeoutMs</code>.</p>
+
+    <h3>Sessions</h3>
+    <p>
+      A <strong>session</strong> is a mapping from a client-provided <code>sessionId</code> to a Claude Agent SDK
+      conversation session. Sessions maintain conversation context — follow-up queries sent with the same
+      <code>sessionId</code> have access to all previous messages in that conversation.
+      Sessions are persisted to <code>SESSION_PERSIST_PATH</code> and survive server restarts.
+    </p>
+
+    <h3>sessionIdleTimeoutMs</h3>
+    <table>
+      <tr><th>Default</th><td><code>0</code> — disabled, sessions persist indefinitely</td></tr>
+      <tr><th>Cleanup granularity</th><td>5 minutes — a background timer runs every 5 minutes and evicts sessions that have been idle longer than the configured timeout. Sessions may therefore exist up to 5 minutes past their timeout.</td></tr>
+    </table>
+    <p>
+      When set to <code>0</code> (the default), no cleanup runs and every unique <code>sessionId</code> stays
+      in memory and on disk forever. This is convenient for long-lived conversational agents but means memory
+      usage grows unboundedly if many distinct session IDs are used.
+    </p>
+    <p>
+      When set to a value greater than <code>0</code>, the cleanup timer is activated. Any session that has
+      not received a query within the configured duration is removed from memory and from disk.
+      The next query that arrives with that <code>sessionId</code> starts a <strong>fresh session</strong> —
+      all previous conversation context is lost.
+    </p>
 
     <h3>Request Body</h3>
 <pre><code>{"sessionIdleTimeoutMs": 3600000}</code></pre>
@@ -375,11 +400,17 @@ curl -N "http://localhost:3001/v1/query/q-001/events?after=5" \
 <pre><code>{"sessionIdleTimeoutMs": 3600000}</code></pre>
 
     <h3>Example</h3>
-<pre><code># Set 1-hour idle timeout
+<pre><code># Set 1-hour idle timeout (sessions idle for &gt;1 h are evicted; check runs every 5 min)
 curl -X PUT http://localhost:3001/v1/settings \
   -H "Authorization: Bearer sk-gw-abc123" \
   -H "Content-Type: application/json" \
-  -d '{"sessionIdleTimeoutMs": 3600000}'</code></pre>
+  -d '{"sessionIdleTimeoutMs": 3600000}'
+
+# Disable cleanup — sessions live forever (default)
+curl -X PUT http://localhost:3001/v1/settings \
+  -H "Authorization: Bearer sk-gw-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"sessionIdleTimeoutMs": 0}'</code></pre>
   </div>
 
   <!-- ============================================================ -->
