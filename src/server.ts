@@ -9,7 +9,7 @@ import {
   type LogLevel,
 } from "./logging.js";
 import {
-  loadSessions,
+  loadPersistedSessions,
   listSessions,
   deleteSession,
   getSessionCount,
@@ -21,6 +21,7 @@ import { queryRouter } from "./query.js";
 import sshRoutes from "./routes/ssh.js";
 import authRoutes from "./routes/auth.js";
 import workspaceRoutes from "./routes/workspace.js";
+import gitRoutes from "./routes/git.js";
 
 /* ------------------------------------------------------------------ */
 /*  Bootstrap                                                           */
@@ -34,7 +35,7 @@ app.use(express.text({ limit: "10mb", type: "text/*" }));
 loadApiKeys();
 
 // Restore sessions from disk
-loadSessions();
+loadPersistedSessions();
 
 // Logging middleware (before auth so we log rejected requests too)
 app.use(requestLoggingMiddleware);
@@ -49,6 +50,7 @@ app.use(queryRouter);
 app.use(sshRoutes);
 app.use(authRoutes);
 app.use(workspaceRoutes);
+app.use(gitRoutes);
 
 /* ------------------------------------------------------------------ */
 /*  Routes: Health (unauthenticated)                                    */
