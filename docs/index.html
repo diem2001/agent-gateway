@@ -121,6 +121,9 @@
       <li><a href="#ep-auth-status">Anthropic Auth Status</a></li>
       <li><a href="#ep-auth-login">Anthropic Auth Login</a></li>
       <li><a href="#ep-auth-code">Anthropic Auth Submit Code</a></li>
+      <li><a href="#ep-git-clone">Git Clone</a></li>
+      <li><a href="#ep-git-pull">Git Pull</a></li>
+      <li><a href="#ep-git-status">Git Status</a></li>
       <li><a href="#ep-workspace">Workspace (Memory, Agents, Skills)</a></li>
       <li><a href="#ndjson">NDJSON Event Reference</a></li>
       <li><a href="#session-mgmt">Session Management</a></li>
@@ -164,6 +167,9 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>GET</strong></td><td><code>/v1/logging</code></td><td>Yes</td><td>Get log level</td></tr>
       <tr><td><strong>PUT</strong></td><td><code>/v1/logging</code></td><td>Yes</td><td>Set log level</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/ssh-keys</code></td><td>Yes</td><td>Upload SSH keys</td></tr>
+      <tr><td><strong>POST</strong></td><td><code>/v1/workspace/git/clone</code></td><td>Yes</td><td>Clone a git repo (or pull if exists)</td></tr>
+      <tr><td><strong>POST</strong></td><td><code>/v1/workspace/git/pull</code></td><td>Yes</td><td>Pull latest changes</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/workspace/git/status</code></td><td>Yes</td><td>Get repo status (branch, commit, dirty)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/auth/status</code></td><td>Yes</td><td>Check Anthropic login status</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/auth/login</code></td><td>Yes</td><td>Start Anthropic OAuth flow</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/auth/submit-code</code></td><td>Yes</td><td>Submit OAuth authorization code</td></tr>
@@ -495,6 +501,106 @@ curl -X PUT http://localhost:3001/v1/settings \
     "privateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----",
     "filename": "id_ed25519"
   }'</code></pre>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="ep-git-clone">Git Clone</h2>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="endpoint-method method-post">POST</span>
+      <span class="endpoint-path">/v1/workspace/git/clone</span>
+    </p>
+    <p>Clone a git repository into the workspace projects directory. If the target path already exists with a <code>.git</code> directory, performs a <code>git pull</code> instead.</p>
+
+    <h3>Request Body</h3>
+<pre><code>{
+  "url": "git@github.com:org/repo.git",   // Required: repository URL
+  "path": "my-project",                    // Required: relative path under projects/
+  "branch": "main",                        // Optional: branch to clone
+  "sshKey": "-----BEGIN OPENSSH..."        // Optional: SSH private key for auth
+}</code></pre>
+
+    <h3>Response (200)</h3>
+<pre><code>{
+  "status": "cloned",    // or "pulled" if target already existed
+  "path": "my-project",
+  "branch": "main",
+  "commit": "a1b2c3d"
+}</code></pre>
+
+    <h3>Security</h3>
+    <p>SSH keys are written to a temp file with <code>0600</code> permissions and deleted immediately after the git operation. Keys are never persisted on disk.</p>
+
+    <h3>Example</h3>
+<pre><code>curl -X POST http://localhost:3001/v1/workspace/git/clone \
+  -H "Authorization: Bearer sk-gw-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "git@github.com:org/repo.git",
+    "path": "my-project",
+    "branch": "main"
+  }'</code></pre>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="ep-git-pull">Git Pull</h2>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="endpoint-method method-post">POST</span>
+      <span class="endpoint-path">/v1/workspace/git/pull</span>
+    </p>
+    <p>Pull latest changes for an existing repository.</p>
+
+    <h3>Request Body</h3>
+<pre><code>{
+  "path": "my-project",                    // Required: relative path under projects/
+  "sshKey": "-----BEGIN OPENSSH..."        // Optional: SSH private key for auth
+}</code></pre>
+
+    <h3>Response (200)</h3>
+<pre><code>{
+  "status": "updated",   // or "up-to-date"
+  "branch": "main",
+  "commit": "a1b2c3d"
+}</code></pre>
+
+    <h3>Example</h3>
+<pre><code>curl -X POST http://localhost:3001/v1/workspace/git/pull \
+  -H "Authorization: Bearer sk-gw-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"path": "my-project"}'</code></pre>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="ep-git-status">Git Status</h2>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="endpoint-method method-get">GET</span>
+      <span class="endpoint-path">/v1/workspace/git/status?path=my-project</span>
+    </p>
+    <p>Get the git status of a project directory.</p>
+
+    <h3>Query Parameters</h3>
+    <p><code>path</code> (required): relative path under <code>projects/</code></p>
+
+    <h3>Response (200) &mdash; repo exists</h3>
+<pre><code>{
+  "exists": true,
+  "branch": "main",
+  "commit": "a1b2c3d",
+  "dirty": false,
+  "lastCommitDate": "2026-03-29T10:00:00+02:00"
+}</code></pre>
+
+    <h3>Response (200) &mdash; repo not found</h3>
+<pre><code>{"exists": false}</code></pre>
+
+    <h3>Example</h3>
+<pre><code>curl http://localhost:3001/v1/workspace/git/status?path=my-project \
+  -H "Authorization: Bearer sk-gw-abc123"</code></pre>
   </div>
 
   <!-- ============================================================ -->
