@@ -2,6 +2,8 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "./logging.js";
 import type { StreamEvent } from "./event-cache.js";
 import { getAllTools } from "./tools.js";
+import type { WebhookContext } from "./webhook.js";
+import { createToolMcpServer } from "./tool-server.js";
 
 export interface QueryParams {
   prompt: string;
@@ -12,6 +14,7 @@ export interface QueryParams {
   isResume?: boolean;
   abortController: AbortController;
   onEvent: (event: Omit<StreamEvent, "seq">) => void;
+  webhookContext?: WebhookContext;
 }
 
 export interface QueryResult {
@@ -33,8 +36,9 @@ function formatToolInput(toolName: string, input: Record<string, unknown> | unde
 
 const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"];
 
-export async function runQuery({ prompt, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent }: QueryParams): Promise<QueryResult> {
-  const registeredToolNames = getAllTools().map((t) => t.name);
+export async function runQuery({ prompt, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext }: QueryParams): Promise<QueryResult> {
+  const registeredTools = getAllTools();
+  const registeredToolNames = registeredTools.map((t) => t.name);
   const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames];
   const options: Record<string, unknown> = {
     allowedTools: effectiveTools,
@@ -44,6 +48,12 @@ export async function runQuery({ prompt, systemPrompt, model, allowedTools, sess
     includePartialMessages: true,
   };
   if (isResume) { options.resume = sessionId; } else { options.systemPrompt = systemPrompt || undefined; options.sessionId = sessionId; }
+
+  if (registeredTools.length > 0 && webhookContext) {
+    options.mcpServers = {
+      "agent-gateway-tools": createToolMcpServer(registeredTools, webhookContext),
+    };
+  }
 
   const conversation = query({ prompt, options });
   let fullResponse = "";
