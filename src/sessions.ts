@@ -167,6 +167,15 @@ export function listSessions(): Array<{
   return result;
 }
 
+export function updateSessionSdkId(clientId: string, sdkSessionId: string): void {
+  const existing = sessions.get(clientId);
+  if (existing && existing.sessionId !== sdkSessionId) {
+    existing.sessionId = sdkSessionId;
+    persistSessions();
+    log("sessions", `Updated SDK sessionId for ${clientId}: ${sdkSessionId}`);
+  }
+}
+
 export function deleteSession(sessionId: string): boolean {
   const deleted = sessions.delete(sessionId);
   if (deleted) {

@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { log, logDebug } from "./logging.js";
 import { createCacheEntry, getCacheEntry, markDone, type StreamEvent } from "./event-cache.js";
 import { runQueryWithRetry } from "./retry.js";
+import { getSession, updateSessionSdkId } from "./sessions.js";
 
 interface QueryRequestBody {
   queryId?: string; sessionId?: string; prompt?: string; systemPrompt?: string;
@@ -45,14 +46,35 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   const startTime = Date.now();
 
   try {
+    // Resolve session: map client sessionId → SDK sessionId for resume
+    let effectiveSessionId = useSession !== false ? sessionId : undefined;
+    let isResume = false;
+    if (effectiveSessionId) {
+      const resolved = getSession(effectiveSessionId, systemPrompt || "", model || "claude-sonnet-4-20250514");
+      if (!resolved.isNew) {
+        // Existing session: resume with the SDK sessionId (stored on disk)
+        effectiveSessionId = resolved.sessionId;
+        isResume = true;
+      } else {
+        // New session: use the SDK sessionId assigned by getSession
+        effectiveSessionId = resolved.sessionId;
+      }
+    }
+
     const { response: _response, resultData } = await runQueryWithRetry({
       prompt, systemPrompt, model, allowedTools,
-      sessionId: useSession !== false ? sessionId : undefined,
-      isResume: false, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
+      sessionId: effectiveSessionId,
+      isResume, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = resultData as any;
+    const sdkResultSessionId = result?.sessionId as string | undefined;
+    log("query", `SDK result sessionId=${sdkResultSessionId || "none"} (client sent: ${sessionId || "none"}, effective: ${effectiveSessionId || "none"}, isResume: ${isResume})`);
+    // Update session mapping if SDK returned a different sessionId than what we generated
+    if (sessionId && sdkResultSessionId) {
+      updateSessionSdkId(sessionId, sdkResultSessionId);
+    }
     const usage = result?.usage || {};
     const inputTokens: number = usage.input_tokens || 0;
     const outputTokens: number = usage.output_tokens || 0;

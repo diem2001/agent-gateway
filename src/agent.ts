@@ -49,6 +49,7 @@ export async function runQuery({ prompt, systemPrompt, model, allowedTools, sess
     includePartialMessages: true,
   };
   if (isResume) { options.resume = sessionId; } else { options.systemPrompt = systemPrompt || undefined; options.sessionId = sessionId; }
+  log("query", `SDK options: sessionId=${sessionId || "none"} isResume=${isResume} resume=${isResume ? sessionId : "n/a"}`);
 
   if (registeredTools.length > 0 && webhookContext) {
     options.mcpServers = {
