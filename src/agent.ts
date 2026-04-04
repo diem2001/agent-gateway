@@ -1,6 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "./logging.js";
 import type { StreamEvent } from "./event-cache.js";
+import { getAllTools } from "./tools.js";
 
 export interface QueryParams {
   prompt: string;
@@ -33,8 +34,10 @@ function formatToolInput(toolName: string, input: Record<string, unknown> | unde
 const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"];
 
 export async function runQuery({ prompt, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent }: QueryParams): Promise<QueryResult> {
+  const registeredToolNames = getAllTools().map((t) => t.name);
+  const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames];
   const options: Record<string, unknown> = {
-    allowedTools: allowedTools || DEFAULT_TOOLS,
+    allowedTools: effectiveTools,
     permissionMode: "bypassPermissions",
     model: model || undefined,
     abortController,

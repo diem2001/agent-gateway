@@ -21,6 +21,8 @@ import { queryRouter } from "./query.js";
 import sshRoutes from "./routes/ssh.js";
 import authRoutes from "./routes/auth.js";
 import workspaceRoutes from "./routes/workspace.js";
+import toolRoutes from "./routes/tools.js";
+import { loadTools } from "./tools.js";
 
 /* ------------------------------------------------------------------ */
 /*  Bootstrap                                                           */
@@ -36,6 +38,9 @@ loadApiKeys();
 // Restore sessions from disk
 loadSessions();
 
+// Restore tools from disk
+loadTools();
+
 // Logging middleware (before auth so we log rejected requests too)
 app.use(requestLoggingMiddleware);
 
@@ -49,6 +54,9 @@ app.use(queryRouter);
 app.use(sshRoutes);
 app.use(authRoutes);
 app.use(workspaceRoutes);
+
+// Tool registry routes
+app.use(toolRoutes);
 
 /* ------------------------------------------------------------------ */
 /*  Routes: Health (unauthenticated)                                    */
