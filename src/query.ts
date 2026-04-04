@@ -69,8 +69,8 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = resultData as any;
-    const sdkResultSessionId = result?.sessionId as string | undefined;
-    log("query", `SDK result sessionId=${sdkResultSessionId || "none"} (client sent: ${sessionId || "none"}, effective: ${effectiveSessionId || "none"}, isResume: ${isResume})`);
+    const sdkResultSessionId = (result?.session_id || result?.sessionId) as string | undefined;
+    log("query", `SDK session_id=${sdkResultSessionId || "none"} (client: ${sessionId || "none"}, isResume: ${isResume})`);
     // Update session mapping if SDK returned a different sessionId than what we generated
     if (sessionId && sdkResultSessionId) {
       updateSessionSdkId(sessionId, sdkResultSessionId);
