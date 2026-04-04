@@ -2,7 +2,6 @@ import { Router, type Request, type Response } from "express";
 import { log, logDebug } from "./logging.js";
 import { createCacheEntry, getCacheEntry, markDone, type StreamEvent } from "./event-cache.js";
 import { runQueryWithRetry } from "./retry.js";
-import { getSession } from "./sessions.js";
 
 interface QueryRequestBody {
   queryId?: string; sessionId?: string; prompt?: string; systemPrompt?: string;
@@ -46,15 +45,9 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   const startTime = Date.now();
 
   try {
-    // Resolve session: use the SDK session ID for continuity (not the client-provided ID)
-    const resolvedSession = sessionId && useSession !== false
-      ? getSession(sessionId, systemPrompt || "", model || "claude-sonnet-4-20250514")
-      : null;
-    const effectiveSessionId = resolvedSession?.sessionId ?? (useSession !== false ? sessionId : undefined);
-
     const { response: _response, resultData } = await runQueryWithRetry({
       prompt, systemPrompt, model, allowedTools,
-      sessionId: effectiveSessionId,
+      sessionId: useSession !== false ? sessionId : undefined,
       isResume: false, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
     });
 
