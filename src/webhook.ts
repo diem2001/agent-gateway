@@ -38,6 +38,7 @@ export async function executeWebhook(
   toolName: string,
   input: Record<string, unknown>,
   context: WebhookContext,
+  authToken?: string,
 ): Promise<WebhookResponse | WebhookError> {
   const timeoutMs = toolDef.timeout_ms ?? 30000;
 
@@ -48,11 +49,16 @@ export async function executeWebhook(
     context,
   };
 
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (authToken) {
+    headers["Authorization"] = `Bearer ${authToken}`;
+  }
+
   let response: Response;
   try {
     response = await fetch(toolDef.webhook_url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });

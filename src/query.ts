@@ -21,6 +21,8 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     conversation_id: conversation_id || undefined,
     session_id: useSession !== false ? sessionId : undefined,
   };
+  // Extract Bearer token from client request to forward to tool webhooks
+  const clientAuthToken = (req.headers.authorization || "").replace(/^Bearer\s+/i, "") || undefined;
 
   res.setHeader("Content-Type", "application/x-ndjson");
   res.setHeader("Transfer-Encoding", "chunked");
@@ -46,7 +48,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     const { response: _response, resultData } = await runQueryWithRetry({
       prompt, systemPrompt, model, allowedTools,
       sessionId: useSession !== false ? sessionId : undefined,
-      isResume: false, abortController, onEvent: emit, queryId, webhookContext,
+      isResume: false, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

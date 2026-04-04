@@ -39,6 +39,7 @@ function buildZodShape(jsonSchema: Record<string, unknown>): Record<string, z.Zo
 export function createToolMcpServer(
   tools: ToolDefinition[],
   context: WebhookContext,
+  authToken?: string,
 ): McpSdkServerConfigWithInstance {
   const sdkTools = tools.map((toolDef) => {
     const inputSchema = buildZodShape(toolDef.input_schema);
@@ -50,7 +51,7 @@ export function createToolMcpServer(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       handler: async (args: Record<string, unknown>, extra: any) => {
         const toolUseId = String(extra?.requestId ?? "mcp-call");
-        const result = await executeWebhook(toolDef, toolUseId, toolDef.name, args, context);
+        const result = await executeWebhook(toolDef, toolUseId, toolDef.name, args, context, authToken);
 
         if ("isError" in result && result.isError) {
           return {

@@ -15,6 +15,7 @@ export interface QueryParams {
   abortController: AbortController;
   onEvent: (event: Omit<StreamEvent, "seq">) => void;
   webhookContext?: WebhookContext;
+  clientAuthToken?: string;
 }
 
 export interface QueryResult {
@@ -36,7 +37,7 @@ function formatToolInput(toolName: string, input: Record<string, unknown> | unde
 
 const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"];
 
-export async function runQuery({ prompt, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext }: QueryParams): Promise<QueryResult> {
+export async function runQuery({ prompt, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
   const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames];
@@ -51,7 +52,7 @@ export async function runQuery({ prompt, systemPrompt, model, allowedTools, sess
 
   if (registeredTools.length > 0 && webhookContext) {
     options.mcpServers = {
-      "agent-gateway-tools": createToolMcpServer(registeredTools, webhookContext),
+      "agent-gateway-tools": createToolMcpServer(registeredTools, webhookContext, clientAuthToken),
     };
   }
 
