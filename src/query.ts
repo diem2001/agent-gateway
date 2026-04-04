@@ -6,13 +6,21 @@ import { runQueryWithRetry } from "./retry.js";
 interface QueryRequestBody {
   queryId?: string; sessionId?: string; prompt?: string; systemPrompt?: string;
   model?: string; allowedTools?: string[]; useSession?: boolean; sshTarget?: string;
+  user_id?: string; conversation_id?: string;
 }
 
 export const queryRouter = Router();
 
 queryRouter.post("/v1/query", async (req: Request, res: Response) => {
-  const { queryId, sessionId, prompt, systemPrompt, model, allowedTools, useSession, sshTarget } = req.body as QueryRequestBody;
+  const { queryId, sessionId, prompt, systemPrompt, model, allowedTools, useSession, sshTarget, user_id, conversation_id } = req.body as QueryRequestBody;
   if (!queryId || !prompt) { res.status(400).json({ error: "queryId and prompt are required" }); return; }
+
+  const webhookContext = {
+    api_key_label: req.clientLabel,
+    user_id: user_id || undefined,
+    conversation_id: conversation_id || undefined,
+    session_id: useSession !== false ? sessionId : undefined,
+  };
 
   res.setHeader("Content-Type", "application/x-ndjson");
   res.setHeader("Transfer-Encoding", "chunked");
@@ -38,7 +46,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     const { response: _response, resultData } = await runQueryWithRetry({
       prompt, systemPrompt, model, allowedTools,
       sessionId: useSession !== false ? sessionId : undefined,
-      isResume: false, abortController, onEvent: emit, queryId,
+      isResume: false, abortController, onEvent: emit, queryId, webhookContext,
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
