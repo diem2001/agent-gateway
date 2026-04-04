@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { log, logDebug } from "./logging.js";
 import { createCacheEntry, getCacheEntry, markDone, type StreamEvent } from "./event-cache.js";
 import { runQueryWithRetry } from "./retry.js";
+import { getSession } from "./sessions.js";
 
 interface QueryRequestBody {
   queryId?: string; sessionId?: string; prompt?: string; systemPrompt?: string;
@@ -45,10 +46,17 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   const startTime = Date.now();
 
   try {
+    // Resolve session: if an existing session is found, resume it instead of starting fresh
+    const resolvedSession = sessionId && useSession !== false
+      ? getSession(sessionId, systemPrompt || "", model || "claude-sonnet-4-20250514")
+      : null;
+    const effectiveSessionId = resolvedSession?.sessionId ?? (useSession !== false ? sessionId : undefined);
+    const isResume = resolvedSession ? !resolvedSession.isNew : false;
+
     const { response: _response, resultData } = await runQueryWithRetry({
       prompt, systemPrompt, model, allowedTools,
-      sessionId: useSession !== false ? sessionId : undefined,
-      isResume: false, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
+      sessionId: effectiveSessionId,
+      isResume, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
