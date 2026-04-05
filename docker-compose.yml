@@ -11,6 +11,7 @@ services:
       - API_KEYS=${API_KEYS:-default:changeme}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - SESSION_PERSIST_PATH=/home/node/.claude/sessions.json
+      - TOOLS_PERSIST_PATH=/home/node/.claude/tools.json
       - SESSION_IDLE_TIMEOUT_MS=${SESSION_IDLE_TIMEOUT_MS:-0}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:3001/health"]

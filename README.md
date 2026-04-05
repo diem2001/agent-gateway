@@ -108,10 +108,13 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `ANTHROPIC_API_KEY` | -- | Anthropic API key (or use OAuth via `/v1/auth/login`) |
 | `API_KEYS` | `default:changeme` | Client authentication keys |
 | `PORT` | `3001` | HTTP listen port |
+| `HOST` | `0.0.0.0` | Bind address |
 | `LOG_LEVEL` | `info` | `off`, `info`, or `debug` |
 | `SESSION_IDLE_TIMEOUT_MS` | `0` | Auto-expire idle sessions (0 = disabled) |
-| `HOST` | `0.0.0.0` | Bind address |
-| `TOOLS_PERSIST_PATH` | `/home/node/.claude/tools.json` | Tool registry storage path |
+| `SESSION_PERSIST_PATH` | `./data/sessions.json` | Session persistence file (Docker: `/home/node/.claude/sessions.json`) |
+| `EVENT_CACHE_TTL_MS` | `1800000` | Query event cache TTL in ms (30 min) |
+| `WORKSPACE_ROOT` | `$HOME/.claude` | Root dir for memory/agents/skills |
+| `TOOLS_PERSIST_PATH` | `./data/tools.json` | Tool registry storage (Docker: `/home/node/.claude/tools.json`) |
 
 ## Development Setup
 

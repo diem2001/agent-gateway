@@ -238,6 +238,8 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
         <tr><td><code>allowedTools</code></td><td>string[]</td><td>No</td><td>Restrict tools (default: all 8 tools)</td></tr>
         <tr><td><code>useSession</code></td><td>boolean</td><td>No</td><td>Set to <code>false</code> to skip session management</td></tr>
         <tr><td><code>sshTarget</code></td><td>string</td><td>No</td><td>SSH target for context (informational)</td></tr>
+        <tr><td><code>user_id</code></td><td>string</td><td>No</td><td>User identifier passed to tool webhook context</td></tr>
+        <tr><td><code>conversation_id</code></td><td>string</td><td>No</td><td>Conversation identifier passed to tool webhook context</td></tr>
       </tbody>
     </table>
 
@@ -1000,7 +1002,7 @@ curl http://localhost:3001/health</code></pre>
       <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
     </thead>
     <tbody>
-      <tr><td><code>ANTHROPIC_API_KEY</code></td><td>--</td><td>Anthropic API key (required)</td></tr>
+      <tr><td><code>ANTHROPIC_API_KEY</code></td><td>--</td><td>Anthropic API key (or use OAuth via <code>POST /v1/auth/login</code>)</td></tr>
       <tr><td><code>API_KEYS</code></td><td><code>default:changeme</code></td><td>Client auth keys (<code>label:secret,...</code>)</td></tr>
       <tr><td><code>LOG_LEVEL</code></td><td><code>info</code></td><td>Logging level (<code>off</code>, <code>info</code>, <code>debug</code>)</td></tr>
       <tr><td><code>SESSION_IDLE_TIMEOUT_MS</code></td><td><code>0</code></td><td>Auto-expire idle sessions (0 = disabled)</td></tr>
@@ -1046,8 +1048,9 @@ curl http://localhost:3001/health</code></pre>
     <li><strong>git</strong> -- for repository operations</li>
     <li><strong>openssh-client</strong> -- for SSH connectivity to remote servers</li>
     <li><strong>tmux</strong> -- for the Anthropic OAuth login flow</li>
-    <li><strong>rsync, wget, curl, jq, python3</strong> -- general utilities</li>
-    <li><strong>@anthropic-ai/claude-code</strong> -- Claude CLI (globally installed)</li>
+    <li><strong>rsync, wget, curl, jq, mc, python3</strong> -- general utilities</li>
+    <li><strong>gosu</strong> -- privilege de-escalation (root to node user)</li>
+    <li><strong>Claude Code CLI</strong> -- installed on first startup via <code>curl -fsSL https://claude.ai/install.sh | bash</code></li>
   </ul>
 
   <h3>Entrypoint Behavior</h3>
@@ -1055,11 +1058,12 @@ curl http://localhost:3001/health</code></pre>
   <p>The container starts as root and performs setup before dropping to the <code>node</code> user:</p>
 
   <ol>
-    <li>Creates workspace directories (<code>~/.claude/memory</code>, <code>~/.claude/agents</code>, <code>~/.claude/skills</code>)</li>
-    <li>Writes Claude settings with broad tool permissions (<code>bypassPermissions</code>)</li>
-    <li>Copies SSH keys uploaded via <code>POST /v1/ssh-keys</code> from <code>/home/node/.ssh/</code> (restored from the bind-mount on startup)</li>
-    <li>Fixes ownership and drops to <code>node</code> user via <code>gosu</code></li>
-    <li>Starts the Express server</li>
+    <li>Creates workspace directories (<code>~/.claude/memory</code>, <code>~/.claude/agents</code>, <code>~/.claude/skills</code>, <code>~/.ssh</code>, <code>~/.local/bin</code>)</li>
+    <li>Writes default Claude settings with broad tool permissions (if not already present)</li>
+    <li>Installs Claude Code CLI via <code>curl</code> install script (if not already installed)</li>
+    <li>Ensures <code>PATH</code> includes <code>~/.local/bin</code> in <code>.bashrc</code></li>
+    <li>Restores SSH key config from bind-mount if keys exist in <code>~/.ssh/</code></li>
+    <li>Drops to <code>node</code> user via <code>gosu</code> and starts the Express server</li>
   </ol>
 
   <h3>Persistent Data</h3>
