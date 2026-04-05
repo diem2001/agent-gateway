@@ -90,7 +90,7 @@ Three-step flow using tmux to interact with Claude CLI:
 3. **GET /v1/auth/status**: Checks if Claude CLI reports a valid login.
 
 ### tools.ts -- Tool Registry
-Manages CRUD operations for webhook-backed tool definitions. Tools are stored in-memory in a `Map<name, ToolDefinition>` and persisted to disk (debounced) at `TOOLS_PERSIST_PATH` (default `./data/tools.json`). Each tool definition includes: `name`, `description`, `input_schema` (JSON Schema), `webhook_url`, and optional `timeout_ms` (default 30s). Tools are loaded from disk on startup via `loadTools()`.
+Manages CRUD operations for webhook-backed tool definitions. Tools are stored in-memory in a `Map<name, ToolDefinition>` and persisted to disk (debounced) at `TOOLS_PERSIST_PATH` (default `/home/node/.claude/tools.json`). Each tool definition includes: `name`, `description`, `input_schema` (JSON Schema), `webhook_url`, and optional `timeout_ms` (default 30s). Tools are loaded from disk on startup via `loadTools()`.
 
 ### webhook.ts -- Webhook Executor
 Executes tool calls by POSTing to the tool's `webhook_url`. The request body contains `tool_use_id`, `tool_name`, `input`, and `context` (user_id, conversation_id, session_id, api_key_label). The client's Bearer token is forwarded in the `Authorization` header. Supports configurable timeouts per tool. Returns either `WebhookResponse` (with output + optional metadata) or `WebhookError` on failure (timeout, HTTP error, network error).

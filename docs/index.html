@@ -685,7 +685,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <p>The Tool Registry allows external tools to be registered and made available to the Claude agent. Each tool defines a <code>webhook_url</code> that is called when the agent invokes the tool. Registered tools are wrapped as in-process MCP servers and injected into the Claude Agent SDK alongside the built-in tools (Bash, Read, Write, etc.).</p>
 
-  <p>Tools persist to <code>TOOLS_PERSIST_PATH</code> (default: <code>./data/tools.json</code>) and survive server restarts.</p>
+  <p>Tools persist to <code>TOOLS_PERSIST_PATH</code> (default: <code>/home/node/.claude/tools.json</code>) and survive server restarts.</p>
 
   <div class="endpoint-section">
     <p>
@@ -1006,10 +1006,10 @@ curl http://localhost:3001/health</code></pre>
       <tr><td><code>SESSION_IDLE_TIMEOUT_MS</code></td><td><code>0</code></td><td>Auto-expire idle sessions (0 = disabled)</td></tr>
       <tr><td><code>PORT</code></td><td><code>3001</code></td><td>HTTP listen port</td></tr>
       <tr><td><code>HOST</code></td><td><code>0.0.0.0</code></td><td>Bind address</td></tr>
-      <tr><td><code>SESSION_PERSIST_PATH</code></td><td><code>/data/sessions.json</code></td><td>Session persistence file (inside Docker volume)</td></tr>
+      <tr><td><code>SESSION_PERSIST_PATH</code></td><td><code>/home/node/.claude/sessions.json</code></td><td>Session persistence file (inside agent_home bind-mount)</td></tr>
       <tr><td><code>EVENT_CACHE_TTL_MS</code></td><td><code>1800000</code></td><td>Query event cache TTL (30 min)</td></tr>
       <tr><td><code>WORKSPACE_ROOT</code></td><td><code>$HOME/.claude</code></td><td>Root dir for memory/agents/skills</td></tr>
-      <tr><td><code>TOOLS_PERSIST_PATH</code></td><td><code>./data/tools.json</code></td><td>Tool registry persistence file</td></tr>
+      <tr><td><code>TOOLS_PERSIST_PATH</code></td><td><code>/home/node/.claude/tools.json</code></td><td>Tool registry persistence file</td></tr>
     </tbody>
   </table>
 
@@ -1057,19 +1057,23 @@ curl http://localhost:3001/health</code></pre>
   <ol>
     <li>Creates workspace directories (<code>~/.claude/memory</code>, <code>~/.claude/agents</code>, <code>~/.claude/skills</code>)</li>
     <li>Writes Claude settings with broad tool permissions (<code>bypassPermissions</code>)</li>
-    <li>Copies SSH keys from the data volume (<code>/data/ssh/</code>) to <code>~/.ssh/</code> if they exist</li>
+    <li>Copies SSH keys uploaded via <code>POST /v1/ssh-keys</code> from <code>/home/node/.ssh/</code> (restored from the bind-mount on startup)</li>
     <li>Fixes ownership and drops to <code>node</code> user via <code>gosu</code></li>
     <li>Starts the Express server</li>
   </ol>
 
   <h3>Persistent Data</h3>
 
-  <p>The <code>gateway_data</code> Docker volume is mounted at <code>/data</code> and stores:</p>
+  <p>The <code>agent_home</code> directory is bind-mounted at <code>/home/node</code> and stores:</p>
 
   <ul>
-    <li><code>/data/sessions.json</code> -- session state (survives container restarts)</li>
-    <li><code>/data/tools.json</code> -- registered tool definitions (survives container restarts)</li>
-    <li><code>/data/ssh/</code> -- SSH keys (copied to <code>~/.ssh/</code> on each start)</li>
+    <li><code>/home/node/.claude/sessions.json</code> -- session state (survives container restarts)</li>
+    <li><code>/home/node/.claude/tools.json</code> -- registered tool definitions (survives container restarts)</li>
+    <li><code>/home/node/.claude/skills/</code> -- published skills</li>
+    <li><code>/home/node/.claude/agents/</code> -- agent configurations</li>
+    <li><code>/home/node/.claude/memory/</code> -- workspace memory</li>
+    <li><code>/home/node/.claude/projects/</code> -- Claude session data</li>
+    <li><code>/home/node/.ssh/</code> -- SSH keys (uploaded via <code>POST /v1/ssh-keys</code>)</li>
   </ul>
 
   <h3>Embedding in an Existing Stack</h3>
@@ -1083,13 +1087,13 @@ curl http://localhost:3001/health</code></pre>
     ports:
       - "127.0.0.1:3001:3001"
     volumes:
-      - gateway_data:/data
+      - ./agent_home:/home/node
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - API_KEYS=${API_KEYS:-default:changeme}
       - LOG_LEVEL=${LOG_LEVEL:-info}
-      - SESSION_PERSIST_PATH=/data/sessions.json
-      - TOOLS_PERSIST_PATH=/data/tools.json
+      - SESSION_PERSIST_PATH=/home/node/.claude/sessions.json
+      - TOOLS_PERSIST_PATH=/home/node/.claude/tools.json
       - SESSION_IDLE_TIMEOUT_MS=${SESSION_IDLE_TIMEOUT_MS:-0}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:3001/health"]
@@ -1097,10 +1101,7 @@ curl http://localhost:3001/health</code></pre>
       timeout: 5s
       retries: 3
       start_period: 10s
-    restart: unless-stopped
-
-volumes:
-  gateway_data:</code></pre>
+    restart: unless-stopped</code></pre>
 
   <p>Other services can reach the gateway at <code>http://agent-gateway:3001</code> on the Docker network. The port <code>127.0.0.1:3001</code> binding ensures it is not exposed publicly -- use a reverse proxy (nginx, Traefik) for external access with SSL.</p>
 

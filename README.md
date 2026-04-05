@@ -111,7 +111,7 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `LOG_LEVEL` | `info` | `off`, `info`, or `debug` |
 | `SESSION_IDLE_TIMEOUT_MS` | `0` | Auto-expire idle sessions (0 = disabled) |
 | `HOST` | `0.0.0.0` | Bind address |
-| `TOOLS_PERSIST_PATH` | `./data/tools.json` | Tool registry storage path |
+| `TOOLS_PERSIST_PATH` | `/home/node/.claude/tools.json` | Tool registry storage path |
 
 ## Development Setup
 

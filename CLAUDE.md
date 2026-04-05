@@ -26,10 +26,10 @@ npm run test:e2e    # E2E session tests (requires running Gateway + GATEWAY_API_
 | `HOST` | No | `0.0.0.0` | Bind address |
 | `LOG_LEVEL` | No | `info` | `off`, `info`, or `debug` |
 | `SESSION_IDLE_TIMEOUT_MS` | No | `0` (disabled) | Auto-cleanup idle sessions after N ms |
-| `SESSION_PERSIST_PATH` | No | `./data/sessions.json` (Docker: `/home/node/.claude/sessions.json`) | File path for session persistence |
+| `SESSION_PERSIST_PATH` | No | `/home/node/.claude/sessions.json` | File path for session persistence (inside agent_home bind-mount) |
 | `EVENT_CACHE_TTL_MS` | No | `1800000` (30 min) | TTL for completed query event caches |
 | `WORKSPACE_ROOT` | No | `$HOME/.claude` | Root for memory/agents/skills workspace |
-| `TOOLS_PERSIST_PATH` | No | `./data/tools.json` (Docker: `/data/tools.json`) | File path for tool registry persistence |
+| `TOOLS_PERSIST_PATH` | No | `/home/node/.claude/tools.json` | File path for tool registry persistence (inside agent_home bind-mount) |
 
 ## API Key Format
 
