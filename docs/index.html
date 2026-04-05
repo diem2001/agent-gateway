@@ -102,7 +102,7 @@
 
 <article class="wiki-article">
   <h1>Agent Gateway <span>API Reference</span></h1>
-  <p class="wiki-meta">Last updated: 2026-03-26 · Epic: <a href="https://diemit.atlassian.net/browse/MVP-2453">MVP-2453</a> · <a href="https://github.com/diem2001/agent-gateway">GitHub</a></p>
+  <p class="wiki-meta">Last updated: 2026-04-03 · Epic: <a href="https://diemit.atlassian.net/browse/MVP-2453">MVP-2453</a> · <a href="https://github.com/diem2001/agent-gateway">GitHub</a></p>
 
   <p>The Agent Gateway is a standalone REST API service wrapping the <strong>Claude Agent SDK</strong>. It exposes Claude Code's agentic capabilities (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch) over HTTP with <strong>NDJSON streaming</strong>, session management, workspace file CRUD, and automatic retry with exponential backoff.</p>
 
@@ -122,6 +122,7 @@
       <li><a href="#ep-auth-login">Anthropic Auth Login</a></li>
       <li><a href="#ep-auth-code">Anthropic Auth Submit Code</a></li>
       <li><a href="#ep-workspace">Workspace (Memory, Agents, Skills)</a></li>
+      <li><a href="#ep-tools">Tool Registry</a></li>
       <li><a href="#ndjson">NDJSON Event Reference</a></li>
       <li><a href="#session-mgmt">Session Management</a></li>
       <li><a href="#deployment">Deployment Guide</a></li>
@@ -179,6 +180,10 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>GET</strong></td><td><code>/v1/skills/*</code></td><td>Yes</td><td>Read skill file</td></tr>
       <tr><td><strong>PUT</strong></td><td><code>/v1/skills/*</code></td><td>Yes</td><td>Write skill file</td></tr>
       <tr><td><strong>DELETE</strong></td><td><code>/v1/skills/*</code></td><td>Yes</td><td>Delete skill file</td></tr>
+      <tr><td><strong>PUT</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Register/update a webhook tool</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/tools</code></td><td>Yes</td><td>List all registered tools</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Get a single tool</td></tr>
+      <tr><td><strong>DELETE</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Delete a tool</td></tr>
     </tbody>
   </table>
 
@@ -676,6 +681,176 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
   </div>
 
   <!-- ============================================================ -->
+  <h2 id="ep-tools">Tool Registry</h2>
+
+  <p>The Tool Registry allows external tools to be registered and made available to the Claude agent. Each tool defines a <code>webhook_url</code> that is called when the agent invokes the tool. Registered tools are wrapped as in-process MCP servers and injected into the Claude Agent SDK alongside the built-in tools (Bash, Read, Write, etc.).</p>
+
+  <p>Tools persist to <code>TOOLS_PERSIST_PATH</code> (default: <code>./data/tools.json</code>) and survive server restarts.</p>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge put">PUT</span>
+      <span class="endpoint-path">/v1/tools/:name</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+
+    <p>Registers a new tool or updates an existing one. Returns <code>201</code> for new tools, <code>200</code> for updates.</p>
+
+    <h3>Request Body</h3>
+
+    <table class="param-table">
+      <thead>
+        <tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>description</code></td><td>string</td><td>Yes</td><td>Human-readable description of what the tool does</td></tr>
+        <tr><td><code>input_schema</code></td><td>object</td><td>Yes</td><td>JSON Schema describing the tool's input parameters (must have a <code>type</code> field)</td></tr>
+        <tr><td><code>webhook_url</code></td><td>string</td><td>Yes</td><td>URL to POST to when the agent invokes this tool</td></tr>
+        <tr><td><code>timeout_ms</code></td><td>number</td><td>No</td><td>Webhook timeout in milliseconds (default: <code>30000</code>)</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Response (201 Created / 200 OK)</h3>
+<pre><code>{
+  "name": "lookup-customer",
+  "description": "Look up a customer by email address",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "email": { "type": "string", "description": "Customer email" }
+    },
+    "required": ["email"]
+  },
+  "webhook_url": "https://api.example.com/tools/lookup-customer",
+  "timeout_ms": 30000
+}</code></pre>
+
+    <h3>Example</h3>
+<pre><code>curl -X PUT http://localhost:3001/v1/tools/lookup-customer \
+  -H "Authorization: Bearer sk-gw-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "description": "Look up a customer by email address",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "description": "Customer email" }
+      },
+      "required": ["email"]
+    },
+    "webhook_url": "https://api.example.com/tools/lookup-customer",
+    "timeout_ms": 10000
+  }'</code></pre>
+  </div>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge get">GET</span>
+      <span class="endpoint-path">/v1/tools</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+
+    <p>Lists all registered tools.</p>
+
+    <h3>Response</h3>
+<pre><code>{
+  "tools": [
+    {
+      "name": "lookup-customer",
+      "description": "Look up a customer by email address",
+      "input_schema": { "type": "object", "properties": { "email": { "type": "string" } } },
+      "webhook_url": "https://api.example.com/tools/lookup-customer",
+      "timeout_ms": 10000
+    }
+  ]
+}</code></pre>
+
+    <h3>Example</h3>
+<pre><code>curl http://localhost:3001/v1/tools \
+  -H "Authorization: Bearer sk-gw-abc123"</code></pre>
+  </div>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge get">GET</span>
+      <span class="endpoint-path">/v1/tools/:name</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+
+    <p>Returns a single tool definition. Returns <code>404</code> if the tool does not exist.</p>
+
+    <h3>Example</h3>
+<pre><code>curl http://localhost:3001/v1/tools/lookup-customer \
+  -H "Authorization: Bearer sk-gw-abc123"</code></pre>
+  </div>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge delete">DELETE</span>
+      <span class="endpoint-path">/v1/tools/:name</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+
+    <p>Deletes a tool. Returns <code>204</code> on success, <code>404</code> if the tool does not exist.</p>
+
+    <h3>Example</h3>
+<pre><code>curl -X DELETE http://localhost:3001/v1/tools/lookup-customer \
+  -H "Authorization: Bearer sk-gw-abc123"</code></pre>
+  </div>
+
+  <h3>Webhook Execution Flow</h3>
+
+  <p>When the Claude agent invokes a registered tool during a query, the gateway POSTs to the tool's <code>webhook_url</code>:</p>
+
+  <div class="vflow">
+    <div class="vflow-step">
+      <div class="vflow-num n-blue">1</div>
+      <div class="vflow-body">
+        <h4 class="c-blue">Agent invokes tool</h4>
+        <p>The Claude agent decides to use a registered tool (e.g., <code>lookup-customer</code>) based on its description and input schema.</p>
+      </div>
+    </div>
+    <div class="vflow-step">
+      <div class="vflow-num n-amber">2</div>
+      <div class="vflow-body">
+        <h4 class="c-amber">Gateway POSTs to webhook</h4>
+        <p>The MCP server handler sends a POST request to the tool's <code>webhook_url</code> with the following body:</p>
+<pre><code>{
+  "tool_use_id": "tu_abc123",
+  "tool_name": "lookup-customer",
+  "input": { "email": "user@example.com" },
+  "context": {
+    "user_id": null,
+    "conversation_id": null,
+    "session_id": "session-1",
+    "api_key_label": "myapp"
+  }
+}</code></pre>
+        <p>The client's Bearer token is forwarded in the <code>Authorization</code> header.</p>
+      </div>
+    </div>
+    <div class="vflow-step">
+      <div class="vflow-num n-green">3</div>
+      <div class="vflow-body">
+        <h4 class="c-green">Webhook responds</h4>
+        <p>The external service processes the request and returns:</p>
+<pre><code>{
+  "output": "Customer found: Jane Doe, Plan: Enterprise",
+  "metadata": { "customer_id": 42 }
+}</code></pre>
+        <p>On error (timeout, HTTP error, network failure), an error result is returned to the agent, which can retry or use an alternative approach.</p>
+      </div>
+    </div>
+    <div class="vflow-step">
+      <div class="vflow-num n-slate">4</div>
+      <div class="vflow-body">
+        <h4 class="c-slate">Agent continues</h4>
+        <p>The tool result is passed back to the Claude agent as a <code>tool_result</code> event, and the agent continues its work.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
   <h2 id="ndjson">NDJSON Event Reference</h2>
 
   <p>All events include a <code>seq</code> field (incrementing integer starting at 0) and a <code>type</code> field. Events are streamed as newline-delimited JSON (<code>application/x-ndjson</code>).</p>
@@ -767,7 +942,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <div class="vflow-num n-amber">2</div>
       <div class="vflow-body">
         <h4 class="c-amber">Gateway resolves session</h4>
-        <p>If a session exists with the same ID, systemPrompt, and model, the existing Claude session is reused (conversation continues). If the prompt or model changed, a new Claude session is created under the same client ID.</p>
+        <p>If a session exists with the same ID, systemPrompt, and model, the existing Claude session is resumed using the SDK's <code>resume</code> option with the stored SDK session ID. If the prompt or model changed, a new Claude session is created under the same client ID using the <code>sessionId</code> option. After each query completes, the gateway syncs the stored SDK session ID with the actual session_id returned by the SDK, ensuring subsequent queries resume the correct conversation.</p>
       </div>
     </div>
     <div class="vflow-step">
@@ -834,6 +1009,7 @@ curl http://localhost:3001/health</code></pre>
       <tr><td><code>SESSION_PERSIST_PATH</code></td><td><code>/data/sessions.json</code></td><td>Session persistence file (inside Docker volume)</td></tr>
       <tr><td><code>EVENT_CACHE_TTL_MS</code></td><td><code>1800000</code></td><td>Query event cache TTL (30 min)</td></tr>
       <tr><td><code>WORKSPACE_ROOT</code></td><td><code>$HOME/.claude</code></td><td>Root dir for memory/agents/skills</td></tr>
+      <tr><td><code>TOOLS_PERSIST_PATH</code></td><td><code>./data/tools.json</code></td><td>Tool registry persistence file</td></tr>
     </tbody>
   </table>
 
@@ -853,7 +1029,7 @@ curl http://localhost:3001/health</code></pre>
           <div class="d-box-name c-green">agent-gateway</div>
           <div class="d-box-detail">Express 5 + Claude Agent SDK</div>
           <div class="d-box-detail">POST /v1/query (NDJSON stream)</div>
-          <div class="d-box-detail">Session mgmt + Workspace CRUD</div>
+          <div class="d-box-detail">Session mgmt + Workspace CRUD + Tool Registry</div>
           <div class="d-box-detail">SSH client + tmux (for auth flow)</div>
           <div class="d-tag t-green">Node.js 22</div>
         </div>
@@ -892,6 +1068,7 @@ curl http://localhost:3001/health</code></pre>
 
   <ul>
     <li><code>/data/sessions.json</code> -- session state (survives container restarts)</li>
+    <li><code>/data/tools.json</code> -- registered tool definitions (survives container restarts)</li>
     <li><code>/data/ssh/</code> -- SSH keys (copied to <code>~/.ssh/</code> on each start)</li>
   </ul>
 
@@ -912,6 +1089,7 @@ curl http://localhost:3001/health</code></pre>
       - API_KEYS=${API_KEYS:-default:changeme}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - SESSION_PERSIST_PATH=/data/sessions.json
+      - TOOLS_PERSIST_PATH=/data/tools.json
       - SESSION_IDLE_TIMEOUT_MS=${SESSION_IDLE_TIMEOUT_MS:-0}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:3001/health"]
@@ -1014,12 +1192,22 @@ volumes:
     </div>
     <div class="seq-row">
       <div class="seq-from sf-green">Agent SDK</div>
-      <div class="seq-msg"><div class="seq-line green"></div><span class="seq-label">tool calls (Bash, Read, ...)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-msg"><div class="seq-line green"></div><span class="seq-label">built-in tool calls (Bash, Read, ...)</span><div class="seq-arrow">→</div></div>
       <div class="seq-to sf-slate">System</div>
     </div>
     <div class="seq-row">
       <div class="seq-from sf-slate">System</div>
       <div class="seq-msg"><div class="seq-line dashed"></div><span class="seq-label">tool output</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-green">Agent SDK</div>
+    </div>
+    <div class="seq-row">
+      <div class="seq-from sf-green">Agent SDK</div>
+      <div class="seq-msg"><div class="seq-line green"></div><span class="seq-label">registered tool call (via MCP server)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-amber">Webhook</div>
+    </div>
+    <div class="seq-row">
+      <div class="seq-from sf-amber">Webhook</div>
+      <div class="seq-msg"><div class="seq-line dashed"></div><span class="seq-label">webhook response</span><div class="seq-arrow">→</div></div>
       <div class="seq-to sf-green">Agent SDK</div>
     </div>
     <div class="seq-section">Response Stream</div>

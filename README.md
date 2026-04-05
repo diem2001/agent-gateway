@@ -80,6 +80,10 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `GET` | `/v1/skills/*` | Read a skill file |
 | `PUT` | `/v1/skills/*` | Write a skill file |
 | `DELETE` | `/v1/skills/*` | Delete a skill file |
+| `PUT` | `/v1/tools/:name` | Register/update a webhook tool |
+| `GET` | `/v1/tools` | List all registered tools |
+| `GET` | `/v1/tools/:name` | Get a single tool |
+| `DELETE` | `/v1/tools/:name` | Delete a tool |
 
 ## Authentication
 
@@ -106,6 +110,8 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `PORT` | `3001` | HTTP listen port |
 | `LOG_LEVEL` | `info` | `off`, `info`, or `debug` |
 | `SESSION_IDLE_TIMEOUT_MS` | `0` | Auto-expire idle sessions (0 = disabled) |
+| `HOST` | `0.0.0.0` | Bind address |
+| `TOOLS_PERSIST_PATH` | `./data/tools.json` | Tool registry storage path |
 
 ## Development Setup
 
@@ -125,6 +131,13 @@ npm run build
 npm start
 ```
 
+### Testing
+
+```bash
+npm test            # Unit tests (vitest, excludes E2E)
+npm run test:e2e    # E2E session tests (requires running Gateway + GATEWAY_API_KEY env var)
+```
+
 ## Architecture
 
 ```
@@ -133,10 +146,11 @@ Client (HTTP)
     v
 Express Server (auth middleware)
     |
-    +-- POST /v1/query -----> Agent (Claude SDK) ----> Tools (Bash, Read, ...)
-    |                              |
-    |                         NDJSON stream
-    |                              |
+    +-- POST /v1/query -----> Agent (Claude SDK) ----> Built-in Tools (Bash, Read, ...)
+    |                              |                |
+    |                              |                +-> Registered Tools (webhook MCP servers)
+    |                         NDJSON stream               |
+    |                              |                      +-> POST webhook_url
     +-- GET /v1/query/:id/events   (replay from event cache)
     |
     +-- /v1/sessions, /v1/settings, /v1/logging
@@ -144,7 +158,31 @@ Express Server (auth middleware)
     +-- /v1/ssh-keys, /v1/auth/*
     |
     +-- /v1/memory/*, /v1/agents/*, /v1/skills/*
+    |
+    +-- /v1/tools (Tool Registry CRUD)
 ```
+
+### Tool Registry + Webhook Execution
+
+External tools can be registered via the `/v1/tools` endpoints. Each tool defines a `webhook_url` that is called when the agent invokes the tool. Registered tools are wrapped as in-process MCP servers and injected into the Claude Agent SDK alongside the built-in tools.
+
+When the agent calls a registered tool, the gateway POSTs to the webhook URL with:
+
+```json
+{
+  "tool_use_id": "tu_abc",
+  "tool_name": "my-tool",
+  "input": { "param": "value" },
+  "context": {
+    "user_id": null,
+    "conversation_id": null,
+    "session_id": "session-1",
+    "api_key_label": "myapp"
+  }
+}
+```
+
+The client's Bearer token is forwarded to webhook calls for authentication. Tools persist to disk at `TOOLS_PERSIST_PATH` and survive server restarts.
 
 For detailed architecture, see [`docs/architecture.md`](docs/architecture.md).
 
