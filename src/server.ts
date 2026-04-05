@@ -23,6 +23,7 @@ import authRoutes from "./routes/auth.js";
 import workspaceRoutes from "./routes/workspace.js";
 import toolRoutes from "./routes/tools.js";
 import { loadTools } from "./tools.js";
+import gitRoutes from "./routes/git.js";
 
 /* ------------------------------------------------------------------ */
 /*  Bootstrap                                                           */
@@ -54,6 +55,7 @@ app.use(queryRouter);
 app.use(sshRoutes);
 app.use(authRoutes);
 app.use(workspaceRoutes);
+app.use(gitRoutes);
 
 // Tool registry routes
 app.use(toolRoutes);
