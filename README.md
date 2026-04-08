@@ -43,11 +43,14 @@ curl http://localhost:3001/v1/auth/status \
 
 OAuth credentials persist in the `./agent_home` bind-mount. Re-authentication only needed if the token expires.
 
-**Option B: API Key** — Set `ANTHROPIC_API_KEY` in `.env`. Simpler but requires a paid API key.
+**Option B: API Key (optional)** — Only if you explicitly need direct API access instead of a subscription. Do NOT set this by default — it overrides OAuth and uses pay-per-token billing.
 
 ```env
-ANTHROPIC_API_KEY=sk-ant-...
+# Only uncomment if you have a specific reason to use API credits instead of subscription:
+# ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+> **Warning:** If `ANTHROPIC_API_KEY` is set (even empty), Claude Code will prefer it over OAuth and fail with "Credit balance is too low" when the API account has no credits. Remove the variable entirely to use the subscription.
 
 ## API Overview
 

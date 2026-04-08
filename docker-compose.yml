@@ -7,7 +7,10 @@ services:
     volumes:
       - ./agent_home:/home/node
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # ANTHROPIC_API_KEY is intentionally NOT passed by default.
+      # The Gateway uses OAuth (claude.ai subscription) for authentication.
+      # Only uncomment if you explicitly need direct API access:
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - API_KEYS=${API_KEYS:-default:changeme}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - SESSION_PERSIST_PATH=/home/node/.claude/sessions.json
