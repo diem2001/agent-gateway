@@ -42,16 +42,20 @@ export async function executeWebhook(
 ): Promise<WebhookResponse | WebhookError> {
   const timeoutMs = toolDef.timeout_ms ?? 30000;
 
-  const body: WebhookRequest = {
-    tool_use_id: toolUseId,
-    tool_name: toolName,
-    input,
-    context,
-  };
+  // Send the tool input as the request body directly (not wrapped).
+  // Webhook endpoints expect flat fields (e.g., {query: "bakery", count: 1}),
+  // not the MCP envelope format ({tool_use_id, tool_name, input: {...}}).
+  // Context is available via X-Webhook-Context header if needed.
+  const body = { ...input };
 
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (authToken) {
     headers["Authorization"] = `Bearer ${authToken}`;
+  }
+  headers["X-Webhook-Tool-Use-Id"] = toolUseId;
+  headers["X-Webhook-Tool-Name"] = toolName;
+  if (context) {
+    headers["X-Webhook-Context"] = JSON.stringify(context);
   }
 
   let response: Response;
@@ -78,6 +82,12 @@ export async function executeWebhook(
     };
   }
 
-  const data = (await response.json()) as WebhookResponse;
-  return data;
+  const data = await response.json();
+
+  // If the webhook returns {output: "..."} format, use it directly.
+  // Otherwise, stringify the full response as the output (most webhooks return raw data).
+  if (typeof data?.output === "string") {
+    return data as WebhookResponse;
+  }
+  return { output: JSON.stringify(data) };
 }
