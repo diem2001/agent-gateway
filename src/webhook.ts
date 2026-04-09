@@ -48,7 +48,10 @@ export async function executeWebhook(
   // Context is available via X-Webhook-Context header if needed.
   const body = { ...input };
 
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+  };
   if (authToken) {
     headers["Authorization"] = `Bearer ${authToken}`;
   }
