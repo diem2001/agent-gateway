@@ -32,21 +32,39 @@ function formatToolInput(toolName: string, input: Record<string, unknown> | unde
   if (toolName === "Edit" && input.file_path) return String(input.file_path);
   if (toolName === "WebSearch" && input.query) return String(input.query);
   if (toolName === "WebFetch" && input.url) return String(input.url);
-  return JSON.stringify(input).substring(0, 500);
+  // Reqlift tools: show readable summary
+  if (toolName === "reqlift_create_draft") {
+    const parts = [input.draft_type, input.title].filter(Boolean).map(String);
+    if (input.project_label) parts.unshift(`[${input.project_label}]`);
+    return parts.join(": ");
+  }
+  if (toolName === "reqlift_update_draft") {
+    const parts: string[] = [];
+    if (input.draft_id) parts.push(String(input.draft_id).substring(0, 8));
+    if (input.title) parts.push(String(input.title));
+    if (input.status) parts.push(`→ ${input.status}`);
+    return parts.join(" ");
+  }
+  if (toolName === "reqlift_get_project_context" && input.project_label) return String(input.project_label);
+  if (toolName === "reqlift_list_projects") return "list all projects";
+  return JSON.stringify(input, null, 2).substring(0, 1000);
 }
 
-const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"];
+const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"];
 
 export async function runQuery({ prompt, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
   const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames];
+  const HOME = process.env.HOME || "/home/node";
   const options: Record<string, unknown> = {
     allowedTools: effectiveTools,
     permissionMode: "bypassPermissions",
-    model: model || undefined,
+    model: model || "claude-opus-4-6",
     abortController,
     includePartialMessages: true,
+    cwd: HOME,
+    settingSources: ["user", "project"],
   };
   if (isResume) { options.resume = sessionId; } else { options.systemPrompt = systemPrompt || undefined; options.sessionId = sessionId; }
   log("query", `SDK options: sessionId=${sessionId || "none"} isResume=${isResume} resume=${isResume ? sessionId : "n/a"}`);
