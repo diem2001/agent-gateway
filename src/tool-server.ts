@@ -3,7 +3,7 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 // zod is a transitive dependency of @anthropic-ai/claude-agent-sdk (required for ZodRawShape)
 import { z } from "zod";
 import type { ToolDefinition } from "./tools.js";
-import type { WebhookContext } from "./webhook.js";
+import type { WebhookContext, WebhookResponse } from "./webhook.js";
 import { executeWebhook } from "./webhook.js";
 
 /* ------------------------------------------------------------------ */
@@ -59,9 +59,19 @@ export function createToolMcpServer(
             content: [{ type: "text" as const, text: result.output }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: result.output }],
-        };
+
+        // Include metadata as structured JSON so Claude sees the full data
+        const success = result as WebhookResponse;
+        const parts: Array<{ type: "text"; text: string }> = [
+          { type: "text" as const, text: success.output },
+        ];
+        if (success.metadata && Object.keys(success.metadata).length > 0) {
+          parts.push({
+            type: "text" as const,
+            text: "\n\n```json\n" + JSON.stringify(success.metadata, null, 2) + "\n```",
+          });
+        }
+        return { content: parts };
       },
     };
   });

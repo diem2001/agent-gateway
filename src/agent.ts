@@ -47,6 +47,10 @@ function formatToolInput(toolName: string, input: Record<string, unknown> | unde
   }
   if (toolName === "reqlift_get_project_context" && input.project_label) return String(input.project_label);
   if (toolName === "reqlift_list_projects") return "list all projects";
+  // Skill: show skill name
+  if (toolName === "Skill" && input.skill) return String(input.skill);
+  // Task/Agent: show description
+  if ((toolName === "Task" || toolName === "Agent") && input.description) return String(input.description);
   return JSON.stringify(input, null, 2).substring(0, 1000);
 }
 
