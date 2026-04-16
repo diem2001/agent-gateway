@@ -119,17 +119,16 @@ export function getSession(
 
   const existing = sessions.get(sessionId);
 
-  if (
-    existing &&
-    existing.systemPrompt === systemPrompt &&
-    existing.model === model
-  ) {
+  if (existing) {
+    // Always resume existing session — the client (Reqlift) decides which session to use
     existing.lastUsed = Date.now();
+    existing.systemPrompt = systemPrompt;
+    existing.model = model;
     persistSessions();
     return { sessionId: existing.sessionId, isNew: false };
   }
 
-  // Create new session (or replace if prompt/model changed)
+  // Create new session
   const claudeSessionId = randomUUID();
   sessions.set(sessionId, {
     sessionId: claudeSessionId,
@@ -139,15 +138,7 @@ export function getSession(
   });
   persistSessions();
 
-  if (existing) {
-    log(
-      "sessions",
-      `Replaced session ${sessionId} (prompt/model changed)`,
-    );
-  } else {
-    log("sessions", `Created session ${sessionId}`);
-  }
-
+  log("sessions", `Created session ${sessionId}`);
   return { sessionId: claudeSessionId, isNew: true };
 }
 

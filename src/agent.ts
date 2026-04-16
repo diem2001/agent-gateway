@@ -70,8 +70,11 @@ export async function runQuery({ prompt, systemPrompt, model, allowedTools, sess
     cwd: HOME,
     settingSources: ["user", "project"],
   };
-  if (isResume) { options.resume = sessionId; } else { options.systemPrompt = systemPrompt || undefined; options.sessionId = sessionId; }
-  log("query", `SDK options: sessionId=${sessionId || "none"} isResume=${isResume} resume=${isResume ? sessionId : "n/a"}`);
+  options.systemPrompt = systemPrompt
+    ? { type: "preset", preset: "claude_code", append: systemPrompt }
+    : { type: "preset", preset: "claude_code" };
+  if (isResume) { options.resume = sessionId; } else { options.sessionId = sessionId; }
+  log("query", `SDK options: sessionId=${sessionId || "none"} isResume=${isResume} resume=${isResume ? sessionId : "n/a"} model=${options.model || "default"}`);
 
   if (registeredTools.length > 0 && webhookContext) {
     options.mcpServers = {
