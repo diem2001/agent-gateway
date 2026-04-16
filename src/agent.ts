@@ -4,6 +4,7 @@ import type { StreamEvent } from "./event-cache.js";
 import { getAllTools } from "./tools.js";
 import type { WebhookContext } from "./webhook.js";
 import { createToolMcpServer } from "./tool-server.js";
+import { buildMcpServersForSdk, getMcpAllowedToolPatterns } from "./mcp-registry.js";
 
 export interface QueryParams {
   prompt: string;
@@ -59,7 +60,8 @@ const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSear
 export async function runQuery({ prompt, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
-  const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames];
+  const mcpToolPatterns = getMcpAllowedToolPatterns();
+  const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns];
   const HOME = process.env.HOME || "/home/node";
   const options: Record<string, unknown> = {
     allowedTools: effectiveTools,
@@ -76,10 +78,20 @@ export async function runQuery({ prompt, systemPrompt, model, allowedTools, sess
   if (isResume) { options.resume = sessionId; } else { options.sessionId = sessionId; }
   log("query", `SDK options: sessionId=${sessionId || "none"} isResume=${isResume} resume=${isResume ? sessionId : "n/a"} model=${options.model || "default"}`);
 
+  // Build mcpServers: merge webhook-based tools + registered MCP servers
+  const mcpServers: Record<string, unknown> = {};
+
   if (registeredTools.length > 0 && webhookContext) {
-    options.mcpServers = {
-      "agent-gateway-tools": createToolMcpServer(registeredTools, webhookContext, clientAuthToken),
-    };
+    mcpServers["agent-gateway-tools"] = createToolMcpServer(registeredTools, webhookContext, clientAuthToken);
+  }
+
+  const registeredMcpServers = buildMcpServersForSdk();
+  if (registeredMcpServers) {
+    Object.assign(mcpServers, registeredMcpServers);
+  }
+
+  if (Object.keys(mcpServers).length > 0) {
+    options.mcpServers = mcpServers;
   }
 
   const conversation = query({ prompt, options });

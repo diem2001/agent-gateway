@@ -23,6 +23,8 @@ import authRoutes from "./routes/auth.js";
 import workspaceRoutes from "./routes/workspace.js";
 import toolRoutes from "./routes/tools.js";
 import { loadTools } from "./tools.js";
+import { loadMcpServers } from "./mcp-registry.js";
+import mcpRoutes from "./routes/mcp.js";
 import gitRoutes from "./routes/git.js";
 
 /* ------------------------------------------------------------------ */
@@ -39,8 +41,9 @@ loadApiKeys();
 // Restore sessions from disk
 loadSessions();
 
-// Restore tools from disk
+// Restore tools and MCP servers from disk
 loadTools();
+loadMcpServers();
 
 // Logging middleware (before auth so we log rejected requests too)
 app.use(requestLoggingMiddleware);
@@ -59,6 +62,9 @@ app.use(gitRoutes);
 
 // Tool registry routes
 app.use(toolRoutes);
+
+// MCP server registry routes
+app.use(mcpRoutes);
 
 /* ------------------------------------------------------------------ */
 /*  Routes: Health (unauthenticated)                                    */
