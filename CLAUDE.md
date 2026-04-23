@@ -30,6 +30,7 @@ npm run test:e2e    # E2E session tests (requires running Gateway + GATEWAY_API_
 | `EVENT_CACHE_TTL_MS` | No | `1800000` (30 min) | TTL for completed query event caches |
 | `WORKSPACE_ROOT` | No | `$HOME/.claude` | Root for memory/agents/skills workspace |
 | `TOOLS_PERSIST_PATH` | No | `./data/tools.json` | File path for tool registry persistence (Docker override: `/home/node/.claude/tools.json`) |
+| `MCP_SERVERS_PERSIST_PATH` | No | `./data/mcp-servers.json` | File path for MCP server registry persistence (Docker override: `/home/node/.claude/mcp-servers.json`) |
 
 ## API Key Format
 
@@ -81,17 +82,22 @@ src/
   tools.ts           # Tool registry CRUD + persistence (TOOLS_PERSIST_PATH)
   webhook.ts         # Webhook executor (POST to tool webhook_url with context)
   tool-server.ts     # MCP server factory (wraps registered tools for Agent SDK)
+  mcp-registry.ts    # External MCP server registry CRUD + persistence (MCP_SERVERS_PERSIST_PATH)
   routes/
     ssh.ts           # POST /v1/ssh-keys
     auth.ts          # Anthropic OAuth flow (login, submit-code, status)
     workspace.ts     # CRUD for /v1/memory/*, /v1/agents/*, /v1/skills/*
+    git.ts           # POST /v1/workspace/git/clone|pull, GET /v1/workspace/git/status
     tools.ts         # PUT/GET/DELETE /v1/tools (Tool Registry REST endpoints)
+    mcp.ts           # PUT/GET/DELETE /v1/mcp-servers + /restart + /health (MCP Server Registry)
   tests/
     e2e-session.test.ts    # E2E session continuity tests
     routes.tools.test.ts   # Tool routes unit tests
     tool-server.test.ts    # MCP server factory tests
     tools.test.ts          # Tool registry unit tests
     webhook.test.ts        # Webhook executor tests
+  __tests__/
+    git.test.ts            # Workspace git endpoints tests
 Dockerfile           # Node 22 + system tools + Claude Code CLI
 docker-compose.yml   # Single-service compose with volume
 entrypoint.sh        # Root setup, SSH key restore, drop to node user

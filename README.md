@@ -87,6 +87,15 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `GET` | `/v1/tools` | List all registered tools |
 | `GET` | `/v1/tools/:name` | Get a single tool |
 | `DELETE` | `/v1/tools/:name` | Delete a tool |
+| `PUT` | `/v1/mcp-servers/:name` | Register/update an external MCP server |
+| `GET` | `/v1/mcp-servers` | List all registered MCP servers |
+| `GET` | `/v1/mcp-servers/:name` | Get a single MCP server |
+| `DELETE` | `/v1/mcp-servers/:name` | Unregister an MCP server |
+| `POST` | `/v1/mcp-servers/:name/restart` | Force the SDK to reconnect to the MCP server on next query |
+| `GET` | `/v1/mcp-servers/:name/health` | Health check for a registered MCP server |
+| `POST` | `/v1/workspace/git/clone` | Clone a repository into the workspace |
+| `POST` | `/v1/workspace/git/pull` | Pull updates for a workspace repository |
+| `GET` | `/v1/workspace/git/status` | Get git status for a workspace repository |
 
 ## Authentication
 
@@ -118,6 +127,7 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `EVENT_CACHE_TTL_MS` | `1800000` | Query event cache TTL in ms (30 min) |
 | `WORKSPACE_ROOT` | `$HOME/.claude` | Root dir for memory/agents/skills |
 | `TOOLS_PERSIST_PATH` | `./data/tools.json` | Tool registry storage (Docker: `/home/node/.claude/tools.json`) |
+| `MCP_SERVERS_PERSIST_PATH` | `./data/mcp-servers.json` | MCP server registry storage (Docker: `/home/node/.claude/mcp-servers.json`) |
 
 ## Development Setup
 
@@ -155,8 +165,12 @@ Express Server (auth middleware)
     +-- POST /v1/query -----> Agent (Claude SDK) ----> Built-in Tools (Bash, Read, ...)
     |                              |                |
     |                              |                +-> Registered Tools (webhook MCP servers)
-    |                         NDJSON stream               |
-    |                              |                      +-> POST webhook_url
+    |                              |                |         |
+    |                              |                |         +-> POST webhook_url
+    |                              |                |
+    |                              |                +-> External MCP Servers (http/sse/stdio)
+    |                         NDJSON stream                   |
+    |                              |                          +-> connect/spawn per query
     +-- GET /v1/query/:id/events   (replay from event cache)
     |
     +-- /v1/sessions, /v1/settings, /v1/logging
@@ -165,7 +179,11 @@ Express Server (auth middleware)
     |
     +-- /v1/memory/*, /v1/agents/*, /v1/skills/*
     |
+    +-- /v1/workspace/git/* (clone, pull, status)
+    |
     +-- /v1/tools (Tool Registry CRUD)
+    |
+    +-- /v1/mcp-servers (External MCP Server Registry CRUD + restart + health)
 ```
 
 ### Tool Registry + Webhook Execution
@@ -189,6 +207,64 @@ When the agent calls a registered tool, the gateway POSTs to the webhook URL wit
 ```
 
 The client's Bearer token is forwarded to webhook calls for authentication. Tools persist to disk at `TOOLS_PERSIST_PATH` and survive server restarts.
+
+### External MCP Server Registry
+
+In addition to webhook-based tools, the gateway can register full external MCP servers via `/v1/mcp-servers`. Unlike the Tool Registry (which wraps custom webhooks as tools), this feature embeds existing MCP servers into every Claude query so the agent can call their tools directly over the MCP protocol.
+
+|                    | Tool Registry (`/v1/tools`)              | MCP Server Registry (`/v1/mcp-servers`)        |
+|--------------------|------------------------------------------|------------------------------------------------|
+| **Purpose**        | Expose custom integrations as tools      | Embed existing MCP servers                     |
+| **Transport**      | HTTP POST to `webhook_url`               | MCP protocol: `http` / `sse` / `stdio`         |
+| **Tool schema**    | Defined by the registrar                 | Discovered from the MCP server itself          |
+| **Auth**           | Client's Bearer token forwarded          | Per-server `headers` / `env`                   |
+
+Register an HTTP/SSE MCP server:
+
+```bash
+curl -X PUT http://localhost:3001/v1/mcp-servers/jira \
+  -H "Authorization: Bearer sk-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "http",
+    "url": "https://mcp-jira.example.com/mcp",
+    "headers": { "X-API-Key": "secret" },
+    "description": "Jira MCP server",
+    "allowedToolsPattern": "mcp__jira__*",
+    "enabled": true
+  }'
+```
+
+Register a stdio MCP server (spawned by the gateway per query):
+
+```bash
+curl -X PUT http://localhost:3001/v1/mcp-servers/fs \
+  -H "Authorization: Bearer sk-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+    "env": { "NODE_ENV": "production" },
+    "allowedToolsPattern": "mcp__fs__*"
+  }'
+```
+
+Payload fields:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `type` | yes | `"http"`, `"sse"`, or `"stdio"` |
+| `url` | http/sse | Endpoint URL of the MCP server |
+| `headers` | no | Extra headers for http/sse requests |
+| `command` | stdio | Executable to spawn |
+| `args` | no | CLI args for stdio command |
+| `env` | no | Environment variables for stdio command |
+| `description` | no | Human-readable description |
+| `enabled` | no | Defaults to `true` |
+| `allowedToolsPattern` | no | Glob restricting which MCP tools the agent may call (e.g. `mcp__jira__*`) |
+
+Registered MCP servers persist to `MCP_SERVERS_PERSIST_PATH` and are merged into `options.mcpServers` on every `/v1/query` call. The SDK connects (http/sse) or spawns (stdio) per query; use `POST /v1/mcp-servers/:name/restart` to force a fresh connection.
 
 For detailed architecture, see [`docs/architecture.md`](docs/architecture.md).
 
