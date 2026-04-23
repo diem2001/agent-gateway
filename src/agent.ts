@@ -76,7 +76,7 @@ export async function runQuery({ prompt, systemPrompt, model, allowedTools, sess
     ? { type: "preset", preset: "claude_code", append: systemPrompt }
     : { type: "preset", preset: "claude_code" };
   if (isResume) { options.resume = sessionId; } else { options.sessionId = sessionId; }
-  log("query", `SDK options: sessionId=${sessionId || "none"} isResume=${isResume} resume=${isResume ? sessionId : "n/a"} model=${options.model || "default"}`);
+  log("query", `SDK options: sessionId=${sessionId || "none"} isResume=${isResume} resume=${isResume ? sessionId : "n/a"} model=${options.model || "default"} mcpPatterns=[${mcpToolPatterns.join(",")}]`);
 
   // Build mcpServers: merge webhook-based tools + registered MCP servers
   const mcpServers: Record<string, unknown> = {};
@@ -92,6 +92,7 @@ export async function runQuery({ prompt, systemPrompt, model, allowedTools, sess
 
   if (Object.keys(mcpServers).length > 0) {
     options.mcpServers = mcpServers;
+    log("query", `MCP servers: ${Object.keys(mcpServers).join(", ")}`);
   }
 
   const conversation = query({ prompt, options });
