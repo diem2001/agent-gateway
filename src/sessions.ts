@@ -9,6 +9,7 @@ import { log } from "./logging.js";
 
 export interface Session {
   sessionId: string;
+  sdkSessionId?: string;  // Set after first successful SDK response
   systemPrompt: string;
   model: string;
   lastUsed: number;
@@ -120,12 +121,17 @@ export function getSession(
   const existing = sessions.get(sessionId);
 
   if (existing) {
-    // Always resume existing session — the client (Reqlift) decides which session to use
     existing.lastUsed = Date.now();
     existing.systemPrompt = systemPrompt;
     existing.model = model;
     persistSessions();
-    return { sessionId: existing.sessionId, isNew: false };
+    if (existing.sdkSessionId) {
+      // SDK has acknowledged this session — safe to resume
+      return { sessionId: existing.sdkSessionId, isNew: false };
+    }
+    // Session exists but SDK never confirmed it (e.g. first query failed) — start fresh
+    log("sessions", `Session ${sessionId} has no confirmed SDK session — starting new query`);
+    return { sessionId: existing.sessionId, isNew: true };
   }
 
   // Create new session
@@ -160,8 +166,8 @@ export function listSessions(): Array<{
 
 export function updateSessionSdkId(clientId: string, sdkSessionId: string): void {
   const existing = sessions.get(clientId);
-  if (existing && existing.sessionId !== sdkSessionId) {
-    existing.sessionId = sdkSessionId;
+  if (existing && existing.sdkSessionId !== sdkSessionId) {
+    existing.sdkSessionId = sdkSessionId;
     persistSessions();
     log("sessions", `Updated SDK sessionId for ${clientId}: ${sdkSessionId}`);
   }
