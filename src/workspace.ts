@@ -50,6 +50,20 @@ export function listFiles(baseDir: string): FileEntry[] {
 }
 
 export function readFile(filePath: string): string { return fs.readFileSync(filePath, "utf-8"); }
-export function writeFile(filePath: string, content: string): void { fs.mkdirSync(path.dirname(filePath), { recursive: true }); fs.writeFileSync(filePath, content); }
+export function writeFile(filePath: string, content: string): void {
+  const dir = path.dirname(filePath);
+  // If a parent path segment exists as a file (e.g. old flat-file skill),
+  // remove it so mkdirSync can create the directory structure
+  let check = dir;
+  while (check !== path.dirname(check)) {
+    if (fs.existsSync(check) && !fs.statSync(check).isDirectory()) {
+      fs.unlinkSync(check);
+      break;
+    }
+    check = path.dirname(check);
+  }
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(filePath, content);
+}
 export function deleteFile(filePath: string): void { fs.unlinkSync(filePath); }
 export function ensureDir(dirPath: string): void { fs.mkdirSync(dirPath, { recursive: true }); log("workspace", "Ensured directory: " + dirPath); }
