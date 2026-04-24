@@ -1,5 +1,7 @@
 import { Router } from "express";
 import { execSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import { log } from "../logging.js";
 
 const router = Router();
@@ -8,9 +10,26 @@ const AUTH_TMUX_SESSION = "claude-auth";
 const HOME = process.env.HOME || "/home/node";
 function execEnv(): NodeJS.ProcessEnv { return { ...process.env, HOME }; }
 
+function readTokenExpiry(): { expiresAt: number | null; tokenExpired: boolean } {
+  try {
+    const credPath = path.join(HOME, ".claude", ".credentials.json");
+    const creds = JSON.parse(fs.readFileSync(credPath, "utf-8"));
+    const expiresAt = creds?.claudeAiOauth?.expiresAt ?? null;
+    if (typeof expiresAt === "number") {
+      return { expiresAt, tokenExpired: Date.now() > expiresAt };
+    }
+  } catch { /* no credentials file or parse error */ }
+  return { expiresAt: null, tokenExpired: false };
+}
+
 router.get("/v1/auth/status", (_req, res) => {
-  try { const result = execSync(CLAUDE_CLI + " auth status", { timeout: 10_000, env: execEnv() }); res.json(JSON.parse(result.toString())); }
-  catch { res.json({ loggedIn: false }); }
+  try {
+    const result = execSync(CLAUDE_CLI + " auth status", { timeout: 10_000, env: execEnv() });
+    const status = JSON.parse(result.toString());
+    const { expiresAt, tokenExpired } = readTokenExpiry();
+    res.json({ ...status, expiresAt, tokenExpired });
+  }
+  catch { res.json({ loggedIn: false, tokenExpired: false, expiresAt: null }); }
 });
 
 router.post("/v1/auth/login", async (_req, res) => {
