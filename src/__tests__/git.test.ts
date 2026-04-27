@@ -1,4 +1,4 @@
-import { describe, it, before, after, beforeEach, afterEach } from "node:test";
+import { describe, it, beforeAll, afterAll } from "vitest";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -68,13 +68,13 @@ async function request(
 describe("Git Routes", () => {
   let app: express.Express;
 
-  before(() => {
+  beforeAll(() => {
     app = express();
     app.use(express.json());
     app.use(gitRoutes);
   });
 
-  after(() => {
+  afterAll(() => {
     fs.rmSync(TEST_WORKSPACE, { recursive: true, force: true });
   });
 
@@ -167,6 +167,52 @@ describe("Git Routes", () => {
       });
       assert.equal(res.status, 200);
       assert.equal(res.body.status, "pulled");
+    });
+
+    it("should pull when local checkout is on a branch without tracking info", async () => {
+      // Reproduces the failure mode reported as "There is no tracking
+      // information for the current branch" — the local repo sits on a
+      // feature branch that was created without -u origin/<branch>.
+      const bare = createBareRemote("no-tracking-remote");
+      const tmpSrc = path.join(TEST_WORKSPACE, "tmp-no-tracking-src");
+      fs.mkdirSync(tmpSrc, { recursive: true });
+      execSync("git init -b main", { cwd: tmpSrc });
+      execSync("git config user.email 'test@test.com'", { cwd: tmpSrc });
+      execSync("git config user.name 'Test'", { cwd: tmpSrc });
+      fs.writeFileSync(path.join(tmpSrc, "file.txt"), "main-content");
+      execSync("git add . && git commit -m 'init'", { cwd: tmpSrc });
+      execSync(`git remote add origin ${bare}`, { cwd: tmpSrc });
+      execSync("git push -u origin main", { cwd: tmpSrc });
+      // Add a feature branch on the remote.
+      execSync("git checkout -b feature/x", { cwd: tmpSrc });
+      fs.writeFileSync(path.join(tmpSrc, "file.txt"), "feature-content");
+      execSync("git commit -am 'feature'", { cwd: tmpSrc });
+      execSync("git push -u origin feature/x", { cwd: tmpSrc });
+      fs.rmSync(tmpSrc, { recursive: true, force: true });
+
+      // Local clone of main…
+      const targetPath = path.join(PROJECTS_DIR, "no-tracking-repo");
+      execSync(`git clone -b main ${bare} ${targetPath}`);
+      // …then create a local feature branch WITHOUT upstream — the bug repro.
+      execSync("git checkout -b feature/x", { cwd: targetPath });
+
+      // Sanity check: a bare `git pull` would fail here.
+      assert.throws(() => execSync("git pull", { cwd: targetPath, stdio: "pipe" }));
+
+      // Calling clone with the correct branch must recover.
+      const res = await request(app, "POST", "/v1/workspace/git/clone", {
+        url: bare,
+        path: "no-tracking-repo",
+        branch: "feature/x",
+      });
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.equal(res.body.status, "pulled");
+      assert.equal(res.body.branch, "feature/x");
+      // Verify the working tree was actually updated to the feature branch.
+      assert.equal(
+        fs.readFileSync(path.join(targetPath, "file.txt"), "utf8"),
+        "feature-content",
+      );
     });
   });
 

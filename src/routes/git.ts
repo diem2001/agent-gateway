@@ -74,6 +74,41 @@ function git(args: string, cwd: string, env?: Record<string, string>): string {
 }
 
 /**
+ * Ensure the local repo is on `branch` and that branch tracks `origin/branch`.
+ * Idempotent. Required before running `git pull` on an existing checkout —
+ * otherwise pull fails with "There is no tracking information for the current
+ * branch" when the working copy was put on a branch that wasn't created with
+ * `-u origin/...`.
+ */
+function ensureBranchAndUpstream(
+  repoPath: string,
+  branch: string,
+  env?: Record<string, string>,
+): void {
+  // Make sure we have the latest ref for this branch from origin.
+  git(`fetch origin ${branch}`, repoPath, env);
+
+  // Switch (or create) the local branch tracking origin/<branch>.
+  const currentBranch = git("rev-parse --abbrev-ref HEAD", repoPath, env);
+  if (currentBranch !== branch) {
+    let localExists = true;
+    try {
+      git(`rev-parse --verify --quiet refs/heads/${branch}`, repoPath, env);
+    } catch {
+      localExists = false;
+    }
+    if (localExists) {
+      git(`checkout ${branch}`, repoPath, env);
+    } else {
+      git(`checkout -b ${branch} origin/${branch}`, repoPath, env);
+    }
+  }
+
+  // Set/repair upstream — safe to run even when already correct.
+  git(`branch --set-upstream-to=origin/${branch} ${branch}`, repoPath, env);
+}
+
+/**
  * Get current branch, commit, dirty status for a repo.
  */
 function repoInfo(repoPath: string): {
@@ -125,9 +160,15 @@ router.post("/v1/workspace/git/clone", (req: Request, res: Response) => {
       env = gitEnvWithSshKey(tempKeyPath);
     }
 
-    // If directory already exists with a .git folder, do pull instead
+    // If directory already exists with a .git folder, do pull instead.
+    // The caller may have changed the desired branch (or the local branch
+    // may lack upstream tracking) so we have to align the checkout with
+    // `branch` before pulling.
     if (fs.existsSync(path.join(targetPath, ".git"))) {
       log("git", "Clone target exists, pulling instead: " + userPath);
+      if (branch) {
+        ensureBranchAndUpstream(targetPath, branch, env);
+      }
       git("pull", targetPath, env);
       const info = repoInfo(targetPath);
       log("git", `Pulled ${userPath}: ${info.branch}@${info.commit}`);
@@ -159,8 +200,9 @@ router.post("/v1/workspace/git/clone", (req: Request, res: Response) => {
 /* ------------------------------------------------------------------ */
 
 router.post("/v1/workspace/git/pull", (req: Request, res: Response) => {
-  const { path: userPath, sshKey } = req.body as {
+  const { path: userPath, branch, sshKey } = req.body as {
     path?: string;
+    branch?: string;
     sshKey?: string;
   };
 
@@ -187,6 +229,10 @@ router.post("/v1/workspace/git/pull", (req: Request, res: Response) => {
     if (sshKey) {
       tempKeyPath = writeTempSshKey(sshKey);
       env = gitEnvWithSshKey(tempKeyPath);
+    }
+
+    if (branch) {
+      ensureBranchAndUpstream(targetPath, branch, env);
     }
 
     const beforeCommit = git("rev-parse HEAD", targetPath);

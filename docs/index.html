@@ -518,7 +518,7 @@ curl -X PUT http://localhost:3001/v1/settings \
       <span class="endpoint-method method-post">POST</span>
       <span class="endpoint-path">/v1/workspace/git/clone</span>
     </p>
-    <p>Clone a git repository into the workspace projects directory. If the target path already exists with a <code>.git</code> directory, performs a <code>git pull</code> instead.</p>
+    <p>Clone a git repository into the workspace projects directory. If the target path already exists with a <code>.git</code> directory, performs a <code>git pull</code> instead — when <code>branch</code> is supplied, the local checkout is first switched to that branch and upstream tracking to <code>origin/&lt;branch&gt;</code> is set/repaired so the pull cannot fail with "no tracking information".</p>
 
     <h3>Request Body</h3>
 <pre><code>{
@@ -563,6 +563,7 @@ curl -X PUT http://localhost:3001/v1/settings \
     <h3>Request Body</h3>
 <pre><code>{
   "path": "my-project",                    // Required: relative path under projects/
+  "branch": "feature/x",                   // Optional: switch to and track origin/&lt;branch&gt; before pulling
   "sshKey": "-----BEGIN OPENSSH..."        // Optional: SSH private key for auth
 }</code></pre>
 
@@ -578,6 +579,11 @@ curl -X PUT http://localhost:3001/v1/settings \
   -H "Authorization: Bearer sk-gw-abc123" \
   -H "Content-Type: application/json" \
   -d '{"path": "my-project"}'</code></pre>
+
+    <p>If <code>branch</code> is supplied, the gateway runs <code>git fetch origin &lt;branch&gt;</code>,
+    switches the local checkout to that branch (creating it from <code>origin/&lt;branch&gt;</code> if needed),
+    and ensures upstream tracking before pulling. Without <code>branch</code> the current checkout must
+    already track an upstream.</p>
   </div>
 
   <!-- ============================================================ -->
