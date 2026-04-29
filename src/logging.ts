@@ -30,6 +30,32 @@ export function logDebug(category: string, ...args: unknown[]): void {
   console.log(`[${category}]`, ...args);
 }
 
+function redactStringRecordValues(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  return Object.fromEntries(Object.keys(value as Record<string, unknown>).map((key) => [key, "[REDACTED]"]));
+}
+
+function redactCredentialRequestBody(url: string, body: unknown): unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const cloned = JSON.parse(JSON.stringify(body)) as Record<string, unknown>;
+
+  const overrides = cloned.mcpCredentialOverrides;
+  if (overrides && typeof overrides === "object" && !Array.isArray(overrides)) {
+    for (const override of Object.values(overrides as Record<string, Record<string, unknown>>)) {
+      if (!override || typeof override !== "object") continue;
+      override.headers = redactStringRecordValues(override.headers) as Record<string, unknown>;
+      override.env = redactStringRecordValues(override.env) as Record<string, unknown>;
+    }
+  }
+
+  if (/^\/v1\/mcp-servers\/[^/]+\/test$/.test(url)) {
+    cloned.headers = redactStringRecordValues(cloned.headers);
+    cloned.env = redactStringRecordValues(cloned.env);
+  }
+
+  return cloned;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Request/Response logging middleware                                  */
 /* ------------------------------------------------------------------ */
@@ -54,7 +80,7 @@ export function requestLoggingMiddleware(
         ? " " +
           (typeof req.body === "string"
             ? req.body
-            : JSON.stringify(req.body)
+            : JSON.stringify(redactCredentialRequestBody(url, req.body))
           ).substring(0, 2000)
         : "";
     log("req", `${method} ${url}${body}`);

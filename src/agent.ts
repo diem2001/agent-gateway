@@ -5,6 +5,11 @@ import { getAllTools } from "./tools.js";
 import type { WebhookContext } from "./webhook.js";
 import { createToolMcpServer } from "./tool-server.js";
 import { buildMcpServersForSdk, getMcpAllowedToolPatterns } from "./mcp-registry.js";
+import {
+  applyMcpCredentialOverrides,
+  summarizeOverrideKeys,
+  type McpCredentialOverrides,
+} from "./mcp-overrides.js";
 
 export interface QueryParams {
   prompt: string;
@@ -17,6 +22,7 @@ export interface QueryParams {
   onEvent: (event: Omit<StreamEvent, "seq">) => void;
   webhookContext?: WebhookContext;
   clientAuthToken?: string;
+  mcpCredentialOverrides?: McpCredentialOverrides;
 }
 
 export interface QueryResult {
@@ -57,7 +63,7 @@ function formatToolInput(toolName: string, input: Record<string, unknown> | unde
 
 const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"];
 
-export async function runQuery({ prompt, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken }: QueryParams): Promise<QueryResult> {
+export async function runQuery({ prompt, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
   const mcpToolPatterns = getMcpAllowedToolPatterns();
@@ -87,7 +93,18 @@ export async function runQuery({ prompt, systemPrompt, model, allowedTools, sess
 
   const registeredMcpServers = buildMcpServersForSdk();
   if (registeredMcpServers) {
-    Object.assign(mcpServers, registeredMcpServers);
+    const effectiveMcpServers = applyMcpCredentialOverrides(
+      registeredMcpServers,
+      mcpCredentialOverrides,
+    );
+    Object.assign(mcpServers, effectiveMcpServers);
+  }
+
+  if (mcpCredentialOverrides) {
+    for (const [serverName, override] of Object.entries(mcpCredentialOverrides)) {
+      const keys = summarizeOverrideKeys(override);
+      log("audit", `mcp.override.applied serverName=${serverName} keys=${keys.join(",") || "none"}`);
+    }
   }
 
   if (Object.keys(mcpServers).length > 0) {

@@ -92,6 +92,7 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `GET` | `/v1/mcp-servers/:name` | Get a single MCP server |
 | `DELETE` | `/v1/mcp-servers/:name` | Unregister an MCP server |
 | `POST` | `/v1/mcp-servers/:name/restart` | Force the SDK to reconnect to the MCP server on next query |
+| `POST` | `/v1/mcp-servers/:name/test` | Test merged MCP credentials with `tools/list` |
 | `GET` | `/v1/mcp-servers/:name/health` | Health check for a registered MCP server |
 | `POST` | `/v1/workspace/git/clone` | Clone a repository into the workspace |
 | `POST` | `/v1/workspace/git/pull` | Pull updates for a workspace repository |
@@ -299,6 +300,36 @@ Payload fields:
 Output templates support plain substitution (`"{fieldKey}"`, `"prefix-{a}-{b}"`) and HTTP Basic auth (`"basic:{email}:{apiToken}"`, emitted as `Basic <base64(email:apiToken)>`). The composer is transport-agnostic; the registry PUT validation enforces the transport-to-target rule before definitions are persisted.
 
 Registered MCP servers persist to `MCP_SERVERS_PERSIST_PATH` and are merged into `options.mcpServers` on every `/v1/query` call. The SDK connects (http/sse) or spawns (stdio) per query; use `POST /v1/mcp-servers/:name/restart` to force a fresh connection.
+
+Per-request MCP credential overrides can be attached to `POST /v1/query` without changing the existing request contract:
+
+```json
+{
+  "queryId": "q-001",
+  "prompt": "Create the Jira issue",
+  "mcpCredentialOverrides": {
+    "jira": {
+      "headers": { "Authorization": "Basic <base64(email:apiToken)>" }
+    },
+    "stdio-example": {
+      "env": { "EXAMPLE_TOKEN": "user-token" }
+    }
+  }
+}
+```
+
+Override server names must already exist and be enabled in the registry. Unknown names return `MCP_SERVER_NOT_FOUND`; disabled names return `MCP_SERVER_DISABLED`. For http/sse transports, `headers` are shallow-merged over the static registry config. For stdio transports, `env` is shallow-merged. Overrides are request-scoped only and never write back to `MCP_SERVERS_PERSIST_PATH`.
+
+Use `POST /v1/mcp-servers/:name/test` to validate a credential set before saving or enabling it:
+
+```bash
+curl -X POST http://localhost:3001/v1/mcp-servers/jira/test \
+  -H "Authorization: Bearer sk-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{ "headers": { "Authorization": "Basic <base64(email:apiToken)>" } }'
+```
+
+Success returns `{ "ok": true, "toolCount": 2, "tools": [{ "name": "..." }] }`. Unknown servers return `MCP_SERVER_NOT_FOUND`, upstream 401/403 returns `MCP_AUTH_FAILED`, transport failures return `MCP_NETWORK_ERROR`, and timeouts return `MCP_TIMEOUT`. Error messages are sanitized and do not echo header or env values.
 
 For detailed architecture, see [`docs/architecture.md`](docs/architecture.md).
 

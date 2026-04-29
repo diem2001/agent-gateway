@@ -195,6 +195,7 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers</code></td><td>Yes</td><td>List registered MCP servers</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Get a registered MCP server</td></tr>
       <tr><td><strong>DELETE</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Delete a registered MCP server</td></tr>
+      <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/test</code></td><td>Yes</td><td>Test MCP credentials with tools/list</td></tr>
     </tbody>
   </table>
 
@@ -251,6 +252,7 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
         <tr><td><code>sshTarget</code></td><td>string</td><td>No</td><td>SSH target for context (informational)</td></tr>
         <tr><td><code>user_id</code></td><td>string</td><td>No</td><td>User identifier passed to tool webhook context</td></tr>
         <tr><td><code>conversation_id</code></td><td>string</td><td>No</td><td>Conversation identifier passed to tool webhook context</td></tr>
+        <tr><td><code>mcpCredentialOverrides</code></td><td>object</td><td>No</td><td>Request-scoped MCP <code>headers</code> or <code>env</code> overrides keyed by registered server name</td></tr>
       </tbody>
     </table>
 
@@ -271,8 +273,14 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
     "queryId": "q-001",
     "prompt": "What files are in the current directory?",
     "sessionId": "session-1",
-    "systemPrompt": "You are a helpful assistant."
+    "systemPrompt": "You are a helpful assistant.",
+    "mcpCredentialOverrides": {
+      "jira": {
+        "headers": { "Authorization": "Basic &lt;base64(email:apiToken)&gt;" }
+      }
+    }
   }'</code></pre>
+    <p>Override server names must exist and be enabled. Unknown names return <code>MCP_SERVER_NOT_FOUND</code>; disabled names return <code>MCP_SERVER_DISABLED</code>. Overrides are merged for that one request only and are never persisted to the MCP registry.</p>
   </div>
 
   <!-- ============================================================ -->
@@ -738,6 +746,42 @@ curl -X PUT http://localhost:3001/v1/settings \
     <h3>Example</h3>
 <pre><code>curl http://localhost:3001/v1/memory \
   -H "Authorization: Bearer sk-gw-abc123"</code></pre>
+  </div>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge post">POST</span>
+      <span class="endpoint-path">/v1/mcp-servers/:name/test</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+    <p>Tests a registered MCP server with merged credential overrides by calling the standard <code>tools/list</code> JSON-RPC method. The endpoint can be used for enabled or disabled registered servers so credentials can be validated before enabling a server.</p>
+
+    <h3>Request Body</h3>
+<pre><code>{
+  "headers": { "Authorization": "Basic &lt;base64(email:apiToken)&gt;" },
+  "env": { "EXAMPLE_TOKEN": "user-token" }
+}</code></pre>
+
+    <h3>Success Response</h3>
+<pre><code>{
+  "ok": true,
+  "toolCount": 1,
+  "tools": [{ "name": "search" }]
+}</code></pre>
+
+    <h3>Error Codes</h3>
+    <table class="param-table">
+      <thead>
+        <tr><th>Status</th><th>Code</th><th>Meaning</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>400</td><td><code>MCP_SERVER_NOT_FOUND</code></td><td>No registered server has this name</td></tr>
+        <tr><td>401</td><td><code>MCP_AUTH_FAILED</code></td><td>The upstream MCP server returned 401/403</td></tr>
+        <tr><td>502</td><td><code>MCP_NETWORK_ERROR</code></td><td>The upstream MCP server could not be reached or returned an invalid response</td></tr>
+        <tr><td>504</td><td><code>MCP_TIMEOUT</code></td><td>The upstream MCP server did not respond before the timeout</td></tr>
+      </tbody>
+    </table>
+    <p>Error messages are sanitized and never echo submitted header or env values.</p>
   </div>
 
   <div class="endpoint-section">

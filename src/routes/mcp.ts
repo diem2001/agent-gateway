@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from "express";
+import { log } from "../logging.js";
 import {
   registerMcpServer,
   getMcpServer,
@@ -9,8 +10,11 @@ import {
   type UserCredentialSchema,
 } from "../mcp-registry.js";
 import { getCredentialTemplateFieldKeys } from "../credential-composer.js";
+import { testMcpServer, McpTestError } from "../mcp-test-client.js";
+import type { McpCredentialOverride } from "../mcp-overrides.js";
 
 const router = Router();
+const MCP_TEST_TIMEOUT_MS = parseInt(process.env.MCP_TEST_TIMEOUT_MS || "10000", 10);
 
 type SchemaValidationErrorCode =
   | "SCHEMA_FIELD_KEY_DUPLICATE"
@@ -26,6 +30,11 @@ interface SchemaValidationError {
 
 const FIELD_TYPES = new Set(["text", "password", "url", "email"]);
 const OUTPUT_TARGETS = new Set(["headers", "env"]);
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.values(value).every((entry) => typeof entry === "string");
+}
 
 function schemaError(code: SchemaValidationErrorCode, message: string): SchemaValidationError {
   return { code, message };
@@ -199,6 +208,50 @@ router.delete("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     return;
   }
   res.status(204).send();
+});
+
+/* ------------------------------------------------------------------ */
+/*  POST /v1/mcp-servers/:name/test — probe tools/list                 */
+/* ------------------------------------------------------------------ */
+
+router.post("/v1/mcp-servers/:name/test", async (req: Request, res: Response) => {
+  const name = String(req.params.name);
+  const srv = getMcpServer(name);
+  if (!srv) {
+    res.status(400).json({ error: { code: "MCP_SERVER_NOT_FOUND", message: `${name} is not registered` } });
+    return;
+  }
+
+  const body = (req.body ?? {}) as McpCredentialOverride;
+  if (body.headers !== undefined && !isStringRecord(body.headers)) {
+    res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: "headers must be a string map" } });
+    return;
+  }
+  if (body.env !== undefined && !isStringRecord(body.env)) {
+    res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: "env must be a string map" } });
+    return;
+  }
+
+  try {
+    const result = await testMcpServer(srv, body, MCP_TEST_TIMEOUT_MS);
+    log("audit", `mcp.test.called serverName=${name} result=ok`);
+    res.json(result);
+  } catch (error) {
+    if (error instanceof McpTestError) {
+      const result =
+        error.code === "MCP_AUTH_FAILED"
+          ? "auth_failed"
+          : error.code === "MCP_TIMEOUT"
+            ? "timeout"
+            : "network_error";
+      log("audit", `mcp.test.called serverName=${name} result=${result}`);
+      const status = error.code === "MCP_AUTH_FAILED" ? 401 : error.code === "MCP_TIMEOUT" ? 504 : 502;
+      res.status(status).json({ error: { code: error.code, message: error.message } });
+      return;
+    }
+    log("audit", `mcp.test.called serverName=${name} result=network_error`);
+    res.status(502).json({ error: { code: "MCP_NETWORK_ERROR", message: "MCP transport failure" } });
+  }
 });
 
 /* ------------------------------------------------------------------ */
