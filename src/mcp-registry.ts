@@ -24,8 +24,38 @@ export interface McpServerDefinition {
   env?: Record<string, string>;
   /** Tool name prefix pattern for allowedTools (e.g. "mcp__jira__*"). Auto-generated if omitted. */
   allowedToolsPattern?: string;
+  /** Optional per-user credential form and composition contract. */
+  userCredentialSchema?: UserCredentialSchema;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CredentialField {
+  /** Stable key used in templates, e.g. "email", "apiToken". */
+  key: string;
+  /** Human-readable label shown in the user form. */
+  label: string;
+  /** Input type for the user form. */
+  type: "text" | "password" | "url" | "email";
+  required: boolean;
+  /** Optional help text rendered under the field. */
+  description?: string;
+  /** Optional placeholder rendered in the input. */
+  placeholder?: string;
+}
+
+export interface CredentialOutput {
+  /** Where the composed value is injected at runtime. */
+  target: "headers" | "env";
+  /** Header name or environment variable name. */
+  outputKey: string;
+  /** Plain `{field}` template or `basic:{userField}:{tokenField}`. */
+  template: string;
+}
+
+export interface UserCredentialSchema {
+  fields: CredentialField[];
+  outputs: CredentialOutput[];
 }
 
 /** Config format passed to the Claude Agent SDK's options.mcpServers. */

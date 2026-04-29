@@ -126,6 +126,7 @@
       <li><a href="#ep-git-status">Git Status</a></li>
       <li><a href="#ep-workspace">Workspace (Memory, Agents, Skills)</a></li>
       <li><a href="#ep-tools">Tool Registry</a></li>
+      <li><a href="#ep-mcp-servers">MCP Server Registry</a></li>
       <li><a href="#ndjson">NDJSON Event Reference</a></li>
       <li><a href="#session-mgmt">Session Management</a></li>
       <li><a href="#deployment">Deployment Guide</a></li>
@@ -190,6 +191,10 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>GET</strong></td><td><code>/v1/tools</code></td><td>Yes</td><td>List all registered tools</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Get a single tool</td></tr>
       <tr><td><strong>DELETE</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Delete a tool</td></tr>
+      <tr><td><strong>PUT</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Register/update an MCP server</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers</code></td><td>Yes</td><td>List registered MCP servers</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Get a registered MCP server</td></tr>
+      <tr><td><strong>DELETE</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Delete a registered MCP server</td></tr>
     </tbody>
   </table>
 
@@ -962,6 +967,125 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
         <p>The tool result is passed back to the Claude agent as a <code>tool_result</code> event, and the agent continues its work.</p>
       </div>
     </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2 id="ep-mcp-servers">MCP Server Registry</h2>
+
+  <p>The MCP Server Registry registers external MCP servers that are injected into every Claude Agent SDK query. Definitions persist to <code>MCP_SERVERS_PERSIST_PATH</code> and support <code>http</code>, <code>sse</code>, and <code>stdio</code> transports.</p>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge put">PUT</span>
+      <span class="endpoint-path">/v1/mcp-servers/:name</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+
+    <p>Registers a new MCP server or updates an existing one. Returns <code>201</code> for new servers and <code>200</code> for updates.</p>
+
+    <h3>Request Body</h3>
+    <table class="param-table">
+      <thead>
+        <tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>type</code></td><td>string</td><td>Yes</td><td><code>http</code>, <code>sse</code>, or <code>stdio</code></td></tr>
+        <tr><td><code>url</code></td><td>string</td><td>http/sse</td><td>Endpoint URL for streamable HTTP or SSE transports</td></tr>
+        <tr><td><code>headers</code></td><td>object</td><td>No</td><td>Static headers sent to http/sse servers</td></tr>
+        <tr><td><code>command</code></td><td>string</td><td>stdio</td><td>Executable to spawn for stdio transport</td></tr>
+        <tr><td><code>args</code></td><td>array</td><td>No</td><td>Arguments passed to the stdio command</td></tr>
+        <tr><td><code>env</code></td><td>object</td><td>No</td><td>Static environment variables for stdio transport</td></tr>
+        <tr><td><code>description</code></td><td>string</td><td>No</td><td>Human-readable description</td></tr>
+        <tr><td><code>enabled</code></td><td>boolean</td><td>No</td><td>Defaults to <code>true</code></td></tr>
+        <tr><td><code>allowedToolsPattern</code></td><td>string</td><td>No</td><td>Tool-name glob such as <code>mcp__jira__*</code></td></tr>
+        <tr><td><code>userCredentialSchema</code></td><td>object</td><td>No</td><td>Per-user credential fields and output templates</td></tr>
+      </tbody>
+    </table>
+
+    <p><code>userCredentialSchema.fields[]</code> declares user form fields. Field keys must be unique and field type must be <code>text</code>, <code>password</code>, <code>url</code>, or <code>email</code>. <code>userCredentialSchema.outputs[]</code> declares composed outputs. HTTP/SSE servers may only emit <code>headers</code> outputs; stdio servers may only emit <code>env</code> outputs. Transport-target mismatches return <code>{"error":{"code":"SCHEMA_TARGET_MISMATCH"}}</code>.</p>
+
+    <p>Output templates support plain substitution such as <code>{fieldKey}</code> and <code>prefix-{a}-{b}</code>, plus Basic auth templates such as <code>basic:{email}:{apiToken}</code>, emitted as <code>Basic &lt;base64(email:apiToken)&gt;</code>.</p>
+
+    <h3>Production Jira HTTP Example</h3>
+<pre><code>curl -X PUT http://localhost:3001/v1/mcp-servers/jira \
+  -H "Authorization: Bearer sk-gw-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "http",
+    "url": "http://mcp-jira:3002/mcp",
+    "headers": {},
+    "description": "Atlassian Jira MCP server (HTTP transport at http://mcp-jira:3002/mcp)",
+    "allowedToolsPattern": "mcp__jira__*",
+    "enabled": true,
+    "userCredentialSchema": {
+      "fields": [
+        { "key": "email", "label": "Atlassian Email", "type": "email", "required": true },
+        {
+          "key": "apiToken",
+          "label": "API Token",
+          "type": "password",
+          "required": true,
+          "description": "Generate at https://id.atlassian.com/manage-profile/security/api-tokens"
+        }
+      ],
+      "outputs": [
+        { "target": "headers", "outputKey": "Authorization", "template": "basic:{email}:{apiToken}" }
+      ]
+    }
+  }'</code></pre>
+
+    <h3>Illustrative Stdio Env Example</h3>
+<pre><code>curl -X PUT http://localhost:3001/v1/mcp-servers/stdio-example \
+  -H "Authorization: Bearer sk-gw-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "stdio",
+    "command": "node",
+    "args": ["./some-mcp/dist/index.js"],
+    "env": {},
+    "enabled": false,
+    "userCredentialSchema": {
+      "fields": [
+        {
+          "key": "token",
+          "label": "Personal Access Token",
+          "type": "password",
+          "required": true,
+          "description": "Generate at the provider token settings page"
+        }
+      ],
+      "outputs": [
+        { "target": "env", "outputKey": "EXAMPLE_TOKEN", "template": "{token}" }
+      ]
+    }
+  }'</code></pre>
+  </div>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge get">GET</span>
+      <span class="endpoint-path">/v1/mcp-servers</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+    <p>Lists all registered MCP servers, including <code>userCredentialSchema</code> when configured.</p>
+  </div>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge get">GET</span>
+      <span class="endpoint-path">/v1/mcp-servers/:name</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+    <p>Returns a single registered MCP server, including <code>userCredentialSchema</code> when configured.</p>
+  </div>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge delete">DELETE</span>
+      <span class="endpoint-path">/v1/mcp-servers/:name</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+    <p>Deletes a registered MCP server. Returns <code>204</code> on success and <code>404</code> if it does not exist.</p>
   </div>
 
   <!-- ============================================================ -->

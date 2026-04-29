@@ -219,7 +219,7 @@ In addition to webhook-based tools, the gateway can register full external MCP s
 | **Tool schema**    | Defined by the registrar                 | Discovered from the MCP server itself          |
 | **Auth**           | Client's Bearer token forwarded          | Per-server `headers` / `env`                   |
 
-Register an HTTP/SSE MCP server:
+Register the production Jira HTTP MCP server with per-user Basic auth outputs:
 
 ```bash
 curl -X PUT http://localhost:3001/v1/mcp-servers/jira \
@@ -227,26 +227,55 @@ curl -X PUT http://localhost:3001/v1/mcp-servers/jira \
   -H "Content-Type: application/json" \
   -d '{
     "type": "http",
-    "url": "https://mcp-jira.example.com/mcp",
-    "headers": { "X-API-Key": "secret" },
-    "description": "Jira MCP server",
+    "url": "http://mcp-jira:3002/mcp",
+    "headers": {},
+    "description": "Atlassian Jira MCP server (HTTP transport at http://mcp-jira:3002/mcp)",
     "allowedToolsPattern": "mcp__jira__*",
-    "enabled": true
+    "enabled": true,
+    "userCredentialSchema": {
+      "fields": [
+        { "key": "email", "label": "Atlassian Email", "type": "email", "required": true },
+        {
+          "key": "apiToken",
+          "label": "API Token",
+          "type": "password",
+          "required": true,
+          "description": "Generate at https://id.atlassian.com/manage-profile/security/api-tokens"
+        }
+      ],
+      "outputs": [
+        { "target": "headers", "outputKey": "Authorization", "template": "basic:{email}:{apiToken}" }
+      ]
+    }
   }'
 ```
 
-Register a stdio MCP server (spawned by the gateway per query):
+Register an illustrative stdio MCP server (spawned by the gateway per query) with per-user env output:
 
 ```bash
-curl -X PUT http://localhost:3001/v1/mcp-servers/fs \
+curl -X PUT http://localhost:3001/v1/mcp-servers/stdio-example \
   -H "Authorization: Bearer sk-abc123" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "stdio",
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
-    "env": { "NODE_ENV": "production" },
-    "allowedToolsPattern": "mcp__fs__*"
+    "command": "node",
+    "args": ["./some-mcp/dist/index.js"],
+    "env": {},
+    "allowedToolsPattern": "mcp__stdio-example__*",
+    "userCredentialSchema": {
+      "fields": [
+        {
+          "key": "token",
+          "label": "Personal Access Token",
+          "type": "password",
+          "required": true,
+          "description": "Generate at the provider token settings page"
+        }
+      ],
+      "outputs": [
+        { "target": "env", "outputKey": "EXAMPLE_TOKEN", "template": "{token}" }
+      ]
+    }
   }'
 ```
 
@@ -263,6 +292,11 @@ Payload fields:
 | `description` | no | Human-readable description |
 | `enabled` | no | Defaults to `true` |
 | `allowedToolsPattern` | no | Glob restricting which MCP tools the agent may call (e.g. `mcp__jira__*`) |
+| `userCredentialSchema` | no | Per-user credential fields and output templates for `headers` or `env` overrides |
+
+`userCredentialSchema.fields[]` defines the form that clients render for a user's credential wallet. Field `type` must be one of `text`, `password`, `url`, or `email`; `key` values must be unique. `userCredentialSchema.outputs[]` defines how those field values are composed at query time. HTTP/SSE servers may only emit `target: "headers"` outputs, and stdio servers may only emit `target: "env"` outputs. Mismatches are rejected with `SCHEMA_TARGET_MISMATCH`.
+
+Output templates support plain substitution (`"{fieldKey}"`, `"prefix-{a}-{b}"`) and HTTP Basic auth (`"basic:{email}:{apiToken}"`, emitted as `Basic <base64(email:apiToken)>`). The composer is transport-agnostic; the registry PUT validation enforces the transport-to-target rule before definitions are persisted.
 
 Registered MCP servers persist to `MCP_SERVERS_PERSIST_PATH` and are merged into `options.mcpServers` on every `/v1/query` call. The SDK connects (http/sse) or spawns (stdio) per query; use `POST /v1/mcp-servers/:name/restart` to force a fresh connection.
 

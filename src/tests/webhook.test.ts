@@ -56,11 +56,15 @@ describe("executeWebhook", () => {
     expect(init.method).toBe("POST");
 
     const body = JSON.parse(init.body as string);
-    expect(body.tool_use_id).toBe("tool-use-42");
-    expect(body.tool_name).toBe("test-tool");
-    expect(body.input).toEqual({ query: "test" });
-    expect(body.context.user_id).toBe("u1");
-    expect(body.context.api_key_label).toBe("test");
+    expect(body).toEqual({ query: "test" });
+
+    const headers = init.headers as Record<string, string>;
+    expect(headers["X-Webhook-Tool-Use-Id"]).toBe("tool-use-42");
+    expect(headers["X-Webhook-Tool-Name"]).toBe("test-tool");
+    expect(JSON.parse(headers["X-Webhook-Context"])).toMatchObject({
+      user_id: "u1",
+      api_key_label: "test",
+    });
   });
 
   it("returns isError on non-2xx response", async () => {
