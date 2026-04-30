@@ -3,18 +3,28 @@ import { log, logDebug } from "./logging.js";
 import { createCacheEntry, getCacheEntry, markDone, type StreamEvent } from "./event-cache.js";
 import { runQueryWithRetry } from "./retry.js";
 import { getSession, updateSessionSdkId } from "./sessions.js";
+import {
+  validateMcpCredentialOverrides,
+  type McpCredentialOverrides,
+} from "./mcp-overrides.js";
 
 interface QueryRequestBody {
   queryId?: string; sessionId?: string; prompt?: string; systemPrompt?: string;
   model?: string; allowedTools?: string[]; useSession?: boolean; sshTarget?: string;
   user_id?: string; conversation_id?: string;
+  mcpCredentialOverrides?: McpCredentialOverrides;
 }
 
 export const queryRouter = Router();
 
 queryRouter.post("/v1/query", async (req: Request, res: Response) => {
-  const { queryId, sessionId, prompt, systemPrompt, model, allowedTools, useSession, sshTarget, user_id, conversation_id } = req.body as QueryRequestBody;
+  const { queryId, sessionId, prompt, systemPrompt, model, allowedTools, useSession, sshTarget, user_id, conversation_id, mcpCredentialOverrides } = req.body as QueryRequestBody;
   if (!queryId || !prompt) { res.status(400).json({ error: "queryId and prompt are required" }); return; }
+  const overrideValidation = validateMcpCredentialOverrides(mcpCredentialOverrides);
+  if (overrideValidation.error) {
+    res.status(400).json({ error: overrideValidation.error });
+    return;
+  }
 
   const webhookContext = {
     api_key_label: req.clientLabel,
@@ -65,6 +75,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
       prompt, systemPrompt, model, allowedTools,
       sessionId: effectiveSessionId,
       isResume, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
+      mcpCredentialOverrides: overrideValidation.overrides,
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
