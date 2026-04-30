@@ -51,7 +51,7 @@ async function testHttpMcpServer(
       headers: {
         ...headers,
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Accept": "application/json, text/event-stream",
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -76,7 +76,7 @@ async function testHttpMcpServer(
     throw new McpTestError("MCP_NETWORK_ERROR", `upstream returned ${response.status}`);
   }
 
-  const payload = await response.json().catch(() => null) as {
+  const payload = await parseMcpResponse(response) as {
     result?: { tools?: Array<{ name?: string }> };
     tools?: Array<{ name?: string }>;
   } | null;
@@ -85,4 +85,24 @@ async function testHttpMcpServer(
     .filter((tool) => tool.name.length > 0);
 
   return { ok: true, toolCount: tools.length, tools };
+}
+
+async function parseMcpResponse(response: Response): Promise<unknown | null> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("text/event-stream")) {
+    return response.json().catch(() => null);
+  }
+
+  const text = await response.text();
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice("data:".length).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      return JSON.parse(payload);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }

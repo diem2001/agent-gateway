@@ -59,8 +59,10 @@ async function startFakeMcpServer(
 describe("POST /v1/mcp-servers/:name/test", () => {
   it("merges headers, calls tools/list, and returns tool names", async () => {
     const seenAuth: string[] = [];
+    const seenAccept: string[] = [];
     const url = await startFakeMcpServer((req, res) => {
       seenAuth.push(String(req.headers.authorization ?? ""));
+      seenAccept.push(String(req.headers.accept ?? ""));
       res.setHeader("Content-Type", "application/json");
       res.end(JSON.stringify({ jsonrpc: "2.0", id: "agent-gateway-mcp-test", result: { tools: [{ name: "search" }] } }));
     });
@@ -79,6 +81,25 @@ describe("POST /v1/mcp-servers/:name/test", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true, toolCount: 1, tools: [{ name: "search" }] });
     expect(seenAuth).toEqual(["Basic USER_X"]);
+    expect(seenAccept).toEqual(["application/json, text/event-stream"]);
+  });
+
+  it("parses Streamable HTTP text/event-stream tools/list responses", async () => {
+    const url = await startFakeMcpServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end([
+        "event: message",
+        'data: {"jsonrpc":"2.0","id":"agent-gateway-mcp-test","result":{"tools":[{"name":"get_issue"}]}}',
+        "",
+      ].join("\n"));
+    });
+    await registerServer({ name: "jira", type: "http", url });
+    const app = await createApp();
+
+    const res = await request(app).post("/v1/mcp-servers/jira/test").send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, toolCount: 1, tools: [{ name: "get_issue" }] });
   });
 
   it("allows disabled registered servers because the endpoint validates before enabling", async () => {
