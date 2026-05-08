@@ -195,7 +195,9 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers</code></td><td>Yes</td><td>List registered MCP servers</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Get a registered MCP server</td></tr>
       <tr><td><strong>DELETE</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Delete a registered MCP server</td></tr>
-      <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/test</code></td><td>Yes</td><td>Test MCP credentials with tools/list</td></tr>
+      <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/test</code></td><td>Yes</td><td>Test MCP credentials with tools/list (accepts streamable SSE responses)</td></tr>
+      <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/restart</code></td><td>Yes</td><td>Force fresh SDK reconnect on next query</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers/:name/health</code></td><td>Yes</td><td>Cheap connectivity health probe</td></tr>
     </tbody>
   </table>
 
@@ -639,13 +641,26 @@ curl -X PUT http://localhost:3001/v1/settings \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Checks whether the Claude CLI inside the container has a valid Anthropic login. This is separate from the gateway's API key auth -- it determines whether the SDK can make API calls to Anthropic.</p>
+    <p>Checks whether the Claude CLI inside the container has a valid Anthropic login. This is separate from the gateway's API key auth -- it determines whether the SDK can make API calls to Anthropic. The response is augmented with <code>expiresAt</code> (epoch ms read from <code>~/.claude.json</code> <code>claudeAiOauth.expiresAt</code>) and <code>tokenExpired</code> (boolean, <code>true</code> if <code>Date.now() &gt; expiresAt</code>) so clients can warn users before queries start failing with auth errors.</p>
 
-    <h3>Response (logged in)</h3>
-<pre><code>{"loggedIn": true, "email": "user@example.com"}</code></pre>
+    <h3>Response (logged in, fresh token)</h3>
+<pre><code>{
+  "loggedIn": true,
+  "email": "user@example.com",
+  "expiresAt": 1746732122000,
+  "tokenExpired": false
+}</code></pre>
+
+    <h3>Response (logged in, token expired)</h3>
+<pre><code>{
+  "loggedIn": true,
+  "email": "user@example.com",
+  "expiresAt": 1714000000000,
+  "tokenExpired": true
+}</code></pre>
 
     <h3>Response (not logged in)</h3>
-<pre><code>{"loggedIn": false}</code></pre>
+<pre><code>{"loggedIn": false, "expiresAt": null, "tokenExpired": false}</code></pre>
 
     <h3>Example</h3>
 <pre><code>curl http://localhost:3001/v1/auth/status \
@@ -754,7 +769,7 @@ curl -X PUT http://localhost:3001/v1/settings \
       <span class="endpoint-path">/v1/mcp-servers/:name/test</span>
       <span class="auth-tag required">Auth Required</span>
     </p>
-    <p>Tests a registered MCP server with merged credential overrides by calling the standard <code>tools/list</code> JSON-RPC method. The endpoint can be used for enabled or disabled registered servers so credentials can be validated before enabling a server.</p>
+    <p>Tests a registered MCP server with merged credential overrides by calling the standard <code>tools/list</code> JSON-RPC method. The endpoint can be used for enabled or disabled registered servers so credentials can be validated before enabling a server. Both plain <code>application/json</code> and streamable <code>text/event-stream</code> MCP responses are accepted, so providers that emit one-shot SSE responses for HTTP requests are supported.</p>
 
     <h3>Request Body</h3>
 <pre><code>{
@@ -776,12 +791,56 @@ curl -X PUT http://localhost:3001/v1/settings \
       </thead>
       <tbody>
         <tr><td>400</td><td><code>MCP_SERVER_NOT_FOUND</code></td><td>No registered server has this name</td></tr>
+        <tr><td>400</td><td><code>MCP_OVERRIDE_INVALID</code></td><td><code>headers</code> / <code>env</code> are not string maps</td></tr>
         <tr><td>401</td><td><code>MCP_AUTH_FAILED</code></td><td>The upstream MCP server returned 401/403</td></tr>
         <tr><td>502</td><td><code>MCP_NETWORK_ERROR</code></td><td>The upstream MCP server could not be reached or returned an invalid response</td></tr>
-        <tr><td>504</td><td><code>MCP_TIMEOUT</code></td><td>The upstream MCP server did not respond before the timeout</td></tr>
+        <tr><td>504</td><td><code>MCP_TIMEOUT</code></td><td>The upstream MCP server did not respond before <code>MCP_TEST_TIMEOUT_MS</code> (default 10s)</td></tr>
       </tbody>
     </table>
     <p>Error messages are sanitized and never echo submitted header or env values.</p>
+  </div>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge post">POST</span>
+      <span class="endpoint-path">/v1/mcp-servers/:name/restart</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+    <p>Forces the Agent SDK to drop and re-establish its connection to a registered MCP server on the next query. The gateway bumps the server's <code>updatedAt</code> and toggles <code>enabled</code> on, which causes <code>buildMcpServersForSdk()</code> to emit a fresh transport on the next <code>POST /v1/query</code> — HTTP/SSE servers reconnect, stdio servers respawn. Useful after rotating credentials, restarting an upstream MCP server, or when a transient connection wedges.</p>
+
+    <h3>Response</h3>
+<pre><code>{"restarted": true, "name": "jira"}</code></pre>
+
+    <h3>Example</h3>
+<pre><code>curl -X POST http://localhost:3001/v1/mcp-servers/jira/restart \
+  -H "Authorization: Bearer sk-gw-abc123"</code></pre>
+  </div>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge get">GET</span>
+      <span class="endpoint-path">/v1/mcp-servers/:name/health</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+    <p>Cheap connectivity probe for a registered MCP server. Unlike <code>/test</code> this does not invoke <code>tools/list</code> — it only verifies that the upstream is reachable and responsive, so it is safe to call frequently from a status dashboard.</p>
+
+    <h3>Response (reachable)</h3>
+<pre><code>{
+  "name": "jira",
+  "ok": true,
+  "latencyMs": 41
+}</code></pre>
+
+    <h3>Response (unreachable)</h3>
+<pre><code>{
+  "name": "jira",
+  "ok": false,
+  "error": "ECONNREFUSED"
+}</code></pre>
+
+    <h3>Example</h3>
+<pre><code>curl http://localhost:3001/v1/mcp-servers/jira/health \
+  -H "Authorization: Bearer sk-gw-abc123"</code></pre>
   </div>
 
   <div class="endpoint-section">
@@ -1292,6 +1351,8 @@ curl http://localhost:3001/health</code></pre>
       <tr><td><code>EVENT_CACHE_TTL_MS</code></td><td><code>1800000</code></td><td>Query event cache TTL (30 min)</td></tr>
       <tr><td><code>WORKSPACE_ROOT</code></td><td><code>$HOME/.claude</code></td><td>Root dir for memory/agents/skills</td></tr>
       <tr><td><code>TOOLS_PERSIST_PATH</code></td><td><code>/home/node/.claude/tools.json</code></td><td>Tool registry persistence file</td></tr>
+      <tr><td><code>MCP_SERVERS_PERSIST_PATH</code></td><td><code>/home/node/.claude/mcp-servers.json</code></td><td>External MCP server registry persistence file</td></tr>
+      <tr><td><code>MCP_TEST_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-test deadline for <code>POST /v1/mcp-servers/:name/test</code></td></tr>
     </tbody>
   </table>
 
@@ -1353,6 +1414,7 @@ curl http://localhost:3001/health</code></pre>
   <ul>
     <li><code>/home/node/.claude/sessions.json</code> -- session state (survives container restarts)</li>
     <li><code>/home/node/.claude/tools.json</code> -- registered tool definitions (survives container restarts)</li>
+    <li><code>/home/node/.claude/mcp-servers.json</code> -- external MCP server registry (survives container restarts)</li>
     <li><code>/home/node/.claude/skills/</code> -- published skills</li>
     <li><code>/home/node/.claude/agents/</code> -- agent configurations</li>
     <li><code>/home/node/.claude/memory/</code> -- workspace memory</li>
@@ -1378,6 +1440,7 @@ curl http://localhost:3001/health</code></pre>
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - SESSION_PERSIST_PATH=/home/node/.claude/sessions.json
       - TOOLS_PERSIST_PATH=/home/node/.claude/tools.json
+      - MCP_SERVERS_PERSIST_PATH=/home/node/.claude/mcp-servers.json
       - SESSION_IDLE_TIMEOUT_MS=${SESSION_IDLE_TIMEOUT_MS:-0}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:3001/health"]

@@ -129,6 +129,7 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `WORKSPACE_ROOT` | `$HOME/.claude` | Root dir for memory/agents/skills |
 | `TOOLS_PERSIST_PATH` | `./data/tools.json` | Tool registry storage (Docker: `/home/node/.claude/tools.json`) |
 | `MCP_SERVERS_PERSIST_PATH` | `./data/mcp-servers.json` | MCP server registry storage (Docker: `/home/node/.claude/mcp-servers.json`) |
+| `MCP_TEST_TIMEOUT_MS` | `10000` | Per-test deadline for `POST /v1/mcp-servers/:name/test` |
 
 ## Development Setup
 
