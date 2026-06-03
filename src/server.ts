@@ -32,7 +32,7 @@ import gitRoutes from "./routes/git.js";
 /* ------------------------------------------------------------------ */
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "25mb" }));
 app.use(express.text({ limit: "10mb", type: "text/*" }));
 
 // Load API keys from env
@@ -159,6 +159,19 @@ app.use(
     _next: express.NextFunction,
   ) => {
     log("error", err.message);
+    // Honor a client-error status set by body-parser (e.g. 413 PayloadTooLargeError
+    // when a request exceeds the JSON body limit, 400 for malformed JSON) so
+    // over-limit/bad requests are not masked as a generic 500.
+    const bodyErr = err as Error & { status?: number; statusCode?: number; type?: string };
+    const status = bodyErr.status || bodyErr.statusCode;
+    if (typeof status === "number" && status >= 400 && status < 500) {
+      const message =
+        bodyErr.type === "entity.too.large"
+          ? "Request body too large"
+          : "Bad request";
+      res.status(status).json({ error: message });
+      return;
+    }
     res.status(500).json({ error: "Internal server error" });
   },
 );
