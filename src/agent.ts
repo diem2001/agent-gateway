@@ -1,4 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import type { ContentBlock } from "./query.js";
 import { log } from "./logging.js";
 import type { StreamEvent } from "./event-cache.js";
 import { getAllTools } from "./tools.js";
@@ -12,7 +13,8 @@ import {
 } from "./mcp-overrides.js";
 
 export interface QueryParams {
-  prompt: string;
+  prompt?: string;
+  content?: ContentBlock[];
   systemPrompt?: string;
   model?: string;
   allowedTools?: string[];
@@ -112,7 +114,7 @@ export async function runQuery({ prompt, systemPrompt, model, allowedTools, sess
     log("query", `MCP servers: ${Object.keys(mcpServers).join(", ")}`);
   }
 
-  const conversation = query({ prompt, options });
+  const conversation = query({ prompt: prompt ?? "", options });
   let fullResponse = "";
   let resultData: Record<string, unknown> | null = null;
   const pendingTools = new Map<string, { name: string }>();
