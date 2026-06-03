@@ -98,6 +98,61 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `POST` | `/v1/workspace/git/pull` | Pull updates for a workspace repository |
 | `GET` | `/v1/workspace/git/status` | Get git status for a workspace repository |
 
+## Query Request Body
+
+`POST /v1/query` accepts a JSON body. The core fields:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `queryId` | string | yes | Client-generated id used for the NDJSON event cache and replay |
+| `prompt` | string | no\* | Plain-text prompt |
+| `content` | `ContentBlock[]` | no\* | Multimodal content array (text + images) |
+| `sessionId` | string | no | Resume an existing session |
+| `systemPrompt` | string | no | Appended to the Claude Code preset system prompt |
+| `model` | string | no | Model id |
+| `allowedTools` | string[] | no | Override the default tool set |
+
+\* Provide **either** `prompt` **or** `content`. If both are present, `content` takes precedence. If neither is present, the request is rejected with HTTP 400.
+
+### Multimodal Content (`content[]`)
+
+Send text and images in a single query by passing a `content` array of content blocks. The array maps directly to the Anthropic API content-block format and is forwarded to the Claude Agent SDK as a structured user message — image blocks are passed through to Anthropic **unmodified**.
+
+```typescript
+type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+```
+
+Rules:
+
+- If `content` is a non-empty array, it takes precedence over `prompt`.
+- If only `prompt` is provided (the backward-compatible path), it is wrapped internally as `[{ "type": "text", "text": prompt }]` — existing text-only queries are unchanged.
+- Each block is structurally validated; a malformed block (e.g. missing `source.data`, non-`base64` `source.type`, unknown `type`) returns HTTP 400 before the stream opens.
+- The NDJSON event stream is identical in shape for multimodal and text-only queries.
+
+The JSON request body limit is **25 MB** to accommodate base64-encoded images. A body that exceeds the limit is rejected with HTTP **413**. (Per-image size and per-query image-count limits are enforced upstream by the caller, not by the gateway.)
+
+```bash
+curl -N -X POST http://localhost:3001/v1/query \
+  -H "Authorization: Bearer sk-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queryId": "q-multimodal-1",
+    "content": [
+      { "type": "text", "text": "What is shown in this screenshot?" },
+      {
+        "type": "image",
+        "source": {
+          "type": "base64",
+          "media_type": "image/png",
+          "data": "<base64-encoded-image-bytes>"
+        }
+      }
+    ]
+  }'
+```
+
 ## Authentication
 
 API keys are configured via the `API_KEYS` environment variable:
