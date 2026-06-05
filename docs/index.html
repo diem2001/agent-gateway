@@ -245,7 +245,8 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       </thead>
       <tbody>
         <tr><td><code>queryId</code></td><td>string</td><td>Yes</td><td>Unique ID for this query (client-generated UUID)</td></tr>
-        <tr><td><code>prompt</code></td><td>string</td><td>Yes</td><td>The prompt to send to the agent</td></tr>
+        <tr><td><code>prompt</code></td><td>string</td><td>No*</td><td>Plain-text prompt. *Provide either <code>prompt</code> or <code>content</code>.</td></tr>
+        <tr><td><code>content</code></td><td>ContentBlock[]</td><td>No*</td><td>Multimodal content array (text + images). Takes precedence over <code>prompt</code>. *Provide either <code>prompt</code> or <code>content</code>.</td></tr>
         <tr><td><code>sessionId</code></td><td>string</td><td>No</td><td>Session ID for conversation continuity</td></tr>
         <tr><td><code>systemPrompt</code></td><td>string</td><td>No</td><td>System prompt to configure agent behavior</td></tr>
         <tr><td><code>model</code></td><td>string</td><td>No</td><td>Claude model to use (e.g., <code>claude-sonnet-4-20250514</code>)</td></tr>
@@ -283,6 +284,36 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
     }
   }'</code></pre>
     <p>Override server names must exist and be enabled. Unknown names return <code>MCP_SERVER_NOT_FOUND</code>; disabled names return <code>MCP_SERVER_DISABLED</code>. Overrides are merged for that one request only and are never persisted to the MCP registry.</p>
+
+    <h3>Multimodal Content (<code>content[]</code>)</h3>
+    <p>Send text and images in a single query by passing a <code>content</code> array of content blocks. The array maps directly to the Anthropic API content-block format and is forwarded to the Claude Agent SDK as a structured user message — image blocks are passed through to Anthropic <strong>unmodified</strong>.</p>
+<pre><code>type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; source: { type: "base64"; media_type: string; data: string } };</code></pre>
+    <ul>
+      <li>If <code>content</code> is a non-empty array, it takes precedence over <code>prompt</code>.</li>
+      <li>If only <code>prompt</code> is provided (backward-compatible path), it is wrapped internally as <code>[{ "type": "text", "text": prompt }]</code> — existing text-only queries are unchanged.</li>
+      <li>Each block is structurally validated; a malformed block (missing <code>source.data</code>, non-<code>base64</code> <code>source.type</code>, unknown <code>type</code>) returns HTTP <code>400</code> before the stream opens.</li>
+      <li>The NDJSON event stream is identical in shape for multimodal and text-only queries.</li>
+    </ul>
+    <p>The JSON request body limit is <strong>25 MB</strong> to accommodate base64-encoded images. A body that exceeds the limit is rejected with HTTP <code>413</code>. Per-image size and per-query image-count limits are enforced upstream by the caller, not by the gateway.</p>
+<pre><code>curl -N -X POST http://localhost:3001/v1/query \
+  -H "Authorization: Bearer sk-gw-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queryId": "q-multimodal-1",
+    "content": [
+      { "type": "text", "text": "What is shown in this screenshot?" },
+      {
+        "type": "image",
+        "source": {
+          "type": "base64",
+          "media_type": "image/png",
+          "data": "&lt;base64-encoded-image-bytes&gt;"
+        }
+      }
+    ]
+  }'</code></pre>
   </div>
 
   <!-- ============================================================ -->

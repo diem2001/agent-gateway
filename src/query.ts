@@ -8,18 +8,82 @@ import {
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
 
+/**
+ * A single block of multimodal request content. Maps directly to the Anthropic
+ * API `ContentBlockParam` shape so it can be forwarded to the Claude Agent SDK
+ * without transformation.
+ */
+export type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+
 interface QueryRequestBody {
   queryId?: string; sessionId?: string; prompt?: string; systemPrompt?: string;
+  content?: ContentBlock[];
   model?: string; allowedTools?: string[]; useSession?: boolean; sshTarget?: string;
   user_id?: string; conversation_id?: string;
   mcpCredentialOverrides?: McpCredentialOverrides;
 }
 
+/**
+ * Validate a single content block against the supported shapes. Returns an error
+ * string if the block is malformed, otherwise null. Never inspects/decodes the
+ * base64 payload (image bytes are validated upstream at upload time).
+ */
+function validateContentBlock(block: unknown, index: number): string | null {
+  if (typeof block !== "object" || block === null) {
+    return `content[${index}] must be an object`;
+  }
+  const b = block as Record<string, unknown>;
+  if (b.type === "text") {
+    if (typeof b.text !== "string") return `content[${index}].text must be a string`;
+    return null;
+  }
+  if (b.type === "image") {
+    const source = b.source as Record<string, unknown> | undefined;
+    if (typeof source !== "object" || source === null) {
+      return `content[${index}].source must be an object`;
+    }
+    if (source.type !== "base64") return `content[${index}].source.type must be "base64"`;
+    if (typeof source.media_type !== "string") return `content[${index}].source.media_type must be a string`;
+    if (typeof source.data !== "string") return `content[${index}].source.data must be a string`;
+    return null;
+  }
+  return `content[${index}].type must be "text" or "image"`;
+}
+
+/**
+ * Resolve the effective content blocks from the request body.
+ * - If `content` is a non-empty array, it takes precedence over `prompt`.
+ * - Otherwise, if `prompt` is a non-empty string, it is wrapped as a single text block.
+ * - Otherwise, neither is present → validation error.
+ * Returns either `{ blocks }` or `{ error }`.
+ */
+function resolveContentBlocks(
+  content: ContentBlock[] | undefined,
+  prompt: string | undefined,
+): { blocks: ContentBlock[] } | { error: string } {
+  if (Array.isArray(content) && content.length > 0) {
+    for (let i = 0; i < content.length; i++) {
+      const err = validateContentBlock(content[i], i);
+      if (err) return { error: err };
+    }
+    return { blocks: content };
+  }
+  if (typeof prompt === "string" && prompt.length > 0) {
+    return { blocks: [{ type: "text", text: prompt }] };
+  }
+  return { error: "queryId and prompt or content are required" };
+}
+
 export const queryRouter = Router();
 
 queryRouter.post("/v1/query", async (req: Request, res: Response) => {
-  const { queryId, sessionId, prompt, systemPrompt, model, allowedTools, useSession, sshTarget, user_id, conversation_id, mcpCredentialOverrides } = req.body as QueryRequestBody;
-  if (!queryId || !prompt) { res.status(400).json({ error: "queryId and prompt are required" }); return; }
+  const { queryId, sessionId, prompt, content, systemPrompt, model, allowedTools, useSession, sshTarget, user_id, conversation_id, mcpCredentialOverrides } = req.body as QueryRequestBody;
+  if (!queryId) { res.status(400).json({ error: "queryId and prompt or content are required" }); return; }
+  const resolved = resolveContentBlocks(content, prompt);
+  if ("error" in resolved) { res.status(400).json({ error: resolved.error }); return; }
+  const contentBlocks = resolved.blocks;
   const overrideValidation = validateMcpCredentialOverrides(mcpCredentialOverrides);
   if (overrideValidation.error) {
     res.status(400).json({ error: overrideValidation.error });
@@ -72,7 +136,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     }
 
     const { response: _response, resultData } = await runQueryWithRetry({
-      prompt, systemPrompt, model, allowedTools,
+      prompt, content: contentBlocks, systemPrompt, model, allowedTools,
       sessionId: effectiveSessionId,
       isResume, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
       mcpCredentialOverrides: overrideValidation.overrides,

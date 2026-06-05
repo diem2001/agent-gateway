@@ -1,4 +1,6 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { ContentBlock } from "./query.js";
 import { log } from "./logging.js";
 import type { StreamEvent } from "./event-cache.js";
 import { getAllTools } from "./tools.js";
@@ -12,7 +14,8 @@ import {
 } from "./mcp-overrides.js";
 
 export interface QueryParams {
-  prompt: string;
+  prompt?: string;
+  content?: ContentBlock[];
   systemPrompt?: string;
   model?: string;
   allowedTools?: string[];
@@ -63,7 +66,30 @@ function formatToolInput(toolName: string, input: Record<string, unknown> | unde
 
 const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"];
 
-export async function runQuery({ prompt, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides }: QueryParams): Promise<QueryResult> {
+/**
+ * Build a fresh single-message AsyncIterable<SDKUserMessage> from the resolved
+ * content blocks. The Claude Agent SDK's `query()` accepts
+ * `prompt: string | AsyncIterable<SDKUserMessage>`; for multimodal input we yield
+ * exactly one user message whose `message.content` is the content-block array,
+ * which is forwarded to the Anthropic API unmodified.
+ *
+ * CRITICAL: an AsyncIterable is single-consumption. The retry path re-invokes
+ * `runQuery` on each attempt, so a new generator MUST be constructed per call.
+ * This function returns a fresh async generator every time it is called.
+ */
+async function* buildContentMessageStream(
+  content: ContentBlock[],
+  sessionId: string | undefined,
+): AsyncGenerator<SDKUserMessage> {
+  yield {
+    type: "user",
+    session_id: sessionId ?? "",
+    parent_tool_use_id: null,
+    message: { role: "user", content },
+  };
+}
+
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
   const mcpToolPatterns = getMcpAllowedToolPatterns();
@@ -112,7 +138,22 @@ export async function runQuery({ prompt, systemPrompt, model, allowedTools, sess
     log("query", `MCP servers: ${Object.keys(mcpServers).join(", ")}`);
   }
 
-  const conversation = query({ prompt, options });
+  // Choose the SDK prompt argument:
+  // - Multimodal / non-trivial content blocks → a FRESH AsyncIterable<SDKUserMessage>
+  //   built per call (the retry path re-invokes runQuery, and an AsyncIterable is
+  //   single-consumption, so it must never be reused).
+  // - A single plain text block (the backward-compatible text-only path) → the
+  //   original string prompt, keeping existing behavior byte-for-byte unchanged.
+  const isPlainTextOnly =
+    Array.isArray(content) &&
+    content.length === 1 &&
+    content[0].type === "text";
+  const useContentStream = Array.isArray(content) && content.length > 0 && !isPlainTextOnly;
+  const promptArg = useContentStream
+    ? buildContentMessageStream(content as ContentBlock[], sessionId)
+    : prompt ?? (isPlainTextOnly && content[0].type === "text" ? content[0].text : "");
+
+  const conversation = query({ prompt: promptArg, options });
   let fullResponse = "";
   let resultData: Record<string, unknown> | null = null;
   const pendingTools = new Map<string, { name: string }>();
