@@ -1245,6 +1245,8 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
     <p>Tool execution completed. Output is truncated to 3000 characters. <code>durationMs</code> is null if timing data is unavailable.</p>
     <p><strong>Note:</strong> There is no <code>success</code> field. The gateway reports tool completion, not tool success/failure. The AI agent internally decides whether a tool result represents success or an error and acts accordingly. Consumers should treat a <code>tool_result</code> event as "tool completed" (e.g., show a checkmark), regardless of the output content. If the output contains an error message, the AI will handle the retry or fallback logic itself.</p>
 <pre><code>{"seq": 2, "type": "tool_result", "toolName": "Bash", "toolUseId": "tu_abc123", "output": "/dev/sda1  50G  35G  15G  70% /var", "durationMs": 245}</code></pre>
+    <p>When an MCP tool returns image content (e.g. a <code>chrome-devtools-mcp</code> screenshot), the event carries an optional <code>images</code> array of <code>{ "data": "&lt;base64&gt;", "mimeType": "image/png" }</code> entries. The field is omitted for text-only results, and the text <code>output</code> path (3000-char truncation) is unchanged. Bounds: at most <strong>5 images per event</strong> and <strong>15&nbsp;MB decoded per image</strong> — excess or oversize images are dropped with a warn log.</p>
+<pre><code>{"seq": 4, "type": "tool_result", "toolName": "take_screenshot", "toolUseId": "tu_shot1", "output": "Screenshot captured", "durationMs": 812, "images": [{"data": "iVBORw0KGgo...", "mimeType": "image/png"}]}</code></pre>
   </div>
 
   <div class="event-card">

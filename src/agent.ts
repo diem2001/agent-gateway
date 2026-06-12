@@ -69,6 +69,67 @@ function formatToolInput(toolName: string, input: Record<string, unknown> | unde
 
 const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"];
 
+/** A forwarded tool_result image block (base64 data + MIME type). */
+export interface ToolResultImage {
+  data: string;
+  mimeType: string;
+}
+
+/** Per-event bound: at most this many image blocks are forwarded per tool_result. */
+const MAX_IMAGES_PER_TOOL_RESULT = 5;
+/** Per-image bound: at most this many DECODED bytes are forwarded per image. */
+const MAX_IMAGE_DECODED_BYTES = 15 * 1024 * 1024;
+
+/** Approximate decoded byte size of a base64 string (ignores padding — close enough for a cap). */
+function base64DecodedBytes(data: string): number {
+  return Math.floor((data.length * 3) / 4);
+}
+
+/**
+ * Extract image content blocks from a tool_result's content array as
+ * `{data, mimeType}` entries so MCP-produced screenshots can reach the client.
+ *
+ * Handles both shapes the SDK may surface:
+ * - Anthropic API shape: `{type:"image", source:{type:"base64", media_type, data}}`
+ * - MCP shape:           `{type:"image", data, mimeType}`
+ *
+ * Bounds (documented in README): at most MAX_IMAGES_PER_TOOL_RESULT images per
+ * event (excess dropped + warn), at most MAX_IMAGE_DECODED_BYTES decoded bytes
+ * per image (oversize dropped + warn). The text path is unaffected.
+ */
+export function extractToolResultImages(content: unknown, toolUseId: string): ToolResultImage[] {
+  if (!Array.isArray(content)) return [];
+  const images: ToolResultImage[] = [];
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const b = block as any;
+    if (b.type !== "image") continue;
+
+    let data: unknown;
+    let mimeType: unknown;
+    if (b.source && typeof b.source === "object" && b.source.type === "base64") {
+      data = b.source.data;
+      mimeType = b.source.media_type;
+    } else {
+      data = b.data;
+      mimeType = b.mimeType;
+    }
+    if (typeof data !== "string" || data.length === 0 || typeof mimeType !== "string") continue;
+
+    if (base64DecodedBytes(data) > MAX_IMAGE_DECODED_BYTES) {
+      log("query", `tool_result image dropped (oversize >${MAX_IMAGE_DECODED_BYTES} decoded bytes) toolUseId=${toolUseId}`);
+      continue;
+    }
+    if (images.length >= MAX_IMAGES_PER_TOOL_RESULT) {
+      log("query", `tool_result image dropped (max ${MAX_IMAGES_PER_TOOL_RESULT} per event) toolUseId=${toolUseId}`);
+      continue;
+    }
+    images.push({ data, mimeType });
+  }
+  return images;
+}
+
 /**
  * Build a fresh single-message AsyncIterable<SDKUserMessage> from the resolved
  * content blocks. The Claude Agent SDK's `query()` accepts
@@ -212,7 +273,8 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
             const truncated = output.length > 3000 ? output.substring(0, 3000) + "\n... (truncated)" : output;
             const durationMs = toolTimings.has(toolUseId) ? Date.now() - toolTimings.get(toolUseId)! : null;
             toolTimings.delete(toolUseId);
-            onEvent({ type: "tool_result", toolName, toolUseId, output: truncated, durationMs });
+            const images = extractToolResultImages(block.content, toolUseId);
+            onEvent({ type: "tool_result", toolName, toolUseId, output: truncated, durationMs, ...(images.length > 0 ? { images } : {}) });
           }
         }
       }

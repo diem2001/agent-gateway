@@ -423,6 +423,17 @@ Validation — every violation returns HTTP 400 with `{ "error": { "code": "MCP_
 - Defense-in-depth, not a substitute for key hygiene: the spawned executable must be on the `GATEWAY_PER_RUN_MCP_ALLOWED_COMMANDS` allowlist (comma-separated, default `npx`). A non-allowlisted command is rejected with `MCP_SERVERS_INVALID`.
 - Every accepted per-run server spawn is audit-logged with the server name, command, args, and env **keys** (env values are never logged).
 
+### Tool-Result Images (`tool_result.images[]`)
+
+When an MCP tool returns image content (e.g. a `chrome-devtools-mcp` screenshot), the NDJSON `tool_result` event carries an optional `images` array:
+
+```json
+{"seq": 4, "type": "tool_result", "toolName": "take_screenshot", "toolUseId": "tu_shot1", "output": "Screenshot captured", "durationMs": 812, "images": [{"data": "<base64>", "mimeType": "image/png"}]}
+```
+
+- The field is omitted entirely for text-only results; the text `output` path (3000-char truncation) is unchanged.
+- Bounds: at most **5 images per event** and **15 MB decoded per image**. Excess or oversize images are dropped with a warn log.
+
 For detailed architecture, see [`docs/architecture.md`](docs/architecture.md).
 
 Full API reference with curl examples: [`docs/index.html`](docs/index.html) or [Agent Gateway Wiki](https://code1.diemit.net/wiki/internal/agent-gateway.html).
