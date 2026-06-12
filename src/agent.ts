@@ -12,6 +12,7 @@ import {
   summarizeOverrideKeys,
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
+import { applyPerRunMcpServers, type PerRunMcpServers } from "./mcp-servers.js";
 
 export interface QueryParams {
   prompt?: string;
@@ -26,6 +27,8 @@ export interface QueryParams {
   webhookContext?: WebhookContext;
   clientAuthToken?: string;
   mcpCredentialOverrides?: McpCredentialOverrides;
+  /** Validated per-run MCP servers (see mcp-servers.ts); merged into options.mcpServers. */
+  mcpServers?: PerRunMcpServers;
 }
 
 export interface QueryResult {
@@ -89,11 +92,12 @@ async function* buildContentMessageStream(
   };
 }
 
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides }: QueryParams): Promise<QueryResult> {
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, mcpServers: perRunMcpServers }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
   const mcpToolPatterns = getMcpAllowedToolPatterns();
-  const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns];
+  const perRunToolPatterns = Object.keys(perRunMcpServers ?? {}).map((name) => `mcp__${name}__*`);
+  const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns, ...perRunToolPatterns];
   const HOME = process.env.HOME || "/home/node";
   const options: Record<string, unknown> = {
     allowedTools: effectiveTools,
@@ -132,6 +136,10 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
       log("audit", `mcp.override.applied serverName=${serverName} keys=${keys.join(",") || "none"}`);
     }
   }
+
+  // Per-run MCP servers (validated in query.ts): names never collide with
+  // registry servers (rejected at validation), so this only adds new entries.
+  applyPerRunMcpServers(mcpServers, perRunMcpServers);
 
   if (Object.keys(mcpServers).length > 0) {
     options.mcpServers = mcpServers;
