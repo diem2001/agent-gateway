@@ -7,6 +7,7 @@ import {
   validateMcpCredentialOverrides,
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
+import { validatePerRunMcpServers } from "./mcp-servers.js";
 
 /**
  * A single block of multimodal request content. Maps directly to the Anthropic
@@ -23,6 +24,7 @@ interface QueryRequestBody {
   model?: string; allowedTools?: string[]; useSession?: boolean; sshTarget?: string;
   user_id?: string; conversation_id?: string;
   mcpCredentialOverrides?: McpCredentialOverrides;
+  mcpServers?: unknown;
 }
 
 /**
@@ -79,7 +81,7 @@ function resolveContentBlocks(
 export const queryRouter = Router();
 
 queryRouter.post("/v1/query", async (req: Request, res: Response) => {
-  const { queryId, sessionId, prompt, content, systemPrompt, model, allowedTools, useSession, sshTarget, user_id, conversation_id, mcpCredentialOverrides } = req.body as QueryRequestBody;
+  const { queryId, sessionId, prompt, content, systemPrompt, model, allowedTools, useSession, sshTarget, user_id, conversation_id, mcpCredentialOverrides, mcpServers } = req.body as QueryRequestBody;
   if (!queryId) { res.status(400).json({ error: "queryId and prompt or content are required" }); return; }
   const resolved = resolveContentBlocks(content, prompt);
   if ("error" in resolved) { res.status(400).json({ error: resolved.error }); return; }
@@ -87,6 +89,11 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   const overrideValidation = validateMcpCredentialOverrides(mcpCredentialOverrides);
   if (overrideValidation.error) {
     res.status(400).json({ error: overrideValidation.error });
+    return;
+  }
+  const perRunValidation = validatePerRunMcpServers(mcpServers);
+  if (perRunValidation.error) {
+    res.status(400).json({ error: perRunValidation.error });
     return;
   }
 
@@ -140,6 +147,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
       sessionId: effectiveSessionId,
       isResume, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
       mcpCredentialOverrides: overrideValidation.overrides,
+      mcpServers: perRunValidation.servers,
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

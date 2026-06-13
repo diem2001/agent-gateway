@@ -185,6 +185,7 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `TOOLS_PERSIST_PATH` | `./data/tools.json` | Tool registry storage (Docker: `/home/node/.claude/tools.json`) |
 | `MCP_SERVERS_PERSIST_PATH` | `./data/mcp-servers.json` | MCP server registry storage (Docker: `/home/node/.claude/mcp-servers.json`) |
 | `MCP_TEST_TIMEOUT_MS` | `10000` | Per-test deadline for `POST /v1/mcp-servers/:name/test` |
+| `GATEWAY_PER_RUN_MCP_ALLOWED_COMMANDS` | `npx` | Comma-separated executable allowlist for per-run `mcpServers` commands |
 
 ## Development Setup
 
@@ -386,6 +387,52 @@ curl -X POST http://localhost:3001/v1/mcp-servers/jira/test \
 ```
 
 Success returns `{ "ok": true, "toolCount": 2, "tools": [{ "name": "..." }] }`. Unknown servers return `MCP_SERVER_NOT_FOUND`, upstream 401/403 returns `MCP_AUTH_FAILED`, transport failures return `MCP_NETWORK_ERROR`, and timeouts return `MCP_TIMEOUT`. Error messages are sanitized and do not echo header or env values.
+
+### Per-Run MCP Servers (`mcpServers`)
+
+`POST /v1/query` accepts one more optional top-level field, `mcpServers` — a sibling of `mcpCredentialOverrides`. It defines **request-scoped stdio MCP servers** that exist only for that one query (e.g. a `chrome-devtools-mcp` bound to a per-run browser endpoint):
+
+```json
+{
+  "queryId": "q-001",
+  "prompt": "Navigate the source and capture a screenshot",
+  "sessionId": "<conversation-id>",
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["chrome-devtools-mcp", "--browser-url=http://recon-<id>:9222"]
+    }
+  }
+}
+```
+
+Value shape: `{ "<serverName>": { "command": string, "args": string[], "env"?: { [key]: string } } }` — nothing else is expressible. The servers are merged over the registry-configured servers into the SDK `query()` options for that request only; nothing is persisted.
+
+Validation — every violation returns HTTP 400 with `{ "error": { "code": "MCP_SERVERS_INVALID", "message": "…" } }`:
+
+- `command` must be a non-empty string on the command allowlist (see below); `args` must be a string array; `env` (optional) must be a string→string map; no other fields are accepted.
+- Server names must not be `__proto__`, `constructor`, `prototype`, or the reserved internal name `agent-gateway-tools`.
+- Server names must NOT collide with an **enabled** registry server — per-run config can never shadow a trusted registry server.
+- Payload bounds: at most 4 servers, 32 args per server, 16 env entries per server, 2048 characters per string.
+
+#### Trust Boundary (read before enabling)
+
+**Per-run `mcpServers` is remote command execution by design.** A stdio MCP server is a process the gateway spawns inside its own container, and queries run with `bypassPermissions`. The ONLY thing standing between a caller and arbitrary process execution is the bearer API key (`API_KEYS`). Therefore:
+
+- Issue gateway API keys **only to fully-trusted backend services** (e.g. the ReqLift server). Never expose the gateway, or any key, to browsers, end users, or semi-trusted services.
+- Defense-in-depth, not a substitute for key hygiene: the spawned executable must be on the `GATEWAY_PER_RUN_MCP_ALLOWED_COMMANDS` allowlist (comma-separated, default `npx`). A non-allowlisted command is rejected with `MCP_SERVERS_INVALID`.
+- Every accepted per-run server spawn is audit-logged with the server name, command, args, and env **keys** (env values are never logged).
+
+### Tool-Result Images (`tool_result.images[]`)
+
+When an MCP tool returns image content (e.g. a `chrome-devtools-mcp` screenshot), the NDJSON `tool_result` event carries an optional `images` array:
+
+```json
+{"seq": 4, "type": "tool_result", "toolName": "take_screenshot", "toolUseId": "tu_shot1", "output": "Screenshot captured", "durationMs": 812, "images": [{"data": "<base64>", "mimeType": "image/png"}]}
+```
+
+- The field is omitted entirely for text-only results; the text `output` path (3000-char truncation) is unchanged.
+- Bounds: at most **5 images per event** and **15 MB decoded per image**. Excess or oversize images are dropped with a warn log.
 
 For detailed architecture, see [`docs/architecture.md`](docs/architecture.md).
 

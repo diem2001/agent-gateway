@@ -32,6 +32,7 @@ npm run test:e2e    # E2E session tests (requires running Gateway + GATEWAY_API_
 | `TOOLS_PERSIST_PATH` | No | `./data/tools.json` | File path for tool registry persistence (Docker override: `/home/node/.claude/tools.json`) |
 | `MCP_SERVERS_PERSIST_PATH` | No | `./data/mcp-servers.json` | File path for MCP server registry persistence (Docker override: `/home/node/.claude/mcp-servers.json`) |
 | `MCP_TEST_TIMEOUT_MS` | No | `10000` | Per-test deadline for `POST /v1/mcp-servers/:name/test` (in ms) |
+| `GATEWAY_PER_RUN_MCP_ALLOWED_COMMANDS` | No | `npx` | Comma-separated executable allowlist for per-run `mcpServers` commands on `POST /v1/query` |
 
 ## API Key Format
 
