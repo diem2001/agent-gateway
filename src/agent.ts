@@ -172,7 +172,12 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
           const toolName: string = pending?.name || block.name;
           const inputStr = formatToolInput(toolName, block.input);
           toolTimings.set(block.id, Date.now());
-          onEvent({ type: "tool_use", toolName, toolUseId: block.id, input: inputStr, startedAt: Date.now() });
+          // parent_tool_use_id is carried at the SDKAssistantMessage level: null for the
+          // main conversation agent, the spawning Task/Agent tool_use id for a sub-agent.
+          // Forward it as parentToolUseId (always present; normalize undefined → null) so
+          // downstream consumers (reqlift, MVP-6306) can attribute sub-agent tool calls.
+          const parentToolUseId: string | null = msg.parent_tool_use_id ?? null;
+          onEvent({ type: "tool_use", toolName, toolUseId: block.id, input: inputStr, startedAt: Date.now(), parentToolUseId });
         }
       }
     } else if (msg.type === "stream_event") {
