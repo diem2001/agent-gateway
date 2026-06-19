@@ -265,7 +265,7 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
     <p>Each line is a JSON object with a <code>seq</code> (sequence number) and <code>type</code>. See <a href="#ndjson">NDJSON Event Reference</a> for all event types.</p>
 
 <pre><code>{"seq":0,"type":"text","content":"Let me check the disk usage..."}
-{"seq":1,"type":"tool_use","toolName":"Bash","toolUseId":"tu_abc","input":"df -h","startedAt":1711461600000}
+{"seq":1,"type":"tool_use","toolName":"Bash","toolUseId":"tu_abc","input":"df -h","startedAt":1711461600000,"parentToolUseId":null}
 {"seq":2,"type":"tool_result","toolName":"Bash","toolUseId":"tu_abc","output":"/dev/sda1  50G  35G  15G  70% /","durationMs":245}
 {"seq":3,"type":"text","content":"The disk is at 70% usage."}
 {"seq":4,"type":"done","inputTokens":1250,"outputTokens":340,"costUsd":0.0087,"sessionId":"abc-123","context":{"usedTokens":1590,"contextWindow":200000,"percentUsed":0.8,"cacheReadTokens":0,"cacheCreationTokens":0}}</code></pre>
@@ -1237,8 +1237,11 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <div class="event-card">
     <h4>tool_use</h4>
-    <p>Agent is invoking a tool. <code>input</code> is a human-readable summary (command for Bash, file path for Read/Write/Edit, pattern for Glob/Grep).</p>
-<pre><code>{"seq": 1, "type": "tool_use", "toolName": "Bash", "toolUseId": "tu_abc123", "input": "df -h /var", "startedAt": 1711461600000}</code></pre>
+    <p>Agent is invoking a tool. <code>input</code> is a human-readable summary (command for Bash, file path for Read/Write/Edit, pattern for Glob/Grep). <code>parentToolUseId</code> attributes the call to its emitting agent: it is the <code>toolUseId</code> of the spawning Task/Agent <code>tool_use</code> for a sub-agent's tool calls, and <code>null</code> for conversation-level (main-agent) tool calls. The field is always present.</p>
+<pre><code>// main-conversation (top-level) tool call
+{"seq": 1, "type": "tool_use", "toolName": "Bash", "toolUseId": "tu_abc123", "input": "df -h /var", "startedAt": 1711461600000, "parentToolUseId": null}
+// sub-agent tool call (spawned via a Task/Agent tool_use whose id is tu_task42)
+{"seq": 5, "type": "tool_use", "toolName": "Grep", "toolUseId": "tu_child9", "input": "TODO in src", "startedAt": 1711461600000, "parentToolUseId": "tu_task42"}</code></pre>
   </div>
 
   <div class="event-card">
