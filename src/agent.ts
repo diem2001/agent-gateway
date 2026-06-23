@@ -64,7 +64,7 @@ function formatToolInput(toolName: string, input: Record<string, unknown> | unde
   return JSON.stringify(input, null, 2).substring(0, 1000);
 }
 
-export const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"];
+export const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite"];
 
 /**
  * Build a fresh single-message AsyncIterable<SDKUserMessage> from the resolved
