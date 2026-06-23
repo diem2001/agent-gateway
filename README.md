@@ -83,6 +83,8 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `GET` | `/v1/skills/*` | Read a skill file |
 | `PUT` | `/v1/skills/*` | Write a skill file |
 | `DELETE` | `/v1/skills/*` | Delete a skill file |
+| `GET` | `/v1/knowledge-base` | List knowledge-base files (read-only) |
+| `GET` | `/v1/knowledge-base/*` | Read a knowledge-base file as `text/markdown` (read-only) |
 | `PUT` | `/v1/tools/:name` | Register/update a webhook tool |
 | `GET` | `/v1/tools` | List all registered tools |
 | `GET` | `/v1/tools/:name` | Get a single tool |
