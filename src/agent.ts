@@ -64,7 +64,24 @@ function formatToolInput(toolName: string, input: Record<string, unknown> | unde
   return JSON.stringify(input, null, 2).substring(0, 1000);
 }
 
-const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"];
+/**
+ * Resolve the `input` payload carried on a tool_use NDJSON event. Most tools get
+ * a short human-readable STRING summary (formatToolInput). TodoWrite is special:
+ * its consumer — reqlift's TodoList checklist widget (MVP-6298) — needs the
+ * STRUCTURED `{ todos: [...] }` object; reqlift's parseTodos requires an object
+ * and a stringified/truncated summary cannot be parsed. So forward TodoWrite's
+ * raw input object verbatim (untruncated) while keeping the string summary for
+ * every other tool (MVP-6497).
+ */
+export function toolUseEventInput(
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+): unknown {
+  if (toolName === "TodoWrite") return input ?? null;
+  return formatToolInput(toolName, input);
+}
+
+export const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite"];
 
 /**
  * Build a fresh single-message AsyncIterable<SDKUserMessage> from the resolved
@@ -170,14 +187,14 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
         if (block.type === "tool_use") {
           const pending = pendingTools.get(block.id);
           const toolName: string = pending?.name || block.name;
-          const inputStr = formatToolInput(toolName, block.input);
+          const eventInput = toolUseEventInput(toolName, block.input);
           toolTimings.set(block.id, Date.now());
           // parent_tool_use_id is carried at the SDKAssistantMessage level: null for the
           // main conversation agent, the spawning Task/Agent tool_use id for a sub-agent.
           // Forward it as parentToolUseId (always present; normalize undefined → null) so
           // downstream consumers (reqlift, MVP-6306) can attribute sub-agent tool calls.
           const parentToolUseId: string | null = msg.parent_tool_use_id ?? null;
-          onEvent({ type: "tool_use", toolName, toolUseId: block.id, input: inputStr, startedAt: Date.now(), parentToolUseId });
+          onEvent({ type: "tool_use", toolName, toolUseId: block.id, input: eventInput, startedAt: Date.now(), parentToolUseId });
         }
       }
     } else if (msg.type === "stream_event") {

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Standalone REST API service wrapping the Claude Agent SDK. Exposes Claude Code's agentic capabilities (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch) over HTTP with NDJSON streaming, session management, and automatic retry with exponential backoff.
+Standalone REST API service wrapping the Claude Agent SDK. Exposes Claude Code's agentic capabilities (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, Skill, TodoWrite) over HTTP with NDJSON streaming, session management, and automatic retry with exponential backoff.
 
 **Tech stack**: Node.js 22, TypeScript, Express 5, Claude Agent SDK, Docker
 
