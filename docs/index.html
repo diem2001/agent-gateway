@@ -187,6 +187,9 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>GET</strong></td><td><code>/v1/skills/*</code></td><td>Yes</td><td>Read skill file</td></tr>
       <tr><td><strong>PUT</strong></td><td><code>/v1/skills/*</code></td><td>Yes</td><td>Write skill file</td></tr>
       <tr><td><strong>DELETE</strong></td><td><code>/v1/skills/*</code></td><td>Yes</td><td>Delete skill file</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/users/{user_id}/skills</code></td><td>Yes</td><td>List a user's per-user skills (reconcile; <code>{ files: [...] }</code>)</td></tr>
+      <tr><td><strong>PUT</strong></td><td><code>/v1/users/{user_id}/skills/*</code></td><td>Yes</td><td>Write a user-namespaced skill (body = SKILL.md)</td></tr>
+      <tr><td><strong>DELETE</strong></td><td><code>/v1/users/{user_id}/skills/*</code></td><td>Yes</td><td>Delete a user-namespaced skill</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/knowledge-base</code></td><td>Yes</td><td>List knowledge-base files (read-only)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/knowledge-base/*</code></td><td>Yes</td><td>Read knowledge-base file as <code>text/markdown</code> (read-only)</td></tr>
       <tr><td><strong>PUT</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Register/update a webhook tool</td></tr>
@@ -1275,6 +1278,19 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
   </div>
 
   <div class="event-card">
+    <h4>skills_loaded</h4>
+    <p>Emitted exactly once per query, derived from the SDK <code>init</code> system message's authoritative loaded-skill set (global skills plus the requesting user's per-user skills, loaded via the SDK <code>plugins</code> lever). <code>user_id</code> is the query's user, or <code>null</code> when the query carried none (global-only load). This is the black-box surface for verifying per-user skill isolation: a skill registered under <code>users/A/skills</code> appears in A's <code>skills_loaded.skills[]</code> but not B's.</p>
+<pre><code>{"seq": 1, "type": "skills_loaded", "user_id": "A", "skills": ["global-skill-a", "deploy-helper"]}
+{"seq": 1, "type": "skills_loaded", "user_id": null, "skills": ["global-skill-a"]}</code></pre>
+  </div>
+
+  <div class="event-card">
+    <h4>skills_truncated</h4>
+    <p>Warning emitted when a user's namespace exceeds the per-user caps (<code>USER_SKILLS_MAX_COUNT</code> or <code>USER_SKILLS_MAX_BYTES</code>). The excess is dropped deterministically (path-sorted) and the query still runs with the remaining skills — it never hard-fails. <code>reason</code> is <code>"count_cap"</code> or <code>"size_cap"</code>.</p>
+<pre><code>{"seq": 1, "type": "skills_truncated", "dropped": ["z/SKILL.md"], "reason": "count_cap"}</code></pre>
+  </div>
+
+  <div class="event-card">
     <h4>done</h4>
     <p>Query completed successfully. Includes token usage, cost, and context window statistics. Always the last event on success.</p>
 <pre><code>{
@@ -1386,6 +1402,8 @@ curl http://localhost:3001/health</code></pre>
       <tr><td><code>SESSION_PERSIST_PATH</code></td><td><code>/home/node/.claude/sessions.json</code></td><td>Session persistence file (inside agent_home bind-mount)</td></tr>
       <tr><td><code>EVENT_CACHE_TTL_MS</code></td><td><code>1800000</code></td><td>Query event cache TTL (30 min)</td></tr>
       <tr><td><code>WORKSPACE_ROOT</code></td><td><code>$HOME/.claude</code></td><td>Root dir for memory/agents/skills</td></tr>
+      <tr><td><code>USER_SKILLS_MAX_COUNT</code></td><td><code>50</code></td><td>Max per-user skills loaded per query (overflow → <code>skills_truncated</code>)</td></tr>
+      <tr><td><code>USER_SKILLS_MAX_BYTES</code></td><td><code>1048576</code></td><td>Max total per-user SKILL.md bytes loaded per query (overflow → <code>skills_truncated</code>)</td></tr>
       <tr><td><code>TOOLS_PERSIST_PATH</code></td><td><code>/home/node/.claude/tools.json</code></td><td>Tool registry persistence file</td></tr>
       <tr><td><code>MCP_SERVERS_PERSIST_PATH</code></td><td><code>/home/node/.claude/mcp-servers.json</code></td><td>External MCP server registry persistence file</td></tr>
       <tr><td><code>MCP_TEST_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-test deadline for <code>POST /v1/mcp-servers/:name/test</code></td></tr>
