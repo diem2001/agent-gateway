@@ -53,6 +53,15 @@ function redactCredentialRequestBody(url: string, body: unknown): unknown {
     cloned.env = redactStringRecordValues(cloned.env);
   }
 
+  if (/^\/v1\/mcp-servers\/[^/]+\/call$/.test(url)) {
+    const credentials = cloned.credentials;
+    if (credentials && typeof credentials === "object" && !Array.isArray(credentials)) {
+      const creds = credentials as Record<string, unknown>;
+      creds.headers = redactStringRecordValues(creds.headers);
+      creds.env = redactStringRecordValues(creds.env);
+    }
+  }
+
   return cloned;
 }
 
