@@ -260,6 +260,17 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
       if (msg.subtype === "compact_boundary" && msg.compact_metadata) {
         onEvent({ type: "sdk_compact_complete", trigger: msg.compact_metadata.trigger || "auto", preTokens: msg.compact_metadata.pre_tokens || 0 });
       }
+      // DEC-GW-004: the SDK `init` system message carries `skills: string[]` — the
+      // AUTHORITATIVE actually-loaded set (global + this query's per-user bundle).
+      // Emit exactly one `skills_loaded` per query as the durable black-box
+      // verification surface GW-S2 (MVP-6577) asserts. `user_id` is null when the
+      // query carried none (global-only load). We derive skills[] from the SDK
+      // message, NOT the gateway's own materialized list — that is what makes this
+      // the real loaded-set surface.
+      if (msg.subtype === "init") {
+        const loadedSkills: string[] = Array.isArray(msg.skills) ? msg.skills : [];
+        onEvent({ type: "skills_loaded", user_id: userId ?? null, skills: loadedSkills });
+      }
     } else if (msg.type === "result") { resultData = msg; }
   }
   } finally {
