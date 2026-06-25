@@ -49,6 +49,48 @@ export function listFiles(baseDir: string): FileEntry[] {
   return files;
 }
 
+/**
+ * True if the string contains any control character. A user_id is a single path
+ * segment; NUL, newlines, and other C0/C1 control characters must never reach
+ * the filesystem. Implemented by codepoint scan (no control-char literals in the
+ * source, which would corrupt the file and trip the no-control-regex lint).
+ */
+function hasControlChar(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    // C0 controls (incl. NUL 0x00) and DEL/C1 controls (0x7f-0x9f).
+    if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return true;
+  }
+  return false;
+}
+
+/**
+ * Sanitize a `user_id` path segment before it is used to build a per-user
+ * workspace directory. A user_id is a SINGLE path segment — it must never be
+ * able to escape the `users/` namespace. Rejects empty, `.`/`..`, anything
+ * containing a path separator (`/` or `\`), control characters, or an absolute
+ * path. Returns the sanitized id, or `null` if invalid (caller → 400).
+ */
+export function sanitizeUserId(userId: string | undefined | null): string | null {
+  if (typeof userId !== "string") return null;
+  if (userId.length === 0) return null;
+  if (userId === "." || userId === "..") return null;
+  if (userId.includes("/") || userId.includes("\\")) return null;
+  if (hasControlChar(userId)) return null;
+  if (path.isAbsolute(userId)) return null;
+  return userId;
+}
+
+/**
+ * Resolve the per-user skill base directory: `<WORKSPACE_ROOT>/users/<id>/skills`.
+ * Returns `null` when the `user_id` segment fails sanitization (caller → 400).
+ */
+export function getUserSkillsDir(userId: string | undefined | null): string | null {
+  const safeId = sanitizeUserId(userId);
+  if (!safeId) return null;
+  return getWorkspaceDir("users/" + safeId + "/skills");
+}
+
 export function readFile(filePath: string): string { return fs.readFileSync(filePath, "utf-8"); }
 export function writeFile(filePath: string, content: string): void {
   const dir = path.dirname(filePath);
