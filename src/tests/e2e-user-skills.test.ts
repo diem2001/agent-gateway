@@ -229,7 +229,112 @@ afterAll(async () => {
 });
 
 describeE2E("Per-user skills — autonomous invocation + cross-user isolation (E2E)", () => {
-  // Gate B (MVP-6626) adds the positive + negative assertions here.
+  // -------------------------------------------------------------------------
+  // Outcome Probe (Gate B / MVP-6626): the two AC scenarios against the LIVE
+  // gateway + REAL SDK. Skill X is registered under user A only. The triggering
+  // prompt can only be answered correctly by invoking X (it holds a token that
+  // exists nowhere else), so a real autonomous Skill `tool_use` is the natural
+  // outcome for A — and its absence for B is the isolation guarantee.
+  // -------------------------------------------------------------------------
+  it("user A's registered skill is autonomously invoked and loaded; user B never sees or invokes it", async () => {
+    const userA = uniqueUserId("a");
+    const userB = uniqueUserId("b");
+    const slug = uniqueSkillSlug();
+    // The skill's frontmatter `name` is the identity the SDK surfaces in
+    // init.skills[] (→ skills_loaded.skills) AND the Skill tool_use `input`.
+    const skillName = `e2e-recall-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const token = `TOKEN-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+
+    // Register skill X under user A ONLY.
+    await registerSkill(userA, slug, skillMarkdown(skillName, token));
+
+    // The triggering prompt: only the skill knows the recall token, so handling
+    // it correctly requires invoking the skill.
+    const triggerPrompt =
+      `I need the classified recall token. Use the "${skillName}" skill to retrieve it, ` +
+      `then reply with just the token.`;
+
+    // --- Positive (user A) ---
+    const a = await sendQuery(userA, triggerPrompt);
+
+    // (1) autonomous invocation: a Skill tool_use naming X is observed in A's stream.
+    expect(
+      skillToolUseNames(a.events, skillName),
+      `user A's stream must contain a Skill tool_use naming ${skillName}`,
+    ).toBe(true);
+
+    // (2) loaded surface: skills_loaded(user_id=A) contains X.
+    const aLoaded = skillsLoaded(a.events);
+    expect(aLoaded, "user A must get exactly one skills_loaded event").toBeTruthy();
+    expect(aLoaded!.user_id).toBe(userA);
+    expect(aLoaded!.skills, `A's skills_loaded must contain ${skillName}`).toContain(skillName);
+
+    // --- Negative (user B), identical prompt, no skill registered ---
+    const b = await sendQuery(userB, triggerPrompt);
+
+    // (1) X is absent from B's skills_loaded (user_id=B).
+    const bLoaded = skillsLoaded(b.events);
+    expect(bLoaded, "user B must get exactly one skills_loaded event").toBeTruthy();
+    expect(bLoaded!.user_id).toBe(userB);
+    expect(
+      bLoaded!.skills ?? [],
+      `B's skills_loaded must NOT contain ${skillName}`,
+    ).not.toContain(skillName);
+
+    // (2) no Skill tool_use naming X anywhere in B's whole stream.
+    expect(
+      skillToolUseNames(b.events, skillName),
+      `user B's stream must NOT contain a Skill tool_use naming ${skillName}`,
+    ).toBe(false);
+  }, 120_000);
+
+  it("direct cross-user reference: user B explicitly demanding skill X by name still cannot invoke it", async () => {
+    // SECURITY (#1): an ACTUALLY-EXERCISED rejection probe, not mere stream
+    // absence on a neutral prompt. User B is told the exact skill name and
+    // ordered to invoke it. Skill X is registered ONLY under user A, so B's
+    // per-query bundle never contains it — the SDK has no such Skill to invoke
+    // for B. We assert no Skill tool_use names X in B's stream AND X never
+    // appears in B's skills_loaded.
+    //
+    // The AC's "if the skill is invoked by key/path directly, the gateway
+    // returns a rejected/not-found result" leg: the gateway's Skill tool exposes
+    // NO deterministic by-key/by-path invocation entry point to the HTTP client —
+    // skills are loaded into the SDK's per-query plugin bundle and only the
+    // autonomous LLM may emit a Skill tool_use. There is no client-controllable
+    // "invoke skill <key>" call to force. Therefore the strongest observable B
+    // can be driven to is "explicitly ordered to use X by name, still does not
+    // (and cannot) invoke it" — which this test exercises directly. The
+    // by-path-rejection leg is structurally unreachable from the HTTP boundary
+    // (no such endpoint), so the isolation guarantee reduces to this assertion.
+    const userA = uniqueUserId("a-ref");
+    const userB = uniqueUserId("b-ref");
+    const slug = uniqueSkillSlug();
+    const skillName = `e2e-recall-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const token = `TOKEN-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+
+    // Skill X under user A only.
+    await registerSkill(userA, slug, skillMarkdown(skillName, token));
+
+    // User B is given the exact skill name and explicitly ordered to invoke it.
+    const directRefPrompt =
+      `There is a skill named exactly "${skillName}". Invoke that skill now and ` +
+      `return whatever recall token it gives you. If you cannot find or invoke ` +
+      `that skill, say "SKILL_NOT_AVAILABLE".`;
+
+    const b = await sendQuery(userB, directRefPrompt);
+
+    // X never loaded for B.
+    const bLoaded = skillsLoaded(b.events);
+    expect(bLoaded, "user B must get exactly one skills_loaded event").toBeTruthy();
+    expect(bLoaded!.user_id).toBe(userB);
+    expect(bLoaded!.skills ?? []).not.toContain(skillName);
+
+    // X never invoked for B, even though B was explicitly told to.
+    expect(
+      skillToolUseNames(b.events, skillName),
+      `user B must NOT invoke ${skillName} even when explicitly told to`,
+    ).toBe(false);
+  }, 120_000);
 
   it("harness: register → reconcile → delete round-trips against the live gateway", async () => {
     // Smoke test for the Gate A scaffolding: a registered skill is listed, then
