@@ -12,6 +12,7 @@ import {
   summarizeOverrideKeys,
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
+import { materializeUserSkills, cleanupUserSkillBundle } from "./user-skills.js";
 
 export interface QueryParams {
   prompt?: string;
@@ -26,6 +27,13 @@ export interface QueryParams {
   webhookContext?: WebhookContext;
   clientAuthToken?: string;
   mcpCredentialOverrides?: McpCredentialOverrides;
+  /**
+   * The requesting user's id (DEC-GW-002 / DEC-GW-004). When present, this query
+   * additionally loads that user's stored skills via the SDK `plugins` local
+   * lever (request-scoped) and the emitted `skills_loaded` event carries it.
+   * `undefined` ⇒ global-only load, `skills_loaded.user_id = null`.
+   */
+  userId?: string;
 }
 
 export interface QueryResult {
@@ -106,7 +114,7 @@ async function* buildContentMessageStream(
   };
 }
 
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides }: QueryParams): Promise<QueryResult> {
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, userId }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
   const mcpToolPatterns = getMcpAllowedToolPatterns();
@@ -121,6 +129,21 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     cwd: HOME,
     settingSources: ["user", "project"],
   };
+
+  // Per-user skill loading (DEC-GW-002): materialize the requesting user's stored
+  // skills into a request-scoped local-plugin bundle and point `plugins` at it for
+  // THIS query only. Global skills still load via cwd/settingSources (additive) —
+  // those are deliberately left untouched. No userId ⇒ no plugins ⇒ global-only
+  // load, byte-for-byte unchanged. Caps overflow is reported here and surfaced as a
+  // `skills_truncated` event below (DEC-GW-004) before the query proceeds.
+  const userSkills = materializeUserSkills(userId);
+  if (userSkills.pluginRoot) {
+    options.plugins = [{ type: "local", path: userSkills.pluginRoot }];
+    log("query", `user skills: loading plugin bundle for userId=${userId} at ${userSkills.pluginRoot}`);
+  }
+  if (userSkills.dropped.length > 0 && userSkills.reason) {
+    onEvent({ type: "skills_truncated", dropped: userSkills.dropped, reason: userSkills.reason });
+  }
   options.systemPrompt = systemPrompt
     ? { type: "preset", preset: "claude_code", append: systemPrompt }
     : { type: "preset", preset: "claude_code" };
@@ -176,6 +199,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   const pendingTools = new Map<string, { name: string }>();
   const toolTimings = new Map<string, number>();
 
+  try {
   for await (const message of conversation) {
     if (abortController.signal.aborted) break;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -237,6 +261,10 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
         onEvent({ type: "sdk_compact_complete", trigger: msg.compact_metadata.trigger || "auto", preTokens: msg.compact_metadata.pre_tokens || 0 });
       }
     } else if (msg.type === "result") { resultData = msg; }
+  }
+  } finally {
+    // Request-scoped bundle: remove it once this query() call has drained.
+    cleanupUserSkillBundle(userSkills.pluginRoot);
   }
 
   return { response: fullResponse, resultData };

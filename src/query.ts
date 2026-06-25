@@ -140,6 +140,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
       sessionId: effectiveSessionId,
       isResume, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
       mcpCredentialOverrides: overrideValidation.overrides,
+      userId: user_id || undefined,
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
