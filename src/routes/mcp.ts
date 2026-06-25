@@ -11,10 +11,12 @@ import {
 } from "../mcp-registry.js";
 import { getCredentialTemplateFieldKeys } from "../credential-composer.js";
 import { testMcpServer, McpTestError } from "../mcp-test-client.js";
+import { callMcpTool, McpCallError } from "../mcp-call-client.js";
 import type { McpCredentialOverride } from "../mcp-overrides.js";
 
 const router = Router();
 const MCP_TEST_TIMEOUT_MS = parseInt(process.env.MCP_TEST_TIMEOUT_MS || "10000", 10);
+const MCP_CALL_TIMEOUT_MS = parseInt(process.env.MCP_CALL_TIMEOUT_MS || "10000", 10);
 
 type SchemaValidationErrorCode =
   | "SCHEMA_FIELD_KEY_DUPLICATE"
@@ -250,6 +252,98 @@ router.post("/v1/mcp-servers/:name/test", async (req: Request, res: Response) =>
       return;
     }
     log("audit", `mcp.test.called serverName=${name} result=network_error`);
+    res.status(502).json({ error: { code: "MCP_NETWORK_ERROR", message: "MCP transport failure" } });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/*  POST /v1/mcp-servers/:name/call — direct (LLM-free) tools/call      */
+/* ------------------------------------------------------------------ */
+
+router.post("/v1/mcp-servers/:name/call", async (req: Request, res: Response) => {
+  const name = String(req.params.name);
+
+  // 1. Unknown / unregistered server → 400 MCP_SERVER_NOT_FOUND.
+  const srv = getMcpServer(name);
+  if (!srv) {
+    res.status(400).json({ error: { code: "MCP_SERVER_NOT_FOUND", message: `${name} is not registered` } });
+    return;
+  }
+
+  // 2. Registered but disabled → 400 MCP_SERVER_DISABLED, BEFORE any upstream
+  //    connection. This is the /call-specific gate (DEC-GW-003): unlike the
+  //    /test diagnostic probe, /call is production execution and must not run
+  //    tools on a disabled server.
+  if (!srv.enabled) {
+    res.status(400).json({
+      error: {
+        code: "MCP_SERVER_DISABLED",
+        message: `${name} is registered but disabled; enable the server before calling its tools`,
+      },
+    });
+    return;
+  }
+
+  // 3. Body validation: tool (non-empty string) + arguments (object) → 400 MCP_CALL_INVALID.
+  const body = (req.body ?? {}) as {
+    tool?: unknown;
+    arguments?: unknown;
+    credentials?: unknown;
+  };
+  if (typeof body.tool !== "string" || body.tool.length === 0) {
+    res.status(400).json({ error: { code: "MCP_CALL_INVALID", message: "tool must be a non-empty string" } });
+    return;
+  }
+  if (!body.arguments || typeof body.arguments !== "object" || Array.isArray(body.arguments)) {
+    res.status(400).json({ error: { code: "MCP_CALL_INVALID", message: "arguments must be an object" } });
+    return;
+  }
+
+  // 4. Credential override validation: credentials.headers / credentials.env
+  //    (if present) must be string maps → 400 MCP_OVERRIDE_INVALID. `credentials`
+  //    is the per-server override VALUE (McpCredentialOverride), not a keyed map.
+  const credentials = (body.credentials ?? {}) as McpCredentialOverride;
+  if (body.credentials !== undefined) {
+    if (!body.credentials || typeof body.credentials !== "object" || Array.isArray(body.credentials)) {
+      res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: "credentials must be an object" } });
+      return;
+    }
+    if (credentials.headers !== undefined && !isStringRecord(credentials.headers)) {
+      res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: "credentials.headers must be a string map" } });
+      return;
+    }
+    if (credentials.env !== undefined && !isStringRecord(credentials.env)) {
+      res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: "credentials.env must be a string map" } });
+      return;
+    }
+  }
+
+  // 5. Execute the tool. Success → the MCP tools/call result verbatim at HTTP 200
+  //    (a tool-level isError:true result is a normal 200, NOT the gateway envelope).
+  try {
+    const result = await callMcpTool(
+      srv,
+      body.tool,
+      body.arguments as Record<string, unknown>,
+      credentials,
+      MCP_CALL_TIMEOUT_MS,
+    );
+    log("audit", `mcp.call.called serverName=${name} tool=${body.tool} result=ok`);
+    res.json(result);
+  } catch (error) {
+    if (error instanceof McpCallError) {
+      const result =
+        error.code === "MCP_AUTH_FAILED"
+          ? "auth_failed"
+          : error.code === "MCP_TIMEOUT"
+            ? "timeout"
+            : "network_error";
+      log("audit", `mcp.call.called serverName=${name} tool=${body.tool} result=${result}`);
+      const status = error.code === "MCP_AUTH_FAILED" ? 401 : error.code === "MCP_TIMEOUT" ? 504 : 502;
+      res.status(status).json({ error: { code: error.code, message: error.message } });
+      return;
+    }
+    log("audit", `mcp.call.called serverName=${name} tool=${body.tool} result=network_error`);
     res.status(502).json({ error: { code: "MCP_NETWORK_ERROR", message: "MCP transport failure" } });
   }
 });
