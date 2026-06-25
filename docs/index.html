@@ -201,6 +201,7 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Get a registered MCP server</td></tr>
       <tr><td><strong>DELETE</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Delete a registered MCP server</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/test</code></td><td>Yes</td><td>Test MCP credentials with tools/list (accepts streamable SSE responses)</td></tr>
+      <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/call</code></td><td>Yes</td><td>Directly execute a registered MCP server's tool (tools/call, no LLM turn)</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/restart</code></td><td>Yes</td><td>Force fresh SDK reconnect on next query</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers/:name/health</code></td><td>Yes</td><td>Cheap connectivity health probe</td></tr>
     </tbody>
@@ -839,6 +840,61 @@ curl -X PUT http://localhost:3001/v1/settings \
   <div class="endpoint-section">
     <p>
       <span class="method-badge post">POST</span>
+      <span class="endpoint-path">/v1/mcp-servers/:name/call</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+    <p>Directly executes a registered MCP server's tool via the standard <code>tools/call</code> JSON-RPC method — <strong>with no LLM turn and no token cost</strong>. The gateway opens a single upstream call (applying any per-call credential override) and returns the tool's result verbatim. Both plain <code>application/json</code> and streamable <code>text/event-stream</code> MCP responses are accepted. Use this when a caller (e.g. reqlift) needs to pass a tool through to an end client without paying for an agent turn.</p>
+    <p><strong>Disabled-server divergence from <code>/test</code>:</strong> a registered-but-disabled server (<code>enabled: false</code>) is rejected with <code>400 MCP_SERVER_DISABLED</code> <em>before</em> any upstream connection is opened. The sibling <code>/test</code> deliberately accepts disabled servers (it is a credential-validation probe); <code>/call</code> is production tool execution, so the <code>enabled</code> flag gates it.</p>
+
+    <h3>Request Body</h3>
+<pre><code>{
+  "tool": "get_issue",
+  "arguments": { "issueKey": "MVP-1" },
+  "credentials": {
+    "headers": { "Authorization": "Basic &lt;base64(email:apiToken)&gt;" },
+    "env": { "EXAMPLE_TOKEN": "user-token" }
+  }
+}</code></pre>
+    <p><code>tool</code> (required, non-empty string) and <code>arguments</code> (required, object). <code>credentials</code> is an optional per-call override — the same <code>{ headers?, env? }</code> shape the <code>/test</code> body accepts (not the keyed map; the path already carries the server name). It overrides the registered server's credentials for this call only and is never persisted.</p>
+
+    <h3>Success Response</h3>
+    <p>HTTP 200 with the MCP <code>tools/call</code> result verbatim — only the JSON-RPC <code>result</code> member, no upstream envelope fields:</p>
+<pre><code>{
+  "content": [ { "type": "text", "text": "..." } ],
+  "structuredContent": { },
+  "isError": false
+}</code></pre>
+    <p>A <strong>tool-level error is still HTTP 200</strong> with <code>isError: true</code> — the upstream call succeeded, so it is the tool's own result, not a gateway failure:</p>
+<pre><code>{ "content": [ /* ... */ ], "isError": true }</code></pre>
+
+    <h3>Example</h3>
+<pre><code>curl -X POST http://localhost:3001/v1/mcp-servers/jira/call \
+  -H "Authorization: Bearer sk-gw-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"tool":"get_issue","arguments":{"issueKey":"MVP-1"},"credentials":{"headers":{"Authorization":"Basic &lt;...&gt;"}}}'</code></pre>
+
+    <h3>Error Codes</h3>
+    <p>Gateway-level failures (never tool errors) return <code>{ "error": { "code", "message" } }</code> and never hang past the per-call deadline:</p>
+    <table class="param-table">
+      <thead>
+        <tr><th>Status</th><th>Code</th><th>Meaning</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>400</td><td><code>MCP_SERVER_NOT_FOUND</code></td><td>No registered server has this name</td></tr>
+        <tr><td>400</td><td><code>MCP_SERVER_DISABLED</code></td><td>The server is registered but disabled (diverges from <code>/test</code>, which accepts disabled servers)</td></tr>
+        <tr><td>400</td><td><code>MCP_CALL_INVALID</code></td><td><code>tool</code> is missing/empty or <code>arguments</code> is not an object</td></tr>
+        <tr><td>400</td><td><code>MCP_OVERRIDE_INVALID</code></td><td><code>credentials.headers</code> / <code>credentials.env</code> are not string maps</td></tr>
+        <tr><td>401</td><td><code>MCP_AUTH_FAILED</code></td><td>The upstream MCP server returned 401/403</td></tr>
+        <tr><td>502</td><td><code>MCP_NETWORK_ERROR</code></td><td>The upstream MCP server could not be reached or returned an invalid response</td></tr>
+        <tr><td>504</td><td><code>MCP_TIMEOUT</code></td><td>The upstream MCP server did not respond before <code>MCP_CALL_TIMEOUT_MS</code> (default 10s)</td></tr>
+      </tbody>
+    </table>
+    <p>Error messages are sanitized and never echo submitted header or env values. Auth-middleware rejections (missing/invalid API key) return the plain <code>{ "error": "&lt;message&gt;" }</code> shape (401) before the handler, like every other <code>/v1/*</code> route.</p>
+  </div>
+
+  <div class="endpoint-section">
+    <p>
+      <span class="method-badge post">POST</span>
       <span class="endpoint-path">/v1/mcp-servers/:name/restart</span>
       <span class="auth-tag required">Auth Required</span>
     </p>
@@ -1407,6 +1463,7 @@ curl http://localhost:3001/health</code></pre>
       <tr><td><code>TOOLS_PERSIST_PATH</code></td><td><code>/home/node/.claude/tools.json</code></td><td>Tool registry persistence file</td></tr>
       <tr><td><code>MCP_SERVERS_PERSIST_PATH</code></td><td><code>/home/node/.claude/mcp-servers.json</code></td><td>External MCP server registry persistence file</td></tr>
       <tr><td><code>MCP_TEST_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-test deadline for <code>POST /v1/mcp-servers/:name/test</code></td></tr>
+      <tr><td><code>MCP_CALL_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-call deadline for <code>POST /v1/mcp-servers/:name/call</code></td></tr>
     </tbody>
   </table>
 

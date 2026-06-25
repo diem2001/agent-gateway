@@ -98,6 +98,7 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `DELETE` | `/v1/mcp-servers/:name` | Unregister an MCP server |
 | `POST` | `/v1/mcp-servers/:name/restart` | Force the SDK to reconnect to the MCP server on next query |
 | `POST` | `/v1/mcp-servers/:name/test` | Test merged MCP credentials with `tools/list` |
+| `POST` | `/v1/mcp-servers/:name/call` | Directly execute a registered MCP server's tool (`tools/call`, no LLM) |
 | `GET` | `/v1/mcp-servers/:name/health` | Health check for a registered MCP server |
 | `POST` | `/v1/workspace/git/clone` | Clone a repository into the workspace |
 | `POST` | `/v1/workspace/git/pull` | Pull updates for a workspace repository |
@@ -190,6 +191,7 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `TOOLS_PERSIST_PATH` | `./data/tools.json` | Tool registry storage (Docker: `/home/node/.claude/tools.json`) |
 | `MCP_SERVERS_PERSIST_PATH` | `./data/mcp-servers.json` | MCP server registry storage (Docker: `/home/node/.claude/mcp-servers.json`) |
 | `MCP_TEST_TIMEOUT_MS` | `10000` | Per-test deadline for `POST /v1/mcp-servers/:name/test` |
+| `MCP_CALL_TIMEOUT_MS` | `10000` | Per-call deadline for `POST /v1/mcp-servers/:name/call` |
 
 ## Development Setup
 
@@ -391,6 +393,53 @@ curl -X POST http://localhost:3001/v1/mcp-servers/jira/test \
 ```
 
 Success returns `{ "ok": true, "toolCount": 2, "tools": [{ "name": "..." }] }`. Unknown servers return `MCP_SERVER_NOT_FOUND`, upstream 401/403 returns `MCP_AUTH_FAILED`, transport failures return `MCP_NETWORK_ERROR`, and timeouts return `MCP_TIMEOUT`. Error messages are sanitized and do not echo header or env values.
+
+### Direct tool call (`POST /v1/mcp-servers/:name/call`)
+
+Execute a registered MCP server's tool directly, with **no LLM turn and no token cost** — the gateway opens a single `tools/call` to the upstream MCP server and returns its result verbatim. Per-call credentials override the registered server's credentials for that call only (request-scoped, never written back):
+
+```bash
+curl -X POST http://localhost:3001/v1/mcp-servers/jira/call \
+  -H "Authorization: Bearer sk-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "tool": "get_issue",
+        "arguments": { "issueKey": "MVP-1" },
+        "credentials": { "headers": { "Authorization": "Basic <base64(email:apiToken)>" } }
+      }'
+```
+
+Request body:
+
+- `tool` (required, non-empty string) — the MCP tool name to invoke.
+- `arguments` (required, object) — the tool arguments.
+- `credentials` (optional) — a per-call credential override, the same `{ headers?, env? }` shape the `/test` body accepts (one entry of `mcpCredentialOverrides`, not the keyed map — the path already carries the server name). `headers` is shallow-merged for http/sse transports; `env` for stdio.
+
+**Success (HTTP 200)** is the MCP `tools/call` result verbatim — only the JSON-RPC `result` member, no upstream envelope fields:
+
+```jsonc
+{ "content": [ /* MCP content blocks */ ], "structuredContent": { }, "isError": false }
+```
+
+A **tool-level error is still HTTP 200** with `isError: true` (the upstream call succeeded — it is the tool's result, not a gateway failure):
+
+```jsonc
+{ "content": [ /* ... */ ], "isError": true }
+```
+
+**Gateway-level failures** (never tool errors) return the structured envelope `{ "error": { "code": "...", "message": "..." } }` and never hang past the per-call deadline:
+
+| Condition | HTTP | `error.code` |
+| --- | --- | --- |
+| unknown / unregistered server | 400 | `MCP_SERVER_NOT_FOUND` |
+| registered but disabled server | 400 | `MCP_SERVER_DISABLED` |
+| missing/invalid `tool`/`arguments` | 400 | `MCP_CALL_INVALID` |
+| invalid `credentials` override | 400 | `MCP_OVERRIDE_INVALID` |
+| upstream rejects auth (401/403) | 401 | `MCP_AUTH_FAILED` |
+| upstream timeout / no response | 504 | `MCP_TIMEOUT` |
+| connection / transport failure | 502 | `MCP_NETWORK_ERROR` |
+
+> **Divergence from `/test`:** `/call` rejects a registered-but-disabled server with 400 `MCP_SERVER_DISABLED` **before** opening any upstream connection. The sibling `/test` deliberately accepts disabled servers (it is a diagnostic probe for verifying credentials before enabling). `/call` is production tool execution, so the `enabled` flag gates it. Auth-middleware rejections (missing/invalid API key) return the plain `{ "error": "<message>" }` shape (401), like every other `/v1/*` route, since they fire before the route handler.
 
 For detailed architecture, see [`docs/architecture.md`](docs/architecture.md).
 
