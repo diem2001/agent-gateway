@@ -215,7 +215,24 @@ npm start
 
 ```bash
 npm test            # Unit tests (vitest, excludes E2E)
-npm run test:e2e    # E2E session tests (requires running Gateway + GATEWAY_API_KEY env var)
+npm run test:e2e    # E2E tests (requires running Gateway + GATEWAY_API_KEY env var)
+```
+
+The E2E suite (`src/tests/e2e-*.test.ts`) runs against a **live, Anthropic-authenticated** gateway and is excluded from the fast unit gate. Each E2E file gates itself on `GATEWAY_API_KEY` (the gateway Bearer token) and **skips cleanly** when it is absent, so `npm run test:e2e` is safe to run in any environment:
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `GATEWAY_API_KEY` | Yes (to run) | — | Gateway Bearer token. Absent ⇒ the E2E suite skips, no failure. |
+| `GATEWAY_URL` | No | `http://127.0.0.1:3001` | Base URL of the running gateway. |
+
+E2E suites:
+
+- `e2e-session.test.ts` — session continuity / isolation across queries.
+- `e2e-user-skills.test.ts` — per-user skills Outcome Probe: a skill registered under user A is autonomously invoked by the real LLM and appears in A's `skills_loaded` NDJSON event, while it is invisible to user B (absent from B's `skills_loaded`, never invoked). Test users use the reserved `e2e-skills-` prefix and are cleaned up (DELETE + reconcile-empty) on pass and fail.
+
+```bash
+# Run the live E2E probe against a running gateway:
+GATEWAY_API_KEY=<key> GATEWAY_URL=http://127.0.0.1:3001 npm run test:e2e
 ```
 
 ## Architecture
