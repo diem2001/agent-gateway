@@ -240,10 +240,15 @@ describeE2E("Per-user skills — autonomous invocation + cross-user isolation (E
     const userA = uniqueUserId("a");
     const userB = uniqueUserId("b");
     const slug = uniqueSkillSlug();
-    // The skill's frontmatter `name` is the identity the SDK surfaces in
-    // init.skills[] (→ skills_loaded.skills) AND the Skill tool_use `input`.
+    // The frontmatter `name` is how the user refers to the skill in the prompt.
+    // The gateway/SDK surface the LOADED skill under its NAMESPACED identity
+    // `user-<userId>-skills:<slug>` — that is the value carried in BOTH
+    // skills_loaded.skills[] and the Skill tool_use `input` (verified against the
+    // live gateway, MVP-6577), NOT the frontmatter name.
     const skillName = `e2e-recall-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const token = `TOKEN-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    // The identity the SDK actually emits for this registered skill.
+    const skillId = `user-${userA}-skills:${slug}`;
 
     // Register skill X under user A ONLY.
     await registerSkill(userA, slug, skillMarkdown(skillName, token));
@@ -257,17 +262,25 @@ describeE2E("Per-user skills — autonomous invocation + cross-user isolation (E
     // --- Positive (user A) ---
     const a = await sendQuery(userA, triggerPrompt);
 
-    // (1) autonomous invocation: a Skill tool_use naming X is observed in A's stream.
+    // (1) autonomous invocation: a Skill tool_use naming X (by its namespaced
+    // identity) is observed in A's stream.
     expect(
-      skillToolUseNames(a.events, skillName),
-      `user A's stream must contain a Skill tool_use naming ${skillName}`,
+      skillToolUseNames(a.events, skillId),
+      `user A's stream must contain a Skill tool_use naming ${skillId}`,
     ).toBe(true);
 
     // (2) loaded surface: skills_loaded(user_id=A) contains X.
     const aLoaded = skillsLoaded(a.events);
     expect(aLoaded, "user A must get exactly one skills_loaded event").toBeTruthy();
     expect(aLoaded!.user_id).toBe(userA);
-    expect(aLoaded!.skills, `A's skills_loaded must contain ${skillName}`).toContain(skillName);
+    expect(aLoaded!.skills, `A's skills_loaded must contain ${skillId}`).toContain(skillId);
+
+    // (3) real outcome: A's reply surfaces the skill's secret token — end-to-end
+    // proof the skill was loaded, autonomously invoked, and read.
+    expect(
+      a.text,
+      "user A's reply must contain the skill's secret recall token",
+    ).toContain(token);
 
     // --- Negative (user B), identical prompt, no skill registered ---
     const b = await sendQuery(userB, triggerPrompt);
@@ -278,13 +291,13 @@ describeE2E("Per-user skills — autonomous invocation + cross-user isolation (E
     expect(bLoaded!.user_id).toBe(userB);
     expect(
       bLoaded!.skills ?? [],
-      `B's skills_loaded must NOT contain ${skillName}`,
-    ).not.toContain(skillName);
+      `B's skills_loaded must NOT contain ${skillId}`,
+    ).not.toContain(skillId);
 
     // (2) no Skill tool_use naming X anywhere in B's whole stream.
     expect(
-      skillToolUseNames(b.events, skillName),
-      `user B's stream must NOT contain a Skill tool_use naming ${skillName}`,
+      skillToolUseNames(b.events, skillId),
+      `user B's stream must NOT contain a Skill tool_use naming ${skillId}`,
     ).toBe(false);
   }, 120_000);
 
@@ -311,6 +324,8 @@ describeE2E("Per-user skills — autonomous invocation + cross-user isolation (E
     const slug = uniqueSkillSlug();
     const skillName = `e2e-recall-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const token = `TOKEN-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    // The namespaced identity the SDK emits for X (never present for B).
+    const skillId = `user-${userA}-skills:${slug}`;
 
     // Skill X under user A only.
     await registerSkill(userA, slug, skillMarkdown(skillName, token));
@@ -327,12 +342,12 @@ describeE2E("Per-user skills — autonomous invocation + cross-user isolation (E
     const bLoaded = skillsLoaded(b.events);
     expect(bLoaded, "user B must get exactly one skills_loaded event").toBeTruthy();
     expect(bLoaded!.user_id).toBe(userB);
-    expect(bLoaded!.skills ?? []).not.toContain(skillName);
+    expect(bLoaded!.skills ?? []).not.toContain(skillId);
 
     // X never invoked for B, even though B was explicitly told to.
     expect(
-      skillToolUseNames(b.events, skillName),
-      `user B must NOT invoke ${skillName} even when explicitly told to`,
+      skillToolUseNames(b.events, skillId),
+      `user B must NOT invoke ${skillId} even when explicitly told to`,
     ).toBe(false);
   }, 120_000);
 
