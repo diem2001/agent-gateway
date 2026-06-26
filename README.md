@@ -383,6 +383,23 @@ Per-request MCP credential overrides can be attached to `POST /v1/query` without
 
 Override server names must already exist and be enabled in the registry. Unknown names return `MCP_SERVER_NOT_FOUND`; disabled names return `MCP_SERVER_DISABLED`. For http/sse transports, `headers` are shallow-merged over the static registry config. For stdio transports, `env` is shallow-merged. Overrides are request-scoped only and never write back to `MCP_SERVERS_PERSIST_PATH`.
 
+Per-request MCP **servers** can also be attached to a single `POST /v1/query` via the optional `mcpServers` field — an unregistered server that lives only for that one query. The value is the SDK `mcpServers` map (server name → `{ command, args?, env? }` for stdio, or `{ url, type? }` for http/sse). The gateway injects these into `options.mcpServers` and adds the matching `mcp__<name>__*` patterns to the default allowed-tool set, so their tools are usable without an explicit `allowedTools`:
+
+```json
+{
+  "queryId": "q-002",
+  "prompt": "Take a screenshot of the current page",
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["chrome-devtools-mcp", "--browser-url=http://recon-abc:9222"]
+    }
+  }
+}
+```
+
+Request servers are merged at the **lowest precedence**: the gateway's own `agent-gateway-tools` webhook server and the registered registry servers always overlay on top, so a request can never override or shadow them — the reserved name `agent-gateway-tools` is rejected with `400`. Each value must define a string `command` (stdio) or `url` (http/sse); malformed entries return `400`. Request servers are query-scoped only and are never persisted to `MCP_SERVERS_PERSIST_PATH`. (Used by reqlift recon to attach a per-run chrome-devtools MCP server.)
+
 Use `POST /v1/mcp-servers/:name/test` to validate a credential set before saving or enabling it:
 
 ```bash

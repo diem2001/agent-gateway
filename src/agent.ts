@@ -13,6 +13,7 @@ import {
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
 import { materializeUserSkills, cleanupUserSkillBundle } from "./user-skills.js";
+import { requestMcpAllowedToolPatterns, type RequestMcpServers } from "./mcp-request-servers.js";
 
 export interface QueryParams {
   prompt?: string;
@@ -27,6 +28,14 @@ export interface QueryParams {
   webhookContext?: WebhookContext;
   clientAuthToken?: string;
   mcpCredentialOverrides?: McpCredentialOverrides;
+  /**
+   * Per-query MCP servers from the request body (MVP-6755). Merged into the SDK
+   * `mcpServers` at the LOWEST precedence — the webhook tool server and the
+   * persistent registry servers overlay on top, so a request can never override
+   * them. The matching `mcp__<name>__*` patterns are added to the default
+   * allowed-tool set (a caller-supplied `allowedTools` stays authoritative).
+   */
+  requestMcpServers?: RequestMcpServers;
   /**
    * The requesting user's id (DEC-GW-002 / DEC-GW-004). When present, this query
    * additionally loads that user's stored skills via the SDK `plugins` local
@@ -114,11 +123,12 @@ async function* buildContentMessageStream(
   };
 }
 
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, userId }: QueryParams): Promise<QueryResult> {
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
   const mcpToolPatterns = getMcpAllowedToolPatterns();
-  const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns];
+  const requestMcpToolPatterns = requestMcpAllowedToolPatterns(requestMcpServers);
+  const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
   const HOME = process.env.HOME || "/home/node";
   const options: Record<string, unknown> = {
     allowedTools: effectiveTools,
@@ -150,8 +160,11 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   if (isResume) { options.resume = sessionId; } else { options.sessionId = sessionId; }
   log("query", `SDK options: sessionId=${sessionId || "none"} isResume=${isResume} resume=${isResume ? sessionId : "n/a"} model=${options.model || "default"} mcpPatterns=[${mcpToolPatterns.join(",")}]`);
 
-  // Build mcpServers: merge webhook-based tools + registered MCP servers
-  const mcpServers: Record<string, unknown> = {};
+  // Build mcpServers: per-query request servers (lowest precedence) +
+  // webhook-based tools + registered MCP servers. The trusted servers below are
+  // assigned AFTER the request servers, so a request can never override the
+  // gateway's own webhook tools or a registered server (MVP-6755).
+  const mcpServers: Record<string, unknown> = { ...(requestMcpServers ?? {}) };
 
   if (registeredTools.length > 0 && webhookContext) {
     mcpServers["agent-gateway-tools"] = createToolMcpServer(registeredTools, webhookContext, clientAuthToken);
