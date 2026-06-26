@@ -7,6 +7,10 @@ import {
   validateMcpCredentialOverrides,
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
+import {
+  validateRequestMcpServers,
+  type RequestMcpServers,
+} from "./mcp-request-servers.js";
 
 /**
  * A single block of multimodal request content. Maps directly to the Anthropic
@@ -23,6 +27,13 @@ interface QueryRequestBody {
   model?: string; allowedTools?: string[]; useSession?: boolean; sshTarget?: string;
   user_id?: string; conversation_id?: string;
   mcpCredentialOverrides?: McpCredentialOverrides;
+  /**
+   * Per-query MCP servers (MVP-6755). Injected into the SDK options for THIS
+   * query only, at the lowest precedence (the gateway's own webhook tools +
+   * registered servers always win). Used by reqlift recon to attach a per-run
+   * chrome-devtools MCP server. See `mcp-request-servers.ts`.
+   */
+  mcpServers?: RequestMcpServers;
 }
 
 /**
@@ -79,7 +90,7 @@ function resolveContentBlocks(
 export const queryRouter = Router();
 
 queryRouter.post("/v1/query", async (req: Request, res: Response) => {
-  const { queryId, sessionId, prompt, content, systemPrompt, model, allowedTools, useSession, sshTarget, user_id, conversation_id, mcpCredentialOverrides } = req.body as QueryRequestBody;
+  const { queryId, sessionId, prompt, content, systemPrompt, model, allowedTools, useSession, sshTarget, user_id, conversation_id, mcpCredentialOverrides, mcpServers } = req.body as QueryRequestBody;
   if (!queryId) { res.status(400).json({ error: "queryId and prompt or content are required" }); return; }
   const resolved = resolveContentBlocks(content, prompt);
   if ("error" in resolved) { res.status(400).json({ error: resolved.error }); return; }
@@ -87,6 +98,11 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   const overrideValidation = validateMcpCredentialOverrides(mcpCredentialOverrides);
   if (overrideValidation.error) {
     res.status(400).json({ error: overrideValidation.error });
+    return;
+  }
+  const mcpServersValidation = validateRequestMcpServers(mcpServers);
+  if (mcpServersValidation.error) {
+    res.status(400).json({ error: mcpServersValidation.error });
     return;
   }
 
@@ -140,6 +156,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
       sessionId: effectiveSessionId,
       isResume, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
       mcpCredentialOverrides: overrideValidation.overrides,
+      requestMcpServers: mcpServersValidation.servers,
       userId: user_id || undefined,
     });
 

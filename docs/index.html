@@ -262,6 +262,7 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
         <tr><td><code>user_id</code></td><td>string</td><td>No</td><td>User identifier passed to tool webhook context</td></tr>
         <tr><td><code>conversation_id</code></td><td>string</td><td>No</td><td>Conversation identifier passed to tool webhook context</td></tr>
         <tr><td><code>mcpCredentialOverrides</code></td><td>object</td><td>No</td><td>Request-scoped MCP <code>headers</code> or <code>env</code> overrides keyed by registered server name</td></tr>
+        <tr><td><code>mcpServers</code></td><td>object</td><td>No</td><td>Per-query MCP servers (SDK <code>mcpServers</code> map). Injected for this query only at the lowest precedence; their <code>mcp__&lt;name&gt;__*</code> tools are auto-allowed. The reserved name <code>agent-gateway-tools</code> is rejected</td></tr>
       </tbody>
     </table>
 
@@ -290,6 +291,7 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
     }
   }'</code></pre>
     <p>Override server names must exist and be enabled. Unknown names return <code>MCP_SERVER_NOT_FOUND</code>; disabled names return <code>MCP_SERVER_DISABLED</code>. Overrides are merged for that one request only and are never persisted to the MCP registry.</p>
+    <p>A single query may also attach an unregistered MCP server via <code>mcpServers</code> (the SDK <code>mcpServers</code> map — <code>{ command, args?, env? }</code> for stdio or <code>{ url, type? }</code> for http/sse). The gateway injects it into <code>options.mcpServers</code> and auto-allows its <code>mcp__&lt;name&gt;__*</code> tools, so no explicit <code>allowedTools</code> is needed. Request servers are merged at the lowest precedence (the gateway's <code>agent-gateway-tools</code> and registered servers always win; the reserved name <code>agent-gateway-tools</code> and malformed entries return <code>400</code>) and are never persisted. reqlift recon uses this to attach a per-run chrome-devtools server.</p>
 
     <h3>Multimodal Content (<code>content[]</code>)</h3>
     <p>Send text and images in a single query by passing a <code>content</code> array of content blocks. The array maps directly to the Anthropic API content-block format and is forwarded to the Claude Agent SDK as a structured user message — image blocks are passed through to Anthropic <strong>unmodified</strong>.</p>
