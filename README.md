@@ -83,6 +83,9 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `GET` | `/v1/skills/*` | Read a skill file |
 | `PUT` | `/v1/skills/*` | Write a skill file |
 | `DELETE` | `/v1/skills/*` | Delete a skill file |
+| `GET` | `/v1/users/{user_id}/skills` | List a user's per-user skills (reconcile; `{ files: [...] }`) |
+| `PUT` | `/v1/users/{user_id}/skills/*` | Write a user-namespaced skill file (body = SKILL.md) |
+| `DELETE` | `/v1/users/{user_id}/skills/*` | Delete a user-namespaced skill file |
 | `GET` | `/v1/knowledge-base` | List knowledge-base files (read-only) |
 | `GET` | `/v1/knowledge-base/*` | Read a knowledge-base file as `text/markdown` (read-only) |
 | `PUT` | `/v1/tools/:name` | Register/update a webhook tool |
@@ -95,6 +98,7 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `DELETE` | `/v1/mcp-servers/:name` | Unregister an MCP server |
 | `POST` | `/v1/mcp-servers/:name/restart` | Force the SDK to reconnect to the MCP server on next query |
 | `POST` | `/v1/mcp-servers/:name/test` | Test merged MCP credentials with `tools/list` |
+| `POST` | `/v1/mcp-servers/:name/call` | Directly execute a registered MCP server's tool (`tools/call`, no LLM) |
 | `GET` | `/v1/mcp-servers/:name/health` | Health check for a registered MCP server |
 | `POST` | `/v1/workspace/git/clone` | Clone a repository into the workspace |
 | `POST` | `/v1/workspace/git/pull` | Pull updates for a workspace repository |
@@ -187,6 +191,7 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `TOOLS_PERSIST_PATH` | `./data/tools.json` | Tool registry storage (Docker: `/home/node/.claude/tools.json`) |
 | `MCP_SERVERS_PERSIST_PATH` | `./data/mcp-servers.json` | MCP server registry storage (Docker: `/home/node/.claude/mcp-servers.json`) |
 | `MCP_TEST_TIMEOUT_MS` | `10000` | Per-test deadline for `POST /v1/mcp-servers/:name/test` |
+| `MCP_CALL_TIMEOUT_MS` | `10000` | Per-call deadline for `POST /v1/mcp-servers/:name/call` |
 
 ## Development Setup
 
@@ -210,7 +215,24 @@ npm start
 
 ```bash
 npm test            # Unit tests (vitest, excludes E2E)
-npm run test:e2e    # E2E session tests (requires running Gateway + GATEWAY_API_KEY env var)
+npm run test:e2e    # E2E tests (requires running Gateway + GATEWAY_API_KEY env var)
+```
+
+The E2E suite (`src/tests/e2e-*.test.ts`) runs against a **live, Anthropic-authenticated** gateway and is excluded from the fast unit gate. Each E2E file gates itself on `GATEWAY_API_KEY` (the gateway Bearer token) and **skips cleanly** when it is absent, so `npm run test:e2e` is safe to run in any environment:
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `GATEWAY_API_KEY` | Yes (to run) | — | Gateway Bearer token. Absent ⇒ the E2E suite skips, no failure. |
+| `GATEWAY_URL` | No | `http://127.0.0.1:3001` | Base URL of the running gateway. |
+
+E2E suites:
+
+- `e2e-session.test.ts` — session continuity / isolation across queries.
+- `e2e-user-skills.test.ts` — per-user skills Outcome Probe: a skill registered under user A is autonomously invoked by the real LLM and appears in A's `skills_loaded` NDJSON event, while it is invisible to user B (absent from B's `skills_loaded`, never invoked). Test users use the reserved `e2e-skills-` prefix and are cleaned up (DELETE + reconcile-empty) on pass and fail.
+
+```bash
+# Run the live E2E probe against a running gateway:
+GATEWAY_API_KEY=<key> GATEWAY_URL=http://127.0.0.1:3001 npm run test:e2e
 ```
 
 ## Architecture
@@ -378,6 +400,23 @@ Per-request MCP credential overrides can be attached to `POST /v1/query` without
 
 Override server names must already exist and be enabled in the registry. Unknown names return `MCP_SERVER_NOT_FOUND`; disabled names return `MCP_SERVER_DISABLED`. For http/sse transports, `headers` are shallow-merged over the static registry config. For stdio transports, `env` is shallow-merged. Overrides are request-scoped only and never write back to `MCP_SERVERS_PERSIST_PATH`.
 
+Per-request MCP **servers** can also be attached to a single `POST /v1/query` via the optional `mcpServers` field — an unregistered server that lives only for that one query. The value is the SDK `mcpServers` map (server name → `{ command, args?, env? }` for stdio, or `{ url, type? }` for http/sse). The gateway injects these into `options.mcpServers` and adds the matching `mcp__<name>__*` patterns to the default allowed-tool set, so their tools are usable without an explicit `allowedTools`:
+
+```json
+{
+  "queryId": "q-002",
+  "prompt": "Take a screenshot of the current page",
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["chrome-devtools-mcp", "--browser-url=http://recon-abc:9222"]
+    }
+  }
+}
+```
+
+Request servers are merged at the **lowest precedence**: the gateway's own `agent-gateway-tools` webhook server and the registered registry servers always overlay on top, so a request can never override or shadow them — the reserved name `agent-gateway-tools` is rejected with `400`. Each value must define a string `command` (stdio) or `url` (http/sse); malformed entries return `400`. Request servers are query-scoped only and are never persisted to `MCP_SERVERS_PERSIST_PATH`. (Used by reqlift recon to attach a per-run chrome-devtools MCP server.)
+
 Use `POST /v1/mcp-servers/:name/test` to validate a credential set before saving or enabling it:
 
 ```bash
@@ -388,6 +427,53 @@ curl -X POST http://localhost:3001/v1/mcp-servers/jira/test \
 ```
 
 Success returns `{ "ok": true, "toolCount": 2, "tools": [{ "name": "..." }] }`. Unknown servers return `MCP_SERVER_NOT_FOUND`, upstream 401/403 returns `MCP_AUTH_FAILED`, transport failures return `MCP_NETWORK_ERROR`, and timeouts return `MCP_TIMEOUT`. Error messages are sanitized and do not echo header or env values.
+
+### Direct tool call (`POST /v1/mcp-servers/:name/call`)
+
+Execute a registered MCP server's tool directly, with **no LLM turn and no token cost** — the gateway opens a single `tools/call` to the upstream MCP server and returns its result verbatim. Per-call credentials override the registered server's credentials for that call only (request-scoped, never written back):
+
+```bash
+curl -X POST http://localhost:3001/v1/mcp-servers/jira/call \
+  -H "Authorization: Bearer sk-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "tool": "get_issue",
+        "arguments": { "issueKey": "MVP-1" },
+        "credentials": { "headers": { "Authorization": "Basic <base64(email:apiToken)>" } }
+      }'
+```
+
+Request body:
+
+- `tool` (required, non-empty string) — the MCP tool name to invoke.
+- `arguments` (required, object) — the tool arguments.
+- `credentials` (optional) — a per-call credential override, the same `{ headers?, env? }` shape the `/test` body accepts (one entry of `mcpCredentialOverrides`, not the keyed map — the path already carries the server name). `headers` is shallow-merged for http/sse transports; `env` for stdio.
+
+**Success (HTTP 200)** is the MCP `tools/call` result verbatim — only the JSON-RPC `result` member, no upstream envelope fields:
+
+```jsonc
+{ "content": [ /* MCP content blocks */ ], "structuredContent": { }, "isError": false }
+```
+
+A **tool-level error is still HTTP 200** with `isError: true` (the upstream call succeeded — it is the tool's result, not a gateway failure):
+
+```jsonc
+{ "content": [ /* ... */ ], "isError": true }
+```
+
+**Gateway-level failures** (never tool errors) return the structured envelope `{ "error": { "code": "...", "message": "..." } }` and never hang past the per-call deadline:
+
+| Condition | HTTP | `error.code` |
+| --- | --- | --- |
+| unknown / unregistered server | 400 | `MCP_SERVER_NOT_FOUND` |
+| registered but disabled server | 400 | `MCP_SERVER_DISABLED` |
+| missing/invalid `tool`/`arguments` | 400 | `MCP_CALL_INVALID` |
+| invalid `credentials` override | 400 | `MCP_OVERRIDE_INVALID` |
+| upstream rejects auth (401/403) | 401 | `MCP_AUTH_FAILED` |
+| upstream timeout / no response | 504 | `MCP_TIMEOUT` |
+| connection / transport failure | 502 | `MCP_NETWORK_ERROR` |
+
+> **Divergence from `/test`:** `/call` rejects a registered-but-disabled server with 400 `MCP_SERVER_DISABLED` **before** opening any upstream connection. The sibling `/test` deliberately accepts disabled servers (it is a diagnostic probe for verifying credentials before enabling). `/call` is production tool execution, so the `enabled` flag gates it. Auth-middleware rejections (missing/invalid API key) return the plain `{ "error": "<message>" }` shape (401), like every other `/v1/*` route, since they fire before the route handler.
 
 For detailed architecture, see [`docs/architecture.md`](docs/architecture.md).
 

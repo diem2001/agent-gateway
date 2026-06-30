@@ -2,7 +2,7 @@ import { Router } from "express";
 import fs from "node:fs";
 import type { Request, Response } from "express";
 import { log } from "../logging.js";
-import { getWorkspaceDir, safePath, listFiles, readFile, writeFile, deleteFile } from "../workspace.js";
+import { getWorkspaceDir, getUserSkillsDir, safePath, listFiles, readFile, writeFile, deleteFile } from "../workspace.js";
 
 const router = Router();
 type WorkspaceSection = "memory" | "agents" | "skills";
@@ -87,6 +87,80 @@ router.get("/v1/" + KB_SECTION + "/{*subpath}", (req: Request, res: Response) =>
   if (!stat.isFile()) { res.status(404).json({ error: "File not found" }); return; }
   try { res.type("text/markdown; charset=utf-8").send(readFile(filePath)); }
   catch { res.status(500).json({ error: "Internal server error" }); }
+});
+
+/* ------------------------------------------------------------------ */
+/*  Per-user skill section  (DEC-GW-003)                                */
+/*                                                                      */
+/*  User-namespaced skill CRUD that reqlift R-S5 (MVP-6582) consumes.   */
+/*  Mirrors the mutable SECTIONS loop above (extractSubPath → safePath  */
+/*  → listFiles → { files: [] }) but the base dir is keyed on the       */
+/*  `:user_id` route segment, so it cannot live inside that loop (which */
+/*  assumes a single flat base dir). The `:user_id` segment is          */
+/*  sanitized via getUserSkillsDir (reject `..`, `/`, NUL, absolute,    */
+/*  control chars → 400) BEFORE any disk access; the `{*subpath}` is    */
+/*  guarded by the same safePath realpath traversal check as the        */
+/*  sectioned routes.                                                   */
+/* ------------------------------------------------------------------ */
+
+const USER_SKILLS_PREFIX = "/v1/users";
+
+// Express 5 decodes `:user_id`; the trailing wildcard is captured as the
+// `subpath` param. Both express's params and a manual re-derivation collapse to
+// the same value, so read straight from req.params.
+function extractUserSubPath(req: Request): string {
+  const raw = req.params.subpath;
+  if (Array.isArray(raw)) return raw.join("/");
+  return typeof raw === "string" ? raw : "";
+}
+
+// In Express 5 a route param is typed `string | string[]`. A user_id is a single
+// segment; if it ever arrives as an array (it shouldn't for `:user_id`), treat it
+// as invalid by returning a non-string so getUserSkillsDir rejects it.
+function userIdParam(req: Request): string | undefined {
+  const raw = req.params.user_id;
+  return typeof raw === "string" ? raw : undefined;
+}
+
+// GET /v1/users/:user_id/skills — reconcile list (mirrors GET /v1/skills shape).
+// 200 { files: [{ path, size, modified }, ...] }. Empty namespace → { files: [] }.
+router.get(USER_SKILLS_PREFIX + "/:user_id/skills", (req: Request, res: Response) => {
+  const baseDir = getUserSkillsDir(userIdParam(req));
+  if (!baseDir) { res.status(400).json({ error: "Invalid user_id" }); return; }
+  try { res.json({ files: listFiles(baseDir) }); }
+  catch (e) { res.status(500).json({ error: e instanceof Error ? e.message : String(e) }); }
+});
+
+// PUT /v1/users/:user_id/skills/{*subpath} — body = SKILL.md content.
+router.put(USER_SKILLS_PREFIX + "/:user_id/skills/{*subpath}", (req: Request, res: Response) => {
+  const baseDir = getUserSkillsDir(userIdParam(req));
+  if (!baseDir) { res.status(400).json({ error: "Invalid user_id" }); return; }
+  const subPath = extractUserSubPath(req);
+  if (!subPath) { res.status(400).json({ error: "Path is required" }); return; }
+  const filePath = safePath(baseDir, subPath);
+  if (!filePath) { res.status(400).json({ error: "Invalid path" }); return; }
+  try {
+    const content = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
+    writeFile(filePath, content);
+    log("workspace", "Written: users/" + (userIdParam(req) ?? "") + "/skills/" + subPath);
+    res.json({ status: "ok", path: subPath });
+  } catch (e) { res.status(500).json({ error: e instanceof Error ? e.message : String(e) }); }
+});
+
+// DELETE /v1/users/:user_id/skills/{*subpath}
+router.delete(USER_SKILLS_PREFIX + "/:user_id/skills/{*subpath}", (req: Request, res: Response) => {
+  const baseDir = getUserSkillsDir(userIdParam(req));
+  if (!baseDir) { res.status(400).json({ error: "Invalid user_id" }); return; }
+  const subPath = extractUserSubPath(req);
+  if (!subPath) { res.status(400).json({ error: "Path is required" }); return; }
+  const filePath = safePath(baseDir, subPath);
+  if (!filePath) { res.status(400).json({ error: "Invalid path" }); return; }
+  if (!fs.existsSync(filePath)) { res.status(404).json({ error: "File not found" }); return; }
+  try {
+    deleteFile(filePath);
+    log("workspace", "Deleted: users/" + (userIdParam(req) ?? "") + "/skills/" + subPath);
+    res.json({ status: "ok" });
+  } catch (e) { res.status(500).json({ error: e instanceof Error ? e.message : String(e) }); }
 });
 
 export default router;

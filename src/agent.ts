@@ -12,6 +12,8 @@ import {
   summarizeOverrideKeys,
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
+import { materializeUserSkills, cleanupUserSkillBundle } from "./user-skills.js";
+import { requestMcpAllowedToolPatterns, type RequestMcpServers } from "./mcp-request-servers.js";
 
 export interface QueryParams {
   prompt?: string;
@@ -26,6 +28,21 @@ export interface QueryParams {
   webhookContext?: WebhookContext;
   clientAuthToken?: string;
   mcpCredentialOverrides?: McpCredentialOverrides;
+  /**
+   * Per-query MCP servers from the request body (MVP-6755). Merged into the SDK
+   * `mcpServers` at the LOWEST precedence — the webhook tool server and the
+   * persistent registry servers overlay on top, so a request can never override
+   * them. The matching `mcp__<name>__*` patterns are added to the default
+   * allowed-tool set (a caller-supplied `allowedTools` stays authoritative).
+   */
+  requestMcpServers?: RequestMcpServers;
+  /**
+   * The requesting user's id (DEC-GW-002 / DEC-GW-004). When present, this query
+   * additionally loads that user's stored skills via the SDK `plugins` local
+   * lever (request-scoped) and the emitted `skills_loaded` event carries it.
+   * `undefined` ⇒ global-only load, `skills_loaded.user_id = null`.
+   */
+  userId?: string;
 }
 
 export interface QueryResult {
@@ -106,11 +123,12 @@ async function* buildContentMessageStream(
   };
 }
 
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides }: QueryParams): Promise<QueryResult> {
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
   const mcpToolPatterns = getMcpAllowedToolPatterns();
-  const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns];
+  const requestMcpToolPatterns = requestMcpAllowedToolPatterns(requestMcpServers);
+  const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
   const HOME = process.env.HOME || "/home/node";
   const options: Record<string, unknown> = {
     allowedTools: effectiveTools,
@@ -121,14 +139,32 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     cwd: HOME,
     settingSources: ["user", "project"],
   };
+
+  // Per-user skill loading (DEC-GW-002): materialize the requesting user's stored
+  // skills into a request-scoped local-plugin bundle and point `plugins` at it for
+  // THIS query only. Global skills still load via cwd/settingSources (additive) —
+  // those are deliberately left untouched. No userId ⇒ no plugins ⇒ global-only
+  // load, byte-for-byte unchanged. Caps overflow is reported here and surfaced as a
+  // `skills_truncated` event below (DEC-GW-004) before the query proceeds.
+  const userSkills = materializeUserSkills(userId);
+  if (userSkills.pluginRoot) {
+    options.plugins = [{ type: "local", path: userSkills.pluginRoot }];
+    log("query", `user skills: loading plugin bundle for userId=${userId} at ${userSkills.pluginRoot}`);
+  }
+  if (userSkills.dropped.length > 0 && userSkills.reason) {
+    onEvent({ type: "skills_truncated", dropped: userSkills.dropped, reason: userSkills.reason });
+  }
   options.systemPrompt = systemPrompt
     ? { type: "preset", preset: "claude_code", append: systemPrompt }
     : { type: "preset", preset: "claude_code" };
   if (isResume) { options.resume = sessionId; } else { options.sessionId = sessionId; }
   log("query", `SDK options: sessionId=${sessionId || "none"} isResume=${isResume} resume=${isResume ? sessionId : "n/a"} model=${options.model || "default"} mcpPatterns=[${mcpToolPatterns.join(",")}]`);
 
-  // Build mcpServers: merge webhook-based tools + registered MCP servers
-  const mcpServers: Record<string, unknown> = {};
+  // Build mcpServers: per-query request servers (lowest precedence) +
+  // webhook-based tools + registered MCP servers. The trusted servers below are
+  // assigned AFTER the request servers, so a request can never override the
+  // gateway's own webhook tools or a registered server (MVP-6755).
+  const mcpServers: Record<string, unknown> = { ...(requestMcpServers ?? {}) };
 
   if (registeredTools.length > 0 && webhookContext) {
     mcpServers["agent-gateway-tools"] = createToolMcpServer(registeredTools, webhookContext, clientAuthToken);
@@ -176,6 +212,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   const pendingTools = new Map<string, { name: string }>();
   const toolTimings = new Map<string, number>();
 
+  try {
   for await (const message of conversation) {
     if (abortController.signal.aborted) break;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -236,7 +273,22 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
       if (msg.subtype === "compact_boundary" && msg.compact_metadata) {
         onEvent({ type: "sdk_compact_complete", trigger: msg.compact_metadata.trigger || "auto", preTokens: msg.compact_metadata.pre_tokens || 0 });
       }
+      // DEC-GW-004: the SDK `init` system message carries `skills: string[]` — the
+      // AUTHORITATIVE actually-loaded set (global + this query's per-user bundle).
+      // Emit exactly one `skills_loaded` per query as the durable black-box
+      // verification surface GW-S2 (MVP-6577) asserts. `user_id` is null when the
+      // query carried none (global-only load). We derive skills[] from the SDK
+      // message, NOT the gateway's own materialized list — that is what makes this
+      // the real loaded-set surface.
+      if (msg.subtype === "init") {
+        const loadedSkills: string[] = Array.isArray(msg.skills) ? msg.skills : [];
+        onEvent({ type: "skills_loaded", user_id: userId ?? null, skills: loadedSkills });
+      }
     } else if (msg.type === "result") { resultData = msg; }
+  }
+  } finally {
+    // Request-scoped bundle: remove it once this query() call has drained.
+    cleanupUserSkillBundle(userSkills.pluginRoot);
   }
 
   return { response: fullResponse, resultData };

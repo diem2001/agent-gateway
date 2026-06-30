@@ -135,4 +135,31 @@ describe("credential redaction", () => {
     expect(logText).not.toContain("Basic USER_X");
     expect(logText).not.toContain("\"TOKEN\":\"USER_X\"");
   });
+
+  it("redacts /call credentials in debug request logs", async () => {
+    const { requestLoggingMiddleware, setLogLevel } = await import("../logging.js");
+    setLogLevel("debug");
+
+    const app = express();
+    app.use(express.json());
+    app.use(requestLoggingMiddleware);
+    app.post("/v1/mcp-servers/jira/call", (_req, res) => res.json({ ok: true }));
+
+    await request(app)
+      .post("/v1/mcp-servers/jira/call")
+      .send({
+        tool: "echo",
+        arguments: { q: 1 },
+        credentials: {
+          headers: { Authorization: "Bearer SECRET_CALLER_TOKEN" },
+          env: { TOKEN: "SECRET_ENV_TOKEN" },
+        },
+      });
+
+    const logText = logs.join("\n");
+    expect(logText).toContain("[REDACTED]");
+    expect(logText).not.toContain("SECRET_CALLER_TOKEN");
+    expect(logText).not.toContain("SECRET_ENV_TOKEN");
+    expect(logText).not.toContain("Bearer SECRET");
+  });
 });

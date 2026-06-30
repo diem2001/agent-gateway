@@ -29,9 +29,12 @@ npm run test:e2e    # E2E session tests (requires running Gateway + GATEWAY_API_
 | `SESSION_PERSIST_PATH` | No | `./data/sessions.json` | File path for session persistence (Docker override: `/home/node/.claude/sessions.json`) |
 | `EVENT_CACHE_TTL_MS` | No | `1800000` (30 min) | TTL for completed query event caches |
 | `WORKSPACE_ROOT` | No | `$HOME/.claude` | Root for memory/agents/skills workspace |
+| `USER_SKILLS_MAX_COUNT` | No | `50` | Max per-user skills loaded per query; excess dropped (path-sorted) → `skills_truncated` |
+| `USER_SKILLS_MAX_BYTES` | No | `1048576` | Max total per-user SKILL.md bytes loaded per query; overflow → `skills_truncated` |
 | `TOOLS_PERSIST_PATH` | No | `./data/tools.json` | File path for tool registry persistence (Docker override: `/home/node/.claude/tools.json`) |
 | `MCP_SERVERS_PERSIST_PATH` | No | `./data/mcp-servers.json` | File path for MCP server registry persistence (Docker override: `/home/node/.claude/mcp-servers.json`) |
 | `MCP_TEST_TIMEOUT_MS` | No | `10000` | Per-test deadline for `POST /v1/mcp-servers/:name/test` (in ms) |
+| `MCP_CALL_TIMEOUT_MS` | No | `10000` | Per-call deadline for `POST /v1/mcp-servers/:name/call` (in ms) |
 
 ## API Key Format
 
@@ -90,7 +93,7 @@ src/
     workspace.ts     # CRUD for /v1/memory/*, /v1/agents/*, /v1/skills/*
     git.ts           # POST /v1/workspace/git/clone|pull, GET /v1/workspace/git/status
     tools.ts         # PUT/GET/DELETE /v1/tools (Tool Registry REST endpoints)
-    mcp.ts           # PUT/GET/DELETE /v1/mcp-servers + /restart + /health (MCP Server Registry)
+    mcp.ts           # PUT/GET/DELETE /v1/mcp-servers + /restart + /health + /test + /call (MCP Server Registry; /call = direct LLM-free tools/call passthrough, gates on enabled unlike /test)
   tests/
     e2e-session.test.ts    # E2E session continuity tests
     routes.tools.test.ts   # Tool routes unit tests
