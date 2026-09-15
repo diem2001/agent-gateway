@@ -19,7 +19,10 @@ export class McpTestError extends Error {
 export interface McpTestSuccess {
   ok: true;
   toolCount: number;
-  tools: Array<{ name: string }>;
+  // description + inputSchema are surfaced so a mirroring client (reqlift) can
+  // advertise the tool's REAL parameters instead of a type-less passthrough
+  // schema — callers otherwise have to guess field names/types.
+  tools: Array<{ name: string; description?: string; inputSchema?: unknown }>;
 }
 
 export async function testMcpServer(
@@ -77,11 +80,15 @@ async function testHttpMcpServer(
   }
 
   const payload = await parseMcpResponse(response) as {
-    result?: { tools?: Array<{ name?: string }> };
-    tools?: Array<{ name?: string }>;
+    result?: { tools?: Array<{ name?: string; description?: string; inputSchema?: unknown }> };
+    tools?: Array<{ name?: string; description?: string; inputSchema?: unknown }>;
   } | null;
   const tools = (payload?.result?.tools ?? payload?.tools ?? [])
-    .map((tool) => ({ name: String(tool.name ?? "") }))
+    .map((tool) => ({
+      name: String(tool.name ?? ""),
+      description: typeof tool.description === "string" ? tool.description : undefined,
+      inputSchema: tool.inputSchema,
+    }))
     .filter((tool) => tool.name.length > 0);
 
   return { ok: true, toolCount: tools.length, tools };

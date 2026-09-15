@@ -84,6 +84,37 @@ describe("POST /v1/mcp-servers/:name/test", () => {
     expect(seenAccept).toEqual(["application/json, text/event-stream"]);
   });
 
+  it("surfaces each tool's description and inputSchema (not just the name)", async () => {
+    const schema = {
+      type: "object",
+      properties: { issueKey: { type: "string" } },
+      required: ["issueKey"],
+    };
+    const url = await startFakeMcpServer((_req, res) => {
+      res.setHeader("Content-Type", "application/json");
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "agent-gateway-mcp-test",
+          result: {
+            tools: [{ name: "get_issue", description: "Get a Jira issue", inputSchema: schema }],
+          },
+        }),
+      );
+    });
+    await registerServer({ name: "jira", type: "http", url });
+    const app = await createApp();
+
+    const res = await request(app).post("/v1/mcp-servers/jira/test").send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true,
+      toolCount: 1,
+      tools: [{ name: "get_issue", description: "Get a Jira issue", inputSchema: schema }],
+    });
+  });
+
   it("parses Streamable HTTP text/event-stream tools/list responses", async () => {
     const url = await startFakeMcpServer((_req, res) => {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
