@@ -524,7 +524,7 @@ is forwarded as `POST <origin of the registered url>/uploads/jira/issue/MVP-1?fi
 - Node's server-wide `requestTimeout` is 3600 s so a slow upload is not cut at 5 minutes; every other route keeps a 300 s deadline for its request body.
 - If the sender disconnects, the upstream request is aborted at once (mcp-jira then stores nothing). If the MCP server answers before the whole body was sent (an early refusal), sending stops and that answer is passed through.
 - Every answer on this route carries `Connection: close`. When the gateway answers while the sender is still sending (any refusal, including the 401), it reads and discards at most 1 MiB more and closes the connection when the sender closes it or 5 s after the answer.
-- An MCP server that resets the connection immediately after an early answer, without reading any more of the body, can surface as 502 "unconfirmed" instead of its answer. mcp-jira drains up to 1 MiB or 5 s before it closes.
+- The relay returns to the event loop after every forwarded chunk, so an early answer is read before more is written, even when a fast sender (curl) has already delivered MBs. mcp-jira refuses a missing credential at once, reads at most 1 MiB more and then closes the connection; its answer (for example `401 UPLOAD_UNAUTHENTICATED`) reaches the sender unchanged. Only an MCP server that resets the connection immediately after an early answer, without reading any more of the body, can still surface as 502 "unconfirmed".
 
 **Resources and logging:**
 

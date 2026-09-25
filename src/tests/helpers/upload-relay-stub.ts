@@ -170,6 +170,12 @@ export interface SendOptions {
   prefix?: Buffer;
   /** Called with the running total each time a chunk is handed to the socket. */
   onWritten?: (written: number) => void;
+  /**
+   * Hand the whole body to the socket in one write, as curl does with
+   * `--data-binary @file`. The gateway then receives it in large bursts.
+   * Holds the body in memory: use for small uploads only.
+   */
+  oneWrite?: boolean;
 }
 
 export interface SendResult {
@@ -185,9 +191,24 @@ export interface SendResult {
   finishedAt: number;
 }
 
+const chunkCache = new Map<string, Buffer>();
+
+/**
+ * Byte `i` of a generated body is `(i * 31 + seed) & 0xff`, so a chunk depends
+ * only on its size and `offset mod 256`. Chunks are cached and reused, which
+ * keeps the sender about as fast as curl: a slow sender would give the gateway
+ * time to poll the upstream socket between chunks and hide races (MVP-7564).
+ * Never mutate a returned chunk.
+ */
 export function bodyChunk(size: number, offset: number, seed = 0): Buffer {
-  const chunk = Buffer.allocUnsafe(size);
-  for (let i = 0; i < size; i++) chunk[i] = (offset + i) * 31 + seed;
+  const key = `${size}:${offset & 0xff}:${seed}`;
+  let chunk = chunkCache.get(key);
+  if (!chunk) {
+    chunk = Buffer.allocUnsafe(size);
+    for (let i = 0; i < size; i++) chunk[i] = (offset + i) * 31 + seed;
+    if (chunkCache.size > 64) chunkCache.clear();
+    chunkCache.set(key, chunk);
+  }
   return chunk;
 }
 
@@ -243,10 +264,10 @@ export function sendUpload(options: SendOptions): Promise<SendResult> {
       let size = Math.min(chunkSize, options.total - written);
       if (options.stallAfter !== undefined) size = Math.min(size, options.stallAfter - written);
       if (options.abortAfter !== undefined) size = Math.min(size, options.abortAfter - written);
-      const chunk = bodyChunk(size, written, options.seed);
-      if (options.prefix && written < options.prefix.length) {
-        options.prefix.copy(chunk, 0, written, Math.min(options.prefix.length, written + size));
-      }
+      const shared = bodyChunk(size, written, options.seed);
+      if (!options.prefix || written >= options.prefix.length) return shared;
+      const chunk = Buffer.from(shared);
+      options.prefix.copy(chunk, 0, written, Math.min(options.prefix.length, written + size));
       return chunk;
     };
     const pump = () => {
@@ -278,6 +299,18 @@ export function sendUpload(options: SendOptions): Promise<SendResult> {
       }
     };
     req.on("close", () => (stopped = true));
+    if (options.oneWrite) {
+      const body = Buffer.allocUnsafe(options.total);
+      for (let offset = 0; offset < options.total; offset += chunkSize) {
+        bodyChunk(Math.min(chunkSize, options.total - offset), offset, options.seed).copy(body, offset);
+      }
+      options.prefix?.copy(body, 0);
+      written = body.length;
+      options.onWritten?.(written);
+      hash.update(body);
+      req.end(body);
+      return;
+    }
     pump();
   });
 }

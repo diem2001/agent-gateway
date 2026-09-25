@@ -389,6 +389,7 @@ class UploadRelay {
   private bodySent = false;
   private answered = false;
   private settled = false;
+  private forwarding = true;
   private bytes = 0;
   /** Frees the dropped chunk buffers every 2 MiB (needs `--expose-gc`). */
   private readonly gcBudget = new GcBudget(DEFAULT_GC_BUDGET);
@@ -428,15 +429,29 @@ class UploadRelay {
     req.on("end", this.onEnd);
   }
 
+  /**
+   * Forwards one chunk, then returns to the event loop before the next one
+   * (after `drain` when the upstream socket is full). When the sender is fast,
+   * Node holds MBs of its body; without this yield every write completes
+   * synchronously and the next chunk follows via nextTick, so the upstream
+   * socket is never read. An MCP server that answers early and closes after a
+   * bounded drain (mcp-jira reads at most 1 MiB) would then reset the
+   * connection under the next write, and its answer would be lost as a 502.
+   */
   private readonly onData = (chunk: Buffer): void => {
     this.bytes += chunk.length;
     this.touch();
     this.gcBudget.add(chunk.length);
     const upstream = this.upstream!;
-    if (!upstream.write(chunk)) {
-      this.req.pause();
-      upstream.once("drain", () => this.req.resume());
-    }
+    this.req.pause();
+    if (upstream.write(chunk)) this.resumeSoon();
+    else upstream.once("drain", this.resumeSoon);
+  };
+
+  private readonly resumeSoon = (): void => {
+    setImmediate(() => {
+      if (this.forwarding) this.req.resume();
+    });
   };
 
   private readonly onEnd = (): void => {
@@ -444,6 +459,7 @@ class UploadRelay {
   };
 
   private stopForwarding(): void {
+    this.forwarding = false;
     this.req.off("data", this.onData);
     this.req.off("end", this.onEnd);
     this.req.pause();

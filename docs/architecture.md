@@ -307,7 +307,9 @@ routes/mcp.ts ------ unknown / disabled (/call codes) -> stdio (MCP_UPLOAD_UNSUP
     v
 UploadRelay -------- node:http(s) request to <origin>/uploads/<target>?<query>
     |                  (fresh connection, never pooled, never retried)
-    |  each sender chunk: write upstream, drop it; upstream full -> pause sender
+    |  each sender chunk: write upstream, drop it, yield to the event loop
+    |    (setImmediate; after drain when upstream is full) so an early answer
+    |    is read before the next write
     |  every 2 MiB: minor GC (gc-budget.ts, needs --expose-gc)
     |  idle timer: reset by every request chunk and every answer chunk
     v

@@ -351,6 +351,51 @@ describe("upload relay in a real gateway process", () => {
     expect(gateway.output()).toContain("result=timeout");
   }, 30_000);
 
+  it.each([5 * MiB, 20 * MiB])(
+    "an mcp-jira style refusal (answer at once, read at most 1 MiB, then close) reaches a fast %i-byte sender verbatim",
+    async (total) => {
+      // mcp-jira refuses a missing credential before it reads the body, then
+      // discards at most 1 MiB and closes the socket with the rest unread, so the
+      // kernel resets the connection. A fast sender (one write, like curl) fills
+      // the gateway with MBs at once; the relay must still read the early
+      // answer before that reset, and the sender must get it unchanged, not a
+      // 502. Found by the Outcome Probe against the real mcp-jira.
+      const refusal = JSON.stringify({ error: { code: "UPLOAD_UNAUTHENTICATED", message: "An Authorization header is required." } });
+      const upstream = await stub(({ req, res }) => {
+        res.writeHead(401, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(refusal), Connection: "close" });
+        res.write(refusal);
+        let drained = 0;
+        let closed = false;
+        const close = () => {
+          if (closed) return;
+          closed = true;
+          res.end(() => req.destroy());
+        };
+        req.on("data", (chunk: Buffer) => {
+          drained += chunk.length;
+          if (drained >= MiB) {
+            req.pause();
+            close();
+          }
+        });
+        req.on("end", close);
+      });
+      const gateway = await spawnGateway({ LOG_LEVEL: "info" });
+      await registerJira(gateway, upstream);
+
+      const statuses: number[] = [];
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const result = await relay(gateway, { total, oneWrite: true });
+        statuses.push(result.status);
+        if (result.status !== 401) report(`attempt ${attempt}: HTTP ${result.status} ${result.text}`);
+        else expect(result.text).toBe(refusal);
+      }
+      report(`mcp-jira style refusal, ${total} bytes: statuses ${statuses.join(",")}`);
+      expect(statuses).toEqual(Array(10).fill(401));
+    },
+    60_000,
+  );
+
   it("a 50 MB sender without an API key gets a readable 401 and the socket closes within about 5 s", async () => {
     const upstream = await stub();
     const gateway = await spawnGateway({ LOG_LEVEL: "info" });
