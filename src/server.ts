@@ -26,14 +26,25 @@ import { loadTools } from "./tools.js";
 import { loadMcpServers } from "./mcp-registry.js";
 import mcpRoutes from "./routes/mcp.js";
 import gitRoutes from "./routes/git.js";
+import {
+  SERVER_REQUEST_TIMEOUT_MS,
+  nonUploadBodyDeadline,
+  skipForUploads,
+  uploadConnectionGuard,
+} from "./mcp-upload-relay.js";
 
 /* ------------------------------------------------------------------ */
 /*  Bootstrap                                                           */
 /* ------------------------------------------------------------------ */
 
 const app = express();
-app.use(express.json({ limit: "25mb" }));
-app.use(express.text({ limit: "10mb", type: "text/*" }));
+// The upload relay (POST /v1/mcp-servers/:name/uploads/*) streams its body
+// untouched: the parsers never run for it, whatever its Content-Type. Every
+// other request body keeps a 300 s deadline, until it is answered, although
+// the server-wide requestTimeout below is raised for the relay.
+app.use(nonUploadBodyDeadline());
+app.use(skipForUploads(express.json({ limit: "25mb" })));
+app.use(skipForUploads(express.text({ limit: "10mb", type: "text/*" })));
 
 // Load API keys from env
 loadApiKeys();
@@ -47,6 +58,10 @@ loadMcpServers();
 
 // Logging middleware (before auth so we log rejected requests too)
 app.use(requestLoggingMiddleware);
+
+// Upload path only: Connection: close and a bounded drain for every refusal,
+// including the API-key 401 below.
+app.use(uploadConnectionGuard());
 
 // Auth middleware (skips /health internally)
 app.use(authMiddleware);
@@ -183,10 +198,13 @@ app.use(
 const PORT = parseInt(process.env.PORT || "3001", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 
-app.listen(PORT, HOST, () => {
+export const server = app.listen(PORT, HOST, () => {
   log("server", `Agent Gateway v${VERSION} listening on ${HOST}:${PORT}`);
   log("server", `Log level: ${getLogLevel()}`);
   log("server", `Sessions: ${getSessionCount()} active`);
 });
+// Node's 300 s default would cut a slow but progressing upload; the relay's own
+// idle timeout bounds it instead (MCP_UPLOAD_IDLE_TIMEOUT_MS).
+server.requestTimeout = SERVER_REQUEST_TIMEOUT_MS;
 
 export default app;

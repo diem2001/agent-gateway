@@ -99,6 +99,7 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `POST` | `/v1/mcp-servers/:name/restart` | Force the SDK to reconnect to the MCP server on next query |
 | `POST` | `/v1/mcp-servers/:name/test` | Test merged MCP credentials with `tools/list` |
 | `POST` | `/v1/mcp-servers/:name/call` | Directly execute a registered MCP server's tool (`tools/call`, no LLM) |
+| `POST` | `/v1/mcp-servers/:name/uploads/*` | Stream a raw file upload to a registered http/sse MCP server's `/uploads/*` route (no buffering) |
 | `GET` | `/v1/mcp-servers/:name/health` | Health check for a registered MCP server |
 | `POST` | `/v1/workspace/git/clone` | Clone a repository into the workspace |
 | `POST` | `/v1/workspace/git/pull` | Pull updates for a workspace repository |
@@ -192,6 +193,7 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `MCP_SERVERS_PERSIST_PATH` | `./data/mcp-servers.json` | MCP server registry storage (Docker: `/home/node/.claude/mcp-servers.json`) |
 | `MCP_TEST_TIMEOUT_MS` | `10000` | Per-test deadline for `POST /v1/mcp-servers/:name/test` |
 | `MCP_CALL_TIMEOUT_MS` | `10000` | Per-call deadline for `POST /v1/mcp-servers/:name/call` |
+| `MCP_UPLOAD_IDLE_TIMEOUT_MS` | `60000` | No-progress timeout for one relayed upload (`POST /v1/mcp-servers/:name/uploads/*`); no overall deadline |
 
 ## Development Setup
 
@@ -208,7 +210,7 @@ Build for production:
 
 ```bash
 npm run build
-npm start
+npm start      # node --expose-gc dist/server.js (the upload relay's memory bound needs --expose-gc)
 ```
 
 ### Testing
@@ -474,6 +476,62 @@ A **tool-level error is still HTTP 200** with `isError: true` (the upstream call
 | connection / transport failure | 502 | `MCP_NETWORK_ERROR` |
 
 > **Divergence from `/test`:** `/call` rejects a registered-but-disabled server with 400 `MCP_SERVER_DISABLED` **before** opening any upstream connection. The sibling `/test` deliberately accepts disabled servers (it is a diagnostic probe for verifying credentials before enabling). `/call` is production tool execution, so the `enabled` flag gates it. Auth-middleware rejections (missing/invalid API key) return the plain `{ "error": "<message>" }` shape (401), like every other `/v1/*` route, since they fire before the route handler.
+
+### Streaming upload relay (`POST /v1/mcp-servers/:name/uploads/*`)
+
+Relay a raw file upload to a registered **http/sse** MCP server as a stream, with a per-call credential. The gateway is a dumb pipe: it does not parse, buffer, store or log the file. Each received chunk is forwarded and dropped, and when the MCP server reads slowly the sender is slowed down too (backpressure end to end).
+
+```bash
+CREDENTIAL=$(printf '%s' 'user@example.com:<api-token>' | base64 -w0)
+curl -X POST "http://localhost:3001/v1/mcp-servers/jira/uploads/jira/issue/MVP-1?filename=shot.png" \
+  -H "Authorization: Bearer sk-abc123" \
+  -H "Content-Type: image/png" \
+  -H "X-MCP-Credential-Headers: $(printf '{"Authorization":"Basic %s"}' "$CREDENTIAL" | base64 -w0)" \
+  --data-binary @shot.png
+```
+
+is forwarded as `POST <origin of the registered url>/uploads/jira/issue/MVP-1?filename=shot.png` (for `jira` registered as `http://mcp-jira:3002/mcp` that is `http://mcp-jira:3002/uploads/...`). The MCP server's HTTP status (200–599) and body come back **verbatim** (for mcp-jira, `201 { attachmentId, mediaApiFileId, filename, size }` or its own error codes such as `401 UPLOAD_UNAUTHENTICATED`).
+
+**Path and query:** everything after `/uploads/` and everything after the first `?` are taken from the raw request URL and forwarded byte for byte. The target is refused with `400 UPLOAD_TARGET_INVALID` when it is empty, has a `.` or `..` segment (also as `%2e`), or contains `%2f`, `%5c` or a backslash. Host and port come only from the registration.
+
+**Headers sent to the MCP server:**
+
+- `Authorization` from `X-MCP-Credential-Headers` — the **only** override key used on uploads; it replaces a registered `Authorization`, like `credentials.headers` on `/call`. Other override keys are dropped.
+- The registered server's static headers, except `Host`, `Content-Length`, `Content-Type`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect` and `Proxy-*`. Static headers of any http/sse registration therefore also travel to `<origin>/uploads/`, which matters for servers behind a path-routing proxy.
+- `Content-Type` and `Content-Length` of the incoming request (a chunked request is forwarded chunked).
+- Never: the gateway's own `Authorization: Bearer`, the `X-MCP-Credential-Headers` header itself.
+
+`X-MCP-Credential-Headers` must be one header holding canonical base64 of a UTF-8 JSON object whose values are strings without CR, LF or NUL, with no two keys that differ only in case; `Authorization` must be printable ASCII. Anything else is `400 MCP_OVERRIDE_INVALID`, and the message never echoes the value.
+
+**Errors** use the envelope `{ "error": { "code", "message" } }`; checks run in this order, all before any upstream connection:
+
+| Condition | HTTP | `error.code` |
+| --- | --- | --- |
+| missing/invalid gateway API key | 401 | plain `{ "error": "<message>" }`, like every `/v1/*` route |
+| unknown / unregistered server | 400 | `MCP_SERVER_NOT_FOUND` |
+| registered but disabled server | 400 | `MCP_SERVER_DISABLED` |
+| server uses stdio transport | 400 | `MCP_UPLOAD_UNSUPPORTED` |
+| invalid `X-MCP-Credential-Headers` | 400 | `MCP_OVERRIDE_INVALID` |
+| invalid target path | 400 | `UPLOAD_TARGET_INVALID` |
+| MCP server unreachable or registration url not http(s) — nothing was sent | 502 | `UPLOAD_UPSTREAM_FAILED` |
+| MCP server dropped the connection before answering — outcome unconfirmed, check the issue's attachments before retrying | 502 | `UPLOAD_UPSTREAM_FAILED` |
+| MCP server answered with a status outside 200–599 (or headers Node cannot send) — outcome unconfirmed; the upstream request is dropped | 502 | `UPLOAD_UPSTREAM_FAILED` |
+| no byte from the sender and none from the MCP server for `MCP_UPLOAD_IDLE_TIMEOUT_MS` | 504 | `UPLOAD_TIMEOUT` |
+| any other answer of the MCP server | its status | passed through unchanged |
+
+**Timing and aborts:**
+
+- `MCP_UPLOAD_IDLE_TIMEOUT_MS` (default 60000) is a no-progress timeout, not an overall deadline: every chunk from the sender and every chunk of the answer resets it, so a slow upload completes while it progresses. On expiry the upstream request is aborted; if the whole body had already been sent, the 504 message says the outcome is unconfirmed.
+- Node's server-wide `requestTimeout` is 3600 s so a slow upload is not cut at 5 minutes; every other route keeps a 300 s deadline for its request body until the gateway has answered (after an early answer, such as a 401, Node's own timeouts no longer apply to the rest of that body).
+- If the sender disconnects, the upstream request is aborted at once (mcp-jira then stores nothing). If the MCP server answers before the whole body was sent (an early refusal), sending stops and that answer is passed through.
+- Every answer on this route carries `Connection: close`. When the gateway answers while the sender is still sending (any refusal, including the 401), it reads and discards at most 1 MiB more and closes the connection when the sender closes it or 5 s after the answer.
+- The relay returns to the event loop after every forwarded chunk, so an early answer is read before more is written, even when a fast sender (curl) has already delivered MBs. mcp-jira refuses a missing credential at once, reads at most 1 MiB more and then closes the connection; its answer (for example `401 UPLOAD_UNAUTHENTICATED`) reaches the sender unchanged. Only an MCP server that resets the connection immediately after an early answer, without reading any more of the body, can still surface as 502 "unconfirmed".
+
+**Resources and logging:**
+
+- The gateway has no size or concurrency cap of its own. reqlift's 100 MiB cap applies to reqlift callers only; other API-key holders are bounded by the MCP server (Jira's attachment limit). Memory stays flat per upload: the test suite asserts that a 50 MB relay raises the peak resident memory by less than 10 MB. That needs `node --expose-gc`, which `entrypoint.sh` and `npm start` use: the relay then forces a minor garbage collection every 2 MiB. Without the flag the relay still works, only with a higher peak.
+- Nothing is written to disk (sessions, transcripts, event cache and temp files are untouched).
+- The request log line carries the URL, i.e. the target (issue key) and the file name; never file bytes, never the credential. One audit line per relay: `mcp.upload.relayed serverName=<name> status=<code> bytes=<n> result=ok|upstream_answer|upstream_failed|timeout|client_aborted`.
 
 For detailed architecture, see [`docs/architecture.md`](docs/architecture.md).
 
