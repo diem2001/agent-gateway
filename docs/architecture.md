@@ -39,7 +39,7 @@ The Agent Gateway is a stateless HTTP service that bridges REST clients with the
 ## Components
 
 ### server.ts -- Express Application
-Entry point. Configures middleware (JSON parsing, request logging, auth), mounts all routers, and exposes health, logging, session, and settings endpoints directly.
+Entry point. Configures middleware (JSON and text parsing, skipped for the upload relay path; a 300 s body deadline for every other request; request logging; the upload path's pre-auth guard; auth), mounts all routers, and exposes health, logging, session, and settings endpoints directly. The kept `app.listen` handle (`server`) sets `requestTimeout` to 3600 s for the upload relay.
 
 ### auth.ts -- API Key Middleware
 Parses `API_KEYS` env var at startup into a `Map<key, label>` for O(1) lookup. Validates `Authorization: Bearer <key>` on all routes except `/health`. Attaches `clientLabel` to the request for audit logging.
@@ -139,6 +139,12 @@ Lightweight template engine used both by the MCP registry's `userCredentialSchem
 ### mcp-test-client.ts -- MCP Credential Test Client
 Implements `POST /v1/mcp-servers/:name/test` — given a registered server name and an override payload (`headers` for http/sse, `env` for stdio), the gateway connects to the upstream MCP server, calls `tools/list`, and returns `{ ok: true, toolCount, tools[] }`. The client accepts both plain `application/json` and streamable `text/event-stream` MCP responses (MVP-3689) so providers that emit one-shot SSE responses for HTTP requests are supported. Auth failures (401/403) surface as `MCP_AUTH_FAILED`, transport problems as `MCP_NETWORK_ERROR`, and the per-test deadline as `MCP_TIMEOUT` (configurable via `MCP_TEST_TIMEOUT_MS`, default 10s).
 
+### mcp-upload-relay.ts -- Streaming Upload Relay
+The raw-path rule shared by the body-parser skip, the pre-auth guard (`Connection: close`, bounded drain) and target extraction; strict `X-MCP-Credential-Headers` parsing (only `Authorization` is used); the upstream request builder (origin of the registered url + `/uploads/` + raw target + raw query, filtered static headers); and `UploadRelay`, which forwards chunks with backpressure, owns the idle timer and writes one audit line. See [Upload Relay Flow](#upload-relay-flow).
+
+### gc-budget.ts -- Byte-Budgeted Garbage Collection
+Forces a minor collection every 2 MiB relayed so dropped chunk buffers do not pile up (the process must run with `--expose-gc`, as `entrypoint.sh` and `npm start` do). Ported from mcp-jira's upload route.
+
 ### routes/mcp.ts -- MCP Server Registry Endpoints
 REST endpoints for the external MCP server registry:
 - **PUT /v1/mcp-servers/:name**: Register or update a server (validates transport, fields, output targets, template references)
@@ -148,6 +154,7 @@ REST endpoints for the external MCP server registry:
 - **POST /v1/mcp-servers/:name/test**: Probe `tools/list` with optional override credentials, returning the discovered tool list or a typed error
 - **POST /v1/mcp-servers/:name/restart**: Bumps the server's `updatedAt` so the SDK reconnects (http/sse) or respawns (stdio) on the next query
 - **GET /v1/mcp-servers/:name/health**: Cheap connectivity probe (no `tools/list`) — returns `{ ok, latencyMs, error? }`
+- **POST /v1/mcp-servers/:name/uploads/\***: Streaming upload relay to `<origin>/uploads/*` of an http/sse server (see [Upload Relay Flow](#upload-relay-flow))
 
 ## Data Flow: Query Request
 
@@ -279,6 +286,47 @@ Query completes -> overrides discarded; static registry config unchanged on disk
 
 `POST /v1/mcp-servers/:name/test` runs the same merge logic out-of-band so the operator can validate a credential set before persisting it. The test client accepts both `application/json` and streamable `text/event-stream` MCP responses (MVP-3689).
 
+## Upload Relay Flow
+
+`POST /v1/mcp-servers/:name/uploads/<target>?<query>` streams a raw file to a registered http/sse MCP server (SC-5 of MVP-7560; reqlift → gateway → mcp-jira → Jira).
+
+```
+Client (reqlift)
+    | POST /v1/mcp-servers/jira/uploads/jira/issue/MVP-1?filename=shot.png
+    | Authorization: Bearer <key>, X-MCP-Credential-Headers: base64(JSON), <raw bytes>
+    v
+body parsers ------- skipped: the raw-path rule (mcp-upload-relay.ts) matches the
+    |                  upload path case-insensitively, also in absolute form
+request logging ---- logs method + URL (target and file name), never the body
+uploadConnectionGuard  Connection: close; bounded drain after any early answer
+authMiddleware ----- 401 as on every /v1/* route
+    v
+routes/mcp.ts ------ unknown / disabled (/call codes) -> stdio (MCP_UPLOAD_UNSUPPORTED)
+    |                -> X-MCP-Credential-Headers (MCP_OVERRIDE_INVALID)
+    |                -> target path (UPLOAD_TARGET_INVALID); nothing is sent before
+    v
+UploadRelay -------- node:http(s) request to <origin>/uploads/<target>?<query>
+    |                  (fresh connection, never pooled, never retried)
+    |  each sender chunk: write upstream, drop it; upstream full -> pause sender
+    |  every 2 MiB: minor GC (gc-budget.ts, needs --expose-gc)
+    |  idle timer: reset by every request chunk and every answer chunk
+    v
+MCP server answer -> status + Content-Type + Content-Length + body, verbatim
+```
+
+**What is and is not held:** at any time only the chunks in flight (Node stream buffers and kernel socket buffers) are in memory; nothing is written to disk and nothing enters the session store, the transcript or the event cache. The request log line carries the URL, i.e. target and file name, never bytes or the credential. One audit line per relay: `mcp.upload.relayed serverName status bytes result`.
+
+**Exits:**
+
+- The MCP server answers after the whole body: its answer is streamed back and the relay ends (`ok` for 2xx, `upstream_answer` otherwise).
+- The MCP server answers early (while the body still streams): forwarding stops, the answer is passed through, and the sender connection is closed after a bounded drain (at most 1 MiB read, closed when the sender closes or 5 s after the answer).
+- Connection refused, DNS failure, bad registration url or an invalid registered header value: `502 UPLOAD_UPSTREAM_FAILED`, nothing sent.
+- The upstream connection drops before an answer: `502 UPLOAD_UPSTREAM_FAILED`, outcome unconfirmed. It drops after the answer's status line: the sender connection is destroyed (the status can no longer change).
+- No progress for `MCP_UPLOAD_IDLE_TIMEOUT_MS`: the upstream request is aborted and the sender gets `504 UPLOAD_TIMEOUT` (unconfirmed wording when the whole body was already sent), or the connection is destroyed if the answer had started.
+- The sender disconnects: the upstream request is destroyed at once, before the multipart trailer, so mcp-jira stores nothing.
+
+**Timers:** the relay's idle timer (default 60 s) is the only per-upload bound; Node's `requestTimeout` is raised to 3600 s on the listen handle so it does not cut a slow upload, while `nonUploadBodyDeadline` keeps a 300 s bound on every other request body. mcp-jira's own no-progress timer (120 s) and `requestTimeout` (3600 s) sit behind it.
+
 ## Security Model
 
 - **API Key Auth**: All authenticated routes require a valid Bearer token from `API_KEYS`.
@@ -290,3 +338,4 @@ Query completes -> overrides discarded; static registry config unchanged on disk
 - **Token Expiry Surfacing**: `/v1/auth/status` exposes `tokenExpired` + `expiresAt` so clients can warn users before queries fail with auth errors.
 - **Docker Isolation**: Container runs as `node` user (dropped from root via `gosu`), SSH keys, sessions, tools, and MCP server definitions persist on a named volume.
 - **Localhost Binding**: Docker compose binds port 3001 to `127.0.0.1` only -- requires a reverse proxy for external access.
+- **Upload Relay**: target path and query come from the raw URL with dot segments, encoded slashes and backslashes refused; upstream host and port come only from the registry. Only `Authorization` is taken from `X-MCP-Credential-Headers`, which is never forwarded or logged; hop-by-hop headers never come from an override or a registration. Refusals on the upload path close the connection after at most 1 MiB / 5 s, so a caller without a key cannot make the gateway read a large body. The gateway enforces no size or concurrency cap of its own (reqlift's 100 MiB cap applies to reqlift callers; other key holders are bounded by the MCP server).

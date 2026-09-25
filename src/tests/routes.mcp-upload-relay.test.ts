@@ -8,7 +8,7 @@
  * upload never opened an upstream connection.
  */
 import fs from "node:fs";
-import type { Server } from "node:http";
+import http, { type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -647,6 +647,35 @@ describe("failure behavior", () => {
 
     expect(result.status).toBe(201);
     expect(JSON.parse(result.text).size).toBe(4 * MiB);
+  });
+
+  it("an answer that breaks off after its status line closes the sender connection instead of completing it", async () => {
+    const upstream = await stub(async ({ req, res, consume }) => {
+      if (!(await consume())) return;
+      res.writeHead(201, { "Content-Type": "application/json", "Content-Length": "100" });
+      res.write('{"partial":');
+      setTimeout(() => req.socket.destroy(), 50);
+    });
+    await register({ name: "jira", type: "http", url: upstream.url });
+
+    const outcome = await new Promise<{ status: number; complete: boolean; bytes: number }>((resolve) => {
+      const req = http.request(
+        { host: "127.0.0.1", port, method: "POST", path: TARGET, agent: false, headers: { ...BEARER, "Content-Length": 1024 } },
+        (res) => {
+          let bytes = 0;
+          res.on("data", (chunk: Buffer) => (bytes += chunk.length));
+          res.on("error", () => undefined);
+          res.on("close", () => resolve({ status: res.statusCode ?? 0, complete: res.complete, bytes }));
+        },
+      );
+      req.on("error", () => undefined);
+      req.end(Buffer.alloc(1024));
+    });
+
+    expect(outcome.status).toBe(201);
+    expect(outcome.complete).toBe(false);
+    expect(outcome.bytes).toBeLessThan(100);
+    expect(await waitFor(() => logs.join("\n").includes("status=201 bytes=1024 result=upstream_failed"), 1000)).toBe(true);
   });
 
   it("a slow but progressing upload (one chunk per second for 10 s) completes with the idle timeout at 2000 ms", async () => {
