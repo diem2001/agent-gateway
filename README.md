@@ -490,7 +490,7 @@ curl -X POST "http://localhost:3001/v1/mcp-servers/jira/uploads/jira/issue/MVP-1
   --data-binary @shot.png
 ```
 
-is forwarded as `POST <origin of the registered url>/uploads/jira/issue/MVP-1?filename=shot.png` (for `jira` registered as `http://mcp-jira:3002/mcp` that is `http://mcp-jira:3002/uploads/...`). The MCP server's HTTP status and body come back **verbatim** (for mcp-jira, `201 { attachmentId, mediaApiFileId, filename, size }` or its own error codes such as `401 UPLOAD_UNAUTHENTICATED`).
+is forwarded as `POST <origin of the registered url>/uploads/jira/issue/MVP-1?filename=shot.png` (for `jira` registered as `http://mcp-jira:3002/mcp` that is `http://mcp-jira:3002/uploads/...`). The MCP server's HTTP status (200–599) and body come back **verbatim** (for mcp-jira, `201 { attachmentId, mediaApiFileId, filename, size }` or its own error codes such as `401 UPLOAD_UNAUTHENTICATED`).
 
 **Path and query:** everything after `/uploads/` and everything after the first `?` are taken from the raw request URL and forwarded byte for byte. The target is refused with `400 UPLOAD_TARGET_INVALID` when it is empty, has a `.` or `..` segment (also as `%2e`), or contains `%2f`, `%5c` or a backslash. Host and port come only from the registration.
 
@@ -515,13 +515,14 @@ is forwarded as `POST <origin of the registered url>/uploads/jira/issue/MVP-1?fi
 | invalid target path | 400 | `UPLOAD_TARGET_INVALID` |
 | MCP server unreachable or registration url not http(s) — nothing was sent | 502 | `UPLOAD_UPSTREAM_FAILED` |
 | MCP server dropped the connection before answering — outcome unconfirmed, check the issue's attachments before retrying | 502 | `UPLOAD_UPSTREAM_FAILED` |
+| MCP server answered with a status outside 200–599 (or headers Node cannot send) — outcome unconfirmed; the upstream request is dropped | 502 | `UPLOAD_UPSTREAM_FAILED` |
 | no byte from the sender and none from the MCP server for `MCP_UPLOAD_IDLE_TIMEOUT_MS` | 504 | `UPLOAD_TIMEOUT` |
-| any answer of the MCP server | its status | passed through unchanged |
+| any other answer of the MCP server | its status | passed through unchanged |
 
 **Timing and aborts:**
 
 - `MCP_UPLOAD_IDLE_TIMEOUT_MS` (default 60000) is a no-progress timeout, not an overall deadline: every chunk from the sender and every chunk of the answer resets it, so a slow upload completes while it progresses. On expiry the upstream request is aborted; if the whole body had already been sent, the 504 message says the outcome is unconfirmed.
-- Node's server-wide `requestTimeout` is 3600 s so a slow upload is not cut at 5 minutes; every other route keeps a 300 s deadline for its request body.
+- Node's server-wide `requestTimeout` is 3600 s so a slow upload is not cut at 5 minutes; every other route keeps a 300 s deadline for its request body until the gateway has answered (after an early answer, such as a 401, Node's own timeouts no longer apply to the rest of that body).
 - If the sender disconnects, the upstream request is aborted at once (mcp-jira then stores nothing). If the MCP server answers before the whole body was sent (an early refusal), sending stops and that answer is passed through.
 - Every answer on this route carries `Connection: close`. When the gateway answers while the sender is still sending (any refusal, including the 401), it reads and discards at most 1 MiB more and closes the connection when the sender closes it or 5 s after the answer.
 - The relay returns to the event loop after every forwarded chunk, so an early answer is read before more is written, even when a fast sender (curl) has already delivered MBs. mcp-jira refuses a missing credential at once, reads at most 1 MiB more and then closes the connection; its answer (for example `401 UPLOAD_UNAUTHENTICATED`) reaches the sender unchanged. Only an MCP server that resets the connection immediately after an early answer, without reading any more of the body, can still surface as 502 "unconfirmed".

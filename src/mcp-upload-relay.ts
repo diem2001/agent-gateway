@@ -7,7 +7,7 @@
  *   <raw bytes>
  *
  * is forwarded as `POST <origin of the registered url>/uploads/{targetPath}?{query}`
- * and the MCP server's status and body come back verbatim.
+ * and the MCP server's status (200-599) and body come back verbatim.
  *
  * The gateway is a dumb pipe here: the body is never parsed, buffered, stored or
  * logged. Each received chunk is written to the upstream request and dropped;
@@ -40,7 +40,11 @@ export const CREDENTIAL_HEADER = "x-mcp-credential-headers";
 
 /**
  * Upload path, matched case-insensitively like Express routes. Express matches
- * the route with this same expression, so routing and target extraction agree.
+ * the route with this same expression, but on its own parsed path: when the URL
+ * contains `#`, that parser turns `\` into `/`, so `/v1/mcp-servers/x\call#/uploads/t`
+ * skips the body parsers here yet routes to `/call`. That is harmless: `/call`
+ * answers 400 without a parsed body, nothing is sent upstream, and the upload
+ * guard still bounds the read.
  */
 export const UPLOAD_ROUTE = /^\/v1\/mcp-servers\/[^/]+\/uploads(?:\/[\s\S]*)?$/i;
 const UPLOAD_PARTS = /^\/v1\/mcp-servers\/([^/]+)\/uploads(?:\/([\s\S]*))?$/i;
@@ -227,6 +231,8 @@ export const UPLOAD_MESSAGES = {
   notReached: (name: string) => `The MCP server ${name} could not be reached; nothing was sent`,
   unconfirmed: (name: string) =>
     `The connection to the MCP server ${name} dropped before it answered; the outcome is unconfirmed. Check the target's attachments before retrying`,
+  invalidAnswer: (name: string) =>
+    `The MCP server ${name} sent an answer the gateway cannot relay; the outcome is unconfirmed. Check the target's attachments before retrying`,
   idle: (ms: number) => `No upload progress for ${ms} ms; the relay was aborted`,
   idleUnconfirmed: (ms: number) =>
     `The MCP server did not answer for ${ms} ms after the whole upload was sent; the outcome is unconfirmed. Check the target's attachments before retrying`,
@@ -270,7 +276,8 @@ export function skipForUploads(parser: RequestHandler): RequestHandler {
 /**
  * The server-wide `requestTimeout` is raised for the relay; every other route
  * keeps Node's previous bound: a request body still incomplete this long after
- * the request reached the app closes the connection.
+ * the request reached the app closes the connection, unless the request was
+ * answered first (the timer clears with the response).
  */
 export function nonUploadBodyDeadline(deadlineMs = NON_UPLOAD_BODY_DEADLINE_MS): RequestHandler {
   return (req, res, next) => {
@@ -492,18 +499,30 @@ class UploadRelay {
       upstreamRes.resume();
       return;
     }
-    this.answered = true;
-    this.touch();
-    // An answer before the whole body was sent (an early refusal): stop sending.
-    if (!this.bodySent) this.stopForwarding();
-
-    const status = upstreamRes.statusCode ?? 502;
+    // The MCP server is not trusted to send a status the relay can pass on:
+    // Node's client accepts any three digits, and a 1xx is never a final answer.
+    const status = upstreamRes.statusCode;
+    if (status === undefined || !Number.isInteger(status) || status < 200 || status > 599) {
+      this.failInvalidAnswer(upstreamRes);
+      return;
+    }
     const headers: Record<string, string> = {};
     const contentType = upstreamRes.headers["content-type"];
     if (contentType !== undefined) headers["Content-Type"] = contentType;
     const contentLength = upstreamRes.headers["content-length"];
     if (contentLength !== undefined) headers["Content-Length"] = contentLength;
-    res.writeHead(status, headers);
+    try {
+      res.writeHead(status, headers);
+    } catch {
+      // A throw here is uncaught in an event handler and would end the process.
+      this.failInvalidAnswer(upstreamRes);
+      return;
+    }
+
+    this.answered = true;
+    this.touch();
+    // An answer before the whole body was sent (an early refusal): stop sending.
+    if (!this.bodySent) this.stopForwarding();
 
     upstreamRes.on("data", (chunk: Buffer) => {
       this.touch();
@@ -536,6 +555,23 @@ class UploadRelay {
       "UPLOAD_UPSTREAM_FAILED",
       sent ? UPLOAD_MESSAGES.unconfirmed(this.serverName) : UPLOAD_MESSAGES.notReached(this.serverName),
     );
+  }
+
+  /**
+   * An answer the relay cannot pass on. The MCP server saw the request, so the
+   * outcome is unconfirmed; the upstream request is dropped.
+   */
+  private failInvalidAnswer(upstreamRes: IncomingMessage): void {
+    if (!this.settle(502, "upstream_failed")) return;
+    upstreamRes.resume();
+    this.upstream?.destroy();
+    if (this.res.headersSent) {
+      this.res.destroy();
+      return;
+    }
+    this.res.removeHeader("Content-Type");
+    this.res.removeHeader("Content-Length");
+    sendError(this.res, 502, "UPLOAD_UPSTREAM_FAILED", UPLOAD_MESSAGES.invalidAnswer(this.serverName));
   }
 
   private expire(): void {

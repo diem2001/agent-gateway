@@ -40,8 +40,8 @@ import {
 const app = express();
 // The upload relay (POST /v1/mcp-servers/:name/uploads/*) streams its body
 // untouched: the parsers never run for it, whatever its Content-Type. Every
-// other request body keeps a 300 s deadline although the server-wide
-// requestTimeout below is raised for the relay.
+// other request body keeps a 300 s deadline, until it is answered, although
+// the server-wide requestTimeout below is raised for the relay.
 app.use(nonUploadBodyDeadline());
 app.use(skipForUploads(express.json({ limit: "25mb" })));
 app.use(skipForUploads(express.text({ limit: "10mb", type: "text/*" })));

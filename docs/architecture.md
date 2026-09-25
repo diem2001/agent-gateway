@@ -39,7 +39,7 @@ The Agent Gateway is a stateless HTTP service that bridges REST clients with the
 ## Components
 
 ### server.ts -- Express Application
-Entry point. Configures middleware (JSON and text parsing, skipped for the upload relay path; a 300 s body deadline for every other request; request logging; the upload path's pre-auth guard; auth), mounts all routers, and exposes health, logging, session, and settings endpoints directly. The kept `app.listen` handle (`server`) sets `requestTimeout` to 3600 s for the upload relay.
+Entry point. Configures middleware (JSON and text parsing, skipped for the upload relay path; a 300 s body deadline for every other request until it is answered; request logging; the upload path's pre-auth guard; auth), mounts all routers, and exposes health, logging, session, and settings endpoints directly. The kept `app.listen` handle (`server`) sets `requestTimeout` to 3600 s for the upload relay.
 
 ### auth.ts -- API Key Middleware
 Parses `API_KEYS` env var at startup into a `Map<key, label>` for O(1) lookup. Validates `Authorization: Bearer <key>` on all routes except `/health`. Attaches `clientLabel` to the request for audit logging.
@@ -313,7 +313,7 @@ UploadRelay -------- node:http(s) request to <origin>/uploads/<target>?<query>
     |  every 2 MiB: minor GC (gc-budget.ts, needs --expose-gc)
     |  idle timer: reset by every request chunk and every answer chunk
     v
-MCP server answer -> status + Content-Type + Content-Length + body, verbatim
+MCP server answer -> status (200-599) + Content-Type + Content-Length + body, verbatim
 ```
 
 **What is and is not held:** at any time only the chunks in flight (Node stream buffers and kernel socket buffers) are in memory; nothing is written to disk and nothing enters the session store, the transcript or the event cache. The request log line carries the URL, i.e. target and file name, never bytes or the credential. One audit line per relay: `mcp.upload.relayed serverName status bytes result`.
@@ -323,11 +323,12 @@ MCP server answer -> status + Content-Type + Content-Length + body, verbatim
 - The MCP server answers after the whole body: its answer is streamed back and the relay ends (`ok` for 2xx, `upstream_answer` otherwise).
 - The MCP server answers early (while the body still streams): forwarding stops, the answer is passed through, and the sender connection is closed after a bounded drain (at most 1 MiB read, closed when the sender closes or 5 s after the answer).
 - Connection refused, DNS failure, bad registration url or an invalid registered header value: `502 UPLOAD_UPSTREAM_FAILED`, nothing sent.
+- The MCP server answers with a status outside 200–599 (Node's client accepts any three digits; `writeHead` would throw below 100, which would end the process) or with headers `writeHead` refuses: the answer is discarded, the upstream request destroyed, and the sender gets `502 UPLOAD_UPSTREAM_FAILED`, outcome unconfirmed.
 - The upstream connection drops before an answer: `502 UPLOAD_UPSTREAM_FAILED`, outcome unconfirmed. It drops after the answer's status line: the sender connection is destroyed (the status can no longer change).
 - No progress for `MCP_UPLOAD_IDLE_TIMEOUT_MS`: the upstream request is aborted and the sender gets `504 UPLOAD_TIMEOUT` (unconfirmed wording when the whole body was already sent), or the connection is destroyed if the answer had started.
 - The sender disconnects: the upstream request is destroyed at once, before the multipart trailer, so mcp-jira stores nothing.
 
-**Timers:** the relay's idle timer (default 60 s) is the only per-upload bound; Node's `requestTimeout` is raised to 3600 s on the listen handle so it does not cut a slow upload, while `nonUploadBodyDeadline` keeps a 300 s bound on every other request body. mcp-jira's own no-progress timer (120 s) and `requestTimeout` (3600 s) sit behind it.
+**Timers:** the relay's idle timer (default 60 s) is the only per-upload bound; Node's `requestTimeout` is raised to 3600 s on the listen handle so it does not cut a slow upload, while `nonUploadBodyDeadline` keeps a 300 s bound on every other request body until its response is sent (it clears with the response, so after an early answer the rest of that body is no longer bounded by it). mcp-jira's own no-progress timer (120 s) and `requestTimeout` (3600 s) sit behind it.
 
 ## Security Model
 

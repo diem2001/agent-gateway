@@ -901,7 +901,7 @@ curl -X PUT http://localhost:3001/v1/settings \
       <span class="endpoint-path">/v1/mcp-servers/:name/uploads/*</span>
       <span class="auth-tag required">Auth Required</span>
     </p>
-    <p>Streams a raw file upload to a registered <strong>http/sse</strong> MCP server, with a per-call credential. The gateway is a dumb pipe: it does not parse, buffer, store or log the file. Each received chunk is forwarded and dropped; a slow MCP server slows the sender down (backpressure end to end). The request is forwarded as <code>POST &lt;origin of the registered url&gt;/uploads/&lt;target&gt;?&lt;query&gt;</code> and the MCP server's status and body come back <strong>verbatim</strong> (for mcp-jira: <code>201 { attachmentId, mediaApiFileId, filename, size }</code> or its own error codes such as <code>401 UPLOAD_UNAUTHENTICATED</code>).</p>
+    <p>Streams a raw file upload to a registered <strong>http/sse</strong> MCP server, with a per-call credential. The gateway is a dumb pipe: it does not parse, buffer, store or log the file. Each received chunk is forwarded and dropped; a slow MCP server slows the sender down (backpressure end to end). The request is forwarded as <code>POST &lt;origin of the registered url&gt;/uploads/&lt;target&gt;?&lt;query&gt;</code> and the MCP server's status (200–599) and body come back <strong>verbatim</strong> (for mcp-jira: <code>201 { attachmentId, mediaApiFileId, filename, size }</code> or its own error codes such as <code>401 UPLOAD_UNAUTHENTICATED</code>).</p>
 
     <h3>Request</h3>
 <pre><code>POST /v1/mcp-servers/jira/uploads/jira/issue/MVP-1?filename=shot.png
@@ -940,13 +940,14 @@ curl -X POST "http://localhost:3001/v1/mcp-servers/jira/uploads/jira/issue/MVP-1
         <tr><td>400</td><td><code>UPLOAD_TARGET_INVALID</code></td><td>Empty target, dot segment, encoded slash/backslash or backslash</td></tr>
         <tr><td>502</td><td><code>UPLOAD_UPSTREAM_FAILED</code></td><td>The MCP server could not be reached (or its registered url is not http/https): nothing was sent</td></tr>
         <tr><td>502</td><td><code>UPLOAD_UPSTREAM_FAILED</code></td><td>The connection dropped before the MCP server answered: the outcome is unconfirmed, check the target's attachments before retrying</td></tr>
+        <tr><td>502</td><td><code>UPLOAD_UPSTREAM_FAILED</code></td><td>The MCP server answered with a status outside 200–599 (or headers the gateway cannot send): the answer is discarded, the outcome is unconfirmed</td></tr>
         <tr><td>504</td><td><code>UPLOAD_TIMEOUT</code></td><td>No byte from the sender and none from the MCP server for <code>MCP_UPLOAD_IDLE_TIMEOUT_MS</code> (default 60s); the upstream request is aborted</td></tr>
       </tbody>
     </table>
 
     <h3>Timing, aborts and resources</h3>
     <ul>
-      <li><code>MCP_UPLOAD_IDLE_TIMEOUT_MS</code> is a no-progress timeout, not an overall deadline: a slow upload completes while it progresses. Node's server-wide <code>requestTimeout</code> is 3600 s; every other route keeps a 300 s deadline for its request body.</li>
+      <li><code>MCP_UPLOAD_IDLE_TIMEOUT_MS</code> is a no-progress timeout, not an overall deadline: a slow upload completes while it progresses. Node's server-wide <code>requestTimeout</code> is 3600 s; every other route keeps a 300 s deadline for its request body until the gateway has answered.</li>
       <li>A sender disconnect aborts the upstream request at once. An early answer of the MCP server (before the whole body was sent) stops forwarding and is passed through.</li>
       <li>Every answer on this route carries <code>Connection: close</code>. When the gateway answers while the sender is still sending (any refusal, including the 401), it discards at most 1 MiB more and closes the connection when the sender closes it or 5 s after the answer.</li>
       <li>The relay returns to the event loop after every forwarded chunk, so an early answer is read before more is written, even from a fast sender such as curl. mcp-jira refuses a missing credential at once and closes after reading at most 1 MiB more; its answer (for example <code>401 UPLOAD_UNAUTHENTICATED</code>) reaches the sender unchanged. Only an MCP server that resets the connection immediately after an early answer, without reading more of the body, can still surface as 502 "unconfirmed".</li>
