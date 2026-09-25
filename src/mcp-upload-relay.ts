@@ -19,6 +19,7 @@
 import http, { type ClientRequest, type IncomingMessage } from "node:http";
 import https from "node:https";
 import type { NextFunction, Request, RequestHandler, Response } from "express";
+import { DEFAULT_GC_BUDGET, GcBudget } from "./gc-budget.js";
 import { log } from "./logging.js";
 import type { McpServerDefinition } from "./mcp-registry.js";
 
@@ -377,11 +378,6 @@ export function uploadConnectionGuard(options: UploadGuardOptions = {}): Request
 
 type RelayResult = "ok" | "upstream_answer" | "upstream_failed" | "timeout" | "client_aborted";
 
-export interface RelayHooks {
-  /** Called with the size of every chunk forwarded upstream. */
-  onForwarded?: (bytes: number) => void;
-}
-
 /**
  * One relayed upload: the sender's request, the upstream request, the idle
  * timer and the single audit line. Every exit path goes through `settle()`.
@@ -394,13 +390,14 @@ class UploadRelay {
   private answered = false;
   private settled = false;
   private bytes = 0;
+  /** Frees the dropped chunk buffers every 2 MiB (needs `--expose-gc`). */
+  private readonly gcBudget = new GcBudget(DEFAULT_GC_BUDGET);
 
   constructor(
     private readonly req: Request,
     private readonly res: Response,
     private readonly serverName: string,
     private readonly idleTimeoutMs: number,
-    private readonly hooks: RelayHooks,
   ) {}
 
   start(upstreamRequest: UpstreamRequest): void {
@@ -434,7 +431,7 @@ class UploadRelay {
   private readonly onData = (chunk: Buffer): void => {
     this.bytes += chunk.length;
     this.touch();
-    this.hooks.onForwarded?.(chunk.length);
+    this.gcBudget.add(chunk.length);
     const upstream = this.upstream!;
     if (!upstream.write(chunk)) {
       this.req.pause();
@@ -553,7 +550,6 @@ export interface RelayInput {
   match: UploadPathMatch;
   authorization: string | null;
   idleTimeoutMs: number;
-  hooks?: RelayHooks;
 }
 
 /** Starts the relay after every gateway check has passed. */
@@ -573,7 +569,7 @@ export function relayUpload(req: Request, res: Response, input: RelayInput): voi
     sendError(res, 502, "UPLOAD_UPSTREAM_FAILED", UPLOAD_MESSAGES.notReached(input.srv.name));
     return;
   }
-  new UploadRelay(req, res, input.srv.name, input.idleTimeoutMs, input.hooks ?? {}).start(upstream);
+  new UploadRelay(req, res, input.srv.name, input.idleTimeoutMs).start(upstream);
 }
 
 /** Answers a gateway refusal on the upload path with the shared error envelope. */

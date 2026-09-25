@@ -168,6 +168,8 @@ export interface SendOptions {
   seed?: number;
   /** Bytes placed at the start of the body (e.g. a PNG signature or a marker). */
   prefix?: Buffer;
+  /** Called with the running total each time a chunk is handed to the socket. */
+  onWritten?: (written: number) => void;
 }
 
 export interface SendResult {
@@ -262,6 +264,7 @@ export function sendUpload(options: SendOptions): Promise<SendResult> {
           return;
         }
         written += chunk.length;
+        options.onWritten?.(written);
         hash.update(chunk);
         const ok = req.write(chunk);
         if (options.intervalMs) {
