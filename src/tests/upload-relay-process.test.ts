@@ -200,16 +200,67 @@ async function spawnGateway(env: Record<string, string>): Promise<SpawnedGateway
   return { child, port, root, output: () => output };
 }
 
-async function registerJira(gateway: SpawnedGateway, upstream: UploadStub): Promise<void> {
+async function registerJira(gateway: SpawnedGateway, upstream: Pick<UploadStub, "url">): Promise<void> {
   const reply = await request(gateway.port, "PUT", "/v1/mcp-servers/jira", {
     type: "http",
     url: upstream.url,
     headers: { "X-Static": "1" },
   });
-  expect(reply.status).toBe(201);
+  // 201 on the first registration, 200 when it replaces an earlier one.
+  expect([200, 201]).toContain(reply.status);
   // The registry persists after a 100 ms debounce; let that write land before
   // any file snapshot is taken.
   await new Promise((resolve) => setTimeout(resolve, 300));
+}
+
+interface RawStatusStub {
+  url: string;
+  /** Connections accepted and connections the gateway has closed again. */
+  accepted: () => number;
+  closed: () => number;
+}
+
+/**
+ * A raw TCP upstream that reads the whole request, then answers with the given
+ * status line and a small JSON body and keeps its socket open. Node's HTTP
+ * client accepts any three digits as a status (`000` to `999`), which an
+ * `http.Server` stub cannot send.
+ */
+async function rawStatusStub(status: string): Promise<RawStatusStub> {
+  let accepted = 0;
+  let closed = 0;
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    accepted += 1;
+    sockets.add(socket);
+    socket.on("close", () => {
+      closed += 1;
+      sockets.delete(socket);
+    });
+    socket.on("error", () => undefined);
+    let received = Buffer.alloc(0);
+    let answered = false;
+    socket.on("data", (data: Buffer) => {
+      if (answered) return;
+      received = Buffer.concat([received, data]);
+      const headEnd = received.indexOf("\r\n\r\n");
+      if (headEnd === -1) return;
+      const length = Number(/^content-length:\s*(\d+)/im.exec(received.subarray(0, headEnd).toString("latin1"))?.[1] ?? 0);
+      if (received.length - headEnd - 4 < length) return;
+      answered = true;
+      socket.write(`HTTP/1.1 ${status} Odd\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}`);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const { port } = server.address() as AddressInfo;
+  cleanups.push(
+    () =>
+      new Promise<void>((resolve) => {
+        for (const socket of sockets) socket.destroy();
+        server.close(() => resolve());
+      }),
+  );
+  return { url: `http://127.0.0.1:${port}/mcp`, accepted: () => accepted, closed: () => closed };
 }
 
 function relay(gateway: SpawnedGateway, options: Omit<SendOptions, "port" | "path"> & { path?: string }) {
@@ -394,6 +445,42 @@ describe("upload relay in a real gateway process", () => {
       expect(statuses).toEqual(Array(10).fill(401));
     },
     60_000,
+  );
+
+  it.each(["099", "000", "101", "600", "999"])(
+    "an upstream answer with status %s becomes 502 UPLOAD_UPSTREAM_FAILED and the gateway keeps serving",
+    async (status) => {
+      // A registered MCP server is untrusted: a status the relay cannot pass on
+      // (Node's client accepts any three digits; writeHead throws below 100) must
+      // not crash the shared gateway, and must not be relayed as an answer.
+      const upstream = await rawStatusStub(status);
+      const gateway = await spawnGateway({ LOG_LEVEL: "info" });
+      await registerJira(gateway, upstream);
+
+      const result = await relay(gateway, { total: 1000 });
+      expect(result.status).toBe(502);
+      const body = JSON.parse(result.text);
+      expect(body.error.code).toBe("UPLOAD_UPSTREAM_FAILED");
+      expect(body.error.message).toContain("the outcome is unconfirmed");
+
+      // The upstream request was destroyed.
+      const deadline = Date.now() + 2000;
+      while (upstream.closed() < upstream.accepted() && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(upstream.accepted()).toBe(1);
+      expect(upstream.closed()).toBe(1);
+
+      // The same process still serves: health, and a follow-up relay.
+      expect(gateway.child.exitCode).toBeNull();
+      expect((await request(gateway.port, "GET", "/health")).status).toBe(200);
+      await registerJira(gateway, await stub());
+      expect((await relay(gateway, { total: 1000 })).status).toBe(201);
+      expect(gateway.child.exitCode).toBeNull();
+      expect(gateway.output()).toContain("mcp.upload.relayed serverName=jira status=502 bytes=1000 result=upstream_failed");
+      expect(gateway.output()).not.toContain("ERR_HTTP_INVALID_STATUS_CODE");
+    },
+    20_000,
   );
 
   it("a 50 MB sender without an API key gets a readable 401 and the socket closes within about 5 s", async () => {
