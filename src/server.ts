@@ -6,6 +6,7 @@ import {
   getLogLevel,
   setLogLevel,
   requestLoggingMiddleware,
+  globalErrorHandler,
   type LogLevel,
 } from "./logging.js";
 import {
@@ -166,30 +167,7 @@ app.put("/v1/settings", (req, res) => {
 /*  Global error handler                                                */
 /* ------------------------------------------------------------------ */
 
-app.use(
-  (
-    err: Error,
-    _req: express.Request,
-    res: express.Response,
-    _next: express.NextFunction,
-  ) => {
-    log("error", err.message);
-    // Honor a client-error status set by body-parser (e.g. 413 PayloadTooLargeError
-    // when a request exceeds the JSON body limit, 400 for malformed JSON) so
-    // over-limit/bad requests are not masked as a generic 500.
-    const bodyErr = err as Error & { status?: number; statusCode?: number; type?: string };
-    const status = bodyErr.status || bodyErr.statusCode;
-    if (typeof status === "number" && status >= 400 && status < 500) {
-      const message =
-        bodyErr.type === "entity.too.large"
-          ? "Request body too large"
-          : "Bad request";
-      res.status(status).json({ error: message });
-      return;
-    }
-    res.status(500).json({ error: "Internal server error" });
-  },
-);
+app.use(globalErrorHandler);
 
 /* ------------------------------------------------------------------ */
 /*  Start server                                                        */

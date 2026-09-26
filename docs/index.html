@@ -510,6 +510,8 @@ curl -X PUT http://localhost:3001/v1/settings \
 
     <p>Changes the log level at runtime. Valid levels: <code>off</code>, <code>info</code>, <code>debug</code>.</p>
 
+    <p><strong>Credentials in the debug log:</strong> at <code>debug</code> the gateway logs request bodies (first 2000 characters) and response previews (first 500 characters). The whole value of every <code>headers</code> and <code>env</code> key, at any depth, is logged as <code>"[REDACTED]"</code> with the keys visible: <code>mcpServers[*]</code> and <code>mcpCredentialOverrides</code> of <code>POST /v1/query</code>, the <code>/test</code> and <code>/call</code> bodies, and MCP server definitions in registry create/update bodies and in the create/update, detail and list answers. Redaction runs before the cut, so no prefix of a value appears. The API answers themselves are unchanged. <code>text/*</code> request bodies are logged as their length, a non-JSON registry answer is not previewed, and an unparseable JSON body is logged as <code>request body rejected type=&lt;type&gt; status=&lt;code&gt;</code>.</p>
+
     <h3>Request Body</h3>
 <pre><code>{"level": "debug"}</code></pre>
 
