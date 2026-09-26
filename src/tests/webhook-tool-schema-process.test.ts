@@ -526,7 +526,8 @@ describe("webhook tool schemas at the real model boundary (spawned gateway + rea
       const result = api.stepResults()[3];
       expect.soft(result?.isError).toBe(true);
       expect.soft(result?.text).toContain('"mode"');
-      expect.soft(result?.text).toMatch(/expected one of "a"\|"b"/);
+      // The issue list is JSON inside the error text, so the quotes arrive escaped.
+      expect.soft(result?.text).toContain('expected one of \\"a\\"|\\"b\\"');
       expect.soft(webhookBodiesWithNote("step-out-of-enum")).toEqual([]);
     });
 

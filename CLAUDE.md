@@ -87,6 +87,7 @@ src/
   tools.ts           # Tool registry CRUD + persistence (TOOLS_PERSIST_PATH)
   webhook.ts         # Webhook executor (POST to tool webhook_url with context)
   tool-server.ts     # MCP server factory (wraps registered tools for Agent SDK)
+  tool-input-schema.ts # Webhook tool input_schema -> typed, described SDK shape; per-property "any value" fallback, per-tool untyped fallback
   mcp-registry.ts    # External MCP server registry CRUD + persistence (MCP_SERVERS_PERSIST_PATH)
   mcp-upload-relay.ts # Streaming upload relay: raw-path rule, parser skip, pre-auth guard, X-MCP-Credential-Headers, relay core
   mcp-credential-relay.ts # Loopback relay for registered http MCP servers: per-run token, header allowlists, refusal answers (no OAuth login in the runtime)
@@ -104,6 +105,8 @@ src/
     e2e-session.test.ts    # E2E session continuity tests
     routes.tools.test.ts   # Tool routes unit tests
     tool-server.test.ts    # MCP server factory tests
+    tool-input-schema.test.ts # Webhook tool schemas via JSON-RPC tools/list + tools/call (advertised types, rejection, fallback, depth, prototype names)
+    webhook-tool-schema-process.test.ts # Real-runtime probe: model-facing webhook tool schemas + pre-dispatch rejection, reqlift/diemcrm fixtures (needs `npm run build`)
     tools.test.ts          # Tool registry unit tests
     webhook.test.ts        # Webhook executor tests
     sdk-login-guard-process.test.ts # Real-runtime probe: spawned gateway, OAuth-capable MCP stub, scripted Anthropic API (needs `npm run build`)

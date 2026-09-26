@@ -117,7 +117,25 @@ Manages CRUD operations for webhook-backed tool definitions. Tools are stored in
 Executes tool calls by POSTing to the tool's `webhook_url`. The request body contains `tool_use_id`, `tool_name`, `input`, and `context` (user_id, conversation_id, session_id, api_key_label). The client's Bearer token is forwarded in the `Authorization` header. Supports configurable timeouts per tool. Returns either `WebhookResponse` (with output + optional metadata) or `WebhookError` on failure (timeout, HTTP error, network error).
 
 ### tool-server.ts -- MCP Server Factory (webhook tools)
-Creates an in-process MCP server wrapping all registered webhook tools for injection into the Claude Agent SDK. Called once per query so the webhook context (session, user, auth) is correctly scoped. Each tool's JSON Schema properties are mapped to `z.unknown()` Zod shapes -- actual validation is the webhook's responsibility. Uses `createSdkMcpServer()` from the Agent SDK.
+Creates an in-process MCP server wrapping all registered webhook tools for injection into the Claude Agent SDK. Called once per query so the webhook context (session, user, auth) is correctly scoped. Each tool's registered `input_schema` is converted by `tool-input-schema.ts`: the model sees the declared field types, required fields and descriptions, and the SDK validates every call against them before the handler runs. Webhooks keep their own validation. Uses `createSdkMcpServer()` from the Agent SDK.
+
+### tool-input-schema.ts -- Webhook Tool Input Schemas
+Converts a webhook tool's `input_schema` (JSON Schema) into the Zod shape the SDK MCP server uses for `tools/list` (what the model is told) and for `tools/call` argument validation. Closed allowlist:
+
+| Registered construct | Advertised to the model | At `tools/call` |
+|---|---|---|
+| `type` `string` / `number` / `integer` / `boolean` | Same type (`integer` stays `integer`) | Another type is rejected |
+| `enum` (non-empty, unique string/number literals matching `type`) | Same values | A value outside the enum is rejected |
+| `type: object` with `properties` / `required` | Nested properties, `required` and descriptions, recursively | Nested violations are rejected; undeclared nested keys still reach the webhook |
+| `type: array` with one `items` schema | Array with the item schema | Item violations are rejected |
+| `required` (top level and nested) | Exactly the registered names that exist in `properties` | A missing required field is rejected |
+| `description` (string) | Same text | -- |
+| `additionalProperties` | Ignored (not advertised, not enforced) | Unchanged: undeclared top-level keys are dropped before the webhook, as before |
+| Anything else (`format`, `pattern`, bounds, `oneOf`/`anyOf`/`allOf`/`$ref`, `default`, `nullable`, `title`, a `type` array or unknown type, a missing `type`, tuple `items`, malformed keywords, nesting deeper than 32 levels) | That property only: "any value", keeping its description and required status | Any value is accepted; the webhook validates it as before |
+
+There are no defaults and no coercion: a valid call reaches the webhook with the model's values unchanged. A rejected call never reaches the webhook; the model receives a tool result with `isError: true` and the text `MCP error -32602: Input validation error: Invalid arguments for tool <name>: [...]`, a JSON list of issues, each naming the field `path` and the expectation (for example `"expected": "string"` with `"message": "Invalid input: expected string, received number"`). Webhook error responses are still relayed as `Tool webhook returned error: <status> <body>`.
+
+The SDK builds `tools/list` with its own bundled zod, so each property carries its advertised JSON fragment through zod's `_zod.toJSONSchema` override (otherwise descriptions are lost and `integer` is widened to `number`); the real-runtime contract test pins this across SDK upgrades. The registry is global, so a conversion is isolated per tool: a schema that cannot be converted (for example a malformed top-level `required`) makes that tool alone fall back to the previous untyped shape (every declared key accepts any value), with a `tools.schema.untyped_fallback tool=<name>` log line. Property names that can never reach the webhook are not advertised and are logged (`tools.schema.property_excluded`): `__proto__` at any level, and a top-level `constructor` (the SDK's MCP protocol rejects any call whose arguments hold that key). Tools are converted per query from `tools.json`, so existing registrations get typed schemas after a restart, without re-registering.
 
 ### routes/tools.ts -- Tool Registry Endpoints
 REST endpoints for webhook tool management:
@@ -238,6 +256,10 @@ When the agent invokes a registered webhook tool during a query:
 
 ```
 Agent SDK calls tool "my-tool" with input
+    |
+    v
+SDK MCP server validates input against the converted input_schema
+(tool-input-schema.ts); a violation returns isError to the agent, no webhook call
     |
     v
 MCP server handler (tool-server.ts)
