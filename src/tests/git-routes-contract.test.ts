@@ -422,13 +422,19 @@ describe("git queues (GIT_MAX_CONCURRENCY = 1)", () => {
       // The first operation is slow either way, so the others arrive while it runs.
       fake.setSlow({ sleepMs: outcome === "fail" ? 1500 : TIMEOUT_MS + 3000, on: ["clone"], match: outcome === "fail" ? "queue-first" : bareR });
       const first = clone(app, { url: firstUrl, path: userR });
-      await fake.waitForStart((inv) => inv.subcommand === "clone" && inv.argv.includes(path.join(PROJECTS, userR)));
+      const firstGit = await fake.waitForStart((inv) => inv.subcommand === "clone" && inv.argv.includes(path.join(PROJECTS, userR)));
       fake.setSlow(null);
 
+      // The first operation (no key) holds the only slot at least until its sleep ends
+      // (fail) or its timeout fires (timeout); 300 ms before that, the window closes.
+      // Any key file seen inside the window belongs to a waiting request.
+      const windowEnd = firstGit.start + (outcome === "fail" ? 1500 : TIMEOUT_MS) - 300;
       const keySightings: string[] = [];
-      let firstDone = false;
+      let samples = 0;
       const sampler = setInterval(() => {
-        if (!firstDone) keySightings.push(...keyFilesInTmp());
+        if (Date.now() >= windowEnd) return;
+        samples++;
+        keySightings.push(...keyFilesInTmp());
       }, 5);
       // The second operation on R waits for R's turn, the one on S for the only slot.
       const secondR = clone(app, { url: bareR, path: userR, sshKey: FAKE_SSH_KEY });
@@ -440,14 +446,14 @@ describe("git queues (GIT_MAX_CONCURRENCY = 1)", () => {
       keySightings.push(...keyFilesInTmp());
 
       const firstReply = await first;
-      firstDone = true;
-      clearInterval(sampler);
       if (outcome === "fail") expectCleanGitError(firstReply, [token]);
       else expect(firstReply).toEqual({ status: 500, body: { error: `git clone timed out after ${TIMEOUT_MS / 1000} s` } });
 
       const [r2, s] = await Promise.all([secondR, onS]);
       expect(r2).toEqual({ status: 200, body: { status: "cloned", path: userR, branch: "main", commit: shortSha(bareR) } });
       expect(s).toEqual({ status: 200, body: { status: "cloned", path: userS, branch: "main", commit: shortSha(bareS) } });
+      clearInterval(sampler);
+      expect(samples).toBeGreaterThan(10);
       expect(keySightings).toEqual([]);
       expect(keyFilesInTmp()).toEqual([]);
     }, 30_000);
