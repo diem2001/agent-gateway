@@ -52,13 +52,72 @@ OAuth credentials persist in the `./agent_home` bind-mount. Re-authentication on
 
 > **Warning:** If `ANTHROPIC_API_KEY` is set (even empty), Claude Code will prefer it over OAuth and fail with "Credit balance is too low" when the API account has no credits. Remove the variable entirely to use the subscription.
 
+### Stopping and recovery
+
+**Init process.** The image runs `tini` as process 1 (`ENTRYPOINT ["/usr/bin/tini", "--", "bash", "/app/entrypoint.sh"]`). It forwards `SIGTERM`/`SIGINT` from `docker stop`, `docker compose down` or a host shutdown to the gateway, reaps finished child processes, and exits with the gateway's exit code. `docker-compose.yml` needs no `init:` setting.
+
+**What a stop does:**
+
+1. The gateway stops accepting new connections and saves every pending change at once.
+2. Requests already received keep running for up to 8 s, including streaming chat answers. Changes they make are saved as usual.
+3. It saves the sessions (with the idle-timeout setting), the tools and the MCP servers once more and exits. Nothing can change between this save and the exit.
+
+A second `SIGTERM`/`SIGINT` skips the rest of the wait. An idle gateway stops within about a second; with open streams it stops after at most about 8 s, below Docker's 10 s grace period. Streams still open at 8 s are cut.
+
+| Exit code | Meaning | What to do |
+|-----------|---------|------------|
+| `0` | Every final save succeeded. | Nothing. |
+| `1` | At least one area's final save failed or was switched off (see `unreadable-not-preserved` below). An `ERROR persistence … problem=final-save-failed` line names the area. Its file keeps its last complete save; changes since then are lost. | Check `docker logs`, disk space and the permissions of `./agent_home/.claude`. |
+| `137` | Killed by Docker after 10 s. Still possible while a git command blocks the gateway (until MVP-7614 is deployed). The files stay intact; changes from the last moment before the block can be lost. | Nothing for the files. |
+
+**State files and `/health`.** `sessions.json`, `tools.json` and `mcp-servers.json` are saved atomically (a temp file `<file>.tmp-*` in the same directory, then a rename), so a kill, crash or full disk never leaves a half-written file. A file that cannot be read or used at start is never overwritten. `GET /health` reports problems in two additive fields; its HTTP status stays 200:
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "uptime": 1,
+  "sessions": 0,
+  "persistence": "degraded",
+  "persistenceIssues": [
+    {
+      "area": "mcpServers",
+      "problem": "corrupt-preserved",
+      "file": "/home/node/.claude/mcp-servers.json",
+      "preservedAs": ["/home/node/.claude/mcp-servers.json.corrupt-20260926T213634Z"]
+    }
+  ]
+}
+```
+
+`persistence` is `"ok"` exactly when `persistenceIssues` is empty. `area` is `sessions`, `tools` or `mcpServers`; several entries may be listed. The compose healthcheck only checks for a 2xx status, so the container stays "healthy" while `persistence` is `"degraded"`: monitoring must read the field (`curl -s http://localhost:3001/health | jq .persistence`).
+
+| `problem` | Meaning | Data at risk | Operator action | Clears when |
+|-----------|---------|--------------|-----------------|-------------|
+| `corrupt-preserved` | The file could not be read or parsed at start, or it held an entry the gateway cannot restore (`null`, a tool or MCP server without a string `name`, a session without a numeric `lastUsed`). It was moved to `<file>.corrupt-<UTC stamp>` with its bytes unchanged, and the area started empty, with none of its entries. | Everything in the copy, until it is restored. | Follow the recovery procedure below. | No `<file>.corrupt-*` exists any more (checked on every `/health` request, no restart needed). |
+| `unreadable-not-preserved` | The file could not be read, parsed or restored and could not be moved aside (usually permissions). The file is left untouched and saves for this area are switched off: API changes still answer success but are lost at the next restart. | Every change to this area since the start. | Fix the cause (usually ownership or permissions of `./agent_home/.claude`), then restart. | The next start loads the file. |
+| `write-failed` | The latest save of this area failed, for example because the disk is full. The previous file is intact. | Changes since the last successful save. | Check disk space and permissions. | The next successful save of this area. A save runs only after a change in this area or at a stop, so after the cause is fixed `degraded` stays until the next change here; a restart also clears it. |
+
+Every problem is also logged, whatever the log level, as one line: `ERROR persistence area=<sessions|tools|mcpServers> problem=<corrupt-preserved|unreadable-not-preserved|write-failed|final-save-failed> file=<path> [preservedAs=<path>] reason=<fixed text> [code=<errno>] (see /health)`. These lines never contain file content.
+
+**Recovering a `.corrupt-*` copy:**
+
+1. The container path `/home/node/.claude/<file>` is `./agent_home/.claude/<file>` on the host.
+2. Stop the gateway first (`docker compose stop agent-gateway`). Otherwise its next save overwrites the restored file.
+3. The copy is usually damaged (for example truncated), or it holds an entry the gateway cannot restore. To restore it, repair it (cut back to the last complete entry and close the array or object, or fix or remove the entry that is `null`, has no string `name` or, for a session, no numeric `lastUsed`; check with `jq . <copy>`) and copy it over `<file>`. This replaces the changes made in that area since the problem was detected. A copy kept after a read error has its original permissions; fix them first.
+4. Give the restored file `node:node` ownership (`chown 1000:1000 <file>`) and its original mode (for example `chmod 600 mcp-servers.json`).
+5. Move the copy out of `./agent_home/.claude/` or delete it. Only this clears `degraded`.
+6. Start the gateway and confirm: `curl -s http://localhost:3001/health | jq '.persistence, .persistenceIssues'`.
+
+Copies of `mcp-servers.json` contain MCP credentials (headers and env values). Handle them as secrets, never attach state files or their copies to tickets or evidence, and delete them once resolved.
+
 ## API Overview
 
 All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Health check (no auth) |
+| `GET` | `/health` | Health check (no auth); `persistence` / `persistenceIssues` report state-file problems ([Stopping and recovery](#stopping-and-recovery)) |
 | `POST` | `/v1/query` | Run an agent query (NDJSON stream) |
 | `GET` | `/v1/query/:queryId/events` | Replay/resume event stream |
 | `GET` | `/v1/sessions` | List active sessions |

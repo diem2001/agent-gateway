@@ -10,7 +10,9 @@
  *
  * Modes: "error" answers every agent request (one that offers tools) with an
  * HTTP 400 API error; "hang-after-tool" never answers an agent request that
- * carries a tool result, so the run stays open until the client aborts it.
+ * carries a tool result, so the run stays open until the client aborts it;
+ * "hang" never answers any agent request, so a streaming chat answer stays
+ * open from its first turn (MVP-7616 shutdown drain).
  * "drip" streams a text answer as `dripChunks` separate `text_delta` events,
  * one every `dripIntervalMs` (default 100 ms); everything else is "normal".
  */
@@ -57,7 +59,7 @@ function blockText(content: unknown): string {
   return "";
 }
 
-export type FakeApiMode = "normal" | "error" | "hang-after-tool" | "drip";
+export type FakeApiMode = "normal" | "error" | "hang-after-tool" | "drip" | "hang";
 
 /** Text of drip chunk `index` (0-based). */
 export function dripChunk(index: number): string {
@@ -117,6 +119,7 @@ export async function startFakeAnthropicApi(options: {
         return;
       }
       if (mode === "hang-after-tool" && tools.length > 0 && toolResults.length > 0) return;
+      if (mode === "hang" && tools.length > 0) return;
 
       const target = tools.find((name) => name.endsWith(`__${options.toolName}`));
       type Block = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } | { type: "text"; text: string };

@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     mc \
     python3 \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Create home dir structure for node user
@@ -50,4 +51,7 @@ EXPOSE 3001
 ENV HOME=/home/node
 ENV PATH="/home/node/.local/bin:$PATH"
 
-ENTRYPOINT ["bash", "/app/entrypoint.sh"]
+# tini runs as process 1: it forwards SIGTERM/SIGINT to the gateway (which
+# then stops cleanly, see src/shutdown.ts), reaps finished child processes and
+# exits with the gateway's exit code (MVP-7616).
+ENTRYPOINT ["/usr/bin/tini", "--", "bash", "/app/entrypoint.sh"]
