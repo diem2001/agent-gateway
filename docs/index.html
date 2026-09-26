@@ -510,7 +510,7 @@ curl -X PUT http://localhost:3001/v1/settings \
 
     <p>Changes the log level at runtime. Valid levels: <code>off</code>, <code>info</code>, <code>debug</code>.</p>
 
-    <p><strong>Credentials in the debug log:</strong> at <code>debug</code> the gateway logs request bodies (first 2000 characters) and response previews (first 500 characters). The whole value of every <code>headers</code> and <code>env</code> key, at any depth, is logged as <code>"[REDACTED]"</code> with the keys visible: <code>mcpServers[*]</code> and <code>mcpCredentialOverrides</code> of <code>POST /v1/query</code>, the <code>/test</code> and <code>/call</code> bodies, and MCP server definitions in registry create/update bodies and in the create/update, detail and list answers. Every <code>sshKey</code> value is logged as <code>"[REDACTED]"</code> and every string <code>url</code> value without its credentials (<code>scheme://***@host/...</code>), which covers the clone URLs and inline SSH keys of <code>/v1/workspace/git/*</code>. Redaction runs before the cut, so no prefix of a value appears. The API answers themselves are unchanged. <code>text/*</code> request bodies are logged as their length, a non-JSON registry answer is not previewed, and an unparseable JSON body is logged as <code>request body rejected type=&lt;type&gt; status=&lt;code&gt;</code>.</p>
+    <p><strong>Credentials in the debug log:</strong> at <code>debug</code> the gateway logs request bodies (first 2000 characters) and response previews (first 500 characters). The whole value of every <code>headers</code> and <code>env</code> key, at any depth, is logged as <code>"[REDACTED]"</code> with the keys visible: <code>mcpServers[*]</code> and <code>mcpCredentialOverrides</code> of <code>POST /v1/query</code>, the <code>/test</code> and <code>/call</code> bodies, and MCP server definitions in registry create/update bodies and in the create/update, detail and list answers. Every <code>sshKey</code> value is logged as <code>"[REDACTED]"</code> and every string under a <code>url</code> key without its credentials (<code>scheme://***@host/...</code>, everything up to the last <code>@</code>), which covers the clone URLs and inline SSH keys of <code>/v1/workspace/git/*</code>. Redaction runs before the cut, so no prefix of a value appears. The API answers themselves are unchanged. <code>text/*</code> request bodies are logged as their length, a non-JSON registry answer is not previewed, and an unparseable JSON body is logged as <code>request body rejected type=&lt;type&gt; status=&lt;code&gt;</code>.</p>
 
     <h3>Request Body</h3>
 <pre><code>{"level": "debug"}</code></pre>
@@ -597,7 +597,9 @@ curl -X PUT http://localhost:3001/v1/settings \
     <ul>
       <li><code>400 {"error": "url is required"}</code>, <code>"path is required"</code>, <code>"Invalid path (must be relative, no traversal)"</code></li>
       <li><code>400 {"error": "Invalid branch"}</code> &mdash; <code>branch</code> starts with <code>-</code>; nothing is queued and no git process starts</li>
-      <li><code>500 {"error": "&lt;git's message&gt;"}</code> &mdash; git's own error output; any <code>scheme://user:password@</code> appears as <code>scheme://***@</code></li>
+      <li><code>400 {"error": "Invalid url"}</code> &mdash; <code>url</code> contains a line break or NUL; nothing is queued and no git process starts</li>
+      <li><code>400 {"error": "&lt;field&gt; must be a string"}</code> &mdash; <code>url</code>, <code>path</code>, <code>branch</code> or <code>sshKey</code> is present but not a string (pull: <code>path</code>, <code>branch</code>, <code>sshKey</code>); nothing is queued and no git process starts</li>
+      <li><code>500 {"error": "&lt;git's message&gt;"}</code> &mdash; git's own error output with URL credentials hidden: on each line, everything from the first <code>scheme://</code> to the last <code>@</code> appears as <code>***</code>, whatever characters the token contains (a host or path on the same line may be hidden too)</li>
       <li><code>500 {"error": "git &lt;subcommand&gt; timed out after &lt;n&gt; s"}</code> &mdash; a git command exceeded <code>GIT_TIMEOUT_MS</code> (default 120 s)</li>
     </ul>
 
@@ -605,7 +607,7 @@ curl -X PUT http://localhost:3001/v1/settings \
     <p>Git runs without blocking the gateway: <code>/health</code> and running streams keep answering. Clone, pull and status requests for the same path run one at a time in arrival order, and a queued request sees the previous one's result (a second first clone of the same path answers <code>"pulled"</code>). At most <code>GIT_MAX_CONCURRENCY</code> (default 3) operations run at once overall; further requests wait in arrival order and are never rejected. Arguments go to git without a shell, so values are used literally.</p>
 
     <h3>Security</h3>
-    <p>SSH keys are written to a private temp directory (key file <code>0600</code>) only once the request's git operation starts, and deleted immediately after it, whether it succeeded, failed or timed out. Keys are never persisted on disk. Neither the key nor the <code>user:password@</code> part of a URL appears in error text or in the gateway log at any level (a token in a query string is not redacted).</p>
+    <p>SSH keys are written to a private temp directory (key file <code>0600</code>) only once the request's git operation starts, and deleted immediately after it, whether it succeeded, failed or timed out. Keys are never persisted on disk. Neither the key nor the <code>user:password@</code> part of a URL appears in error text or in the gateway log at any level, whatever characters the token contains, including <code>/</code>, whitespace, quotes and <code>@</code> (a token in a query string is not redacted).</p>
 
     <h3>Example</h3>
 <pre><code>curl -X POST http://localhost:3001/v1/workspace/git/clone \
@@ -1788,7 +1790,7 @@ curl http://localhost:3001/health</code></pre>
     <div class="seq-section">Workspace Git (POST /v1/workspace/git/clone|pull, GET /status)</div>
     <div class="seq-row">
       <div class="seq-from sf-slate">Client</div>
-      <div class="seq-msg"><div class="seq-line"></div><span class="seq-label">validate path + branch (400 Invalid branch)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-msg"><div class="seq-line"></div><span class="seq-label">validate fields, path, branch, url (400)</span><div class="seq-arrow">→</div></div>
       <div class="seq-to sf-blue">Repo Turn</div>
     </div>
     <div class="seq-row">

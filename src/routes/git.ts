@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { Request, Response } from "express";
-import { log, redactUrlCredentials } from "../logging.js";
+import { log, redactUrlValue } from "../logging.js";
 import { gitErrorText, runGit, withGitSlot, withRepoTurn } from "../git-exec.js";
 
 const router = Router();
@@ -34,6 +34,27 @@ function resolveProjectPath(userPath: string): string | null {
  */
 function isInvalidBranch(branch: unknown): boolean {
   return typeof branch === "string" && branch.startsWith("-");
+}
+
+/**
+ * A line break would split the URL across lines of git's error text, where the
+ * line-based credential redaction cannot follow it, and a NUL cannot be passed
+ * to a process at all; git refuses such URLs anyway.
+ */
+function isInvalidUrl(url: string): boolean {
+  return /[\r\n\0]/.test(url);
+}
+
+/**
+ * The first of `fields` that is present but not a string, as a 400 message.
+ * An array or object would reach git or the key file unchecked.
+ */
+function nonStringField(body: Record<string, unknown>, fields: string[]): string | null {
+  for (const field of fields) {
+    const value = body[field];
+    if (value !== undefined && value !== null && typeof value !== "string") return `${field} must be a string`;
+  }
+  return null;
 }
 
 /**
@@ -168,6 +189,12 @@ router.post("/v1/workspace/git/clone", async (req: Request, res: Response) => {
     sshKey?: string;
   };
 
+  const typeError = nonStringField(req.body, ["url", "path", "branch", "sshKey"]);
+  if (typeError) {
+    res.status(400).json({ error: typeError });
+    return;
+  }
+
   if (!url) {
     res.status(400).json({ error: "url is required" });
     return;
@@ -184,6 +211,10 @@ router.post("/v1/workspace/git/clone", async (req: Request, res: Response) => {
   }
   if (isInvalidBranch(branch)) {
     res.status(400).json({ error: "Invalid branch" });
+    return;
+  }
+  if (isInvalidUrl(url)) {
+    res.status(400).json({ error: "Invalid url" });
     return;
   }
 
@@ -214,7 +245,7 @@ router.post("/v1/workspace/git/clone", async (req: Request, res: Response) => {
           await git(["clone", ...branchArgs, "--", url, targetPath], WORKSPACE_ROOT, env);
 
           const info = await repoInfo(targetPath);
-          log("git", `Cloned ${redactUrlCredentials(url)} -> ${userPath}: ${info.branch}@${info.commit}`);
+          log("git", `Cloned ${redactUrlValue(url)} -> ${userPath}: ${info.branch}@${info.commit}`);
           return { status: "cloned", path: userPath, branch: info.branch, commit: info.commit };
         }),
       ),
@@ -237,6 +268,12 @@ router.post("/v1/workspace/git/pull", async (req: Request, res: Response) => {
     branch?: string;
     sshKey?: string;
   };
+
+  const typeError = nonStringField(req.body, ["path", "branch", "sshKey"]);
+  if (typeError) {
+    res.status(400).json({ error: typeError });
+    return;
+  }
 
   if (!userPath) {
     res.status(400).json({ error: "path is required" });

@@ -38,13 +38,47 @@ const CREDENTIAL_KEYS = new Set(["headers", "env"]);
 /** Keys whose value is a secret by itself: the SSH private key of the git routes. */
 const SECRET_VALUE_KEYS = new Set(["sshKey"]);
 
+const URL_SCHEME = /[a-z][a-z0-9+.-]*:\/\//i;
+
 /**
- * Replace the userinfo of every `scheme://user:password@` in `text` with `***`.
- * The match runs to the last `@` of the authority, so a password that itself
- * contains `@` leaves no tail behind.
+ * Replace everything between `://` and the last `@` of `segment` with `***`;
+ * a segment without `://`, or without `@` after it, is returned unchanged.
+ */
+function redactFromSchemeToLastAt(segment: string): string {
+  const scheme = URL_SCHEME.exec(segment);
+  if (!scheme) return segment;
+  const start = scheme.index + scheme[0].length;
+  const lastAt = segment.lastIndexOf("@");
+  return lastAt < start ? segment : segment.slice(0, start) + "***" + segment.slice(lastAt);
+}
+
+/**
+ * Remove URL credentials from free text such as git's error output. Tokens
+ * reach git unencoded and git echoes a URL it cannot parse as is, so a token
+ * may contain `/`, whitespace, quotes or `@`: on every line, everything from
+ * the first `scheme://` to the last `@` becomes `***`. This may also hide a
+ * host or path after an earlier URL on the same line; that is accepted.
  */
 export function redactUrlCredentials(text: string): string {
-  return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s'"]*@/gi, "$1***@");
+  return text
+    .split(/(\r\n|\r|\n)/)
+    .map((part) => redactFromSchemeToLastAt(part))
+    .join("");
+}
+
+/** Remove the credentials of a whole URL value: everything from `scheme://` to its last `@`, line breaks included. */
+export function redactUrlValue(url: string): string {
+  return redactFromSchemeToLastAt(url);
+}
+
+/** Every string under a `url` key, at any depth, as a URL value. */
+function redactUrlEntry(value: unknown): unknown {
+  if (typeof value === "string") return redactUrlValue(value);
+  if (Array.isArray(value)) return value.map(redactUrlEntry);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, redactUrlEntry(entry)]));
+  }
+  return value;
 }
 
 /**
@@ -64,8 +98,8 @@ function redactCredentialValue(value: unknown): unknown {
  * redacted at any depth. This covers `mcpServers[*]` and `mcpCredentialOverrides`
  * of POST /v1/query, the /test and /call bodies, and registry definitions in
  * request and response bodies. Every `sshKey` value becomes "[REDACTED]" and
- * every string `url` value loses its URL credentials (the git routes' clone URL
- * can carry an access token). The original value is never changed.
+ * every string under a `url` key loses its URL credentials (the git routes'
+ * clone URL can carry an access token). The original value is never changed.
  */
 export function redactCredentialsForLog(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactCredentialsForLog);
@@ -74,7 +108,7 @@ export function redactCredentialsForLog(value: unknown): unknown {
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
     if (CREDENTIAL_KEYS.has(key)) copy[key] = redactCredentialValue(entry);
     else if (SECRET_VALUE_KEYS.has(key)) copy[key] = entry === undefined ? undefined : REDACTED;
-    else if (key === "url" && typeof entry === "string") copy[key] = redactUrlCredentials(entry);
+    else if (key === "url") copy[key] = redactUrlEntry(entry);
     else copy[key] = redactCredentialsForLog(entry);
   }
   return copy;
@@ -102,7 +136,7 @@ function responsePreview(url: string, chunk: unknown): string {
     return JSON.stringify(redactCredentialsForLog(JSON.parse(text))).substring(0, RESPONSE_PREVIEW_CHARS);
   } catch {
     if (isMcpRegistryPath(url)) return "[unparseable body omitted]";
-    return text.substring(0, RESPONSE_PREVIEW_CHARS);
+    return redactUrlCredentials(text).substring(0, RESPONSE_PREVIEW_CHARS);
   }
 }
 

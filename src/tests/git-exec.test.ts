@@ -270,12 +270,17 @@ describe("runGit", () => {
 });
 
 describe("redactUrlCredentials", () => {
-  it("removes every userinfo, including passwords that contain '@'", async () => {
+  it("removes every userinfo, including passwords that contain '@'; per line, from the first scheme to the last '@'", async () => {
     const { redactUrlCredentials } = await loadGitExec({});
-    expect(redactUrlCredentials("a https://u:p@h/x and ssh://git:t@k@host:22/y 'http://x:y@z'")).toBe(
-      "a https://***@h/x and ssh://***@host:22/y 'http://***@z'",
+    expect(redactUrlCredentials("a https://u:p@h/x\nssh://git:t@k@host:22/y\r\n'http://x:y@z'")).toBe(
+      "a https://***@h/x\nssh://***@host:22/y\r\n'http://***@z'",
     );
-    expect(redactUrlCredentials("no credentials: https://host/x git@host:repo")).toBe("no credentials: https://host/x git@host:repo");
+    // Several URLs on one line: the part between them is hidden too (accepted over-redaction).
+    expect(redactUrlCredentials("a https://u:p@h/x and ssh://git:t@k@host:22/y")).toBe("a https://***@host:22/y");
+    expect(redactUrlCredentials("no credentials: https://host/x\ngit@host:repo")).toBe("no credentials: https://host/x\ngit@host:repo");
+    expect(redactUrlCredentials("git@host:repo https://host/x")).toBe("git@host:repo https://host/x");
+    // An '@' later on the same line as a credential-free URL is also treated as its userinfo end.
+    expect(redactUrlCredentials("no credentials: https://host/x git@host:repo")).toBe("no credentials: https://***@host:repo");
   });
 
   // Tokens are inserted into the URL unencoded, and git echoes a URL it cannot parse as is.
@@ -290,11 +295,7 @@ describe("redactUrlCredentials", () => {
   }
 
   it("a whole URL value loses everything up to its last '@', line breaks included", async () => {
-    const logging = (await import("../logging.js")) as unknown as { redactUrlValue?: (url: string) => string };
-    const redactUrlValue = (url: string) => {
-      if (!logging.redactUrlValue) throw new Error("logging.redactUrlValue is missing");
-      return logging.redactUrlValue(url);
-    };
+    const { redactUrlValue } = await import("../logging.js");
     expect(redactUrlValue("https://user:ab\ncd/SEC@host/r.git")).toBe("https://***@host/r.git");
     expect(redactUrlValue("https://user:a b'c\"d/e@f@host/r.git")).toBe("https://***@host/r.git");
     expect(redactUrlValue("git@host:repo")).toBe("git@host:repo");
