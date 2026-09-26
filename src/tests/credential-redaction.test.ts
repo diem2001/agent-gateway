@@ -163,4 +163,56 @@ describe("credential redaction", () => {
     expect(logText).not.toContain("SECRET_ENV_TOKEN");
     expect(logText).not.toContain("Bearer SECRET");
   });
+
+  it("redacts the git routes' sshKey and URL credentials in debug request and response logs (MVP-7614)", async () => {
+    const { requestLoggingMiddleware, setLogLevel } = await import("../logging.js");
+    setLogLevel("debug");
+
+    const app = express();
+    app.use(express.json());
+    app.use(requestLoggingMiddleware);
+    // The response echoes the URL under a `url` key, so the response preview is covered too.
+    app.post("/v1/workspace/git/clone", (req, res) => res.status(500).json({ error: "fatal: failed", url: req.body.url }));
+
+    await request(app)
+      .post("/v1/workspace/git/clone")
+      .send({
+        url: "https://user:SECRET_GIT_TOKEN@host.invalid/r.git",
+        path: "r",
+        sshKey: "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRET_KEY_LINE\n-----END OPENSSH PRIVATE KEY-----",
+        nested: { sshKey: "SECRET_NESTED_KEY", url: "ssh://git:SECRET_AT@PART@host.invalid/r.git" },
+      });
+
+    const logText = logs.join("\n");
+    expect(logText).toContain('"url":"https://***@host.invalid/r.git"');
+    expect(logText).toContain('"sshKey":"[REDACTED]"');
+    expect(logText).toContain('"url":"ssh://***@host.invalid/r.git"');
+    expect(logText).toContain('"path":"r"');
+    for (const secret of ["SECRET_GIT_TOKEN", "SECRET_KEY_LINE", "PRIVATE KEY", "SECRET_NESTED_KEY", "SECRET_AT", "PART@"]) {
+      expect(logText).not.toContain(secret);
+    }
+    expect(logText).toMatch(/\[res\] POST \/v1\/workspace\/git\/clone 500 .*"url":"https:\/\/\*\*\*@host.invalid\/r.git"/);
+  });
+
+  it("redacts git URL credentials whatever characters the token has, and url values that are not strings (MVP-7614)", async () => {
+    const { requestLoggingMiddleware, setLogLevel } = await import("../logging.js");
+    setLogLevel("debug");
+
+    const app = express();
+    app.use(express.json());
+    app.use(requestLoggingMiddleware);
+    app.post("/v1/workspace/git/clone", (req, res) => res.status(500).json({ error: "fatal: failed", url: req.body.url }));
+
+    const tokens = ["ab/SLASHSECRET+z", "SPACESECRET ", "QU'OTE/SECRET", 'DQ"SECRET/x', "AT@SECRET/x", "PCT%SECRET", "UNI€SECRET/ä", "NL\nSECRET"];
+    for (const token of tokens) {
+      await request(app).post("/v1/workspace/git/clone").send({ url: `https://user:${token}@host.invalid/r.git`, path: "r" });
+    }
+    await request(app).post("/v1/workspace/git/clone").send({ url: ["https://user:ARRAYSECRET@host.invalid/r.git"], path: "r" });
+
+    const logText = logs.join("\n");
+    expect(logText.match(/"url":"https:\/\/\*\*\*@host.invalid\/r.git"/g)?.length).toBe(2 * tokens.length);
+    expect(logText).toContain('"url":["https://***@host.invalid/r.git"]');
+    expect(logText).not.toContain("SECRET");
+    expect(logText).not.toContain("user:");
+  });
 });
