@@ -41,6 +41,12 @@ The Agent Gateway is a stateless HTTP service that bridges REST clients with the
 ### server.ts -- Express Application
 Entry point. Configures middleware (JSON and text parsing, skipped for the upload relay path; a 300 s body deadline for every other request until it is answered; request logging; the upload path's pre-auth guard; auth), mounts all routers, and exposes health, logging, session, and settings endpoints directly. The kept `app.listen` handle (`server`) sets `requestTimeout` to 3600 s for the upload relay. At startup it also removes `DEBUG_CLAUDE_AGENT_SDK` from the environment (with a warning), sweeps leftover per-run runtime log directories, and starts the credential relay (`mcp-credential-relay.ts`).
 
+### persistence.ts -- State Files
+Shared by `sessions.ts`, `tools.ts` and `mcp-registry.ts`. Saves are debounced (100 ms) and atomic: a temp file `<file>.tmp-<pid>-<hex>` is created in the same directory (`wx`, mode 0600), written, flushed and renamed over the file; the new file then gets the previous file's mode. On start a missing file is an empty start; any other read error or invalid content moves the file to `<file>.corrupt-<UTC stamp>`; if that move fails, the file stays in place and every save of that area is suppressed for the process lifetime. Leftover temp files of the area are removed at start. The per-area issues (`corrupt-preserved`, `unreadable-not-preserved`, `write-failed`) feed the `persistence` / `persistenceIssues` fields of `/health`; see [State Files, Recovery and Shutdown](#state-files-recovery-and-shutdown).
+
+### shutdown.ts -- Clean Stop
+Installed by `server.ts` only when it is the process entry point. Handles `SIGTERM`/`SIGINT`: refuse new connections, save early, drain requests already received for up to 8 s, then save all three state files synchronously and exit 0 (all saved) or 1 (a save failed or was suppressed). A second signal ends the drain.
+
 ### auth.ts -- API Key Middleware
 Parses `API_KEYS` env var at startup into a `Map<key, label>` for O(1) lookup. Validates `Authorization: Bearer <key>` on all routes except `/health`. Attaches `clientLabel` to the request for audit logging.
 
@@ -69,7 +75,7 @@ Maps client-provided session IDs to internal Claude SDK session IDs. Sessions ar
 - **Reused** when the same sessionId, systemPrompt, and model match
 - **Replaced** when systemPrompt or model changes (new Claude session, same client ID)
 - **Synced** via `updateSessionSdkId()` after each query -- the SDK may return a different session_id than the one provided, so the gateway updates the stored mapping to ensure subsequent queries resume the correct conversation
-- **Persisted** to disk (debounced) at `SESSION_PERSIST_PATH`
+- **Persisted** to disk (debounced, atomic; see `persistence.ts`) at `SESSION_PERSIST_PATH`
 - **Restored** from disk on startup (expired sessions filtered out)
 - **Cleaned** every 5 minutes if `SESSION_IDLE_TIMEOUT_MS > 0`
 
@@ -372,6 +378,42 @@ MCP server answer -> status (200-599) + Content-Type + Content-Length + body, ve
 
 **Timers:** the relay's idle timer (default 60 s) is the only per-upload bound; Node's `requestTimeout` is raised to 3600 s on the listen handle so it does not cut a slow upload, while `nonUploadBodyDeadline` keeps a 300 s bound on every other request body until its response is sent (it clears with the response, so after an early answer the rest of that body is no longer bounded by it). mcp-jira's own no-progress timer (120 s) and `requestTimeout` (3600 s) sit behind it.
 
+## State Files, Recovery and Shutdown
+
+**Files:** `sessions.json` (sessions and the idle-timeout setting), `tools.json` and `mcp-servers.json` under `/home/node/.claude/` in the container (`./agent_home/.claude/` on the host). `mcp-servers.json` is the only copy of the MCP server registry.
+
+**Saving:** every save writes a complete temp file next to the target and renames it over the target, so a kill, crash or `ENOSPC` leaves either the complete old file or the complete new one. A failed save keeps the previous file, logs an ERROR line and reports `write-failed` until a later save of that area succeeds.
+
+**Loading:**
+
+| File state at start | Result | `/health` |
+|---------------------|--------|-----------|
+| missing | empty area | no issue |
+| valid | loaded | no issue |
+| read error other than "not found", invalid JSON or wrong top-level shape | moved to `<file>.corrupt-<UTC stamp>` (bytes unchanged), empty area | `corrupt-preserved` while any `<file>.corrupt-*` exists |
+| as above, and the move fails | file untouched, saves for the area suppressed until a restart loads it | `unreadable-not-preserved` |
+
+**ERROR line** (via `console.error`, independent of the log level; never file content or error messages):
+
+```
+ERROR persistence area=<sessions|tools|mcpServers> problem=<corrupt-preserved|unreadable-not-preserved|write-failed|final-save-failed> file=<path> [preservedAs=<path>] reason=<fixed text> [code=<errno>] (see /health)
+```
+
+**Shutdown sequence:**
+
+```
+SIGTERM/SIGINT ──> server.close() (no new connections; idle ones closed)
+               ──> save all areas now (early save)
+               ──> drain: received requests and streams run on, changes saved as usual
+               ──> last connection closed | 8 s deadline | second signal
+               ──> destroy remaining sockets, save all areas synchronously
+               ──> exit 0 (all saved) | exit 1 (a save failed or was suppressed)
+```
+
+In the image `tini` is process 1 and forwards the signal, so the container exit code is the gateway's. Exit `137` (Docker's SIGKILL after 10 s) remains possible while a synchronous git command blocks the event loop (MVP-7614): the files stay intact, but debounced changes pending at that moment can be lost.
+
+**Recovering a `.corrupt-*` copy:** stop the gateway first (its next save would overwrite a restored file); repair the JSON of the copy (it is damaged by definition) and copy it over `<file>`, which replaces changes made in that area since detection; restore `node:node` ownership (uid 1000) and the original mode (a copy kept after a read error has its original permissions); move the copy out of the directory or delete it, which alone clears `degraded`; confirm with `curl -s http://localhost:3001/health | jq .persistence`. Copies of `mcp-servers.json` contain MCP credentials: handle them as secrets and never attach state files or copies to tickets or evidence.
+
 ## Security Model
 
 - **API Key Auth**: All authenticated routes require a valid Bearer token from `API_KEYS`.
@@ -382,5 +424,6 @@ MCP server answer -> status (200-599) + Content-Type + Content-Length + body, ve
 - **Credential Boundaries**: `userCredentialSchema` enforces transport-appropriate output targets (`SCHEMA_TARGET_MISMATCH`); per-request overrides are never written back to `MCP_SERVERS_PERSIST_PATH`; test-client errors are sanitized so header/env values do not leak in error messages.
 - **Token Expiry Surfacing**: `/v1/auth/status` exposes `tokenExpired` + `expiresAt` so clients can warn users before queries fail with auth errors.
 - **Docker Isolation**: Container runs as `node` user (dropped from root via `gosu`), SSH keys, sessions, tools, and MCP server definitions persist on a named volume.
+- **State File Protection**: temp files are created with `O_EXCL` and mode 0600 (no symlink follow, never more readable than the owner while credentials are written); `.corrupt-*` copies keep the original bytes and permissions; ERROR lines and `/health` carry only area, problem, paths, a fixed reason and the errno.
 - **Localhost Binding**: Docker compose binds port 3001 to `127.0.0.1` only -- requires a reverse proxy for external access.
 - **Upload Relay**: target path and query come from the raw URL with dot segments, encoded slashes and backslashes refused; upstream host and port come only from the registry. Only `Authorization` is taken from `X-MCP-Credential-Headers`, which is never forwarded or logged; hop-by-hop headers never come from an override or a registration. Refusals on the upload path close the connection after at most 1 MiB / 5 s, so a caller without a key cannot make the gateway read a large body. The gateway enforces no size or concurrency cap of its own (reqlift's 100 MiB cap applies to reqlift callers; other key holders are bounded by the MCP server).
