@@ -11,6 +11,8 @@
  * Modes: "error" answers every agent request (one that offers tools) with an
  * HTTP 400 API error; "hang-after-tool" never answers an agent request that
  * carries a tool result, so the run stays open until the client aborts it.
+ * "drip" streams a text answer as `dripChunks` separate `text_delta` events,
+ * one every `dripIntervalMs` (default 100 ms); everything else is "normal".
  */
 
 import http from "node:http";
@@ -55,9 +57,19 @@ function blockText(content: unknown): string {
   return "";
 }
 
-export type FakeApiMode = "normal" | "error" | "hang-after-tool";
+export type FakeApiMode = "normal" | "error" | "hang-after-tool" | "drip";
 
-export async function startFakeAnthropicApi(options: { toolName: string; mode?: FakeApiMode }): Promise<FakeAnthropicApi> {
+/** Text of drip chunk `index` (0-based). */
+export function dripChunk(index: number): string {
+  return `drip-${index} `;
+}
+
+export async function startFakeAnthropicApi(options: {
+  toolName: string;
+  mode?: FakeApiMode;
+  dripChunks?: number;
+  dripIntervalMs?: number;
+}): Promise<FakeAnthropicApi> {
   const mode = options.mode ?? "normal";
   const requests: RecordedMessagesRequest[] = [];
   const sockets = new Set<net.Socket>();
@@ -124,6 +136,32 @@ export async function startFakeAnthropicApi(options: { toolName: string; mode?: 
 
       res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
       const send = (event: string, data: unknown) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      if (mode === "drip" && content[0].type === "text") {
+        const chunks = options.dripChunks ?? 10;
+        const intervalMs = options.dripIntervalMs ?? 100;
+        send("message_start", {
+          type: "message_start",
+          message: { id: messageId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage },
+        });
+        send("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+        let sent = 0;
+        const timer = setInterval(() => {
+          if (res.writableEnded || res.destroyed) {
+            clearInterval(timer);
+            return;
+          }
+          send("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: dripChunk(sent) } });
+          sent += 1;
+          if (sent < chunks) return;
+          clearInterval(timer);
+          send("content_block_stop", { type: "content_block_stop", index: 0 });
+          send("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 5 } });
+          send("message_stop", { type: "message_stop" });
+          res.end();
+        }, intervalMs);
+        res.on("close", () => clearInterval(timer));
+        return;
+      }
       send("message_start", {
         type: "message_start",
         message: { id: messageId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage },
