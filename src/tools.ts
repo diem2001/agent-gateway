@@ -1,6 +1,5 @@
-import fs from "node:fs";
-import path from "node:path";
 import { log } from "./logging.js";
+import { createPersistentStore } from "./persistence.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */
@@ -23,7 +22,12 @@ const tools = new Map<string, ToolDefinition>();
 const PERSIST_PATH =
   process.env.TOOLS_PERSIST_PATH || "./data/tools.json";
 
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
+const store = createPersistentStore({
+  area: "tools",
+  file: PERSIST_PATH,
+  snapshot: () => Array.from(tools.values()),
+  isValid: Array.isArray,
+});
 
 /* ------------------------------------------------------------------ */
 /*  Validation                                                          */
@@ -42,37 +46,22 @@ export function isValidJsonSchema(schema: unknown): boolean {
 /* ------------------------------------------------------------------ */
 
 export function loadTools(): void {
-  try {
-    if (fs.existsSync(PERSIST_PATH)) {
-      const raw = fs.readFileSync(PERSIST_PATH, "utf-8");
-      const data: ToolDefinition[] = JSON.parse(raw);
-      for (const tool of data) {
-        tools.set(tool.name, tool);
-      }
-      log("tools", `Loaded ${tools.size} tool(s) from disk`);
-    }
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    log("tools", `Failed to load: ${msg}`);
+  const data = store.load() as ToolDefinition[] | undefined;
+  if (!data) return;
+  for (const tool of data) {
+    tools.set(tool.name, tool);
   }
+  log("tools", `Loaded ${tools.size} tool(s) from disk`);
 }
 
+/** Debounced atomic save (src/persistence.ts). */
 export function persistTools(): void {
-  if (persistTimer) return; // debounce
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    try {
-      const dir = path.dirname(PERSIST_PATH);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      const data = Array.from(tools.values());
-      fs.writeFileSync(PERSIST_PATH, JSON.stringify(data, null, 2));
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      log("tools", `Failed to persist: ${msg}`);
-    }
-  }, 100);
+  store.schedule();
+}
+
+/** Save the tool registry now; false when the save failed or is suppressed. */
+export function flushTools(): boolean {
+  return store.flush();
 }
 
 /* ------------------------------------------------------------------ */

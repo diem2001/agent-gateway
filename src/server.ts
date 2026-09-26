@@ -25,6 +25,7 @@ import workspaceRoutes from "./routes/workspace.js";
 import toolRoutes from "./routes/tools.js";
 import { loadTools } from "./tools.js";
 import { loadMcpServers } from "./mcp-registry.js";
+import { persistenceReport } from "./persistence.js";
 import mcpRoutes from "./routes/mcp.js";
 import gitRoutes from "./routes/git.js";
 import { credentialRelay } from "./mcp-credential-relay.js";
@@ -105,6 +106,9 @@ app.get("/health", (_req, res) => {
     version: VERSION,
     uptime: Math.round(process.uptime()),
     sessions: getSessionCount(),
+    // Additive (MVP-7616): "degraded" plus the issue list while any state file
+    // is preserved aside, unwritable or failing to save.
+    ...persistenceReport(),
   });
 });
 

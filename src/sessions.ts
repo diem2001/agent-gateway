@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import { log } from "./logging.js";
+import { createPersistentStore } from "./persistence.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */
@@ -37,66 +36,55 @@ const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const PERSIST_PATH =
   process.env.SESSION_PERSIST_PATH || "./data/sessions.json";
 
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
+const store = createPersistentStore({
+  area: "sessions",
+  file: PERSIST_PATH,
+  snapshot: (): PersistedData => ({
+    sessions: Object.fromEntries(sessions),
+    settings: { sessionIdleTimeoutMs },
+  }),
+  isValid: (data) => typeof data === "object" && data !== null && !Array.isArray(data),
+});
 
 /* ------------------------------------------------------------------ */
 /*  Persistence                                                         */
 /* ------------------------------------------------------------------ */
 
 export function loadSessions(): void {
-  try {
-    if (fs.existsSync(PERSIST_PATH)) {
-      const raw = fs.readFileSync(PERSIST_PATH, "utf-8");
-      const data: PersistedData = JSON.parse(raw);
-      const now = Date.now();
+  const data = store.load() as PersistedData | undefined;
+  if (!data) return;
+  const now = Date.now();
 
-      // Restore settings
-      if (
-        data.settings &&
-        typeof data.settings.sessionIdleTimeoutMs === "number"
-      ) {
-        sessionIdleTimeoutMs = data.settings.sessionIdleTimeoutMs;
-      }
-
-      // Restore sessions (filter expired ones)
-      for (const [id, session] of Object.entries(data.sessions || {})) {
-        if (
-          sessionIdleTimeoutMs > 0 &&
-          now - session.lastUsed >= sessionIdleTimeoutMs
-        ) {
-          continue;
-        }
-        sessions.set(id, session);
-      }
-
-      log("sessions", `Restored ${sessions.size} session(s) from disk`);
-    }
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    log("sessions", `Failed to load: ${msg}`);
+  // Restore settings
+  if (
+    data.settings &&
+    typeof data.settings.sessionIdleTimeoutMs === "number"
+  ) {
+    sessionIdleTimeoutMs = data.settings.sessionIdleTimeoutMs;
   }
+
+  // Restore sessions (filter expired ones)
+  for (const [id, session] of Object.entries(data.sessions || {})) {
+    if (
+      sessionIdleTimeoutMs > 0 &&
+      now - session.lastUsed >= sessionIdleTimeoutMs
+    ) {
+      continue;
+    }
+    sessions.set(id, session);
+  }
+
+  log("sessions", `Restored ${sessions.size} session(s) from disk`);
 }
 
+/** Debounced atomic save (src/persistence.ts). */
 export function persistSessions(): void {
-  if (persistTimer) return; // debounce
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    try {
-      const dir = path.dirname(PERSIST_PATH);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
+  store.schedule();
+}
 
-      const data: PersistedData = {
-        sessions: Object.fromEntries(sessions),
-        settings: { sessionIdleTimeoutMs },
-      };
-      fs.writeFileSync(PERSIST_PATH, JSON.stringify(data, null, 2));
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      log("sessions", `Failed to persist: ${msg}`);
-    }
-  }, 100);
+/** Save sessions and settings now; false when the save failed or is suppressed. */
+export function flushSessions(): boolean {
+  return store.flush();
 }
 
 /* ------------------------------------------------------------------ */
