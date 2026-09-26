@@ -162,6 +162,8 @@ export class PersistentStore {
   private suppressed = false;
   /** The most recent save failed; cleared by a later successful save. */
   private writeFailed = false;
+  /** errno name of the most recent failed save, for the shutdown ERROR line. */
+  lastWriteErrorCode: string | undefined;
 
   constructor(options: PersistentStoreOptions) {
     this.area = options.area;
@@ -234,9 +236,11 @@ export class PersistentStore {
     try {
       atomicWriteFileSync(this.file, JSON.stringify(this.snapshot(), null, 2));
       this.writeFailed = false;
+      this.lastWriteErrorCode = undefined;
       return true;
     } catch (e) {
       this.writeFailed = true;
+      this.lastWriteErrorCode = errnoCode(e);
       logPersistenceError({
         area: this.area,
         problem: "write-failed",

@@ -1,4 +1,6 @@
 import "dotenv/config";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import express from "express";
 import { loadApiKeys, authMiddleware } from "./auth.js";
 import {
@@ -26,6 +28,7 @@ import toolRoutes from "./routes/tools.js";
 import { loadTools } from "./tools.js";
 import { loadMcpServers } from "./mcp-registry.js";
 import { persistenceReport } from "./persistence.js";
+import { installShutdownHandlers } from "./shutdown.js";
 import mcpRoutes from "./routes/mcp.js";
 import gitRoutes from "./routes/git.js";
 import { credentialRelay } from "./mcp-credential-relay.js";
@@ -199,5 +202,17 @@ export const server = app.listen(PORT, HOST, () => {
 // Node's 300 s default would cut a slow but progressing upload; the relay's own
 // idle timeout bounds it instead (MCP_UPLOAD_IDLE_TIMEOUT_MS).
 server.requestTimeout = SERVER_REQUEST_TIMEOUT_MS;
+
+// Clean stop on SIGTERM/SIGINT (MVP-7616), only when this file is the process
+// entry point: tests that import server.js in-process keep their own signals.
+function isEntryPoint(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+if (isEntryPoint()) installShutdownHandlers(server);
 
 export default app;
