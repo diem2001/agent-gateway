@@ -10,8 +10,9 @@
  * file", "An unreadable file is kept, reported and never overwritten", "An
  * unreadable file that cannot be moved aside is left untouched", "Several
  * damaged areas are all reported", "A failed save is reported until a later
- * save succeeds", and the credential invariant of MVP-7667 for the new ERROR
- * lines and /health fields.
+ * save succeeds", a file whose entries cannot be restored (valid JSON, set
+ * aside like invalid JSON), and the credential invariant of MVP-7667 for the
+ * new ERROR lines and /health fields.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
@@ -508,6 +509,60 @@ describe("Several damaged areas are all reported", () => {
       { area: "mcpServers", problem: "corrupt-preserved", file: fx.file("mcpServers"), preservedAs: corruptCopies(fx, "mcpServers") },
     ]);
     expect(errorLines(gateway.output()).map((l) => l.split(" ")[2])).toEqual(["area=tools", "area=mcpServers"]);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  A file with an entry that cannot be restored is kept aside          */
+/* ------------------------------------------------------------------ */
+
+/** Valid JSON whose entries the gateway cannot restore; before the fix, rows 1, 3 and 5 stopped start-up. */
+const UNRESTORABLE_ROWS: [area: Area, label: string, content: () => unknown][] = [
+  ["tools", "null entry", () => [null]],
+  ["tools", "entry without name", () => [{ description: "d", input_schema: { type: "object" }, webhook_url: "http://127.0.0.1:9/hook" }]],
+  ["mcpServers", "null entry", () => [null]],
+  ["mcpServers", "entry without name", () => [{ description: "", enabled: true, type: "http", url: "http://127.0.0.1:9/mcp", createdAt: "x", updatedAt: "x" }]],
+  ["sessions", "null session, idle timeout on", () => ({ sessions: { "earlier-session": null }, settings: { sessionIdleTimeoutMs: 60_000 } })],
+  [
+    "sessions",
+    "session without lastUsed, idle timeout on",
+    () => ({ sessions: { "earlier-session": { sessionId: "sdk-earlier", systemPrompt: "", model: "m" } }, settings: { sessionIdleTimeoutMs: 60_000 } }),
+  ],
+];
+
+describe("A file with an entry that cannot be restored is kept aside and the gateway keeps serving", () => {
+  it.each(UNRESTORABLE_ROWS)("%s, %s", async (area, _label, content) => {
+    const fx = fixture();
+    const file = fx.file(area);
+    const originalBytes = Buffer.from(JSON.stringify(content(), null, 2));
+    fs.writeFileSync(file, originalBytes);
+    // A complete entry in another area is still restored.
+    const other: Area = area === "tools" ? "mcpServers" : "tools";
+    fs.writeFileSync(fx.file(other), JSON.stringify(earlierState(other), null, 2));
+
+    const gateway = await startGateway(fx);
+    const copies = corruptCopies(fx, area);
+    expect(copies).toHaveLength(1);
+    expect(fs.readFileSync(copies[0]).equals(originalBytes)).toBe(true);
+    expect(fs.existsSync(file)).toBe(false);
+
+    const lines = errorLines(gateway.output());
+    expect(lines).toEqual([
+      `ERROR persistence area=${area} problem=corrupt-preserved file=${file} preservedAs=${copies[0]} reason=unexpected content, starting empty (see /health)`,
+    ]);
+
+    const report = await health(gateway);
+    expect(report.persistence).toBe("degraded");
+    expect(report.persistenceIssues).toEqual([{ area, problem: "corrupt-preserved", file, preservedAs: copies }]);
+
+    // The area starts empty, with nothing of the file restored; the other area is intact.
+    expect(await listNames(gateway, area)).toEqual([]);
+    expect(await listNames(gateway, other)).toEqual([EARLIER_NAME[other]]);
+
+    // The area keeps saving; the copy stays as it was.
+    await changeArea(gateway, area, "after-bad-entry");
+    expect(fileHoldsChange(file, area, "after-bad-entry")).toBe(true);
+    expect(fs.readFileSync(copies[0]).equals(originalBytes)).toBe(true);
   });
 });
 

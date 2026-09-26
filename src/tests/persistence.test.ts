@@ -322,6 +322,10 @@ interface StoreCase {
   envKey: string;
   fileName: string;
   valid: unknown;
+  /** Valid JSON with at least one entry the store cannot restore; each is set aside like invalid JSON. */
+  unrestorable: [label: string, content: unknown][];
+  /** Files the pre-MVP-7616 load accepted; they still load, with the listed names. */
+  tolerated: [label: string, content: unknown, names: string[]][];
   /** Load, change one entry, flush; returns the flush result. */
   loadAndChange: (dirOfFile: string) => Promise<{ loadedNames: string[]; flushed: boolean }>;
 }
@@ -331,12 +335,42 @@ async function freshImport<T>(specifier: string): Promise<T> {
   return (await import(specifier)) as T;
 }
 
+const session = (fields: Record<string, unknown> = {}) => ({ sessionId: "sdk-1", systemPrompt: "", model: "m", lastUsed: Date.now(), ...fields });
+const tool = (fields: Record<string, unknown> = {}) => ({ name: "t1", description: "d", input_schema: { type: "object" }, webhook_url: "http://127.0.0.1/x", ...fields });
+const mcpServer = (fields: Record<string, unknown> = {}) => ({ name: "m1", description: "", enabled: true, type: "http", url: "http://127.0.0.1/mcp", createdAt: "x", updatedAt: "x", ...fields });
+
+function withoutKey(entry: Record<string, unknown>, key: string): Record<string, unknown> {
+  const { [key]: _removed, ...rest } = entry;
+  return rest;
+}
+
 const CASES: StoreCase[] = [
   {
     area: "sessions",
     envKey: "SESSION_PERSIST_PATH",
     fileName: "sessions.json",
-    valid: { sessions: { s1: { sessionId: "sdk-1", systemPrompt: "", model: "m", lastUsed: Date.now() } }, settings: { sessionIdleTimeoutMs: 0 } },
+    valid: { sessions: { s1: session() }, settings: { sessionIdleTimeoutMs: 0 } },
+    unrestorable: [
+      ["null session, idle timeout on", { sessions: { s1: null }, settings: { sessionIdleTimeoutMs: 60_000 } }],
+      ["null session, idle timeout off", { sessions: { s1: null }, settings: { sessionIdleTimeoutMs: 0 } }],
+      ["wrong-typed session", { sessions: { s1: "text" }, settings: { sessionIdleTimeoutMs: 0 } }],
+      ["session without lastUsed, idle timeout on", { sessions: { s1: withoutKey(session(), "lastUsed") }, settings: { sessionIdleTimeoutMs: 60_000 } }],
+      ["session without lastUsed, idle timeout off", { sessions: { s1: withoutKey(session(), "lastUsed") }, settings: { sessionIdleTimeoutMs: 0 } }],
+      ["session with a non-numeric lastUsed", { sessions: { s1: session({ lastUsed: "yesterday" }) }, settings: { sessionIdleTimeoutMs: 0 } }],
+      ["one good and one null session", { sessions: { s1: session(), s2: null }, settings: { sessionIdleTimeoutMs: 0 } }],
+      ["sessions is an array", { sessions: [session()], settings: { sessionIdleTimeoutMs: 0 } }],
+    ],
+    tolerated: [
+      ["no settings", { sessions: { s1: session() } }, ["s1"]],
+      ["no sessions", { settings: { sessionIdleTimeoutMs: 0 } }, []],
+      ["settings of the wrong type", { sessions: { s1: session() }, settings: "x" }, ["s1"]],
+      ["session without sdkSessionId and with an extra field", { sessions: { s1: withoutKey(session({ extra: 1 }), "sdkSessionId") } }, ["s1"]],
+      [
+        "an expired session is dropped as before",
+        { sessions: { s1: session(), old: session({ lastUsed: 1 }) }, settings: { sessionIdleTimeoutMs: 60_000 } },
+        ["s1"],
+      ],
+    ],
     loadAndChange: async () => {
       const m = await freshImport<typeof import("../sessions.js")>("../sessions.js");
       m.loadSessions();
@@ -349,7 +383,18 @@ const CASES: StoreCase[] = [
     area: "tools",
     envKey: "TOOLS_PERSIST_PATH",
     fileName: "tools.json",
-    valid: [{ name: "t1", description: "d", input_schema: { type: "object" }, webhook_url: "http://127.0.0.1/x" }],
+    valid: [tool()],
+    unrestorable: [
+      ["null entry", [null]],
+      ["wrong-typed entry", ["t1"]],
+      ["entry without name", [withoutKey(tool(), "name")]],
+      ["entry with a non-string name", [tool({ name: 7 })]],
+      ["one good entry and one null entry", [tool(), null]],
+    ],
+    tolerated: [
+      ["entries without optional fields and with an extra field", [tool({ extra: 1 }), withoutKey(tool({ name: "t2" }), "description")], ["t1", "t2"]],
+      ["no entries", [], []],
+    ],
     loadAndChange: async () => {
       const m = await freshImport<typeof import("../tools.js")>("../tools.js");
       m.loadTools();
@@ -362,7 +407,18 @@ const CASES: StoreCase[] = [
     area: "mcpServers",
     envKey: "MCP_SERVERS_PERSIST_PATH",
     fileName: "mcp-servers.json",
-    valid: [{ name: "m1", description: "", enabled: true, type: "http", url: "http://127.0.0.1/mcp", createdAt: "x", updatedAt: "x" }],
+    valid: [mcpServer()],
+    unrestorable: [
+      ["null entry", [null]],
+      ["wrong-typed entry", [["m1"]]],
+      ["entry without name", [withoutKey(mcpServer(), "name")]],
+      ["entry with a non-string name", [mcpServer({ name: { first: "m1" } })]],
+      ["one good entry and one null entry", [mcpServer(), null]],
+    ],
+    tolerated: [
+      ["entries without optional fields and with an extra field", [mcpServer({ extra: 1 }), withoutKey(mcpServer({ name: "m2" }), "url")], ["m1", "m2"]],
+      ["no entries", [], []],
+    ],
     loadAndChange: async () => {
       const m = await freshImport<typeof import("../mcp-registry.js")>("../mcp-registry.js");
       m.loadMcpServers();
@@ -417,6 +473,32 @@ describe.each(CASES)("$area store", (c) => {
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toBeTruthy();
     expect((await report()).map((i) => i.problem)).toEqual(["corrupt-preserved"]);
     expect(errors.some((l) => l.startsWith(`ERROR persistence area=${c.area} problem=corrupt-preserved`))).toBe(true);
+  });
+
+  it.each(c.unrestorable)("unrestorable entry (%s): preserves the bytes aside, starts empty, reports corrupt-preserved", async (_label, content) => {
+    const bytes = JSON.stringify(content, null, 2);
+    fs.writeFileSync(file, bytes);
+    const { loadedNames, flushed } = await c.loadAndChange(dir);
+    // Nothing of the file is restored, not even the entries before the bad one.
+    expect(loadedNames).toEqual([]);
+    expect(flushed).toBe(true);
+    const copies = corruptCopies(file);
+    expect(copies).toHaveLength(1);
+    expect(fs.readFileSync(path.join(dir, copies[0]), "utf8")).toBe(bytes);
+    expect((await report()).map((i) => i.problem)).toEqual(["corrupt-preserved"]);
+    expect(errors).toEqual([
+      `ERROR persistence area=${c.area} problem=corrupt-preserved file=${file} preservedAs=${path.join(dir, copies[0])} reason=unexpected content, starting empty (see /health)`,
+    ]);
+  });
+
+  it.each(c.tolerated)("existing file loads as before (%s)", async (_label, content, names) => {
+    fs.writeFileSync(file, JSON.stringify(content, null, 2));
+    const { loadedNames, flushed } = await c.loadAndChange(dir);
+    expect(loadedNames.sort()).toEqual(names);
+    expect(flushed).toBe(true);
+    expect(corruptCopies(file)).toEqual([]);
+    expect(await report()).toEqual([]);
+    expect(errors).toEqual([]);
   });
 
   it("read error (EISDIR): moves the path aside and reports corrupt-preserved", async () => {
