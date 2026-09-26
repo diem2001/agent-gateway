@@ -53,8 +53,10 @@ interface JsonRpcMessage {
 }
 
 interface ActiveBinding extends RelayBinding {
-  /** Upstream requests and runtime responses in flight, destroyed on revoke. */
+  /** Requests still uploading, upstream requests and runtime responses in flight, destroyed on revoke. */
   inFlight: Set<{ destroy: () => void }>;
+  /** Set by revoke(); a revoked binding never sends another upstream request. */
+  revoked: boolean;
 }
 
 type RefusalReason = "refused the credential" | "unavailable";
@@ -132,7 +134,7 @@ export class CredentialRelay {
   register(binding: RelayBinding): { token: string; url: string } {
     if (!this.isListening()) throw new Error("credential relay is not listening");
     const token = randomBytes(16).toString("base64url");
-    this.bindings.set(token, { ...binding, headers: { ...binding.headers }, inFlight: new Set() });
+    this.bindings.set(token, { ...binding, headers: { ...binding.headers }, inFlight: new Set(), revoked: false });
     return { token, url: `http://127.0.0.1:${this.port}${RELAY_PATH_PREFIX}${token}` };
   }
 
@@ -141,6 +143,7 @@ export class CredentialRelay {
     const binding = this.bindings.get(token);
     if (!binding) return;
     this.bindings.delete(token);
+    binding.revoked = true;
     for (const exchange of binding.inFlight) exchange.destroy();
     binding.inFlight.clear();
   }
@@ -205,6 +208,15 @@ export class CredentialRelay {
     const chunks: Buffer[] = [];
     let size = 0;
     let tooLarge = false;
+    // A request whose body is still arriving is in flight too: revoking the token closes its connection.
+    const upload = {
+      destroy: () => {
+        req.destroy();
+        res.destroy();
+      },
+    };
+    binding.inFlight.add(upload);
+    res.on("close", () => binding.inFlight.delete(upload));
     req.on("data", (chunk: Buffer) => {
       size += chunk.length;
       if (size > this.maxBodyBytes) tooLarge = true;
@@ -213,6 +225,7 @@ export class CredentialRelay {
     });
     req.on("error", () => res.destroy());
     req.on("end", () => {
+      binding.inFlight.delete(upload);
       try {
         if (tooLarge) {
           log("audit", `mcp.relay.refused serverName=${binding.serverName} reason=body_too_large`);
@@ -227,6 +240,12 @@ export class CredentialRelay {
   }
 
   private forward(req: IncomingMessage, res: ServerResponse, binding: ActiveBinding, method: "POST" | "DELETE", body: Buffer): void {
+    // Every forward re-checks the binding: after revoke() no upstream request is sent with the run's credential.
+    if (binding.revoked) {
+      if (res.headersSent || res.destroyed) res.destroy();
+      else sendEmpty(res, 404);
+      return;
+    }
     const { messages, batch } = method === "POST" ? parseMessages(body) : { messages: [], batch: false };
     const sessionHeader = req.headers["mcp-session-id"];
     const hadSession = typeof sessionHeader === "string" && sessionHeader.length > 0;
@@ -306,7 +325,7 @@ export class CredentialRelay {
           return;
         }
         if (status === 404 && hadSession) {
-          // Session miss: a bodiless 404 makes the runtime initialize a new session.
+          // Session miss: passed on as a bodiless 404, as the upstream answered it.
           upstreamRes.resume();
           if (!settled) {
             finish();

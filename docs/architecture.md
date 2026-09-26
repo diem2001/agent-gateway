@@ -58,7 +58,7 @@ Default tools: `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebSearch`, `We
 If registered webhook tools exist, they are wrapped as in-process MCP servers via `createToolMcpServer()` and injected into the SDK query alongside the built-in tools. The webhook context (user_id, session_id, api_key_label) and the client's Bearer token are passed to each webhook call. External MCP servers from the MCP Server Registry are merged into the same `mcpServers` map (per-server credentials applied), so the agent can call their tools over the MCP protocol. A registered **http** server reaches the SDK as a credential-relay URL with a per-run token and no headers (see [Credential Relay Flow](#credential-relay-flow)); the tokens are revoked when the run ends. The SDK child environment points the runtime's own log files into a private per-run directory (`sdk-run-logs.ts`), deleted after the runtime child has exited.
 
 ### mcp-credential-relay.ts -- Credential Relay
-A `node:http` listener on 127.0.0.1 (ephemeral port, never an Express route). `register()` binds a 128-bit token to a run's upstream URL and header snapshot; `revoke()` ends it and destroys its in-flight upstream requests. Only `POST` and `DELETE` on the exact `/mcp/<token>` path are forwarded; see the flow below for header allowlists and refusal answers.
+A `node:http` listener on 127.0.0.1 (ephemeral port, never an Express route). `register()` binds a 128-bit token to a run's upstream URL and header snapshot; `revoke()` ends it: requests still uploading are closed, in-flight upstream requests are destroyed, and no upstream request is sent with its headers afterwards. Only `POST` and `DELETE` on the exact `/mcp/<token>` path are forwarded; see the flow below for header allowlists and refusal answers.
 
 ### sdk-run-logs.ts -- Per-Run Runtime Logs
 Creates the per-run directory (0700, prefix `agent-gateway-run-` under the OS temp directory) and the SDK child environment additions `CLAUDE_CODE_DEBUG_LOGS_DIR=<dir>/debug/run.txt` and `XDG_CACHE_HOME=<dir>/cache`. A `spawnClaudeCodeProcess` hook spawns the runtime like the SDK's default and reports the child; the directory is deleted once the child has exited (after 10 s it is killed first). Also sweeps leftovers at startup (every `agent-gateway-run-*` directory in the OS temp directory, so one gateway per temp directory is assumed, as in the Docker image) and strips `DEBUG_CLAUDE_AGENT_SDK`.
@@ -319,7 +319,7 @@ upstream MCP server (registered url)
     |   initialize / list requests -> HTTP 200 JSON-RPC error (the server contributes no tools)
     |   notifications -> 202; batches -> an array of these answers; DELETE -> 204; no upstream body is echoed
     v
-run ends (answer, error, abort) -> credentialRelay.revoke(token): the URL answers 404, in-flight upstream requests destroyed
+run ends (answer, error, abort) -> credentialRelay.revoke(token): the URL answers 404 on every method, requests still uploading are closed, in-flight upstream requests destroyed; nothing more is sent upstream
 ```
 
 If the relay is not listening, registered http servers are left out of the run (`mcp.server.omitted serverName=<name> reason=relay_unavailable`), and a request-supplied server may not take their name. Every handler is wrapped so that a relay error answers "unavailable" and never ends the gateway process. Audit lines carry the server name and reason only (`mcp.relay.refused serverName=<name> reason=credential_refused|unavailable|body_too_large [status=<code>]`); the URL, path and token are never logged.

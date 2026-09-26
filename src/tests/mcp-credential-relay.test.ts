@@ -371,6 +371,94 @@ describe("credential relay: what is never forwarded", () => {
     expect(upstreamClosed).toBe(true);
   });
 
+  it.each([
+    ["a single request", rpc("tools/call", 1, { name: "x", arguments: {} })],
+    ["a batch", [rpc("tools/call", 1, { name: "x", arguments: {} }), rpc("tools/call", 2, { name: "y", arguments: {} })]],
+  ])("revoking a token while %s is still uploading closes the connection and sends nothing upstream", async (_label, message) => {
+    const seenAuth: (string | undefined)[] = [];
+    const upstream = await rawUpstream((req, res) => {
+      seenAuth.push(req.headers.authorization);
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end('{"jsonrpc":"2.0","id":1,"result":{}}');
+      });
+    });
+    const r = await relay();
+    const { url, token } = r.register({ serverName: "records", url: upstream.url, headers: { Authorization: "Bearer RUN-SECRET" } });
+    const body = JSON.stringify(message);
+    const half = Math.floor(body.length / 2);
+
+    let closedBeforeRest = false;
+    let restSent = false;
+    const outcome = await new Promise<string>((resolve) => {
+      const req = http.request(url, { method: "POST", agent: false, headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) } }, (res) => {
+        res.resume();
+        res.on("end", () => resolve(`status ${res.statusCode}`));
+        res.on("error", () => resolve("destroyed"));
+      });
+      req.on("error", () => resolve("destroyed"));
+      req.on("socket", (socket) => socket.on("close", () => (closedBeforeRest ||= !restSent)));
+      req.write(body.slice(0, half));
+      setTimeout(() => {
+        r.revoke(token);
+        setTimeout(() => {
+          restSent = true;
+          if (!req.destroyed) req.end(body.slice(half));
+        }, 100);
+      }, 150);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(outcome).toBe("destroyed");
+    expect(closedBeforeRest).toBe(true);
+    expect(upstream.hits()).toBe(0);
+    expect(seenAuth).toEqual([]);
+  });
+
+  it("revoking a token destroys its in-flight DELETE", async () => {
+    let upstreamClosed = false;
+    const upstream = await rawUpstream((req) => {
+      req.resume();
+      req.socket.on("close", () => (upstreamClosed = true));
+    });
+    const r = await relay();
+    const { url, token } = r.register({ serverName: "records", url: upstream.url, headers: {} });
+
+    const pending = send(url, { method: "DELETE", headers: { "Mcp-Session-Id": "stub-session-9" } }).then(
+      () => "answered",
+      () => "destroyed",
+    );
+    while (upstream.hits() === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+    r.revoke(token);
+
+    expect(await pending).toBe("destroyed");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(upstreamClosed).toBe(true);
+  });
+
+  it("after revocation every relay entry point answers a local 404: POST, batch POST, GET stream and DELETE", async () => {
+    const upstream = await rawUpstream((req, res) => {
+      req.resume();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end("{}");
+    });
+    const r = await relay();
+    const { url, token } = r.register({ serverName: "records", url: upstream.url, headers: { Authorization: "Bearer RUN-SECRET" } });
+    r.revoke(token);
+
+    const answers = [
+      await send(url, { body: rpc("tools/call", 1, { name: "x" }) }),
+      await send(url, { body: [rpc("tools/call", 1, { name: "x" }), rpc("tools/list", 2)] }),
+      await send(url, { method: "GET", headers: { Accept: "text/event-stream" } }),
+      await send(url, { method: "DELETE", headers: { "Mcp-Session-Id": "stub-session-9" } }),
+    ];
+
+    expect(answers.map((a) => a.status)).toEqual([404, 404, 404, 404]);
+    expect(answers.map((a) => a.text)).toEqual(["", "", "", ""]);
+    expect(upstream.hits()).toBe(0);
+  });
+
   it("never logs the relay URL, path or token", async () => {
     const upstream = await stub({ refuse: "tools-call" });
     const r = await relay();
