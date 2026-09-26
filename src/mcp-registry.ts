@@ -1,5 +1,5 @@
 import { log } from "./logging.js";
-import { createPersistentStore } from "./persistence.js";
+import { createPersistentStore, isNamedEntryList } from "./persistence.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */
@@ -82,7 +82,7 @@ const store = createPersistentStore({
   area: "mcpServers",
   file: PERSIST_PATH,
   snapshot: () => Array.from(servers.values()),
-  isValid: Array.isArray,
+  isValid: isNamedEntryList,
 });
 
 /* ------------------------------------------------------------------ */

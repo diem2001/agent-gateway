@@ -144,8 +144,23 @@ export interface PersistentStoreOptions {
   file: string;
   /** The current in-memory state, serialized as `JSON.stringify(data, null, 2)`. */
   snapshot: () => unknown;
-  /** Shape check for loaded data; false is handled like invalid JSON. */
+  /**
+   * Shape check for loaded data, covering every entry the load restores;
+   * false is handled like invalid JSON. It runs before anything is restored,
+   * so an entry the load could not use never leaves partial state.
+   */
   isValid: (data: unknown) => boolean;
+}
+
+/** A list of objects that each have a string `name`, the key tools and MCP servers are restored by. */
+export function isNamedEntryList(data: unknown): boolean {
+  return (
+    Array.isArray(data) &&
+    data.every(
+      (entry) =>
+        typeof entry === "object" && entry !== null && !Array.isArray(entry) && typeof entry.name === "string",
+    )
+  );
 }
 
 /**

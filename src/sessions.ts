@@ -36,6 +36,24 @@ const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const PERSIST_PATH =
   process.env.SESSION_PERSIST_PATH || "./data/sessions.json";
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Every session must be an object with a numeric `lastUsed`, whatever the idle
+ * timeout, because the expiry check and GET /v1/sessions read it. A missing
+ * `sessions` or `settings` key and a non-numeric timeout load as before.
+ */
+function isPersistedData(data: unknown): boolean {
+  if (!isObject(data)) return false;
+  if (data.sessions === undefined || data.sessions === null) return true;
+  return (
+    isObject(data.sessions) &&
+    Object.values(data.sessions).every((session) => isObject(session) && typeof session.lastUsed === "number")
+  );
+}
+
 const store = createPersistentStore({
   area: "sessions",
   file: PERSIST_PATH,
@@ -43,7 +61,7 @@ const store = createPersistentStore({
     sessions: Object.fromEntries(sessions),
     settings: { sessionIdleTimeoutMs },
   }),
-  isValid: (data) => typeof data === "object" && data !== null && !Array.isArray(data),
+  isValid: isPersistedData,
 });
 
 /* ------------------------------------------------------------------ */

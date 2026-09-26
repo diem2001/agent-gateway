@@ -1,5 +1,5 @@
 import { log } from "./logging.js";
-import { createPersistentStore } from "./persistence.js";
+import { createPersistentStore, isNamedEntryList } from "./persistence.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */
@@ -26,7 +26,7 @@ const store = createPersistentStore({
   area: "tools",
   file: PERSIST_PATH,
   snapshot: () => Array.from(tools.values()),
-  isValid: Array.isArray,
+  isValid: isNamedEntryList,
 });
 
 /* ------------------------------------------------------------------ */
