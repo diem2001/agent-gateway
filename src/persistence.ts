@@ -189,10 +189,10 @@ export class PersistentStore {
 
   /**
    * Read the state file. Returns the parsed data, or undefined for an empty
-   * start: the file is missing, or it could not be read or parsed. An
-   * unreadable file is moved aside to `<file>.corrupt-<UTC stamp>`; if that
-   * fails, the file stays in place and every later save of this area is
-   * suppressed for the lifetime of the process.
+   * start: the file is missing, or it could not be read, parsed or validated
+   * by `isValid`. Such a file is moved aside to `<file>.corrupt-<UTC stamp>`;
+   * if that fails, the file stays in place and every later save of this area
+   * is suppressed for the lifetime of the process.
    */
   load(): unknown {
     this.suppressed = false;

@@ -70,7 +70,7 @@ A second `SIGTERM`/`SIGINT` skips the rest of the wait. An idle gateway stops wi
 | `1` | At least one area's final save failed or was switched off (see `unreadable-not-preserved` below). An `ERROR persistence … problem=final-save-failed` line names the area. Its file keeps its last complete save; changes since then are lost. | Check `docker logs`, disk space and the permissions of `./agent_home/.claude`. |
 | `137` | Killed by Docker after 10 s. Still possible while a git command blocks the gateway (until MVP-7614 is deployed). The files stay intact; changes from the last moment before the block can be lost. | Nothing for the files. |
 
-**State files and `/health`.** `sessions.json`, `tools.json` and `mcp-servers.json` are saved atomically (a temp file `<file>.tmp-*` in the same directory, then a rename), so a kill, crash or full disk never leaves a half-written file. A file that cannot be read at start is never overwritten. `GET /health` reports problems in two additive fields; its HTTP status stays 200:
+**State files and `/health`.** `sessions.json`, `tools.json` and `mcp-servers.json` are saved atomically (a temp file `<file>.tmp-*` in the same directory, then a rename), so a kill, crash or full disk never leaves a half-written file. A file that cannot be read or used at start is never overwritten. `GET /health` reports problems in two additive fields; its HTTP status stays 200:
 
 ```json
 {
@@ -94,9 +94,9 @@ A second `SIGTERM`/`SIGINT` skips the rest of the wait. An idle gateway stops wi
 
 | `problem` | Meaning | Data at risk | Operator action | Clears when |
 |-----------|---------|--------------|-----------------|-------------|
-| `corrupt-preserved` | The file could not be read or parsed at start. It was moved to `<file>.corrupt-<UTC stamp>` with its bytes unchanged, and the area started empty. | Everything in the copy, until it is restored. | Follow the recovery procedure below. | No `<file>.corrupt-*` exists any more (checked on every `/health` request, no restart needed). |
-| `unreadable-not-preserved` | The file could not be read or parsed and could not be moved aside (usually permissions). The file is left untouched and saves for this area are switched off: API changes still answer success but are lost at the next restart. | Every change to this area since the start. | Fix the cause (usually ownership or permissions of `./agent_home/.claude`), then restart. | The next start loads the file. |
-| `write-failed` | The latest save of this area failed, for example because the disk is full. The previous file is intact. | Changes since the last successful save. | Check disk space and permissions. | The next successful save of this area. |
+| `corrupt-preserved` | The file could not be read or parsed at start, or it held an entry the gateway cannot restore (`null`, a tool or MCP server without a string `name`, a session without a numeric `lastUsed`). It was moved to `<file>.corrupt-<UTC stamp>` with its bytes unchanged, and the area started empty, with none of its entries. | Everything in the copy, until it is restored. | Follow the recovery procedure below. | No `<file>.corrupt-*` exists any more (checked on every `/health` request, no restart needed). |
+| `unreadable-not-preserved` | The file could not be read, parsed or restored and could not be moved aside (usually permissions). The file is left untouched and saves for this area are switched off: API changes still answer success but are lost at the next restart. | Every change to this area since the start. | Fix the cause (usually ownership or permissions of `./agent_home/.claude`), then restart. | The next start loads the file. |
+| `write-failed` | The latest save of this area failed, for example because the disk is full. The previous file is intact. | Changes since the last successful save. | Check disk space and permissions. | The next successful save of this area. A save runs only after a change in this area or at a stop, so after the cause is fixed `degraded` stays until the next change here; a restart also clears it. |
 
 Every problem is also logged, whatever the log level, as one line: `ERROR persistence area=<sessions|tools|mcpServers> problem=<corrupt-preserved|unreadable-not-preserved|write-failed|final-save-failed> file=<path> [preservedAs=<path>] reason=<fixed text> [code=<errno>] (see /health)`. These lines never contain file content.
 
@@ -104,7 +104,7 @@ Every problem is also logged, whatever the log level, as one line: `ERROR persis
 
 1. The container path `/home/node/.claude/<file>` is `./agent_home/.claude/<file>` on the host.
 2. Stop the gateway first (`docker compose stop agent-gateway`). Otherwise its next save overwrites the restored file.
-3. The copy is damaged by definition (for example truncated). To restore it, repair the JSON (cut back to the last complete entry and close the array or object; check with `jq . <copy>`) and copy it over `<file>`. This replaces the changes made in that area since the problem was detected. A copy kept after a read error has its original permissions; fix them first.
+3. The copy is usually damaged (for example truncated), or it holds an entry the gateway cannot restore. To restore it, repair it (cut back to the last complete entry and close the array or object, or fix or remove the entry that is `null`, has no string `name` or, for a session, no numeric `lastUsed`; check with `jq . <copy>`) and copy it over `<file>`. This replaces the changes made in that area since the problem was detected. A copy kept after a read error has its original permissions; fix them first.
 4. Give the restored file `node:node` ownership (`chown 1000:1000 <file>`) and its original mode (for example `chmod 600 mcp-servers.json`).
 5. Move the copy out of `./agent_home/.claude/` or delete it. Only this clears `degraded`.
 6. Start the gateway and confirm: `curl -s http://localhost:3001/health | jq '.persistence, .persistenceIssues'`.
