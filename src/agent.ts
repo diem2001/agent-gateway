@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlock } from "./query.js";
@@ -6,14 +7,17 @@ import type { StreamEvent } from "./event-cache.js";
 import { getAllTools } from "./tools.js";
 import type { WebhookContext } from "./webhook.js";
 import { createToolMcpServer } from "./tool-server.js";
-import { buildMcpServersForSdk, getMcpAllowedToolPatterns } from "./mcp-registry.js";
+import { buildMcpServersForSdk, getEnabledMcpServers, getMcpAllowedToolPatterns } from "./mcp-registry.js";
 import {
   applyMcpCredentialOverrides,
+  selectRegistryServersForRun,
   summarizeOverrideKeys,
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
 import { materializeUserSkills, cleanupUserSkillBundle } from "./user-skills.js";
 import { requestMcpAllowedToolPatterns, type RequestMcpServers } from "./mcp-request-servers.js";
+import { credentialRelay } from "./mcp-credential-relay.js";
+import { createRunLogDir, removeRunLogDirAfterExit, spawnRuntimeWithHandle } from "./sdk-run-logs.js";
 
 export interface QueryParams {
   prompt?: string;
@@ -126,8 +130,27 @@ async function* buildContentMessageStream(
 export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
-  const mcpToolPatterns = getMcpAllowedToolPatterns();
-  const requestMcpToolPatterns = requestMcpAllowedToolPatterns(requestMcpServers);
+  // A registry server with requireUserCredentials is left out of a run without
+  // the user's credential: no SDK entry, no allowed-tool pattern, and a request
+  // server may not take its name (it would otherwise fill the vacated slot).
+  const selection = selectRegistryServersForRun(getEnabledMcpServers(), mcpCredentialOverrides);
+  const omitted = selection.omitted.map((name) => ({ name, reason: "missing_user_credential" }));
+  let runRegistryServers = selection.attached;
+  // Registered http servers are reached only through the credential relay; if it
+  // is not listening they are left out, never connected directly (fail closed).
+  if (!credentialRelay.isListening()) {
+    for (const def of runRegistryServers) if (def.type === "http") omitted.push({ name: def.name, reason: "relay_unavailable" });
+    runRegistryServers = runRegistryServers.filter((def) => def.type !== "http");
+  }
+  for (const { name, reason } of omitted) {
+    log("audit", `mcp.server.omitted serverName=${name} reason=${reason}`);
+  }
+  const omittedServers = omitted.map(({ name }) => name);
+  const runRequestMcpServers = requestMcpServers
+    ? Object.fromEntries(Object.entries(requestMcpServers).filter(([name]) => !omittedServers.includes(name)))
+    : undefined;
+  const mcpToolPatterns = getMcpAllowedToolPatterns(runRegistryServers);
+  const requestMcpToolPatterns = requestMcpAllowedToolPatterns(runRequestMcpServers);
   const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
   const HOME = process.env.HOME || "/home/node";
   const options: Record<string, unknown> = {
@@ -164,18 +187,37 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // webhook-based tools + registered MCP servers. The trusted servers below are
   // assigned AFTER the request servers, so a request can never override the
   // gateway's own webhook tools or a registered server (MVP-6755).
-  const mcpServers: Record<string, unknown> = { ...(requestMcpServers ?? {}) };
+  const mcpServers: Record<string, unknown> = { ...(runRequestMcpServers ?? {}) };
 
   if (registeredTools.length > 0 && webhookContext) {
     mcpServers["agent-gateway-tools"] = createToolMcpServer(registeredTools, webhookContext, clientAuthToken);
   }
 
-  const registeredMcpServers = buildMcpServersForSdk();
+  // The runtime's own log files (they hold MCP connection options) go to a
+  // private per-run directory, deleted once the runtime child has exited.
+  // Created before any relay token, so a failure here cannot leave a token unrevoked.
+  const runLogs = createRunLogDir();
+  let runtimeChild: ChildProcess | null = null;
+  options.env = { ...process.env, ...runLogs.env };
+  options.spawnClaudeCodeProcess = spawnRuntimeWithHandle((child) => {
+    runtimeChild = child;
+  });
+
+  const relayTokens: string[] = [];
+  const registeredMcpServers = buildMcpServersForSdk(runRegistryServers);
   if (registeredMcpServers) {
     const effectiveMcpServers = applyMcpCredentialOverrides(
       registeredMcpServers,
       mcpCredentialOverrides,
     );
+    // The runtime gets a loopback relay URL with a per-run token and no header;
+    // the relay holds this run's URL and header snapshot until the run ends.
+    for (const [name, config] of Object.entries(effectiveMcpServers)) {
+      if (!("type" in config) || config.type !== "http") continue;
+      const { token, url } = credentialRelay.register({ serverName: name, url: config.url, headers: config.headers ?? {} });
+      relayTokens.push(token);
+      effectiveMcpServers[name] = { type: "http", url };
+    }
     Object.assign(mcpServers, effectiveMcpServers);
   }
 
@@ -206,13 +248,13 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     ? buildContentMessageStream(content as ContentBlock[], sessionId)
     : prompt ?? (isPlainTextOnly && content[0].type === "text" ? content[0].text : "");
 
-  const conversation = query({ prompt: promptArg, options });
   let fullResponse = "";
   let resultData: Record<string, unknown> | null = null;
   const pendingTools = new Map<string, { name: string }>();
   const toolTimings = new Map<string, number>();
 
   try {
+  const conversation = query({ prompt: promptArg, options });
   for await (const message of conversation) {
     if (abortController.signal.aborted) break;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -287,8 +329,12 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     } else if (msg.type === "result") { resultData = msg; }
   }
   } finally {
+    // Every end (answer, error, abort): the relay URLs stop working and their
+    // in-flight upstream requests are destroyed.
+    for (const token of relayTokens) credentialRelay.revoke(token);
     // Request-scoped bundle: remove it once this query() call has drained.
     cleanupUserSkillBundle(userSkills.pluginRoot);
+    void removeRunLogDirAfterExit(runLogs.dir, runtimeChild);
   }
 
   return { response: fullResponse, resultData };

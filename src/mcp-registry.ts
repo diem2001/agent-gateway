@@ -26,6 +26,12 @@ export interface McpServerDefinition {
   allowedToolsPattern?: string;
   /** Optional per-user credential form and composition contract. */
   userCredentialSchema?: UserCredentialSchema;
+  /**
+   * When true, the server is attached to a run only if the run's
+   * mcpCredentialOverrides contains an entry for it with a non-empty credential.
+   * Default false: every existing server keeps its current behaviour.
+   */
+  requireUserCredentials?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -178,11 +184,13 @@ export function toSdkConfig(def: McpServerDefinition): SdkMcpServerConfig {
 }
 
 /**
- * Build the mcpServers object for the SDK query options.
+ * Build the mcpServers object for the SDK query options from the given
+ * registry servers (default: every enabled server).
  * Merges registered MCP servers with the existing webhook-tools server.
  */
-export function buildMcpServersForSdk(): Record<string, SdkMcpServerConfig> | null {
-  const enabled = getEnabledMcpServers();
+export function buildMcpServersForSdk(
+  enabled: McpServerDefinition[] = getEnabledMcpServers(),
+): Record<string, SdkMcpServerConfig> | null {
   if (enabled.length === 0) return null;
 
   const result: Record<string, SdkMcpServerConfig> = {};
@@ -193,11 +201,11 @@ export function buildMcpServersForSdk(): Record<string, SdkMcpServerConfig> | nu
 }
 
 /**
- * Get the allowedTools patterns for all enabled MCP servers.
- * Returns patterns like ["mcp__jira__*", "mcp__confluence__*"].
+ * Get the allowedTools patterns for the given registry servers (default: every
+ * enabled server). Returns patterns like ["mcp__jira__*", "mcp__confluence__*"].
  */
-export function getMcpAllowedToolPatterns(): string[] {
-  return getEnabledMcpServers().map(
+export function getMcpAllowedToolPatterns(servers: McpServerDefinition[] = getEnabledMcpServers()): string[] {
+  return servers.map(
     (srv) => srv.allowedToolsPattern || `mcp__${srv.name}__*`,
   );
 }

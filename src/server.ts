@@ -6,6 +6,7 @@ import {
   getLogLevel,
   setLogLevel,
   requestLoggingMiddleware,
+  globalErrorHandler,
   type LogLevel,
 } from "./logging.js";
 import {
@@ -26,6 +27,8 @@ import { loadTools } from "./tools.js";
 import { loadMcpServers } from "./mcp-registry.js";
 import mcpRoutes from "./routes/mcp.js";
 import gitRoutes from "./routes/git.js";
+import { credentialRelay } from "./mcp-credential-relay.js";
+import { stripSdkDebugEnv, sweepRunLogDirs } from "./sdk-run-logs.js";
 import {
   SERVER_REQUEST_TIMEOUT_MS,
   nonUploadBodyDeadline,
@@ -55,6 +58,15 @@ loadSessions();
 // Restore tools and MCP servers from disk
 loadTools();
 loadMcpServers();
+
+// Runtime log files and credentials (MVP-7667): no SDK debug log, no leftover
+// run directories, and the loopback relay every registered http MCP server is
+// reached through. A relay that fails to start leaves those servers out of runs.
+stripSdkDebugEnv();
+sweepRunLogDirs();
+credentialRelay.start().catch((e: unknown) => {
+  log("server", `Credential relay failed to start: ${e instanceof Error ? e.message : String(e)}`);
+});
 
 // Logging middleware (before auth so we log rejected requests too)
 app.use(requestLoggingMiddleware);
@@ -166,30 +178,7 @@ app.put("/v1/settings", (req, res) => {
 /*  Global error handler                                                */
 /* ------------------------------------------------------------------ */
 
-app.use(
-  (
-    err: Error,
-    _req: express.Request,
-    res: express.Response,
-    _next: express.NextFunction,
-  ) => {
-    log("error", err.message);
-    // Honor a client-error status set by body-parser (e.g. 413 PayloadTooLargeError
-    // when a request exceeds the JSON body limit, 400 for malformed JSON) so
-    // over-limit/bad requests are not masked as a generic 500.
-    const bodyErr = err as Error & { status?: number; statusCode?: number; type?: string };
-    const status = bodyErr.status || bodyErr.statusCode;
-    if (typeof status === "number" && status >= 400 && status < 500) {
-      const message =
-        bodyErr.type === "entity.too.large"
-          ? "Request body too large"
-          : "Bad request";
-      res.status(status).json({ error: message });
-      return;
-    }
-    res.status(500).json({ error: "Internal server error" });
-  },
-);
+app.use(globalErrorHandler);
 
 /* ------------------------------------------------------------------ */
 /*  Start server                                                        */

@@ -99,7 +99,8 @@ describe("credential redaction", () => {
           updatedAt: new Date().toISOString(),
         },
         { headers: { Authorization: "Basic USER_X" } },
-        100,
+        // The stub answers 401 at once; a generous deadline keeps a loaded run from reporting a timeout instead.
+        5000,
       ),
     ).rejects.toMatchObject({
       code: "MCP_AUTH_FAILED",
