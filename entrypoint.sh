@@ -80,4 +80,4 @@ else
 fi
 
 echo "[entrypoint] Agent Gateway starting..."
-exec gosu node node /app/dist/server.js
+exec gosu node node --expose-gc /app/dist/server.js

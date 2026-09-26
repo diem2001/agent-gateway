@@ -102,7 +102,7 @@
 
 <article class="wiki-article">
   <h1>Agent Gateway <span>API Reference</span></h1>
-  <p class="wiki-meta">Last updated: 2026-04-03 · Epic: <a href="https://diemit.atlassian.net/browse/MVP-2453">MVP-2453</a> · <a href="https://github.com/diem2001/agent-gateway">GitHub</a></p>
+  <p class="wiki-meta">Last updated: 2026-09-25 · Epic: <a href="https://diemit.atlassian.net/browse/MVP-2453">MVP-2453</a> · <a href="https://github.com/diem2001/agent-gateway">GitHub</a></p>
 
   <p>The Agent Gateway is a standalone REST API service wrapping the <strong>Claude Agent SDK</strong>. It exposes Claude Code's agentic capabilities (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch) over HTTP with <strong>NDJSON streaming</strong>, session management, workspace file CRUD, and automatic retry with exponential backoff.</p>
 
@@ -202,6 +202,7 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>DELETE</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Delete a registered MCP server</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/test</code></td><td>Yes</td><td>Test MCP credentials with tools/list (accepts streamable SSE responses)</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/call</code></td><td>Yes</td><td>Directly execute a registered MCP server's tool (tools/call, no LLM turn)</td></tr>
+      <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/uploads/*</code></td><td>Yes</td><td>Stream a raw file upload to a registered http/sse MCP server's <code>/uploads/*</code> route (no buffering; <a href="#ep-mcp-uploads">details</a>)</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/restart</code></td><td>Yes</td><td>Force fresh SDK reconnect on next query</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers/:name/health</code></td><td>Yes</td><td>Cheap connectivity health probe</td></tr>
     </tbody>
@@ -894,6 +895,67 @@ curl -X PUT http://localhost:3001/v1/settings \
     <p>Error messages are sanitized and never echo submitted header or env values. Auth-middleware rejections (missing/invalid API key) return the plain <code>{ "error": "&lt;message&gt;" }</code> shape (401) before the handler, like every other <code>/v1/*</code> route.</p>
   </div>
 
+  <div class="endpoint-section" id="ep-mcp-uploads">
+    <p>
+      <span class="method-badge post">POST</span>
+      <span class="endpoint-path">/v1/mcp-servers/:name/uploads/*</span>
+      <span class="auth-tag required">Auth Required</span>
+    </p>
+    <p>Streams a raw file upload to a registered <strong>http/sse</strong> MCP server, with a per-call credential. The gateway is a dumb pipe: it does not parse, buffer, store or log the file. Each received chunk is forwarded and dropped; a slow MCP server slows the sender down (backpressure end to end). The request is forwarded as <code>POST &lt;origin of the registered url&gt;/uploads/&lt;target&gt;?&lt;query&gt;</code> and the MCP server's status (200–599) and body come back <strong>verbatim</strong> (for mcp-jira: <code>201 { attachmentId, mediaApiFileId, filename, size }</code> or its own error codes such as <code>401 UPLOAD_UNAUTHENTICATED</code>).</p>
+
+    <h3>Request</h3>
+<pre><code>POST /v1/mcp-servers/jira/uploads/jira/issue/MVP-1?filename=shot.png
+Authorization: Bearer &lt;gateway API key&gt;
+X-MCP-Credential-Headers: &lt;base64 of {"Authorization":"Basic &lt;base64(email:apiToken)&gt;"}&gt;   (optional)
+Content-Type: image/png
+Content-Length: 5242880
+&lt;raw bytes&gt;</code></pre>
+    <ul>
+      <li><strong>Path and query</strong> are taken from the raw request URL and forwarded byte for byte. The target is refused (<code>400 UPLOAD_TARGET_INVALID</code>) when it is empty, has a <code>.</code> or <code>..</code> segment (also as <code>%2e</code>), or contains <code>%2f</code>, <code>%5c</code> or a backslash. Host and port come only from the registration.</li>
+      <li><strong><code>X-MCP-Credential-Headers</code></strong>: one header, canonical base64 of a UTF-8 JSON object of string values (no CR, LF, NUL; no keys that differ only in case). Only <code>Authorization</code> is used, and it must be printable ASCII; it replaces a registered <code>Authorization</code>. The header itself is never forwarded or logged.</li>
+      <li><strong>Forwarded headers</strong>: the override <code>Authorization</code>, the registered static headers (minus <code>Host</code>, <code>Content-Length</code>, <code>Content-Type</code>, <code>Transfer-Encoding</code>, <code>Connection</code>, <code>Keep-Alive</code>, <code>Upgrade</code>, <code>TE</code>, <code>Trailer</code>, <code>Expect</code>, <code>Proxy-*</code>), and the incoming <code>Content-Type</code> / <code>Content-Length</code>. A chunked request is forwarded chunked. Static headers of any http/sse registration therefore also reach <code>&lt;origin&gt;/uploads/</code> (relevant for servers behind a path-routing proxy). The gateway's own Bearer key is never forwarded.</li>
+      <li>The body is never read by the JSON/text parsers, whatever its <code>Content-Type</code>.</li>
+    </ul>
+
+    <h3>Example</h3>
+<pre><code>CREDENTIAL=$(printf '%s' 'user@example.com:&lt;api-token&gt;' | base64 -w0)
+curl -X POST "http://localhost:3001/v1/mcp-servers/jira/uploads/jira/issue/MVP-1?filename=shot.png" \
+  -H "Authorization: Bearer sk-gw-abc123" \
+  -H "Content-Type: image/png" \
+  -H "X-MCP-Credential-Headers: $(printf '{"Authorization":"Basic %s"}' "$CREDENTIAL" | base64 -w0)" \
+  --data-binary @shot.png</code></pre>
+
+    <h3>Error Codes</h3>
+    <p>Checks run in this order, all before any upstream connection. Gateway errors use <code>{ "error": { "code", "message" } }</code>; the MCP server's own answers pass through unchanged.</p>
+    <table class="param-table">
+      <thead>
+        <tr><th>Status</th><th>Code</th><th>Meaning</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>401</td><td>plain <code>{ "error" }</code></td><td>Missing or invalid gateway API key (auth middleware, like every <code>/v1/*</code> route)</td></tr>
+        <tr><td>400</td><td><code>MCP_SERVER_NOT_FOUND</code></td><td>No registered server has this name (same as <code>/call</code>)</td></tr>
+        <tr><td>400</td><td><code>MCP_SERVER_DISABLED</code></td><td>The server is registered but disabled (same as <code>/call</code>)</td></tr>
+        <tr><td>400</td><td><code>MCP_UPLOAD_UNSUPPORTED</code></td><td>The server uses stdio transport; only http/sse servers have an origin to relay to</td></tr>
+        <tr><td>400</td><td><code>MCP_OVERRIDE_INVALID</code></td><td><code>X-MCP-Credential-Headers</code> is repeated, not canonical base64, not a JSON object of strings, or <code>Authorization</code> is not printable ASCII</td></tr>
+        <tr><td>400</td><td><code>UPLOAD_TARGET_INVALID</code></td><td>Empty target, dot segment, encoded slash/backslash or backslash</td></tr>
+        <tr><td>502</td><td><code>UPLOAD_UPSTREAM_FAILED</code></td><td>The MCP server could not be reached (or its registered url is not http/https): nothing was sent</td></tr>
+        <tr><td>502</td><td><code>UPLOAD_UPSTREAM_FAILED</code></td><td>The connection dropped before the MCP server answered: the outcome is unconfirmed, check the target's attachments before retrying</td></tr>
+        <tr><td>502</td><td><code>UPLOAD_UPSTREAM_FAILED</code></td><td>The MCP server answered with a status outside 200–599 (or headers the gateway cannot send): the answer is discarded, the outcome is unconfirmed</td></tr>
+        <tr><td>504</td><td><code>UPLOAD_TIMEOUT</code></td><td>No byte from the sender and none from the MCP server for <code>MCP_UPLOAD_IDLE_TIMEOUT_MS</code> (default 60s); the upstream request is aborted</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Timing, aborts and resources</h3>
+    <ul>
+      <li><code>MCP_UPLOAD_IDLE_TIMEOUT_MS</code> is a no-progress timeout, not an overall deadline: a slow upload completes while it progresses. Node's server-wide <code>requestTimeout</code> is 3600 s; every other route keeps a 300 s deadline for its request body until the gateway has answered.</li>
+      <li>A sender disconnect aborts the upstream request at once. An early answer of the MCP server (before the whole body was sent) stops forwarding and is passed through.</li>
+      <li>Every answer on this route carries <code>Connection: close</code>. When the gateway answers while the sender is still sending (any refusal, including the 401), it discards at most 1 MiB more and closes the connection when the sender closes it or 5 s after the answer.</li>
+      <li>The relay returns to the event loop after every forwarded chunk, so an early answer is read before more is written, even from a fast sender such as curl. mcp-jira refuses a missing credential at once and closes after reading at most 1 MiB more; its answer (for example <code>401 UPLOAD_UNAUTHENTICATED</code>) reaches the sender unchanged. Only an MCP server that resets the connection immediately after an early answer, without reading more of the body, can still surface as 502 "unconfirmed".</li>
+      <li>No size or concurrency cap in the gateway: reqlift's 100 MiB cap applies to reqlift callers only; other key holders are bounded by the MCP server (Jira's attachment limit). Memory stays flat per upload: the test suite asserts a 50 MB relay raises the peak resident memory by less than 10 MB, with <code>node --expose-gc</code> (set in <code>entrypoint.sh</code>) forcing a minor GC every 2 MiB relayed.</li>
+      <li>Nothing is written to disk. The request log line carries the URL (target and file name), never file bytes or the credential; one audit line per relay: <code>mcp.upload.relayed serverName=… status=… bytes=… result=ok|upstream_answer|upstream_failed|timeout|client_aborted</code>.</li>
+    </ul>
+  </div>
+
   <div class="endpoint-section">
     <p>
       <span class="method-badge post">POST</span>
@@ -1466,6 +1528,7 @@ curl http://localhost:3001/health</code></pre>
       <tr><td><code>MCP_SERVERS_PERSIST_PATH</code></td><td><code>/home/node/.claude/mcp-servers.json</code></td><td>External MCP server registry persistence file</td></tr>
       <tr><td><code>MCP_TEST_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-test deadline for <code>POST /v1/mcp-servers/:name/test</code></td></tr>
       <tr><td><code>MCP_CALL_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-call deadline for <code>POST /v1/mcp-servers/:name/call</code></td></tr>
+      <tr><td><code>MCP_UPLOAD_IDLE_TIMEOUT_MS</code></td><td><code>60000</code></td><td>No-progress timeout for one relayed upload (<code>POST /v1/mcp-servers/:name/uploads/*</code>); 504 <code>UPLOAD_TIMEOUT</code> on expiry, no overall deadline</td></tr>
     </tbody>
   </table>
 
@@ -1681,6 +1744,22 @@ curl http://localhost:3001/health</code></pre>
       <div class="seq-from sf-green">Agent SDK</div>
       <div class="seq-msg"><div class="seq-line dashed"></div><span class="seq-label">cache events by queryId</span><div class="seq-arrow">→</div></div>
       <div class="seq-to sf-blue">Event Cache</div>
+    </div>
+    <div class="seq-section">Upload Relay (POST /v1/mcp-servers/:name/uploads/*)</div>
+    <div class="seq-row">
+      <div class="seq-from sf-slate">Client</div>
+      <div class="seq-msg"><div class="seq-line"></div><span class="seq-label">raw bytes + X-MCP-Credential-Headers (parsers skipped)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-amber">Auth</div>
+    </div>
+    <div class="seq-row">
+      <div class="seq-from sf-amber">Upload Relay</div>
+      <div class="seq-msg"><div class="seq-line green"></div><span class="seq-label">stream to &lt;origin&gt;/uploads/* (backpressure, nothing buffered or stored)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-green">MCP Server</div>
+    </div>
+    <div class="seq-row">
+      <div class="seq-from sf-green">MCP Server</div>
+      <div class="seq-msg"><div class="seq-line dashed"></div><span class="seq-label">status + body, verbatim</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-slate">Client</div>
     </div>
   </div>
 

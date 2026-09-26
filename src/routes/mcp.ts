@@ -13,10 +13,21 @@ import { getCredentialTemplateFieldKeys } from "../credential-composer.js";
 import { testMcpServer, McpTestError } from "../mcp-test-client.js";
 import { callMcpTool, McpCallError } from "../mcp-call-client.js";
 import type { McpCredentialOverride } from "../mcp-overrides.js";
+import {
+  UPLOAD_MESSAGES,
+  UPLOAD_ROUTE,
+  isValidUploadTarget,
+  matchUploadPath,
+  parseCredentialHeader,
+  readUploadIdleTimeout,
+  refuseUpload,
+  relayUpload,
+} from "../mcp-upload-relay.js";
 
 const router = Router();
 const MCP_TEST_TIMEOUT_MS = parseInt(process.env.MCP_TEST_TIMEOUT_MS || "10000", 10);
 const MCP_CALL_TIMEOUT_MS = parseInt(process.env.MCP_CALL_TIMEOUT_MS || "10000", 10);
+const MCP_UPLOAD_IDLE_TIMEOUT_MS = readUploadIdleTimeout(process.env.MCP_UPLOAD_IDLE_TIMEOUT_MS);
 
 type SchemaValidationErrorCode =
   | "SCHEMA_FIELD_KEY_DUPLICATE"
@@ -346,6 +357,65 @@ router.post("/v1/mcp-servers/:name/call", async (req: Request, res: Response) =>
     log("audit", `mcp.call.called serverName=${name} tool=${body.tool} result=network_error`);
     res.status(502).json({ error: { code: "MCP_NETWORK_ERROR", message: "MCP transport failure" } });
   }
+});
+
+/* ------------------------------------------------------------------ */
+/*  POST /v1/mcp-servers/:name/uploads/* — streaming upload relay       */
+/* ------------------------------------------------------------------ */
+
+// Same expression as the parser skip and the pre-auth guard (mcp-upload-relay.ts),
+// so the body of every request routed here is still unread.
+router.post(UPLOAD_ROUTE, (req: Request, res: Response) => {
+  const match = matchUploadPath(req.originalUrl);
+  let name: string;
+  try {
+    name = decodeURIComponent(match?.rawName ?? "");
+  } catch {
+    name = match?.rawName ?? "";
+  }
+
+  // Checks run in this order, each before any upstream connection.
+  // 1. Unknown / disabled server: same codes and texts as /call.
+  const srv = getMcpServer(name);
+  if (!srv) {
+    refuseUpload(res, 400, "MCP_SERVER_NOT_FOUND", `${name} is not registered`);
+    return;
+  }
+  if (!srv.enabled) {
+    refuseUpload(
+      res,
+      400,
+      "MCP_SERVER_DISABLED",
+      `${name} is registered but disabled; enable the server before calling its tools`,
+    );
+    return;
+  }
+
+  // 2. Only http/sse servers have an origin to relay to.
+  if (srv.type === "stdio") {
+    refuseUpload(res, 400, "MCP_UPLOAD_UNSUPPORTED", UPLOAD_MESSAGES.unsupported(name));
+    return;
+  }
+
+  // 3. Credential override header; the text never echoes its value.
+  const override = parseCredentialHeader(req);
+  if (!override.ok) {
+    refuseUpload(res, 400, "MCP_OVERRIDE_INVALID", UPLOAD_MESSAGES.overrideInvalid);
+    return;
+  }
+
+  // 4. Target path from the raw URL.
+  if (!match || !isValidUploadTarget(match.target, match.query)) {
+    refuseUpload(res, 400, "UPLOAD_TARGET_INVALID", UPLOAD_MESSAGES.targetInvalid);
+    return;
+  }
+
+  relayUpload(req, res, {
+    srv,
+    match,
+    authorization: override.authorization,
+    idleTimeoutMs: MCP_UPLOAD_IDLE_TIMEOUT_MS,
+  });
 });
 
 /* ------------------------------------------------------------------ */
