@@ -278,6 +278,29 @@ describe("redactUrlCredentials", () => {
     expect(redactUrlCredentials("no credentials: https://host/x git@host:repo")).toBe("no credentials: https://host/x git@host:repo");
   });
 
+  // Tokens are inserted into the URL unencoded, and git echoes a URL it cannot parse as is.
+  const oddTokens = ["ab/SEC+z", "ab cd/SEC", "ab'cd/SEC", 'ab"cd/SEC', "ab@cd/SEC", "50%/SEC", "a+b/SEC", "äö€/SEC", "ab\tcd/SEC", "SEC "];
+  for (const token of oddTokens) {
+    it(`removes a userinfo whose token is ${JSON.stringify(token)} from git's error text`, async () => {
+      const { redactUrlCredentials } = await loadGitExec({});
+      const text = `Cloning into 'r'...\nfatal: unable to access 'https://user:${token}@127.0.0.1:9/x.git/': URL rejected: Port number was not a decimal number`;
+      const redacted = redactUrlCredentials(text);
+      expect(redacted).toBe("Cloning into 'r'...\nfatal: unable to access 'https://***@127.0.0.1:9/x.git/': URL rejected: Port number was not a decimal number");
+    });
+  }
+
+  it("a whole URL value loses everything up to its last '@', line breaks included", async () => {
+    const logging = (await import("../logging.js")) as unknown as { redactUrlValue?: (url: string) => string };
+    const redactUrlValue = (url: string) => {
+      if (!logging.redactUrlValue) throw new Error("logging.redactUrlValue is missing");
+      return logging.redactUrlValue(url);
+    };
+    expect(redactUrlValue("https://user:ab\ncd/SEC@host/r.git")).toBe("https://***@host/r.git");
+    expect(redactUrlValue("https://user:a b'c\"d/e@f@host/r.git")).toBe("https://***@host/r.git");
+    expect(redactUrlValue("git@host:repo")).toBe("git@host:repo");
+    expect(redactUrlValue("https://host/r.git")).toBe("https://host/r.git");
+  });
+
   it("redacts before shortening a long error text; other errors get the same treatment", async () => {
     const mod = await loadGitExec({});
     const secret = "SECRET-LONG-7614";

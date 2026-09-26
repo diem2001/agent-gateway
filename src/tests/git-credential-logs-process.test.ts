@@ -135,6 +135,68 @@ for (const level of ["info", "debug"] as const) {
       expect(gateway.output()).toMatch(/Pull failed/);
       expect(leaks(gateway, seen, [...needlesFor(http.user, http.token), ...needlesFor("user", closedToken)])).toEqual([]);
     });
+
+    // reqlift inserts tokens into the clone URL unencoded, and git echoes a URL it cannot
+    // parse as is. Every token is built from random markers; no marker may appear anywhere.
+    it("token-bearing first clones that fail, with '/', whitespace, quotes, '@', '%', '+' or unicode in the token", async () => {
+      const gateway = await spawnGateway(cleanups, { env: { LOG_LEVEL: level } });
+      const seen: Seen = { replies: [] };
+      const port = await closedPort();
+      const needles: string[] = [];
+      const marker = () => {
+        const value = `SECRET${randomBytes(6).toString("hex").toUpperCase()}`;
+        needles.push(value);
+        return value;
+      };
+      const tokens = [
+        `${marker()}/${marker()}+z`,
+        `${marker()} `,
+        `${marker()} ${marker()}`,
+        `${marker()}\t${marker()}`,
+        `${marker()}'${marker()}/c`,
+        `${marker()}"${marker()}/c`,
+        `${marker()}@${marker()}+z`,
+        `${marker()}%${marker()}/c`,
+        `${marker()}+${marker()}/c`,
+        `${marker()}€ä${marker()}/c`,
+      ];
+      for (const token of tokens) {
+        const reply = await send(gateway, seen, "POST", "/v1/workspace/git/clone", { url: `http://user:${token}@127.0.0.1:${port}/repo.git`, path: "cred-odd" });
+        expect(reply.status, reply.text).toBe(500);
+      }
+      expect(gateway.output()).toMatch(/Clone failed/);
+      expect(leaks(gateway, seen, needles)).toEqual([]);
+    });
+
+    it("a pull that fails on a checkout whose stored origin URL has a token with '/'", async () => {
+      const root = testRoot();
+      const git = realGit();
+      const bare = path.join(root, "remote.git");
+      createBareRepo(git, bare);
+      const gateway = await spawnGateway(cleanups, { env: { LOG_LEVEL: level } });
+      const seen: Seen = { replies: [] };
+      const [a, b] = [`SECRET${randomBytes(6).toString("hex")}`, `SECRET${randomBytes(6).toString("hex")}`];
+      const checkout = path.join(gateway.dirs.projects, "cred-pull-slash");
+      fixtureGit(git, ["clone", "-b", "main", "--", bare, checkout], root);
+      fixtureGit(git, ["remote", "set-url", "origin", `http://user:${a}/${b}@127.0.0.1:${await closedPort()}/repo.git`], checkout);
+      const reply = await send(gateway, seen, "POST", "/v1/workspace/git/pull", { path: "cred-pull-slash", branch: "main" });
+      expect(reply.status, reply.text).toBe(500);
+      expect(gateway.output()).toMatch(/Pull failed/);
+      expect(leaks(gateway, seen, [a, b])).toEqual([]);
+    });
+
+    it("a clone URL whose token holds a line break is refused before git runs", async () => {
+      const gateway = await spawnGateway(cleanups, { env: { LOG_LEVEL: level } });
+      const seen: Seen = { replies: [] };
+      const [a, b] = [`SECRET${randomBytes(6).toString("hex")}`, `SECRET${randomBytes(6).toString("hex")}`];
+      const reply = await send(gateway, seen, "POST", "/v1/workspace/git/clone", {
+        url: `http://user:${a}\n${b}@127.0.0.1:${await closedPort()}/repo.git`,
+        path: "cred-newline",
+      });
+      expect(reply.status).toBe(400);
+      expect(reply.json).toEqual({ error: "Invalid url" });
+      expect(leaks(gateway, seen, [a, b])).toEqual([]);
+    });
   });
 }
 

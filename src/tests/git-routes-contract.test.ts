@@ -246,6 +246,32 @@ describe("git endpoints keep their contract", () => {
     expect(fake.invocations()).toEqual([]);
   });
 
+  it("a url, path, branch or sshKey that is not a string is 400 on clone and pull, and no git process starts", async () => {
+    const bare = bareRemote("types");
+    fixtureCheckout(bare, "contract-types");
+    fake.clearLog();
+    const rows: [Record<string, unknown>, string][] = [
+      [{ url: [bare], path: "contract-types-new" }, "url must be a string"],
+      [{ url: bare, path: ["contract-types-new"] }, "path must be a string"],
+      [{ url: bare, path: "contract-types-new", branch: ["--orphan"] }, "branch must be a string"],
+      [{ url: bare, path: "contract-types-new", sshKey: { key: "x" } }, "sshKey must be a string"],
+    ];
+    for (const [body, error] of rows) expect(await clone(app, body)).toEqual({ status: 400, body: { error } });
+    expect(await pull(app, { path: ["contract-types"] })).toEqual({ status: 400, body: { error: "path must be a string" } });
+    expect(await pull(app, { path: "contract-types", branch: ["--orphan"] })).toEqual({ status: 400, body: { error: "branch must be a string" } });
+    expect(await pull(app, { path: "contract-types", sshKey: 7 })).toEqual({ status: 400, body: { error: "sshKey must be a string" } });
+    expect(fake.invocations()).toEqual([]);
+    expect(fs.existsSync(path.join(PROJECTS, "contract-types-new"))).toBe(false);
+  });
+
+  it("a url with a line break or NUL is 400 Invalid url on clone, and no git process starts", async () => {
+    fake.clearLog();
+    for (const url of ["https://user:ab\ncd@127.0.0.1:9/r.git", "https://user:ab\rcd@127.0.0.1:9/r.git", "https://user:ab\u0000cd@127.0.0.1:9/r.git"]) {
+      expect(await clone(app, { url, path: "contract-bad-url" })).toEqual({ status: 400, body: { error: "Invalid url" } });
+    }
+    expect(fake.invocations()).toEqual([]);
+  });
+
   it("wrong credentials: 500 with git's message and no credentials (clone and pull)", async () => {
     const wrongPassword = httpRemote.wrongAuthUrl.split("@")[0].split(":").pop()!;
     const cloneReply = await clone(app, { url: httpRemote.wrongAuthUrl, path: "contract-wrong-auth" });

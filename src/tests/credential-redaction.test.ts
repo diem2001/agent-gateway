@@ -193,4 +193,26 @@ describe("credential redaction", () => {
     }
     expect(logText).toMatch(/\[res\] POST \/v1\/workspace\/git\/clone 500 .*"url":"https:\/\/\*\*\*@host.invalid\/r.git"/);
   });
+
+  it("redacts git URL credentials whatever characters the token has, and url values that are not strings (MVP-7614)", async () => {
+    const { requestLoggingMiddleware, setLogLevel } = await import("../logging.js");
+    setLogLevel("debug");
+
+    const app = express();
+    app.use(express.json());
+    app.use(requestLoggingMiddleware);
+    app.post("/v1/workspace/git/clone", (req, res) => res.status(500).json({ error: "fatal: failed", url: req.body.url }));
+
+    const tokens = ["ab/SLASHSECRET+z", "SPACESECRET ", "QU'OTE/SECRET", 'DQ"SECRET/x', "AT@SECRET/x", "PCT%SECRET", "UNI€SECRET/ä", "NL\nSECRET"];
+    for (const token of tokens) {
+      await request(app).post("/v1/workspace/git/clone").send({ url: `https://user:${token}@host.invalid/r.git`, path: "r" });
+    }
+    await request(app).post("/v1/workspace/git/clone").send({ url: ["https://user:ARRAYSECRET@host.invalid/r.git"], path: "r" });
+
+    const logText = logs.join("\n");
+    expect(logText.match(/"url":"https:\/\/\*\*\*@host.invalid\/r.git"/g)?.length).toBe(2 * tokens.length);
+    expect(logText).toContain('"url":["https://***@host.invalid/r.git"]');
+    expect(logText).not.toContain("SECRET");
+    expect(logText).not.toContain("user:");
+  });
 });
