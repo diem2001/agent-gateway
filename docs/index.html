@@ -510,7 +510,7 @@ curl -X PUT http://localhost:3001/v1/settings \
 
     <p>Changes the log level at runtime. Valid levels: <code>off</code>, <code>info</code>, <code>debug</code>.</p>
 
-    <p><strong>Credentials in the debug log:</strong> at <code>debug</code> the gateway logs request bodies (first 2000 characters) and response previews (first 500 characters). The whole value of every <code>headers</code> and <code>env</code> key, at any depth, is logged as <code>"[REDACTED]"</code> with the keys visible: <code>mcpServers[*]</code> and <code>mcpCredentialOverrides</code> of <code>POST /v1/query</code>, the <code>/test</code> and <code>/call</code> bodies, and MCP server definitions in registry create/update bodies and in the create/update, detail and list answers. Redaction runs before the cut, so no prefix of a value appears. The API answers themselves are unchanged. <code>text/*</code> request bodies are logged as their length, a non-JSON registry answer is not previewed, and an unparseable JSON body is logged as <code>request body rejected type=&lt;type&gt; status=&lt;code&gt;</code>.</p>
+    <p><strong>Credentials in the debug log:</strong> at <code>debug</code> the gateway logs request bodies (first 2000 characters) and response previews (first 500 characters). The whole value of every <code>headers</code> and <code>env</code> key, at any depth, is logged as <code>"[REDACTED]"</code> with the keys visible: <code>mcpServers[*]</code> and <code>mcpCredentialOverrides</code> of <code>POST /v1/query</code>, the <code>/test</code> and <code>/call</code> bodies, and MCP server definitions in registry create/update bodies and in the create/update, detail and list answers. Every <code>sshKey</code> value is logged as <code>"[REDACTED]"</code> and every string <code>url</code> value without its credentials (<code>scheme://***@host/...</code>), which covers the clone URLs and inline SSH keys of <code>/v1/workspace/git/*</code>. Redaction runs before the cut, so no prefix of a value appears. The API answers themselves are unchanged. <code>text/*</code> request bodies are logged as their length, a non-JSON registry answer is not previewed, and an unparseable JSON body is logged as <code>request body rejected type=&lt;type&gt; status=&lt;code&gt;</code>.</p>
 
     <h3>Request Body</h3>
 <pre><code>{"level": "debug"}</code></pre>
@@ -593,8 +593,19 @@ curl -X PUT http://localhost:3001/v1/settings \
   "commit": "a1b2c3d"
 }</code></pre>
 
+    <h3>Errors</h3>
+    <ul>
+      <li><code>400 {"error": "url is required"}</code>, <code>"path is required"</code>, <code>"Invalid path (must be relative, no traversal)"</code></li>
+      <li><code>400 {"error": "Invalid branch"}</code> &mdash; <code>branch</code> starts with <code>-</code>; nothing is queued and no git process starts</li>
+      <li><code>500 {"error": "&lt;git's message&gt;"}</code> &mdash; git's own error output; any <code>scheme://user:password@</code> appears as <code>scheme://***@</code></li>
+      <li><code>500 {"error": "git &lt;subcommand&gt; timed out after &lt;n&gt; s"}</code> &mdash; a git command exceeded <code>GIT_TIMEOUT_MS</code> (default 120 s)</li>
+    </ul>
+
+    <h3>Queueing</h3>
+    <p>Git runs without blocking the gateway: <code>/health</code> and running streams keep answering. Clone, pull and status requests for the same path run one at a time in arrival order, and a queued request sees the previous one's result (a second first clone of the same path answers <code>"pulled"</code>). At most <code>GIT_MAX_CONCURRENCY</code> (default 3) operations run at once overall; further requests wait in arrival order and are never rejected. Arguments go to git without a shell, so values are used literally.</p>
+
     <h3>Security</h3>
-    <p>SSH keys are written to a temp file with <code>0600</code> permissions and deleted immediately after the git operation. Keys are never persisted on disk.</p>
+    <p>SSH keys are written to a private temp directory (key file <code>0600</code>) only once the request's git operation starts, and deleted immediately after it, whether it succeeded, failed or timed out. Keys are never persisted on disk. Neither the key nor the <code>user:password@</code> part of a URL appears in error text or in the gateway log at any level (a token in a query string is not redacted).</p>
 
     <h3>Example</h3>
 <pre><code>curl -X POST http://localhost:3001/v1/workspace/git/clone \
@@ -637,10 +648,12 @@ curl -X PUT http://localhost:3001/v1/settings \
   -H "Content-Type: application/json" \
   -d '{"path": "my-project"}'</code></pre>
 
-    <p>If <code>branch</code> is supplied, the gateway runs <code>git fetch origin &lt;branch&gt;</code>,
+    <p>If <code>branch</code> is supplied, the gateway runs <code>git fetch origin -- +refs/heads/&lt;branch&gt;:refs/remotes/origin/&lt;branch&gt;</code>,
     switches the local checkout to that branch (creating it from <code>origin/&lt;branch&gt;</code> if needed),
     and ensures upstream tracking before pulling. Without <code>branch</code> the current checkout must
     already track an upstream.</p>
+    <p>Errors, queueing and SSH key handling are the same as for <a href="#ep-git-clone">Git Clone</a>, plus
+    <code>404 {"error": "Not a git repository: &lt;path&gt;"}</code> when the path has no <code>.git</code> directory.</p>
   </div>
 
   <!-- ============================================================ -->
@@ -1538,6 +1551,8 @@ curl http://localhost:3001/health</code></pre>
       <tr><td><code>MCP_TEST_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-test deadline for <code>POST /v1/mcp-servers/:name/test</code></td></tr>
       <tr><td><code>MCP_CALL_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-call deadline for <code>POST /v1/mcp-servers/:name/call</code></td></tr>
       <tr><td><code>MCP_UPLOAD_IDLE_TIMEOUT_MS</code></td><td><code>60000</code></td><td>No-progress timeout for one relayed upload (<code>POST /v1/mcp-servers/:name/uploads/*</code>); 504 <code>UPLOAD_TIMEOUT</code> on expiry, no overall deadline</td></tr>
+      <tr><td><code>GIT_MAX_CONCURRENCY</code></td><td><code>3</code></td><td>Git operations of <code>/v1/workspace/git/*</code> running at once across all repositories; further requests wait in arrival order, none is rejected</td></tr>
+      <tr><td><code>GIT_TIMEOUT_MS</code></td><td><code>120000</code></td><td>Deadline for one git command of <code>/v1/workspace/git/*</code>; on expiry 500 <code>git &lt;subcommand&gt; timed out after &lt;n&gt; s</code></td></tr>
     </tbody>
   </table>
 
@@ -1768,6 +1783,27 @@ curl http://localhost:3001/health</code></pre>
     <div class="seq-row">
       <div class="seq-from sf-green">MCP Server</div>
       <div class="seq-msg"><div class="seq-line dashed"></div><span class="seq-label">status + body, verbatim</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-slate">Client</div>
+    </div>
+    <div class="seq-section">Workspace Git (POST /v1/workspace/git/clone|pull, GET /status)</div>
+    <div class="seq-row">
+      <div class="seq-from sf-slate">Client</div>
+      <div class="seq-msg"><div class="seq-line"></div><span class="seq-label">validate path + branch (400 Invalid branch)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-blue">Repo Turn</div>
+    </div>
+    <div class="seq-row">
+      <div class="seq-from sf-blue">Repo Turn</div>
+      <div class="seq-msg"><div class="seq-line"></div><span class="seq-label">one at a time per path, arrival order; then a global slot (GIT_MAX_CONCURRENCY, FIFO)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-amber">Git Slot</div>
+    </div>
+    <div class="seq-row">
+      <div class="seq-from sf-amber">Git Slot</div>
+      <div class="seq-msg"><div class="seq-line green"></div><span class="seq-label">temp SSH key, git without a shell (own process group, GIT_TIMEOUT_MS)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-green">git</div>
+    </div>
+    <div class="seq-row">
+      <div class="seq-from sf-green">git</div>
+      <div class="seq-msg"><div class="seq-line dashed"></div><span class="seq-label">result or git's message without credentials; event loop never blocked</span><div class="seq-arrow">→</div></div>
       <div class="seq-to sf-slate">Client</div>
     </div>
   </div>
