@@ -2,9 +2,9 @@ import { Router } from "express";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execSync } from "node:child_process";
 import type { Request, Response } from "express";
 import { log } from "../logging.js";
+import { gitErrorText, runGit, withGitSlot, withRepoTurn } from "../git-exec.js";
 
 const router = Router();
 const HOME = process.env.HOME || "/home/node";
@@ -28,49 +28,72 @@ function resolveProjectPath(userPath: string): string | null {
 }
 
 /**
- * Write an SSH key to a temp file, return its path.
- * The caller MUST delete it after use.
+ * A branch starting with "-" would be read as an option by `git checkout`,
+ * where "--" cannot help (it switches checkout to paths). Git itself does not
+ * allow such branch names.
  */
-function writeTempSshKey(sshKey: string): string {
-  const tmpDir = os.tmpdir();
-  const keyPath = path.join(tmpDir, `agw-ssh-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
-  fs.writeFileSync(keyPath, sshKey.trim() + "\n", { mode: 0o600 });
-  return keyPath;
+function isInvalidBranch(branch: unknown): boolean {
+  return typeof branch === "string" && branch.startsWith("-");
 }
 
 /**
- * Build env object with GIT_SSH_COMMAND pointing to a temp key file.
+ * Write an SSH key into a private temp directory (0700, exclusive create) and
+ * return the directory and key path. The caller MUST remove the directory.
  */
-function gitEnvWithSshKey(keyPath: string): Record<string, string> {
+async function writeTempSshKey(sshKey: string): Promise<{ dir: string; keyPath: string }> {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "agw-ssh-"));
+  const keyPath = path.join(dir, "key");
+  try {
+    await fs.promises.writeFile(keyPath, sshKey.trim() + "\n", { flag: "wx", mode: 0o600 });
+  } catch (e) {
+    await removeTempKeyDir(dir);
+    throw e;
+  }
+  return { dir, keyPath };
+}
+
+/**
+ * Build env object with GIT_SSH_COMMAND pointing to a temp key file. The
+ * command is run by a shell, so the path is single-quoted.
+ */
+function gitEnvWithSshKey(keyPath: string): NodeJS.ProcessEnv {
+  const quoted = `'${keyPath.replace(/'/g, `'\\''`)}'`;
   return {
-    ...process.env as Record<string, string>,
-    GIT_SSH_COMMAND: `ssh -i ${keyPath} -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes`,
+    ...process.env,
+    GIT_SSH_COMMAND: `ssh -i ${quoted} -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes`,
   };
 }
 
 /**
- * Safely remove a temp SSH key file.
+ * Safely remove a temp SSH key directory.
  */
-function removeTempKey(keyPath: string): void {
+async function removeTempKeyDir(dir: string): Promise<void> {
   try {
-    fs.unlinkSync(keyPath);
+    await fs.promises.rm(dir, { recursive: true, force: true });
   } catch {
-    log("git", "Warning: failed to remove temp SSH key: " + keyPath);
+    log("git", "Warning: failed to remove temp SSH key directory: " + dir);
   }
 }
 
 /**
- * Run a git command and return stdout.
+ * Run `fn` with a git environment for the SSH key, if one was given. The key
+ * file exists only while `fn` runs, i.e. after the operation got its slot.
  */
-function git(args: string, cwd: string, env?: Record<string, string>): string {
-  return execSync(`git ${args}`, {
-    cwd,
-    env: env || (process.env as Record<string, string>),
-    timeout: 120_000,
-    maxBuffer: 10 * 1024 * 1024,
-  })
-    .toString()
-    .trim();
+async function withSshKey<T>(sshKey: string | undefined, fn: (env?: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
+  if (!sshKey) return fn(undefined);
+  const key = await writeTempSshKey(sshKey);
+  try {
+    return await fn(gitEnvWithSshKey(key.keyPath));
+  } finally {
+    await removeTempKeyDir(key.dir);
+  }
+}
+
+/**
+ * Run a git command (argument array, no shell) and return stdout.
+ */
+function git(args: string[], cwd: string, env?: NodeJS.ProcessEnv): Promise<string> {
+  return runGit(args, cwd, env);
 }
 
 /**
@@ -80,55 +103,64 @@ function git(args: string, cwd: string, env?: Record<string, string>): string {
  * branch" when the working copy was put on a branch that wasn't created with
  * `-u origin/...`.
  */
-function ensureBranchAndUpstream(
+async function ensureBranchAndUpstream(
   repoPath: string,
   branch: string,
-  env?: Record<string, string>,
-): void {
-  // Make sure we have the latest ref for this branch from origin.
-  git(`fetch origin ${branch}`, repoPath, env);
+  env?: NodeJS.ProcessEnv,
+): Promise<void> {
+  // Make sure we have the latest ref for this branch from origin. The explicit
+  // refspec keeps a branch value from acting as a refspec of its own
+  // (`a:refs/heads/x` would otherwise write a local ref).
+  await git(["fetch", "origin", "--", `+refs/heads/${branch}:refs/remotes/origin/${branch}`], repoPath, env);
 
   // Switch (or create) the local branch tracking origin/<branch>.
-  const currentBranch = git("rev-parse --abbrev-ref HEAD", repoPath, env);
+  const currentBranch = await git(["rev-parse", "--abbrev-ref", "HEAD"], repoPath, env);
   if (currentBranch !== branch) {
     let localExists = true;
     try {
-      git(`rev-parse --verify --quiet refs/heads/${branch}`, repoPath, env);
+      await git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], repoPath, env);
     } catch {
       localExists = false;
     }
     if (localExists) {
-      git(`checkout ${branch}`, repoPath, env);
+      await git(["checkout", branch], repoPath, env);
     } else {
-      git(`checkout -b ${branch} origin/${branch}`, repoPath, env);
+      await git(["checkout", "-b", branch, `origin/${branch}`], repoPath, env);
     }
   }
 
   // Set/repair upstream — safe to run even when already correct.
-  git(`branch --set-upstream-to=origin/${branch} ${branch}`, repoPath, env);
+  await git(["branch", `--set-upstream-to=origin/${branch}`, branch], repoPath, env);
 }
 
 /**
  * Get current branch, commit, dirty status for a repo.
  */
-function repoInfo(repoPath: string): {
+async function repoInfo(repoPath: string): Promise<{
   branch: string;
   commit: string;
   dirty: boolean;
   lastCommitDate: string;
-} {
-  const branch = git("rev-parse --abbrev-ref HEAD", repoPath);
-  const commit = git("rev-parse --short HEAD", repoPath);
-  const dirty = git("status --porcelain", repoPath).length > 0;
-  const lastCommitDate = git("log -1 --format=%aI", repoPath);
+}> {
+  const branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], repoPath);
+  const commit = await git(["rev-parse", "--short", "HEAD"], repoPath);
+  const dirty = (await git(["status", "--porcelain"], repoPath)).length > 0;
+  const lastCommitDate = await git(["log", "-1", "--format=%aI"], repoPath);
   return { branch, commit, dirty, lastCommitDate };
 }
+
+/*
+ * Every operation runs inside its repository's turn (same resolved path: one
+ * at a time, in arrival order) and then inside a global slot
+ * (GIT_MAX_CONCURRENCY). Existence checks run inside the turn, so a queued
+ * request sees the result of the operation before it.
+ */
 
 /* ------------------------------------------------------------------ */
 /*  POST /v1/workspace/git/clone                                       */
 /* ------------------------------------------------------------------ */
 
-router.post("/v1/workspace/git/clone", (req: Request, res: Response) => {
+router.post("/v1/workspace/git/clone", async (req: Request, res: Response) => {
   const { url, path: userPath, branch, sshKey } = req.body as {
     url?: string;
     path?: string;
@@ -150,48 +182,48 @@ router.post("/v1/workspace/git/clone", (req: Request, res: Response) => {
     res.status(400).json({ error: "Invalid path (must be relative, no traversal)" });
     return;
   }
-
-  let tempKeyPath: string | null = null;
+  if (isInvalidBranch(branch)) {
+    res.status(400).json({ error: "Invalid branch" });
+    return;
+  }
 
   try {
-    let env: Record<string, string> | undefined;
-    if (sshKey) {
-      tempKeyPath = writeTempSshKey(sshKey);
-      env = gitEnvWithSshKey(tempKeyPath);
-    }
+    const result = await withRepoTurn(targetPath, () =>
+      withGitSlot(() =>
+        withSshKey(sshKey, async (env) => {
+          // If directory already exists with a .git folder, do pull instead.
+          // The caller may have changed the desired branch (or the local branch
+          // may lack upstream tracking) so we have to align the checkout with
+          // `branch` before pulling.
+          if (fs.existsSync(path.join(targetPath, ".git"))) {
+            log("git", "Clone target exists, pulling instead: " + userPath);
+            if (branch) {
+              await ensureBranchAndUpstream(targetPath, branch, env);
+            }
+            await git(["pull"], targetPath, env);
+            const info = await repoInfo(targetPath);
+            log("git", `Pulled ${userPath}: ${info.branch}@${info.commit}`);
+            return { status: "pulled", path: userPath, branch: info.branch, commit: info.commit };
+          }
 
-    // If directory already exists with a .git folder, do pull instead.
-    // The caller may have changed the desired branch (or the local branch
-    // may lack upstream tracking) so we have to align the checkout with
-    // `branch` before pulling.
-    if (fs.existsSync(path.join(targetPath, ".git"))) {
-      log("git", "Clone target exists, pulling instead: " + userPath);
-      if (branch) {
-        ensureBranchAndUpstream(targetPath, branch, env);
-      }
-      git("pull", targetPath, env);
-      const info = repoInfo(targetPath);
-      log("git", `Pulled ${userPath}: ${info.branch}@${info.commit}`);
-      res.json({ status: "pulled", path: userPath, branch: info.branch, commit: info.commit });
-      return;
-    }
+          // Ensure parent directory exists
+          await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
 
-    // Ensure parent directory exists
-    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+          // Clone. "--" keeps a URL such as "--upload-pack=…" from being read as an option.
+          const branchArgs = branch ? ["-b", branch] : [];
+          await git(["clone", ...branchArgs, "--", url, targetPath], WORKSPACE_ROOT, env);
 
-    // Clone
-    const branchArg = branch ? ` -b ${branch}` : "";
-    git(`clone${branchArg} ${url} ${targetPath}`, WORKSPACE_ROOT, env);
-
-    const info = repoInfo(targetPath);
-    log("git", `Cloned ${url} -> ${userPath}: ${info.branch}@${info.commit}`);
-    res.json({ status: "cloned", path: userPath, branch: info.branch, commit: info.commit });
+          const info = await repoInfo(targetPath);
+          log("git", `Cloned ${url} -> ${userPath}: ${info.branch}@${info.commit}`);
+          return { status: "cloned", path: userPath, branch: info.branch, commit: info.commit };
+        }),
+      ),
+    );
+    res.json(result);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
+    const msg = gitErrorText(e);
     log("git", "Clone failed: " + msg);
     res.status(500).json({ error: msg });
-  } finally {
-    if (tempKeyPath) removeTempKey(tempKeyPath);
   }
 });
 
@@ -199,7 +231,7 @@ router.post("/v1/workspace/git/clone", (req: Request, res: Response) => {
 /*  POST /v1/workspace/git/pull                                        */
 /* ------------------------------------------------------------------ */
 
-router.post("/v1/workspace/git/pull", (req: Request, res: Response) => {
+router.post("/v1/workspace/git/pull", async (req: Request, res: Response) => {
   const { path: userPath, branch, sshKey } = req.body as {
     path?: string;
     branch?: string;
@@ -216,40 +248,41 @@ router.post("/v1/workspace/git/pull", (req: Request, res: Response) => {
     res.status(400).json({ error: "Invalid path (must be relative, no traversal)" });
     return;
   }
-
-  if (!fs.existsSync(path.join(targetPath, ".git"))) {
-    res.status(404).json({ error: "Not a git repository: " + userPath });
+  if (isInvalidBranch(branch)) {
+    res.status(400).json({ error: "Invalid branch" });
     return;
   }
 
-  let tempKeyPath: string | null = null;
-
   try {
-    let env: Record<string, string> | undefined;
-    if (sshKey) {
-      tempKeyPath = writeTempSshKey(sshKey);
-      env = gitEnvWithSshKey(tempKeyPath);
+    const result = await withRepoTurn(targetPath, async () => {
+      if (!fs.existsSync(path.join(targetPath, ".git"))) return null;
+      return withGitSlot(() =>
+        withSshKey(sshKey, async (env) => {
+          if (branch) {
+            await ensureBranchAndUpstream(targetPath, branch, env);
+          }
+
+          const beforeCommit = await git(["rev-parse", "HEAD"], targetPath);
+          await git(["pull"], targetPath, env);
+          const afterCommit = await git(["rev-parse", "HEAD"], targetPath);
+
+          const info = await repoInfo(targetPath);
+          const status = beforeCommit === afterCommit ? "up-to-date" : "updated";
+
+          log("git", `Pull ${userPath}: ${status} (${info.branch}@${info.commit})`);
+          return { status, branch: info.branch, commit: info.commit };
+        }),
+      );
+    });
+    if (!result) {
+      res.status(404).json({ error: "Not a git repository: " + userPath });
+      return;
     }
-
-    if (branch) {
-      ensureBranchAndUpstream(targetPath, branch, env);
-    }
-
-    const beforeCommit = git("rev-parse HEAD", targetPath);
-    git("pull", targetPath, env);
-    const afterCommit = git("rev-parse HEAD", targetPath);
-
-    const info = repoInfo(targetPath);
-    const status = beforeCommit === afterCommit ? "up-to-date" : "updated";
-
-    log("git", `Pull ${userPath}: ${status} (${info.branch}@${info.commit})`);
-    res.json({ status, branch: info.branch, commit: info.commit });
+    res.json(result);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
+    const msg = gitErrorText(e);
     log("git", "Pull failed: " + msg);
     res.status(500).json({ error: msg });
-  } finally {
-    if (tempKeyPath) removeTempKey(tempKeyPath);
   }
 });
 
@@ -257,7 +290,7 @@ router.post("/v1/workspace/git/pull", (req: Request, res: Response) => {
 /*  GET /v1/workspace/git/status                                       */
 /* ------------------------------------------------------------------ */
 
-router.get("/v1/workspace/git/status", (req: Request, res: Response) => {
+router.get("/v1/workspace/git/status", async (req: Request, res: Response) => {
   const userPath = req.query.path as string | undefined;
 
   if (!userPath) {
@@ -271,13 +304,15 @@ router.get("/v1/workspace/git/status", (req: Request, res: Response) => {
     return;
   }
 
-  if (!fs.existsSync(path.join(targetPath, ".git"))) {
-    res.json({ exists: false });
-    return;
-  }
-
   try {
-    const info = repoInfo(targetPath);
+    const info = await withRepoTurn(targetPath, async () => {
+      if (!fs.existsSync(path.join(targetPath, ".git"))) return null;
+      return withGitSlot(() => repoInfo(targetPath));
+    });
+    if (!info) {
+      res.json({ exists: false });
+      return;
+    }
     res.json({
       exists: true,
       branch: info.branch,
@@ -286,7 +321,7 @@ router.get("/v1/workspace/git/status", (req: Request, res: Response) => {
       lastCommitDate: info.lastCommitDate,
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
+    const msg = gitErrorText(e);
     log("git", "Status failed: " + msg);
     res.status(500).json({ error: msg });
   }

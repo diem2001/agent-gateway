@@ -48,26 +48,19 @@ process.env.GIT_TIMEOUT_MS = String(TIMEOUT_MS);
 process.env.PATH = `${fake.binDir}${path.delimiter}${process.env.PATH ?? ""}`;
 for (const key of ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]) delete process.env[key];
 
-interface GitExecModule {
-  gitQueueSnapshot: () => { running: number; waiting: number };
-}
-
 interface LoadedApp {
   port: number;
   server: Server;
-  /** The queue module, or null when it does not exist (baseline). */
-  gitExec: GitExecModule | null;
+  /** The queue module instance the router of this app uses. */
+  gitExec: typeof import("../git-exec.js");
 }
-
-// A variable specifier keeps tsc from resolving the module on the baseline, where it does not exist.
-const GIT_EXEC_MODULE = "../git-exec.js";
 
 async function loadApp(maxConcurrency?: string): Promise<LoadedApp> {
   if (maxConcurrency === undefined) delete process.env.GIT_MAX_CONCURRENCY;
   else process.env.GIT_MAX_CONCURRENCY = maxConcurrency;
   vi.resetModules();
   const { default: gitRoutes } = await import("../routes/git.js");
-  const gitExec = (await import(GIT_EXEC_MODULE).catch(() => null)) as GitExecModule | null;
+  const gitExec = await import("../git-exec.js");
   const app = express();
   app.use(express.json());
   app.use(gitRoutes);
@@ -146,12 +139,8 @@ const FAKE_SSH_KEY = [
   "-----END OPENSSH PRIVATE KEY-----",
 ].join("\n");
 
-/** Resolves once `n` requests wait for a global slot (fallback on the baseline: a fixed pause). */
+/** Resolves once `n` requests wait for a global slot. */
 async function waitForWaiting(app: LoadedApp, n: number): Promise<void> {
-  if (!app.gitExec) {
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    return;
-  }
   const started = Date.now();
   while (app.gitExec.gitQueueSnapshot().waiting < n) {
     if (Date.now() - started > 10_000) throw new Error(`fewer than ${n} requests waiting after 10 s`);
@@ -441,10 +430,13 @@ describe("git queues (GIT_MAX_CONCURRENCY = 1)", () => {
       const sampler = setInterval(() => {
         if (!firstDone) keySightings.push(...keyFilesInTmp());
       }, 5);
+      // The second operation on R waits for R's turn, the one on S for the only slot.
       const secondR = clone(app, { url: bareR, path: userR, sshKey: FAKE_SSH_KEY });
-      await waitForWaiting(app, 1);
       const onS = clone(app, { url: bareS, path: userS, sshKey: FAKE_SSH_KEY });
-      await waitForWaiting(app, 2);
+      await waitForWaiting(app, 1);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      // Only the first operation's git has started.
+      expect(fake.invocations()).toHaveLength(1);
       keySightings.push(...keyFilesInTmp());
 
       const firstReply = await first;
