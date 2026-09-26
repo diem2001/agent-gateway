@@ -6,9 +6,10 @@ import type { StreamEvent } from "./event-cache.js";
 import { getAllTools } from "./tools.js";
 import type { WebhookContext } from "./webhook.js";
 import { createToolMcpServer } from "./tool-server.js";
-import { buildMcpServersForSdk, getMcpAllowedToolPatterns } from "./mcp-registry.js";
+import { buildMcpServersForSdk, getEnabledMcpServers, getMcpAllowedToolPatterns } from "./mcp-registry.js";
 import {
   applyMcpCredentialOverrides,
+  selectRegistryServersForRun,
   summarizeOverrideKeys,
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
@@ -126,8 +127,21 @@ async function* buildContentMessageStream(
 export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
-  const mcpToolPatterns = getMcpAllowedToolPatterns();
-  const requestMcpToolPatterns = requestMcpAllowedToolPatterns(requestMcpServers);
+  // A registry server with requireUserCredentials is left out of a run without
+  // the user's credential: no SDK entry, no allowed-tool pattern, and a request
+  // server may not take its name (it would otherwise fill the vacated slot).
+  const { attached: runRegistryServers, omitted: omittedServers } = selectRegistryServersForRun(
+    getEnabledMcpServers(),
+    mcpCredentialOverrides,
+  );
+  for (const serverName of omittedServers) {
+    log("audit", `mcp.server.omitted serverName=${serverName} reason=missing_user_credential`);
+  }
+  const runRequestMcpServers = requestMcpServers
+    ? Object.fromEntries(Object.entries(requestMcpServers).filter(([name]) => !omittedServers.includes(name)))
+    : undefined;
+  const mcpToolPatterns = getMcpAllowedToolPatterns(runRegistryServers);
+  const requestMcpToolPatterns = requestMcpAllowedToolPatterns(runRequestMcpServers);
   const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
   const HOME = process.env.HOME || "/home/node";
   const options: Record<string, unknown> = {
@@ -164,13 +178,13 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // webhook-based tools + registered MCP servers. The trusted servers below are
   // assigned AFTER the request servers, so a request can never override the
   // gateway's own webhook tools or a registered server (MVP-6755).
-  const mcpServers: Record<string, unknown> = { ...(requestMcpServers ?? {}) };
+  const mcpServers: Record<string, unknown> = { ...(runRequestMcpServers ?? {}) };
 
   if (registeredTools.length > 0 && webhookContext) {
     mcpServers["agent-gateway-tools"] = createToolMcpServer(registeredTools, webhookContext, clientAuthToken);
   }
 
-  const registeredMcpServers = buildMcpServersForSdk();
+  const registeredMcpServers = buildMcpServersForSdk(runRegistryServers);
   if (registeredMcpServers) {
     const effectiveMcpServers = applyMcpCredentialOverrides(
       registeredMcpServers,

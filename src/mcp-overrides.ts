@@ -1,4 +1,5 @@
-import type { SdkMcpServerConfig } from "./mcp-registry.js";
+import { validateHeaderName, validateHeaderValue } from "node:http";
+import type { McpServerDefinition, SdkMcpServerConfig } from "./mcp-registry.js";
 import { getMcpServer } from "./mcp-registry.js";
 
 export interface McpCredentialOverride {
@@ -43,11 +44,9 @@ export function validateMcpCredentialOverrides(
         },
       };
     }
-    if (override.headers !== undefined && !isStringRecord(override.headers)) {
-      return { error: { code: "MCP_OVERRIDE_INVALID", message: `${serverName}.headers must be a string map` } };
-    }
-    if (override.env !== undefined && !isStringRecord(override.env)) {
-      return { error: { code: "MCP_OVERRIDE_INVALID", message: `${serverName}.env must be a string map` } };
+    const credentialError = credentialMapsError(override.headers, override.env, `${serverName}.`);
+    if (credentialError) {
+      return { error: { code: "MCP_OVERRIDE_INVALID", message: credentialError } };
     }
   }
 
@@ -112,4 +111,71 @@ function cloneMcpServerConfigs(
 function isStringRecord(value: unknown): value is Record<string, string> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   return Object.values(value).every((entry) => typeof entry === "string");
+}
+
+function isSendableHeader(name: string, value: string): boolean {
+  try {
+    validateHeaderName(name);
+    validateHeaderValue(name, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Checks `headers` and `env` credential maps: both must be string maps, every
+ * header must be one Node can send (token name; no CR, LF, NUL or other invalid
+ * character in the value), and env names and values must hold no NUL (a child
+ * process cannot be started with one). Returns the error message, which never
+ * echoes a value, or null. `label` prefixes the field name, e.g. "jira.".
+ */
+export function credentialMapsError(headers: unknown, env: unknown, label = ""): string | null {
+  if (headers !== undefined) {
+    if (!isStringRecord(headers)) return `${label}headers must be a string map`;
+    for (const [name, value] of Object.entries(headers)) {
+      if (!isSendableHeader(name, value)) return `${label}headers holds a name or value that cannot be sent as an HTTP header`;
+    }
+  }
+  if (env !== undefined) {
+    if (!isStringRecord(env)) return `${label}env must be a string map`;
+    for (const [name, value] of Object.entries(env)) {
+      if (name.length === 0 || name.includes("=") || name.includes("\0") || value.includes("\0")) {
+        return `${label}env holds a name or value that cannot be passed to a process`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Whether a run's override entry carries the user credential a
+ * `requireUserCredentials` server needs: at least one non-empty value for the
+ * transport's target (`headers` for http/sse, `env` for stdio) and, when the
+ * server has a `userCredentialSchema`, a non-empty value for every output key.
+ */
+export function hasUserCredential(def: McpServerDefinition, override: McpCredentialOverride | undefined): boolean {
+  const target = def.type === "stdio" ? "env" : "headers";
+  const values = override?.[target] ?? {};
+  if (!Object.values(values).some((value) => value.length > 0)) return false;
+  const required = (def.userCredentialSchema?.outputs ?? []).filter((output) => output.target === target);
+  return required.every((output) => (values[output.outputKey] ?? "").length > 0);
+}
+
+/**
+ * Splits the enabled registry servers for one run: a server with
+ * `requireUserCredentials: true` is attached only when the run carries its user
+ * credential (see `hasUserCredential`); every other server is attached as before.
+ */
+export function selectRegistryServersForRun(
+  enabled: McpServerDefinition[],
+  overrides: McpCredentialOverrides | undefined,
+): { attached: McpServerDefinition[]; omitted: string[] } {
+  const attached: McpServerDefinition[] = [];
+  const omitted: string[] = [];
+  for (const def of enabled) {
+    if (def.requireUserCredentials === true && !hasUserCredential(def, overrides?.[def.name])) omitted.push(def.name);
+    else attached.push(def);
+  }
+  return { attached, omitted };
 }
