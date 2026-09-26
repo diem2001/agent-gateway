@@ -39,7 +39,7 @@ The Agent Gateway is a stateless HTTP service that bridges REST clients with the
 ## Components
 
 ### server.ts -- Express Application
-Entry point. Configures middleware (JSON and text parsing, skipped for the upload relay path; a 300 s body deadline for every other request until it is answered; request logging; the upload path's pre-auth guard; auth), mounts all routers, and exposes health, logging, session, and settings endpoints directly. The kept `app.listen` handle (`server`) sets `requestTimeout` to 3600 s for the upload relay.
+Entry point. Configures middleware (JSON and text parsing, skipped for the upload relay path; a 300 s body deadline for every other request until it is answered; request logging; the upload path's pre-auth guard; auth), mounts all routers, and exposes health, logging, session, and settings endpoints directly. The kept `app.listen` handle (`server`) sets `requestTimeout` to 3600 s for the upload relay. At startup it also removes `DEBUG_CLAUDE_AGENT_SDK` from the environment (with a warning), sweeps leftover per-run runtime log directories, and starts the credential relay (`mcp-credential-relay.ts`).
 
 ### auth.ts -- API Key Middleware
 Parses `API_KEYS` env var at startup into a `Map<key, label>` for O(1) lookup. Validates `Authorization: Bearer <key>` on all routes except `/health`. Attaches `clientLabel` to the request for audit logging.
@@ -55,7 +55,13 @@ Calls `query()` from `@anthropic-ai/claude-agent-sdk` with configured tools, per
 
 Default tools: `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebSearch`, `WebFetch`.
 
-If registered webhook tools exist, they are wrapped as in-process MCP servers via `createToolMcpServer()` and injected into the SDK query alongside the built-in tools. The webhook context (user_id, session_id, api_key_label) and the client's Bearer token are passed to each webhook call. External MCP servers from the MCP Server Registry are merged into the same `mcpServers` map (per-server credentials applied), so the agent can call their tools directly over the MCP protocol.
+If registered webhook tools exist, they are wrapped as in-process MCP servers via `createToolMcpServer()` and injected into the SDK query alongside the built-in tools. The webhook context (user_id, session_id, api_key_label) and the client's Bearer token are passed to each webhook call. External MCP servers from the MCP Server Registry are merged into the same `mcpServers` map (per-server credentials applied), so the agent can call their tools over the MCP protocol. A registered **http** server reaches the SDK as a credential-relay URL with a per-run token and no headers (see [Credential Relay Flow](#credential-relay-flow)); the tokens are revoked when the run ends. The SDK child environment points the runtime's own log files into a private per-run directory (`sdk-run-logs.ts`), deleted after the runtime child has exited.
+
+### mcp-credential-relay.ts -- Credential Relay
+A `node:http` listener on 127.0.0.1 (ephemeral port, never an Express route). `register()` binds a 128-bit token to a run's upstream URL and header snapshot; `revoke()` ends it and destroys its in-flight upstream requests. Only `POST` and `DELETE` on the exact `/mcp/<token>` path are forwarded; see the flow below for header allowlists and refusal answers.
+
+### sdk-run-logs.ts -- Per-Run Runtime Logs
+Creates the per-run directory (0700, prefix `agent-gateway-run-` under the OS temp directory) and the SDK child environment additions `CLAUDE_CODE_DEBUG_LOGS_DIR=<dir>/debug/run.txt` and `XDG_CACHE_HOME=<dir>/cache`. A `spawnClaudeCodeProcess` hook spawns the runtime like the SDK's default and reports the child; the directory is deleted once the child has exited (after 10 s it is killed first). Also sweeps leftovers at startup (every `agent-gateway-run-*` directory in the OS temp directory, so one gateway per temp directory is assumed, as in the Docker image) and strips `DEBUG_CLAUDE_AGENT_SDK`.
 
 ### sessions.ts -- Session Management
 Maps client-provided session IDs to internal Claude SDK session IDs. Sessions are:
@@ -174,7 +180,7 @@ REST endpoints for the external MCP server registry:
    - `rate_limited` -- rate limit detected, retrying
    - `sdk_status` -- SDK status changes (compacting)
    - `sdk_compact_complete` -- context compaction completed
-9. For registered webhook tools, the in-process MCP server handler POSTs to the webhook URL and returns the result. For external MCP servers, the SDK speaks MCP directly to the upstream service over the configured transport
+9. For registered webhook tools, the in-process MCP server handler POSTs to the webhook URL and returns the result. For registered http MCP servers, the SDK speaks MCP to the credential relay, which forwards to the upstream with the run's headers; stdio, sse and request-supplied servers use their transport directly
 10. Events are written to response stream (NDJSON) and cached
 11. On completion, `done` event emitted with token usage, cost, context stats; SDK session ID synced via `updateSessionSdkId()`
 12. On error, `error` event emitted with message
@@ -276,7 +282,8 @@ buildMcpServersForSdk() merges static registry config with overrides:
     |
     v
 Agent SDK opens MCP transport per server:
-  - http/sse: connects on first tool call, uses merged headers
+  - http:    connects to the credential relay URL (no headers); the relay adds the merged headers
+  - sse:     connects directly, uses merged headers
   - stdio:   spawns command with merged env, talks MCP over stdin/stdout
     |
     v
@@ -287,6 +294,39 @@ Query completes -> overrides discarded; static registry config unchanged on disk
 ```
 
 `POST /v1/mcp-servers/:name/test` runs the same merge logic out-of-band so the operator can validate a credential set before persisting it. The test client accepts both `application/json` and streamable `text/event-stream` MCP responses (MVP-3689).
+
+## Credential Relay Flow
+
+Registered http MCP servers are reached only through the gateway's credential relay (MVP-7667). The runtime never holds their URL or credential, so an upstream refusal cannot start the runtime's MCP OAuth login and header values stay out of its command line and log files.
+
+```
+runQuery (agent.ts)
+    | credentialRelay.register({ serverName, url, headers: static + override }) -> http://127.0.0.1:<port>/mcp/<token>
+    v
+Claude runtime (SDK child)  -- POST/DELETE http://127.0.0.1:<port>/mcp/<token>, no credential
+    v
+relay listener (127.0.0.1, own node:http server)
+    | Host must be 127.0.0.1:<port>; only the exact /mcp/<token> path; anything else (/.well-known/*, /register,
+    | /authorize, /token, sub-paths, unknown or revoked token) -> local 404, never forwarded; GET -> 405
+    | request headers upstream: Accept, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID + bound headers
+    | (a runtime Authorization or Cookie is dropped); POST bodies buffered up to 25 MiB (larger -> JSON-RPC error)
+    v
+upstream MCP server (registered url)
+    | 2xx: streamed back with backpressure; only Content-Type and Mcp-Session-Id are returned
+    | 404 on a request with Mcp-Session-Id: a bodiless 404 (session miss)
+    | 401/403 -> "refused the credential"; 3xx, other non-2xx, unreachable, idle > 120 s -> "unavailable":
+    |   tools/call -> HTTP 200 JSON-RPC result isError:true naming the server
+    |   initialize / list requests -> HTTP 200 JSON-RPC error (the server contributes no tools)
+    |   notifications -> 202; batches -> an array of these answers; DELETE -> 204; no upstream body is echoed
+    v
+run ends (answer, error, abort) -> credentialRelay.revoke(token): the URL answers 404, in-flight upstream requests destroyed
+```
+
+If the relay is not listening, registered http servers are left out of the run (`mcp.server.omitted serverName=<name> reason=relay_unavailable`), and a request-supplied server may not take their name. Every handler is wrapped so that a relay error answers "unavailable" and never ends the gateway process. Audit lines carry the server name and reason only (`mcp.relay.refused serverName=<name> reason=credential_refused|unavailable|body_too_large [status=<code>]`); the URL, path and token are never logged.
+
+Observed with Claude Code 2.0.77: after a session-miss 404 the runtime does not initialize a new session; it reports that tool call as failed, as it does with a direct connection.
+
+Not covered: request-supplied `mcpServers` (per-query servers such as chrome-devtools) and registered `sse` servers keep the direct path; stdio `env` values are passed to the runtime as before. While a run lasts, its relay tokens and stdio env values are in the runtime's `--mcp-config` argument; isolation between concurrent runs is owned by Epic MVP-7676.
 
 ## Upload Relay Flow
 

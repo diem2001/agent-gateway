@@ -14,12 +14,14 @@ import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServerDefinition, UserCredentialSchema } from "../mcp-registry.js";
+import { RELAY_URL, startRecordingUpstream, touchHttpMcpServers, type RecordingUpstream } from "./helpers/relay-upstream.js";
 
 let capturedOptions: Array<Record<string, unknown>> = [];
 let logs: string[] = [];
 let tempDir = "";
+let upstream: RecordingUpstream;
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.resetModules();
   capturedOptions = [];
   logs = [];
@@ -33,17 +35,27 @@ beforeEach(() => {
     query: vi.fn(({ options }) => {
       capturedOptions.push(options as Record<string, unknown>);
       return (async function* () {
+        // The runtime's part: use each registered http server through its relay URL.
+        await touchHttpMcpServers(options as Record<string, unknown>);
         yield { type: "assistant", message: { content: [{ type: "text", text: "ack" }] } };
         yield { type: "result", usage: { input_tokens: 1, output_tokens: 1 }, total_cost_usd: 0, sessionId: "sdk-session" };
       })();
     }),
   }));
+  upstream = await startRecordingUpstream();
+  const { credentialRelay } = await import("../mcp-credential-relay.js");
+  await credentialRelay.start();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  const { credentialRelay } = await import("../mcp-credential-relay.js");
+  await credentialRelay.close();
+  await upstream.close();
   vi.restoreAllMocks();
   vi.doUnmock("@anthropic-ai/claude-agent-sdk");
   delete process.env.MCP_SERVERS_PERSIST_PATH;
+  // The registry persists 100 ms after a change; let that write land before removing its directory.
+  await new Promise((resolve) => setTimeout(resolve, 150));
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -75,8 +87,8 @@ async function register(app: express.Express, name: string, body: Partial<McpSer
 
 /** Registers the flagged `aida` (http) and the unflagged `jira` (http, static header). */
 async function registerAidaAndJira(app: express.Express, aida: Partial<McpServerDefinition> = {}) {
-  await register(app, "aida", { type: "http", url: "http://aida.invalid/mcp", headers: { "X-Static": "s" }, requireUserCredentials: true, ...aida });
-  await register(app, "jira", { type: "http", url: "http://jira.invalid/mcp", headers: { Authorization: "Basic STATIC" } });
+  await register(app, "aida", { type: "http", url: `${upstream.origin}/aida`, headers: { "X-Static": "s" }, requireUserCredentials: true, ...aida });
+  await register(app, "jira", { type: "http", url: `${upstream.origin}/jira`, headers: { Authorization: "Basic STATIC" } });
 }
 
 async function runQuery(app: express.Express, extra: Record<string, unknown> = {}) {
@@ -112,8 +124,9 @@ describe("requireUserCredentials: a flagged server is left out of runs without t
       expect(Object.keys(servers)).not.toContain("aida");
       expect(allowedTools).not.toContain("mcp__aida__*");
       expect(logs.join("\n")).toContain(omittedLine("aida"));
+      expect(upstream.headersAt("/aida")).toEqual([]);
       // The unflagged server is attached as before.
-      expect(servers.jira).toBeDefined();
+      expect(servers.jira).toEqual({ type: "http", url: expect.stringMatching(RELAY_URL) });
       expect(allowedTools).toContain("mcp__jira__*");
     });
   }
@@ -124,7 +137,8 @@ describe("requireUserCredentials: a flagged server is left out of runs without t
 
     const { servers, allowedTools } = await runQuery(app, { mcpCredentialOverrides: { aida: { headers: { Authorization: "Bearer USER_TOKEN" } } } });
 
-    expect(servers.aida).toEqual({ type: "http", url: "http://aida.invalid/mcp", headers: { "X-Static": "s", Authorization: "Bearer USER_TOKEN" } });
+    expect(servers.aida).toEqual({ type: "http", url: expect.stringMatching(RELAY_URL) });
+    expect(upstream.headersAt("/aida")).toEqual([expect.objectContaining({ "x-static": "s", authorization: "Bearer USER_TOKEN" })]);
     expect(allowedTools).toContain("mcp__aida__*");
     expect(logs.join("\n")).not.toContain(omittedLine("aida"));
   });
@@ -139,8 +153,11 @@ describe("requireUserCredentials: a flagged server is left out of runs without t
     const emptyKey = await runQuery(app, { mcpCredentialOverrides: { aida: { headers: { Authorization: "Bearer T", "X-Tenant": "" } } } });
     expect(Object.keys(emptyKey.servers)).not.toContain("aida");
 
+    expect(upstream.headersAt("/aida")).toEqual([]);
+
     const full = await runQuery(app, { mcpCredentialOverrides: { aida: { headers: { Authorization: "Bearer T", "X-Tenant": "acme" } } } });
-    expect(full.servers.aida?.headers).toMatchObject({ Authorization: "Bearer T", "X-Tenant": "acme" });
+    expect(full.servers.aida?.url).toMatch(RELAY_URL);
+    expect(upstream.headersAt("/aida")).toEqual([expect.objectContaining({ authorization: "Bearer T", "x-tenant": "acme" })]);
   });
 
   it("a custom allowedToolsPattern is removed with the server and kept when it is attached", async () => {
@@ -177,19 +194,23 @@ describe("requireUserCredentials: a flagged server is left out of runs without t
 
   it("every server without the flag (absent or false) behaves exactly as before, with and without overrides", async () => {
     const app = await createApp();
-    await register(app, "jira", { type: "http", url: "http://jira.invalid/mcp", headers: { Authorization: "Basic STATIC" } });
-    await register(app, "wiki", { type: "http", url: "http://wiki.invalid/mcp", requireUserCredentials: false });
+    await register(app, "jira", { type: "http", url: `${upstream.origin}/jira`, headers: { Authorization: "Basic STATIC" } });
+    await register(app, "wiki", { type: "http", url: `${upstream.origin}/wiki`, requireUserCredentials: false });
+    await register(app, "local", { type: "stdio", command: "node", args: ["server.js"], env: { TOKEN: "static" } });
 
     const plain = await runQuery(app);
     expect(plain.servers).toEqual({
-      jira: { type: "http", url: "http://jira.invalid/mcp", headers: { Authorization: "Basic STATIC" } },
-      wiki: { type: "http", url: "http://wiki.invalid/mcp" },
+      jira: { type: "http", url: expect.stringMatching(RELAY_URL) },
+      wiki: { type: "http", url: expect.stringMatching(RELAY_URL) },
+      local: { command: "node", args: ["server.js"], env: { TOKEN: "static" } },
     });
-    expect(plain.allowedTools).toEqual(expect.arrayContaining(["mcp__jira__*", "mcp__wiki__*"]));
+    expect(plain.allowedTools).toEqual(expect.arrayContaining(["mcp__jira__*", "mcp__wiki__*", "mcp__local__*"]));
+    expect(upstream.headersAt("/jira").map((h) => h.authorization)).toEqual(["Basic STATIC"]);
+    expect(upstream.headersAt("/wiki").map((h) => h.authorization)).toEqual([undefined]);
 
     const overridden = await runQuery(app, { mcpCredentialOverrides: { jira: { headers: { Authorization: "Basic USER" } } } });
-    expect(overridden.servers.jira.headers).toEqual({ Authorization: "Basic USER" });
-    expect(overridden.servers.wiki).toEqual({ type: "http", url: "http://wiki.invalid/mcp" });
+    expect(overridden.servers.wiki).toEqual({ type: "http", url: expect.stringMatching(RELAY_URL) });
+    expect(upstream.headersAt("/jira").map((h) => h.authorization)).toEqual(["Basic STATIC", "Basic USER"]);
     expect(logs.join("\n")).not.toContain("mcp.server.omitted");
   });
 });

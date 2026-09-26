@@ -89,6 +89,9 @@ src/
   tool-server.ts     # MCP server factory (wraps registered tools for Agent SDK)
   mcp-registry.ts    # External MCP server registry CRUD + persistence (MCP_SERVERS_PERSIST_PATH)
   mcp-upload-relay.ts # Streaming upload relay: raw-path rule, parser skip, pre-auth guard, X-MCP-Credential-Headers, relay core
+  mcp-credential-relay.ts # Loopback relay for registered http MCP servers: per-run token, header allowlists, refusal answers (no OAuth login in the runtime)
+  sdk-run-logs.ts    # Per-run directory for the Claude runtime's log files, deleted after the child exits; startup sweep; DEBUG_CLAUDE_AGENT_SDK strip
+  mcp-overrides.ts   # mcpCredentialOverrides validation, header/env checks, requireUserCredentials attachment rule
   gc-budget.ts       # Minor GC every 2 MiB relayed (needs node --expose-gc, set in entrypoint.sh and npm start)
   routes/
     ssh.ts           # POST /v1/ssh-keys
@@ -103,6 +106,10 @@ src/
     tool-server.test.ts    # MCP server factory tests
     tools.test.ts          # Tool registry unit tests
     webhook.test.ts        # Webhook executor tests
+    sdk-login-guard-process.test.ts # Real-runtime probe: spawned gateway, OAuth-capable MCP stub, scripted Anthropic API (needs `npm run build`)
+    mcp-credential-relay.test.ts    # Credential relay unit tests
+    require-user-credentials.test.ts # requireUserCredentials + header/env validation
+    credential-redaction-rows.test.ts # Debug-log redaction for every credential entry point
   __tests__/
     git.test.ts            # Workspace git endpoints tests
 Dockerfile           # Node 22 + system tools + Claude Code CLI

@@ -7,6 +7,10 @@
  * `__<toolName>` and the conversation has no tool result yet, answer with one
  * `tool_use` of that tool; otherwise answer with the fixed final text. Requests
  * that offer no tools (the runtime's own side requests) get the final text too.
+ *
+ * Modes: "error" answers every agent request (one that offers tools) with an
+ * HTTP 400 API error; "hang-after-tool" never answers an agent request that
+ * carries a tool result, so the run stays open until the client aborts it.
  */
 
 import http from "node:http";
@@ -51,7 +55,10 @@ function blockText(content: unknown): string {
   return "";
 }
 
-export async function startFakeAnthropicApi(options: { toolName: string }): Promise<FakeAnthropicApi> {
+export type FakeApiMode = "normal" | "error" | "hang-after-tool";
+
+export async function startFakeAnthropicApi(options: { toolName: string; mode?: FakeApiMode }): Promise<FakeAnthropicApi> {
+  const mode = options.mode ?? "normal";
   const requests: RecordedMessagesRequest[] = [];
   const sockets = new Set<net.Socket>();
   let toolUseSeq = 0;
@@ -91,6 +98,13 @@ export async function startFakeAnthropicApi(options: { toolName: string }): Prom
       const model = body.model ?? "unknown";
       const stream = body.stream === true;
       requests.push({ model, stream, tools, toolResults });
+
+      if (mode === "error" && tools.length > 0) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "PROBE-7667-API-ERROR" } }));
+        return;
+      }
+      if (mode === "hang-after-tool" && tools.length > 0 && toolResults.length > 0) return;
 
       const target = tools.find((name) => name.endsWith(`__${options.toolName}`));
       type Block = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } | { type: "text"; text: string };

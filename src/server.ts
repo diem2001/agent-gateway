@@ -27,6 +27,8 @@ import { loadTools } from "./tools.js";
 import { loadMcpServers } from "./mcp-registry.js";
 import mcpRoutes from "./routes/mcp.js";
 import gitRoutes from "./routes/git.js";
+import { credentialRelay } from "./mcp-credential-relay.js";
+import { stripSdkDebugEnv, sweepRunLogDirs } from "./sdk-run-logs.js";
 import {
   SERVER_REQUEST_TIMEOUT_MS,
   nonUploadBodyDeadline,
@@ -56,6 +58,15 @@ loadSessions();
 // Restore tools and MCP servers from disk
 loadTools();
 loadMcpServers();
+
+// Runtime log files and credentials (MVP-7667): no SDK debug log, no leftover
+// run directories, and the loopback relay every registered http MCP server is
+// reached through. A relay that fails to start leaves those servers out of runs.
+stripSdkDebugEnv();
+sweepRunLogDirs();
+credentialRelay.start().catch((e: unknown) => {
+  log("server", `Credential relay failed to start: ${e instanceof Error ? e.message : String(e)}`);
+});
 
 // Logging middleware (before auth so we log rejected requests too)
 app.use(requestLoggingMiddleware);

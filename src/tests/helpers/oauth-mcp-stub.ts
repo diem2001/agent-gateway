@@ -25,10 +25,11 @@ export interface OAuthStubOptions {
   /** Size in bytes of the text in a `tools/call` result (default: a short text). */
   toolResultBytes?: number;
   /**
-   * The first non-initialize POST that carries a session id answers 404 once
-   * (an upstream that lost the session), so the client has to initialize again.
+   * The first POST of this JSON-RPC method that carries a session id answers
+   * 404 once (an upstream that lost the session), so the client has to
+   * initialize again.
    */
-  loseSessionOnce?: boolean;
+  loseSessionOn?: string;
 }
 
 export interface OAuthStubRequest {
@@ -147,7 +148,7 @@ export async function startOAuthMcpStub(options: OAuthStubOptions = {}): Promise
     const sessionHeader = headers["mcp-session-id"];
     const sessionId = typeof sessionHeader === "string" ? sessionHeader : undefined;
     const isInitialize = messages.some((m) => m.method === "initialize");
-    if (!isInitialize && sessionId && options.loseSessionOnce && !sessionLost) {
+    if (sessionId && options.loseSessionOn && messages.some((m) => m.method === options.loseSessionOn) && !sessionLost) {
       sessionLost = true;
       sessions.delete(sessionId);
       res.writeHead(404);
