@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { Request, Response } from "express";
-import { log } from "../logging.js";
+import { log, redactUrlCredentials } from "../logging.js";
 import { gitErrorText, runGit, withGitSlot, withRepoTurn } from "../git-exec.js";
 
 const router = Router();
@@ -214,7 +214,7 @@ router.post("/v1/workspace/git/clone", async (req: Request, res: Response) => {
           await git(["clone", ...branchArgs, "--", url, targetPath], WORKSPACE_ROOT, env);
 
           const info = await repoInfo(targetPath);
-          log("git", `Cloned ${url} -> ${userPath}: ${info.branch}@${info.commit}`);
+          log("git", `Cloned ${redactUrlCredentials(url)} -> ${userPath}: ${info.branch}@${info.commit}`);
           return { status: "cloned", path: userPath, branch: info.branch, commit: info.commit };
         }),
       ),

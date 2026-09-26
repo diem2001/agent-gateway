@@ -35,6 +35,18 @@ const REDACTED = "[REDACTED]";
 /** Keys whose whole value is a credential container: MCP `headers` (http/sse) and `env` (stdio). */
 const CREDENTIAL_KEYS = new Set(["headers", "env"]);
 
+/** Keys whose value is a secret by itself: the SSH private key of the git routes. */
+const SECRET_VALUE_KEYS = new Set(["sshKey"]);
+
+/**
+ * Replace the userinfo of every `scheme://user:password@` in `text` with `***`.
+ * The match runs to the last `@` of the authority, so a password that itself
+ * contains `@` leaves no tail behind.
+ */
+export function redactUrlCredentials(text: string): string {
+  return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s'"]*@/gi, "$1***@");
+}
+
 /**
  * Replace the whole value of a `headers`/`env` key: a map keeps its keys with
  * "[REDACTED]" values, any other shape becomes "[REDACTED]".
@@ -51,14 +63,19 @@ function redactCredentialValue(value: unknown): unknown {
  * A copy of a parsed JSON value for the log, with every `headers` and `env` key
  * redacted at any depth. This covers `mcpServers[*]` and `mcpCredentialOverrides`
  * of POST /v1/query, the /test and /call bodies, and registry definitions in
- * request and response bodies. The original value is never changed.
+ * request and response bodies. Every `sshKey` value becomes "[REDACTED]" and
+ * every string `url` value loses its URL credentials (the git routes' clone URL
+ * can carry an access token). The original value is never changed.
  */
 export function redactCredentialsForLog(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactCredentialsForLog);
   if (!value || typeof value !== "object") return value;
   const copy: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    copy[key] = CREDENTIAL_KEYS.has(key) ? redactCredentialValue(entry) : redactCredentialsForLog(entry);
+    if (CREDENTIAL_KEYS.has(key)) copy[key] = redactCredentialValue(entry);
+    else if (SECRET_VALUE_KEYS.has(key)) copy[key] = entry === undefined ? undefined : REDACTED;
+    else if (key === "url" && typeof entry === "string") copy[key] = redactUrlCredentials(entry);
+    else copy[key] = redactCredentialsForLog(entry);
   }
   return copy;
 }

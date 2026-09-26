@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
-import { log } from "./logging.js";
+import { log, redactUrlCredentials } from "./logging.js";
+
+export { redactUrlCredentials };
 
 /* ------------------------------------------------------------------ */
 /*  Non-blocking git execution with per-repository and global queues    */
@@ -25,15 +27,6 @@ function positiveIntFromEnv(name: string, fallback: number): number {
 export const GIT_TIMEOUT_MS = positiveIntFromEnv("GIT_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
 /** Git operations that may run at the same time across all repositories. Read once at startup. */
 export const GIT_MAX_CONCURRENCY = positiveIntFromEnv("GIT_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY);
-
-/**
- * Replace the userinfo of every `scheme://user:password@` in `text` with `***`.
- * The match runs to the last `@` of the authority, so a password that itself
- * contains `@` leaves no tail behind.
- */
-export function redactUrlCredentials(text: string): string {
-  return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s'"]*@/gi, "$1***@");
-}
 
 /** Redacted first, then shortened: no prefix of a credential can survive the cut. */
 function safeErrorText(text: string): string {
