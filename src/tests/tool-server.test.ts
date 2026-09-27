@@ -93,6 +93,37 @@ describe("createToolMcpServer", () => {
     expect(server1.instance).not.toBe(server2.instance);
   });
 
+  it("tools/list advertises the registered property type and description (JSON-RPC, MVP-7697)", async () => {
+    const { createToolMcpServer } = await import("../tool-server.js");
+    const described: ToolDefinition = {
+      ...TOOL,
+      input_schema: { type: "object", properties: { city: { type: "string", description: "City name" } }, required: ["city"] },
+    };
+    const server = createToolMcpServer([described], CONTEXT);
+
+    const responses = new Map<number, unknown>();
+    const transport = {
+      onmessage: undefined as ((message: unknown) => void) | undefined,
+      async start() {},
+      async close() {},
+      async send(message: { id?: number; result?: unknown }) {
+        if (message.id !== undefined) responses.set(message.id, message.result);
+      },
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await server.instance.connect(transport as any);
+    transport.onmessage!({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    transport.onmessage!({ jsonrpc: "2.0", method: "notifications/initialized" });
+    transport.onmessage!({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    await vi.waitFor(() => expect(responses.has(2)).toBe(true));
+
+    const [listed] = (responses.get(2) as { tools: { name: string; description: string; inputSchema: Record<string, unknown> }[] }).tools;
+    expect(listed.name).toBe("weather");
+    expect(listed.description).toBe("Get weather for a city");
+    expect(listed.inputSchema.properties).toEqual({ city: { type: "string", description: "City name" } });
+    expect(listed.inputSchema.required).toEqual(["city"]);
+  });
+
   it("returns empty tool list server when no tools provided", async () => {
     const { createToolMcpServer } = await import("../tool-server.js");
     const server = createToolMcpServer([], CONTEXT);

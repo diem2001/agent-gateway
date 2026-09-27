@@ -1132,11 +1132,42 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       </thead>
       <tbody>
         <tr><td><code>description</code></td><td>string</td><td>Yes</td><td>Human-readable description of what the tool does</td></tr>
-        <tr><td><code>input_schema</code></td><td>object</td><td>Yes</td><td>JSON Schema describing the tool's input parameters (must have a <code>type</code> field)</td></tr>
+        <tr><td><code>input_schema</code></td><td>object</td><td>Yes</td><td>JSON Schema describing the tool's input parameters (must have a <code>type</code> field). This is what the model is told about the arguments; see <em>How input_schema is used</em> below</td></tr>
         <tr><td><code>webhook_url</code></td><td>string</td><td>Yes</td><td>URL to POST to when the agent invokes this tool</td></tr>
         <tr><td><code>timeout_ms</code></td><td>number</td><td>No</td><td>Webhook timeout in milliseconds (default: <code>30000</code>)</td></tr>
       </tbody>
     </table>
+
+    <h3>How input_schema is used</h3>
+
+    <p>The model receives each declared field's type, whether it is required, and its description. The gateway validates every call against the same schema before the webhook is called. Registration never fails because of an unsupported construct.</p>
+
+    <table class="param-table">
+      <thead>
+        <tr><th>Registered construct</th><th>Model sees</th><th>Call that violates it</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>type</code>: <code>string</code>, <code>number</code>, <code>integer</code>, <code>boolean</code></td><td>Same type (<code>integer</code> stays <code>integer</code>)</td><td>Rejected before the webhook</td></tr>
+        <tr><td><code>enum</code> (string/number values)</td><td>Same values</td><td>Rejected before the webhook</td></tr>
+        <tr><td><code>type: object</code> with <code>properties</code> / <code>required</code></td><td>Nested fields, required list and descriptions</td><td>Rejected before the webhook; undeclared nested keys are passed through</td></tr>
+        <tr><td><code>type: array</code> with one <code>items</code> schema</td><td>Array with the item schema</td><td>Rejected before the webhook</td></tr>
+        <tr><td><code>required</code></td><td>Exactly the registered names</td><td>Missing field rejected before the webhook</td></tr>
+        <tr><td><code>description</code></td><td>Same text</td><td>&mdash;</td></tr>
+        <tr><td><code>additionalProperties</code></td><td>Ignored</td><td>Unchanged: undeclared top-level arguments are dropped before the webhook</td></tr>
+        <tr><td>Anything else (<code>format</code>, <code>pattern</code>, bounds, <code>oneOf</code>/<code>anyOf</code>/<code>$ref</code>, <code>default</code>, <code>nullable</code>, malformed keywords, nesting deeper than 32 levels)</td><td>That field only: any value, with its description and required status</td><td>Any value accepted; the webhook validates it</td></tr>
+      </tbody>
+    </table>
+
+    <p>Values are never converted or defaulted: a valid call reaches the webhook unchanged. For a rejected call the model receives a tool error (<code>isError: true</code>) whose text names the field path and the expectation, for example:</p>
+<pre><code>MCP error -32602: Input validation error: Invalid arguments for tool lookup-customer: [
+  {
+    "expected": "string",
+    "code": "invalid_type",
+    "path": ["email"],
+    "message": "Invalid input: expected string, received number"
+  }
+]</code></pre>
+    <p>Webhooks keep their own validation; their error responses still reach the model as <code>Tool webhook returned error: &lt;status&gt; &lt;body&gt;</code>. A schema the gateway cannot convert makes that tool alone accept any value for every declared field (logged as <code>tools.schema.untyped_fallback</code>). The field names <code>__proto__</code> and a top-level <code>constructor</code> are never advertised, because they cannot reach the webhook.</p>
 
     <h3>Response (201 Created / 200 OK)</h3>
 <pre><code>{

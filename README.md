@@ -334,6 +334,8 @@ Express Server (auth middleware)
 
 External tools can be registered via the `/v1/tools` endpoints. Each tool defines a `webhook_url` that is called when the agent invokes the tool. Registered tools are wrapped as in-process MCP servers and injected into the Claude Agent SDK alongside the built-in tools.
 
+The tool's `input_schema` is what the model is told about its arguments: field types (`string`, `number`, `integer`, `boolean`, `object`, `array`), `enum` values, nested `properties`/`required`, array `items` and every `description` are passed through. The gateway rejects a call that violates them before the webhook is called; the model gets a tool error naming the field and the expected type, so it can correct itself. Unsupported JSON Schema constructs (`format`, `pattern`, `oneOf`, numeric bounds, ...) make that property alone accept any value, so registration never fails because of them. Values are never converted or defaulted, undeclared top-level arguments are still dropped, and webhooks keep their own validation. Details: [docs/architecture.md](docs/architecture.md#tool-input-schemats----webhook-tool-input-schemas).
+
 When the agent calls a registered tool, the gateway POSTs to the webhook URL with:
 
 ```json
