@@ -119,7 +119,7 @@ src/
     git-exec.test.ts                # Git runner and queue unit tests
     git-routes-contract.test.ts     # Git endpoint contract, queue, injection rows (fake git on PATH)
     git-nonblocking-process.test.ts # Spawned gateway stays responsive during slow git (needs `npm run build`)
-    git-credential-logs-process.test.ts # No token or SSH key in git error text or logs at info/debug (needs `npm run build`)
+    git-credential-logs-process.test.ts # No http(s) URL token or SSH key in git error text or logs at info/debug (needs `npm run build`)
   __tests__/
     git.test.ts            # Workspace git endpoints tests
 Dockerfile           # Node 22 + system tools + Claude Code CLI
