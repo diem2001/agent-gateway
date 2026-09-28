@@ -385,7 +385,10 @@ UploadRelay -------- node:http(s) request to <origin>/uploads/<target>?<query>
     |                  (fresh connection, never pooled, never retried)
     |  each sender chunk: write upstream, drop it, yield to the event loop
     |    (setImmediate; after drain when upstream is full) so an early answer
-    |    is read before the next write
+    |    is normally read before the next write
+    |  a write that fails because the MCP server reset the connection first
+    |    (EPIPE/ECONNRESET, no answer yet): stop forwarding, keep reading for
+    |    at most ANSWER_AFTER_RESET_MS (1 s) for an answer that already arrived
     |  every 2 MiB: minor GC (gc-budget.ts, needs --expose-gc)
     |  idle timer: reset by every request chunk and every answer chunk
     v
@@ -397,10 +400,10 @@ MCP server answer -> status (200-599) + Content-Type + Content-Length + body, ve
 **Exits:**
 
 - The MCP server answers after the whole body: its answer is streamed back and the relay ends (`ok` for 2xx, `upstream_answer` otherwise).
-- The MCP server answers early (while the body still streams): forwarding stops, the answer is passed through, and the sender connection is closed after a bounded drain (at most 1 MiB read, closed when the sender closes or 5 s after the answer).
+- The MCP server answers early (while the body still streams): forwarding stops, the answer is passed through, and the sender connection is closed after a bounded drain (at most 1 MiB read, closed when the sender closes or 5 s after the answer). This also holds when the MCP server resets the connection right after its answer (mcp-jira closes with unread body data) and the reset reaches the gateway before the answer was read: the failed write does not destroy the socket at once. Forwarding stops, the socket keeps reading for at most `ANSWER_AFTER_RESET_MS`, and the answer is passed through. Node marks a socket's readable side errored when a write fails, so `keepReadingAfterWriteReset` wraps the socket's `destroy()` and clears `_readableState.errored`; if that is not possible, the socket is destroyed at once (502 unconfirmed).
 - Connection refused, DNS failure, bad registration url or an invalid registered header value: `502 UPLOAD_UPSTREAM_FAILED`, nothing sent.
 - The MCP server answers with a status outside 200–599 (Node's client accepts any three digits; `writeHead` would throw below 100, which would end the process) or with headers `writeHead` refuses: the answer is discarded, the upstream request destroyed, and the sender gets `502 UPLOAD_UPSTREAM_FAILED`, outcome unconfirmed.
-- The upstream connection drops before an answer: `502 UPLOAD_UPSTREAM_FAILED`, outcome unconfirmed. It drops after the answer's status line: the sender connection is destroyed (the status can no longer change).
+- The upstream connection drops before an answer: `502 UPLOAD_UPSTREAM_FAILED`, outcome unconfirmed (after a failed write, as soon as the next read reports the reset, at the latest `ANSWER_AFTER_RESET_MS` later; a 1xx is not an answer). It drops after the answer's status line: the sender connection is destroyed (the status can no longer change).
 - No progress for `MCP_UPLOAD_IDLE_TIMEOUT_MS`: the upstream request is aborted and the sender gets `504 UPLOAD_TIMEOUT` (unconfirmed wording when the whole body was already sent), or the connection is destroyed if the answer had started.
 - The sender disconnects: the upstream request is destroyed at once, before the multipart trailer, so mcp-jira stores nothing.
 
