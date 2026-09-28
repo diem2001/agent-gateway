@@ -614,6 +614,9 @@ describe("failure behavior", () => {
     expect(body.error.code).toBe("UPLOAD_UPSTREAM_FAILED");
     expect(body.error.message).toContain("unconfirmed");
     expect(logs.join("\n")).toContain("result=upstream_failed");
+    // Waiting for an answer after a write-side reset is bounded.
+    const { ANSWER_AFTER_RESET_MS } = await import("../mcp-upload-relay.js");
+    expect(result.finishedAt - upstream.requests[0].abortedAt!).toBeLessThan(ANSWER_AFTER_RESET_MS + 1500);
   }, 15_000);
 
   it("MCP server answers early while a 50 MB body still streams → the sender gets that answer verbatim", async () => {
