@@ -2,9 +2,32 @@ import { describe, expect, it } from "vitest";
 import {
   applyMcpCredentialOverride,
   applyMcpCredentialOverrides,
+  hasUserCredential,
+  selectRegistryServersForRun,
   summarizeOverrideKeys,
 } from "../mcp-overrides.js";
-import type { SdkMcpServerConfig } from "../mcp-registry.js";
+import type { McpServerDefinition, SdkMcpServerConfig } from "../mcp-registry.js";
+
+function perUserServer(overrides: Partial<McpServerDefinition> = {}): McpServerDefinition {
+  return {
+    name: "aida",
+    description: "",
+    enabled: true,
+    type: "http",
+    url: "http://aida-sim:8080/mcp",
+    requireUserCredentials: true,
+    createdAt: "2026-09-28T00:00:00.000Z",
+    updatedAt: "2026-09-28T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function headerSchema(outputKey: string): McpServerDefinition["userCredentialSchema"] {
+  return {
+    fields: [{ key: "token", label: "Token", type: "password", required: true }],
+    outputs: [{ target: "headers", outputKey, template: "Bearer {token}" }],
+  };
+}
 
 describe("MCP credential overrides", () => {
   it("shallow-merges HTTP headers with override keys winning", () => {
@@ -91,3 +114,56 @@ describe("MCP credential overrides", () => {
     ).toEqual(["headers.Authorization", "env.TOKEN"]);
   });
 });
+
+describe("requireUserCredentials header output keys (MVP-7763)", () => {
+  const casings = ["Authorization", "authorization", "AUTHORIZATION"];
+
+  it.each(casings)("a headers output key %s is satisfied by an Authorization header", (outputKey) => {
+    const def = perUserServer({ userCredentialSchema: headerSchema(outputKey) });
+    expect(hasUserCredential(def, { headers: { Authorization: "Bearer USER_X" } })).toBe(true);
+  });
+
+  it.each(casings)("selectRegistryServersForRun attaches the server for output key %s", (outputKey) => {
+    const def = perUserServer({ userCredentialSchema: headerSchema(outputKey) });
+    expect(selectRegistryServersForRun([def], { aida: { headers: { Authorization: "Bearer USER_X" } } })).toEqual({
+      attached: [def],
+      omitted: [],
+    });
+  });
+
+  it("is not satisfied by an empty duplicate header that differs only by case", () => {
+    const def = perUserServer({ userCredentialSchema: headerSchema("Authorization") });
+    const override = { headers: { Authorization: "Bearer USER_X", authorization: "" } };
+    expect(hasUserCredential(def, override)).toBe(false);
+    expect(selectRegistryServersForRun([def], { aida: override })).toEqual({ attached: [], omitted: ["aida"] });
+  });
+
+  it("is not satisfied by an empty Authorization header alone", () => {
+    const def = perUserServer({ userCredentialSchema: headerSchema("Authorization") });
+    expect(hasUserCredential(def, { headers: { Authorization: "", "X-Other": "1" } })).toBe(false);
+  });
+
+  it("is not satisfied when no header matches the output key in any casing", () => {
+    const def = perUserServer({ userCredentialSchema: headerSchema("authorization") });
+    expect(hasUserCredential(def, { headers: { "X-Api-Key": "KEY" } })).toBe(false);
+  });
+
+  it("keeps env output keys case-sensitive for stdio servers", () => {
+    const def = perUserServer({
+      type: "stdio",
+      url: undefined,
+      command: "node",
+      userCredentialSchema: {
+        fields: [{ key: "token", label: "Token", type: "password", required: true }],
+        outputs: [{ target: "env", outputKey: "API_TOKEN", template: "{token}" }],
+      },
+    });
+    expect(hasUserCredential(def, { env: { api_token: "USER_X" } })).toBe(false);
+    expect(hasUserCredential(def, { env: { API_TOKEN: "USER_X" } })).toBe(true);
+    expect(selectRegistryServersForRun([def], { aida: { env: { api_token: "USER_X" } } })).toEqual({
+      attached: [],
+      omitted: ["aida"],
+    });
+  });
+});
+

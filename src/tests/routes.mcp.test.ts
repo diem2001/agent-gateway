@@ -175,3 +175,71 @@ describe("PUT /v1/mcp-servers/:name userCredentialSchema", () => {
     expect(res.body.error.code).toBe("SCHEMA_FIELD_TYPE_INVALID");
   });
 });
+
+describe("PUT /v1/mcp-servers/:name name rule for new entries (MVP-7763)", () => {
+  const NAME_ERROR = {
+    code: "MCP_SERVER_NAME_INVALID",
+    message: "Use 1–32 letters, digits, '-' or '_', starting with a letter or digit.",
+  };
+  const httpBody = { type: "http", url: "http://aida-sim:8080/mcp", requireUserCredentials: true };
+
+  it.each(["Ask Aida (AI-Admin)", "a.b", "a".repeat(33), "-aida", "_aida"])(
+    "refuses to create %j with 400 MCP_SERVER_NAME_INVALID and stores nothing",
+    async (name) => {
+      const app = await createApp();
+      const res = await request(app).put(`/v1/mcp-servers/${encodeURIComponent(name)}`).send(httpBody);
+
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: NAME_ERROR });
+      expect((await request(app).get(`/v1/mcp-servers/${encodeURIComponent(name)}`)).status).toBe(404);
+      expect((await request(app).get("/v1/mcp-servers")).body.servers).toEqual([]);
+    },
+  );
+
+  it("checks the name before any other validation", async () => {
+    const app = await createApp();
+    const res = await request(app).put("/v1/mcp-servers/a.b").send({});
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: NAME_ERROR });
+  });
+
+  it.each(["aida", "a".repeat(32), "A1_b-2", "9x"])("creates %j", async (name) => {
+    const app = await createApp();
+    const res = await request(app).put(`/v1/mcp-servers/${name}`).send(httpBody);
+    expect(res.status).toBe(201);
+    expect(res.body.name).toBe(name);
+  });
+
+  it("still updates and deletes a legacy entry whose name fails the rule", async () => {
+    const legacy = "Ask Aida (AI-Admin)";
+    const { registerMcpServer } = await import("../mcp-registry.js");
+    registerMcpServer({
+      name: legacy,
+      description: "created before the name rule",
+      enabled: true,
+      type: "http",
+      url: "http://aida-sim:8080/mcp",
+      requireUserCredentials: true,
+      createdAt: "2026-09-01T00:00:00.000Z",
+      updatedAt: "2026-09-01T00:00:00.000Z",
+    });
+    const app = await createApp();
+    const path = `/v1/mcp-servers/${encodeURIComponent(legacy)}`;
+
+    const update = await request(app)
+      .put(path)
+      .send({ ...httpBody, enabled: false, description: "switched off" });
+    expect(update.status).toBe(200);
+    expect(update.body).toMatchObject({
+      name: legacy,
+      enabled: false,
+      description: "switched off",
+      createdAt: "2026-09-01T00:00:00.000Z",
+    });
+
+    const del = await request(app).delete(path);
+    expect(del.status).toBe(204);
+    expect((await request(app).get(path)).status).toBe(404);
+  });
+});
+
