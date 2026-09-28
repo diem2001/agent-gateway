@@ -152,14 +152,24 @@ export function credentialMapsError(headers: unknown, env: unknown, label = ""):
  * Whether a run's override entry carries the user credential a
  * `requireUserCredentials` server needs: at least one non-empty value for the
  * transport's target (`headers` for http/sse, `env` for stdio) and, when the
- * server has a `userCredentialSchema`, a non-empty value for every output key.
+ * server has a `userCredentialSchema`, a value for every output key.
+ *
+ * Header names are case-insensitive in HTTP, so a `headers` output key matches
+ * override headers in any casing; it is satisfied only when at least one header
+ * matches and every matching header is non-empty (an empty duplicate that
+ * differs only by case makes the credential ambiguous). `env` keys are exact.
  */
 export function hasUserCredential(def: McpServerDefinition, override: McpCredentialOverride | undefined): boolean {
   const target = def.type === "stdio" ? "env" : "headers";
   const values = override?.[target] ?? {};
   if (!Object.values(values).some((value) => value.length > 0)) return false;
   const required = (def.userCredentialSchema?.outputs ?? []).filter((output) => output.target === target);
-  return required.every((output) => (values[output.outputKey] ?? "").length > 0);
+  if (target === "env") return required.every((output) => (values[output.outputKey] ?? "").length > 0);
+  return required.every((output) => {
+    const key = output.outputKey.toLowerCase();
+    const matches = Object.entries(values).filter(([name]) => name.toLowerCase() === key);
+    return matches.length > 0 && matches.every(([, value]) => value.length > 0);
+  });
 }
 
 /**

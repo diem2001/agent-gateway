@@ -41,6 +41,15 @@ interface SchemaValidationError {
   message: string;
 }
 
+/**
+ * Name rule for NEW registry entries. The Agent SDK builds tool names as
+ * `mcp__<server>__<tool>` without shortening them, so the cap stays at 32.
+ * Existing entries are never refused because of their name, so an
+ * administrator can still edit, switch off or delete an entry created earlier.
+ */
+const MCP_SERVER_NAME_RULE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
+const MCP_SERVER_NAME_INVALID_MESSAGE = "Use 1–32 letters, digits, '-' or '_', starting with a letter or digit.";
+
 const FIELD_TYPES = new Set(["text", "password", "url", "email"]);
 const OUTPUT_TARGETS = new Set(["headers", "env"]);
 
@@ -139,6 +148,12 @@ function validateUserCredentialSchema(
 router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
   const name = String(req.params.name);
   const body = req.body as Partial<McpServerDefinition>;
+  const existing = getMcpServer(name);
+
+  if (!existing && !MCP_SERVER_NAME_RULE.test(name)) {
+    res.status(400).json({ error: { code: "MCP_SERVER_NAME_INVALID", message: MCP_SERVER_NAME_INVALID_MESSAGE } });
+    return;
+  }
 
   if (!body.type || !["http", "sse", "stdio"].includes(body.type)) {
     res.status(400).json({ error: 'type is required and must be "http", "sse", or "stdio"' });
@@ -178,7 +193,6 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     return;
   }
 
-  const existing = getMcpServer(name);
   const now = new Date().toISOString();
 
   const def: McpServerDefinition = {
