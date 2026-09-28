@@ -1,6 +1,5 @@
-import fs from "node:fs";
-import path from "node:path";
 import { log } from "./logging.js";
+import { createPersistentStore, isNamedEntryList } from "./persistence.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */
@@ -26,6 +25,12 @@ export interface McpServerDefinition {
   allowedToolsPattern?: string;
   /** Optional per-user credential form and composition contract. */
   userCredentialSchema?: UserCredentialSchema;
+  /**
+   * When true, the server is attached to a run only if the run's
+   * mcpCredentialOverrides contains an entry for it with a non-empty credential.
+   * Default false: every existing server keeps its current behaviour.
+   */
+  requireUserCredentials?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -73,44 +78,34 @@ const servers = new Map<string, McpServerDefinition>();
 const PERSIST_PATH =
   process.env.MCP_SERVERS_PERSIST_PATH || "./data/mcp-servers.json";
 
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
+const store = createPersistentStore({
+  area: "mcpServers",
+  file: PERSIST_PATH,
+  snapshot: () => Array.from(servers.values()),
+  isValid: isNamedEntryList,
+});
 
 /* ------------------------------------------------------------------ */
 /*  Persistence                                                         */
 /* ------------------------------------------------------------------ */
 
 export function loadMcpServers(): void {
-  try {
-    if (fs.existsSync(PERSIST_PATH)) {
-      const raw = fs.readFileSync(PERSIST_PATH, "utf-8");
-      const data: McpServerDefinition[] = JSON.parse(raw);
-      for (const srv of data) {
-        servers.set(srv.name, srv);
-      }
-      log("mcp", `Loaded ${servers.size} MCP server(s) from disk`);
-    }
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    log("mcp", `Failed to load MCP servers: ${msg}`);
+  const data = store.load() as McpServerDefinition[] | undefined;
+  if (!data) return;
+  for (const srv of data) {
+    servers.set(srv.name, srv);
   }
+  log("mcp", `Loaded ${servers.size} MCP server(s) from disk`);
 }
 
+/** Debounced atomic save (src/persistence.ts). */
 function persistMcpServers(): void {
-  if (persistTimer) return;
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    try {
-      const dir = path.dirname(PERSIST_PATH);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      const data = Array.from(servers.values());
-      fs.writeFileSync(PERSIST_PATH, JSON.stringify(data, null, 2));
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      log("mcp", `Failed to persist MCP servers: ${msg}`);
-    }
-  }, 100);
+  store.schedule();
+}
+
+/** Save the MCP server registry now; false when the save failed or is suppressed. */
+export function flushMcpServers(): boolean {
+  return store.flush();
 }
 
 /* ------------------------------------------------------------------ */
@@ -178,11 +173,13 @@ export function toSdkConfig(def: McpServerDefinition): SdkMcpServerConfig {
 }
 
 /**
- * Build the mcpServers object for the SDK query options.
+ * Build the mcpServers object for the SDK query options from the given
+ * registry servers (default: every enabled server).
  * Merges registered MCP servers with the existing webhook-tools server.
  */
-export function buildMcpServersForSdk(): Record<string, SdkMcpServerConfig> | null {
-  const enabled = getEnabledMcpServers();
+export function buildMcpServersForSdk(
+  enabled: McpServerDefinition[] = getEnabledMcpServers(),
+): Record<string, SdkMcpServerConfig> | null {
   if (enabled.length === 0) return null;
 
   const result: Record<string, SdkMcpServerConfig> = {};
@@ -193,11 +190,11 @@ export function buildMcpServersForSdk(): Record<string, SdkMcpServerConfig> | nu
 }
 
 /**
- * Get the allowedTools patterns for all enabled MCP servers.
- * Returns patterns like ["mcp__jira__*", "mcp__confluence__*"].
+ * Get the allowedTools patterns for the given registry servers (default: every
+ * enabled server). Returns patterns like ["mcp__jira__*", "mcp__confluence__*"].
  */
-export function getMcpAllowedToolPatterns(): string[] {
-  return getEnabledMcpServers().map(
+export function getMcpAllowedToolPatterns(servers: McpServerDefinition[] = getEnabledMcpServers()): string[] {
+  return servers.map(
     (srv) => srv.allowedToolsPattern || `mcp__${srv.name}__*`,
   );
 }

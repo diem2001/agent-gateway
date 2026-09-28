@@ -12,7 +12,7 @@ import {
 import { getCredentialTemplateFieldKeys } from "../credential-composer.js";
 import { testMcpServer, McpTestError } from "../mcp-test-client.js";
 import { callMcpTool, McpCallError } from "../mcp-call-client.js";
-import type { McpCredentialOverride } from "../mcp-overrides.js";
+import { credentialMapsError, type McpCredentialOverride } from "../mcp-overrides.js";
 import {
   UPLOAD_MESSAGES,
   UPLOAD_ROUTE,
@@ -43,11 +43,6 @@ interface SchemaValidationError {
 
 const FIELD_TYPES = new Set(["text", "password", "url", "email"]);
 const OUTPUT_TARGETS = new Set(["headers", "env"]);
-
-function isStringRecord(value: unknown): value is Record<string, string> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  return Object.values(value).every((entry) => typeof entry === "string");
-}
 
 function schemaError(code: SchemaValidationErrorCode, message: string): SchemaValidationError {
   return { code, message };
@@ -166,6 +161,23 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     return;
   }
 
+  const credentialError = credentialMapsError(body.headers, body.env);
+  if (credentialError) {
+    res.status(400).json({ error: credentialError });
+    return;
+  }
+
+  if (body.requireUserCredentials !== undefined && typeof body.requireUserCredentials !== "boolean") {
+    res.status(400).json({ error: "requireUserCredentials must be a boolean" });
+    return;
+  }
+
+  // The credential relay cannot cover SSE (its endpoint event may name another upstream URL).
+  if (body.requireUserCredentials === true && body.type === "sse") {
+    res.status(400).json({ error: "requireUserCredentials is not supported for sse transport" });
+    return;
+  }
+
   const existing = getMcpServer(name);
   const now = new Date().toISOString();
 
@@ -181,6 +193,8 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     env: body.env,
     allowedToolsPattern: body.allowedToolsPattern,
     userCredentialSchema: body.userCredentialSchema,
+    // Stored and returned only when sent.
+    ...(body.requireUserCredentials !== undefined ? { requireUserCredentials: body.requireUserCredentials } : {}),
     createdAt: existing?.createdAt || now,
     updatedAt: now,
   };
@@ -236,12 +250,9 @@ router.post("/v1/mcp-servers/:name/test", async (req: Request, res: Response) =>
   }
 
   const body = (req.body ?? {}) as McpCredentialOverride;
-  if (body.headers !== undefined && !isStringRecord(body.headers)) {
-    res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: "headers must be a string map" } });
-    return;
-  }
-  if (body.env !== undefined && !isStringRecord(body.env)) {
-    res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: "env must be a string map" } });
+  const credentialError = credentialMapsError(body.headers, body.env);
+  if (credentialError) {
+    res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: credentialError } });
     return;
   }
 
@@ -311,7 +322,7 @@ router.post("/v1/mcp-servers/:name/call", async (req: Request, res: Response) =>
   }
 
   // 4. Credential override validation: credentials.headers / credentials.env
-  //    (if present) must be string maps → 400 MCP_OVERRIDE_INVALID. `credentials`
+  //    (if present) must be string maps of sendable values → 400 MCP_OVERRIDE_INVALID. `credentials`
   //    is the per-server override VALUE (McpCredentialOverride), not a keyed map.
   const credentials = (body.credentials ?? {}) as McpCredentialOverride;
   if (body.credentials !== undefined) {
@@ -319,12 +330,9 @@ router.post("/v1/mcp-servers/:name/call", async (req: Request, res: Response) =>
       res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: "credentials must be an object" } });
       return;
     }
-    if (credentials.headers !== undefined && !isStringRecord(credentials.headers)) {
-      res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: "credentials.headers must be a string map" } });
-      return;
-    }
-    if (credentials.env !== undefined && !isStringRecord(credentials.env)) {
-      res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: "credentials.env must be a string map" } });
+    const credentialError = credentialMapsError(credentials.headers, credentials.env, "credentials.");
+    if (credentialError) {
+      res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: credentialError } });
       return;
     }
   }

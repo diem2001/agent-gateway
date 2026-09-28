@@ -1,10 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServerDefinition } from "../mcp-registry.js";
+import { RELAY_URL, postJsonRpc, startRecordingUpstream, type RecordingUpstream } from "./helpers/relay-upstream.js";
 
 let sdkOptions: Array<Record<string, unknown>> = [];
 let releaseQueries: Array<() => void> = [];
+let upstream: RecordingUpstream | null = null;
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.resetModules();
   sdkOptions = [];
   releaseQueries = [];
@@ -18,6 +20,17 @@ beforeEach(() => {
       })();
     }),
   }));
+  upstream = await startRecordingUpstream();
+  const { credentialRelay } = await import("../mcp-credential-relay.js");
+  await credentialRelay.start();
+});
+
+afterEach(async () => {
+  const { credentialRelay } = await import("../mcp-credential-relay.js");
+  await credentialRelay.close();
+  await upstream?.close();
+  upstream = null;
+  vi.doUnmock("@anthropic-ai/claude-agent-sdk");
 });
 
 async function registerServer(def: Partial<McpServerDefinition> & Pick<McpServerDefinition, "name" | "type">) {
@@ -44,7 +57,7 @@ describe("request-scoped MCP override isolation", () => {
     await registerServer({
       name: "jira",
       type: "http",
-      url: "http://127.0.0.1:3002/mcp",
+      url: `${upstream!.origin}/mcp`,
       headers: { Authorization: "Basic STATIC" },
     });
     const { runQuery } = await import("../agent.js");
@@ -66,13 +79,22 @@ describe("request-scoped MCP override isolation", () => {
 
     await waitForSdkCalls(2);
     expect(sdkOptions).toHaveLength(2);
+    const firstMcp = sdkOptions[0].mcpServers as Record<string, { url: string; headers?: Record<string, string> }>;
+    const secondMcp = sdkOptions[1].mcpServers as Record<string, { url: string; headers?: Record<string, string> }>;
+    expect(firstMcp.jira).toEqual({ type: "http", url: expect.stringMatching(RELAY_URL) });
+    expect(secondMcp.jira).toEqual({ type: "http", url: expect.stringMatching(RELAY_URL) });
+
+    // While both runs overlap, each relay URL carries its own run's override, in either order.
+    expect(await postJsonRpc(secondMcp.jira.url)).toBe(200);
+    expect(await postJsonRpc(firstMcp.jira.url)).toBe(200);
+    expect(upstream!.headersAt("/mcp").map((h) => h.authorization)).toEqual(["Basic USER_B", "Basic USER_A"]);
+
     releaseQueries.forEach((release) => release());
     await Promise.all([first, second]);
 
-    const firstMcp = sdkOptions[0].mcpServers as Record<string, { headers: Record<string, string> }>;
-    const secondMcp = sdkOptions[1].mcpServers as Record<string, { headers: Record<string, string> }>;
-    expect(firstMcp.jira.headers.Authorization).toBe("Basic USER_A");
-    expect(secondMcp.jira.headers.Authorization).toBe("Basic USER_B");
+    // Both runs ended: their relay URLs are revoked.
+    expect(await postJsonRpc(firstMcp.jira.url)).toBe(404);
+    expect(await postJsonRpc(secondMcp.jira.url)).toBe(404);
     expect(JSON.stringify(getEnabledMcpServers())).toBe(before);
   });
 });

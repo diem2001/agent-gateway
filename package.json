@@ -9,7 +9,8 @@
     "start": "node --expose-gc dist/server.js",
     "dev": "tsx watch src/server.ts",
     "test": "vitest run --exclude 'src/tests/e2e-*'",
-    "test:e2e": "vitest run src/tests/e2e-*.test.ts"
+    "test:e2e": "vitest run src/tests/e2e-*.test.ts",
+    "probe:docker-stop": "node scripts/docker-stop-probe.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.2",

@@ -159,7 +159,7 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><th>Method</th><th>Path</th><th>Auth</th><th>Description</th></tr>
     </thead>
     <tbody>
-      <tr><td><strong>GET</strong></td><td><code>/health</code></td><td>No</td><td>Health check</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/health</code></td><td>No</td><td>Health check, including state-file problems (<code>persistence</code>, <code>persistenceIssues</code>)</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/query</code></td><td>Yes</td><td>Run agent query (NDJSON stream)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/query/:queryId/events</code></td><td>Yes</td><td>Replay/resume event stream</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/sessions</code></td><td>Yes</td><td>List active sessions</td></tr>
@@ -218,18 +218,51 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <span class="auth-tag none">No Auth</span>
     </p>
 
-    <p>Returns server status, version, uptime, and active session count.</p>
+    <p>Returns server status, version, uptime, active session count, and whether the three state files (<code>sessions.json</code>, <code>tools.json</code>, <code>mcp-servers.json</code>) are being saved normally. The HTTP status is always 200 and <code>status</code> stays <code>"ok"</code>; <code>persistence</code> and <code>persistenceIssues</code> are additive.</p>
 
     <h3>Response</h3>
 <pre><code>{
   "status": "ok",
   "version": "0.1.0",
   "uptime": 3600,
-  "sessions": 2
+  "sessions": 2,
+  "persistence": "ok",
+  "persistenceIssues": []
 }</code></pre>
 
+    <h3>Response (degraded)</h3>
+<pre><code>{
+  "status": "ok",
+  "version": "0.1.0",
+  "uptime": 1,
+  "sessions": 0,
+  "persistence": "degraded",
+  "persistenceIssues": [
+    {
+      "area": "mcpServers",
+      "problem": "corrupt-preserved",
+      "file": "/home/node/.claude/mcp-servers.json",
+      "preservedAs": ["/home/node/.claude/mcp-servers.json.corrupt-20260926T213634Z"]
+    }
+  ]
+}</code></pre>
+
+    <p><code>persistence</code> is <code>"ok"</code> exactly when <code>persistenceIssues</code> is empty. <code>area</code> is <code>sessions</code>, <code>tools</code> or <code>mcpServers</code>; several entries may be listed, also for the same area. <code>preservedAs</code> is present only for <code>corrupt-preserved</code>. The compose healthcheck only checks for a 2xx status, so the container stays healthy while degraded: monitoring must read <code>persistence</code>.</p>
+
+    <table>
+      <thead>
+        <tr><th><code>problem</code></th><th>Meaning</th><th>Data at risk</th><th>Operator action</th><th>Clears when</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>corrupt-preserved</code></td><td>The file could not be read or parsed at start, or it held an entry the gateway cannot restore (<code>null</code>, a tool or MCP server without a string <code>name</code>, a session without a numeric <code>lastUsed</code>). It was moved to <code>&lt;file&gt;.corrupt-&lt;UTC stamp&gt;</code> with its bytes unchanged; the area started empty, with none of its entries.</td><td>Everything in the copy, until restored.</td><td>Follow the <a href="#state-recovery">recovery procedure</a>.</td><td>No <code>&lt;file&gt;.corrupt-*</code> exists any more (checked on every request, no restart needed).</td></tr>
+        <tr><td><code>unreadable-not-preserved</code></td><td>The file could not be read, parsed or restored and could not be moved aside (usually permissions). It is left untouched and saves for the area are switched off: API changes still answer success but are lost at the next restart.</td><td>Every change to the area since the start.</td><td>Fix the cause (usually ownership or permissions of <code>./agent_home/.claude</code>), then restart.</td><td>The next start loads the file.</td></tr>
+        <tr><td><code>write-failed</code></td><td>The latest save of the area failed (for example, disk full). The previous file is intact.</td><td>Changes since the last successful save.</td><td>Check disk space and permissions.</td><td>The next successful save of the area. A save runs only after a change in the area or at a stop, so after the cause is fixed <code>degraded</code> stays until the next change there; a restart also clears it.</td></tr>
+      </tbody>
+    </table>
+
     <h3>Example</h3>
-<pre><code>curl http://localhost:3001/health</code></pre>
+<pre><code>curl http://localhost:3001/health
+curl -s http://localhost:3001/health | jq .persistence</code></pre>
   </div>
 
   <!-- ============================================================ -->
@@ -510,6 +543,8 @@ curl -X PUT http://localhost:3001/v1/settings \
 
     <p>Changes the log level at runtime. Valid levels: <code>off</code>, <code>info</code>, <code>debug</code>.</p>
 
+    <p><strong>Credentials in the debug log:</strong> at <code>debug</code> the gateway logs request bodies (first 2000 characters) and response previews (first 500 characters). The whole value of every <code>headers</code> and <code>env</code> key, at any depth, is logged as <code>"[REDACTED]"</code> with the keys visible: <code>mcpServers[*]</code> and <code>mcpCredentialOverrides</code> of <code>POST /v1/query</code>, the <code>/test</code> and <code>/call</code> bodies, and MCP server definitions in registry create/update bodies and in the create/update, detail and list answers. Every <code>sshKey</code> value is logged as <code>"[REDACTED]"</code> and every string under a <code>url</code> key without its credentials (<code>scheme://***@host/...</code>, everything up to the last <code>@</code>), which covers the clone URLs and inline SSH keys of <code>/v1/workspace/git/*</code>. Redaction runs before the cut, so no prefix of a value appears. The API answers themselves are unchanged. <code>text/*</code> request bodies are logged as their length, a non-JSON registry answer is not previewed, and an unparseable JSON body is logged as <code>request body rejected type=&lt;type&gt; status=&lt;code&gt;</code>.</p>
+
     <h3>Request Body</h3>
 <pre><code>{"level": "debug"}</code></pre>
 
@@ -591,8 +626,21 @@ curl -X PUT http://localhost:3001/v1/settings \
   "commit": "a1b2c3d"
 }</code></pre>
 
+    <h3>Errors</h3>
+    <ul>
+      <li><code>400 {"error": "url is required"}</code>, <code>"path is required"</code>, <code>"Invalid path (must be relative, no traversal)"</code></li>
+      <li><code>400 {"error": "Invalid branch"}</code> &mdash; <code>branch</code> starts with <code>-</code>; nothing is queued and no git process starts</li>
+      <li><code>400 {"error": "Invalid url"}</code> &mdash; <code>url</code> contains a line break or NUL; nothing is queued and no git process starts</li>
+      <li><code>400 {"error": "&lt;field&gt; must be a string"}</code> &mdash; <code>url</code>, <code>path</code>, <code>branch</code> or <code>sshKey</code> is present but not a string (pull: <code>path</code>, <code>branch</code>, <code>sshKey</code>); nothing is queued and no git process starts</li>
+      <li><code>500 {"error": "&lt;git's message&gt;"}</code> &mdash; git's own error output with URL credentials hidden: on each line, everything from the first <code>scheme://</code> to the last <code>@</code> appears as <code>***</code>, so the <code>user:password@</code> part of an <code>http://</code> or <code>https://</code> URL stays hidden whatever characters the token contains (a host or path on the same line may be hidden too). <code>ssh://</code>, <code>git://</code> and <code>file://</code> URLs do not use passwords, and ssh or git may repeat their <code>user:password</code> part in a form this redaction does not catch.</li>
+      <li><code>500 {"error": "git &lt;subcommand&gt; timed out after &lt;n&gt; s"}</code> &mdash; a git command exceeded <code>GIT_TIMEOUT_MS</code> (default 120 s)</li>
+    </ul>
+
+    <h3>Queueing</h3>
+    <p>Git runs without blocking the gateway: <code>/health</code> and running streams keep answering. Clone, pull and status requests for the same path run one at a time in arrival order, and a queued request sees the previous one's result (a second first clone of the same path answers <code>"pulled"</code>). At most <code>GIT_MAX_CONCURRENCY</code> (default 3) operations run at once overall; further requests wait in arrival order and are never rejected. Arguments go to git without a shell, so values are used literally.</p>
+
     <h3>Security</h3>
-    <p>SSH keys are written to a temp file with <code>0600</code> permissions and deleted immediately after the git operation. Keys are never persisted on disk.</p>
+    <p>SSH keys are written to a private temp directory (key file <code>0600</code>) only once the request's git operation starts, and deleted immediately after it, whether it succeeded, failed or timed out. Keys are never persisted on disk. The key never appears in error text or in the gateway log. The <code>user:password@</code> part of an <code>http://</code> or <code>https://</code> URL does not appear in error text or in the gateway log at any level, whatever characters the token contains, including <code>/</code>, whitespace, quotes and <code>@</code> (a token in a query string is not redacted). <code>ssh://</code>, <code>git://</code> and <code>file://</code> transports do not use URL passwords; ssh or git may echo such a URL's <code>user:password</code> part (for example <code>Could not resolve hostname user:&lt;password&gt;</code>) where the redaction cannot see it, so put tokens only into <code>http(s)://</code> URLs.</p>
 
     <h3>Example</h3>
 <pre><code>curl -X POST http://localhost:3001/v1/workspace/git/clone \
@@ -635,10 +683,12 @@ curl -X PUT http://localhost:3001/v1/settings \
   -H "Content-Type: application/json" \
   -d '{"path": "my-project"}'</code></pre>
 
-    <p>If <code>branch</code> is supplied, the gateway runs <code>git fetch origin &lt;branch&gt;</code>,
+    <p>If <code>branch</code> is supplied, the gateway runs <code>git fetch origin -- +refs/heads/&lt;branch&gt;:refs/remotes/origin/&lt;branch&gt;</code>,
     switches the local checkout to that branch (creating it from <code>origin/&lt;branch&gt;</code> if needed),
     and ensures upstream tracking before pulling. Without <code>branch</code> the current checkout must
     already track an upstream.</p>
+    <p>Errors, queueing and SSH key handling are the same as for <a href="#ep-git-clone">Git Clone</a>, plus
+    <code>404 {"error": "Not a git repository: &lt;path&gt;"}</code> when the path has no <code>.git</code> directory.</p>
   </div>
 
   <!-- ============================================================ -->
@@ -831,7 +881,7 @@ curl -X PUT http://localhost:3001/v1/settings \
       </thead>
       <tbody>
         <tr><td>400</td><td><code>MCP_SERVER_NOT_FOUND</code></td><td>No registered server has this name</td></tr>
-        <tr><td>400</td><td><code>MCP_OVERRIDE_INVALID</code></td><td><code>headers</code> / <code>env</code> are not string maps</td></tr>
+        <tr><td>400</td><td><code>MCP_OVERRIDE_INVALID</code></td><td><code>headers</code> / <code>env</code> are not string maps, or hold a header Node cannot send or an env value with NUL</td></tr>
         <tr><td>401</td><td><code>MCP_AUTH_FAILED</code></td><td>The upstream MCP server returned 401/403</td></tr>
         <tr><td>502</td><td><code>MCP_NETWORK_ERROR</code></td><td>The upstream MCP server could not be reached or returned an invalid response</td></tr>
         <tr><td>504</td><td><code>MCP_TIMEOUT</code></td><td>The upstream MCP server did not respond before <code>MCP_TEST_TIMEOUT_MS</code> (default 10s)</td></tr>
@@ -886,7 +936,7 @@ curl -X PUT http://localhost:3001/v1/settings \
         <tr><td>400</td><td><code>MCP_SERVER_NOT_FOUND</code></td><td>No registered server has this name</td></tr>
         <tr><td>400</td><td><code>MCP_SERVER_DISABLED</code></td><td>The server is registered but disabled (diverges from <code>/test</code>, which accepts disabled servers)</td></tr>
         <tr><td>400</td><td><code>MCP_CALL_INVALID</code></td><td><code>tool</code> is missing/empty or <code>arguments</code> is not an object</td></tr>
-        <tr><td>400</td><td><code>MCP_OVERRIDE_INVALID</code></td><td><code>credentials.headers</code> / <code>credentials.env</code> are not string maps</td></tr>
+        <tr><td>400</td><td><code>MCP_OVERRIDE_INVALID</code></td><td><code>credentials.headers</code> / <code>credentials.env</code> are not string maps, or hold a header Node cannot send or an env value with NUL</td></tr>
         <tr><td>401</td><td><code>MCP_AUTH_FAILED</code></td><td>The upstream MCP server returned 401/403</td></tr>
         <tr><td>502</td><td><code>MCP_NETWORK_ERROR</code></td><td>The upstream MCP server could not be reached or returned an invalid response</td></tr>
         <tr><td>504</td><td><code>MCP_TIMEOUT</code></td><td>The upstream MCP server did not respond before <code>MCP_CALL_TIMEOUT_MS</code> (default 10s)</td></tr>
@@ -1082,11 +1132,42 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       </thead>
       <tbody>
         <tr><td><code>description</code></td><td>string</td><td>Yes</td><td>Human-readable description of what the tool does</td></tr>
-        <tr><td><code>input_schema</code></td><td>object</td><td>Yes</td><td>JSON Schema describing the tool's input parameters (must have a <code>type</code> field)</td></tr>
+        <tr><td><code>input_schema</code></td><td>object</td><td>Yes</td><td>JSON Schema describing the tool's input parameters (must have a <code>type</code> field). This is what the model is told about the arguments; see <em>How input_schema is used</em> below</td></tr>
         <tr><td><code>webhook_url</code></td><td>string</td><td>Yes</td><td>URL to POST to when the agent invokes this tool</td></tr>
         <tr><td><code>timeout_ms</code></td><td>number</td><td>No</td><td>Webhook timeout in milliseconds (default: <code>30000</code>)</td></tr>
       </tbody>
     </table>
+
+    <h3>How input_schema is used</h3>
+
+    <p>The model receives each declared field's type, whether it is required, and its description. The gateway validates every call against the same schema before the webhook is called. Registration never fails because of an unsupported construct.</p>
+
+    <table class="param-table">
+      <thead>
+        <tr><th>Registered construct</th><th>Model sees</th><th>Call that violates it</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>type</code>: <code>string</code>, <code>number</code>, <code>integer</code>, <code>boolean</code></td><td>Same type (<code>integer</code> stays <code>integer</code>)</td><td>Rejected before the webhook</td></tr>
+        <tr><td><code>enum</code> (string/number values)</td><td>Same values</td><td>Rejected before the webhook</td></tr>
+        <tr><td><code>type: object</code> with <code>properties</code> / <code>required</code></td><td>Nested fields, required list and descriptions</td><td>Rejected before the webhook; undeclared nested keys are passed through</td></tr>
+        <tr><td><code>type: array</code> with one <code>items</code> schema</td><td>Array with the item schema</td><td>Rejected before the webhook</td></tr>
+        <tr><td><code>required</code></td><td>Exactly the registered names</td><td>Missing field rejected before the webhook</td></tr>
+        <tr><td><code>description</code></td><td>Same text</td><td>&mdash;</td></tr>
+        <tr><td><code>additionalProperties</code></td><td>Ignored</td><td>Unchanged: undeclared top-level arguments are dropped before the webhook</td></tr>
+        <tr><td>Anything else (<code>format</code>, <code>pattern</code>, bounds, <code>oneOf</code>/<code>anyOf</code>/<code>$ref</code>, <code>default</code>, <code>nullable</code>, malformed keywords, nesting deeper than 32 levels)</td><td>That field only: any value, with its description and required status</td><td>Any value accepted; the webhook validates it</td></tr>
+      </tbody>
+    </table>
+
+    <p>Values are never converted or defaulted: a valid call reaches the webhook unchanged. For a rejected call the model receives a tool error (<code>isError: true</code>) whose text names the field path and the expectation, for example:</p>
+<pre><code>MCP error -32602: Input validation error: Invalid arguments for tool lookup-customer: [
+  {
+    "expected": "string",
+    "code": "invalid_type",
+    "path": ["email"],
+    "message": "Invalid input: expected string, received number"
+  }
+]</code></pre>
+    <p>Webhooks keep their own validation; their error responses still reach the model as <code>Tool webhook returned error: &lt;status&gt; &lt;body&gt;</code>. A schema the gateway cannot convert makes that tool alone accept any value for every declared field (logged as <code>tools.schema.untyped_fallback</code>). The field names <code>__proto__</code> and a top-level <code>constructor</code> are never advertised, because they cannot reach the webhook.</p>
 
     <h3>Response (201 Created / 200 OK)</h3>
 <pre><code>{
@@ -1258,12 +1339,19 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
         <tr><td><code>enabled</code></td><td>boolean</td><td>No</td><td>Defaults to <code>true</code></td></tr>
         <tr><td><code>allowedToolsPattern</code></td><td>string</td><td>No</td><td>Tool-name glob such as <code>mcp__jira__*</code></td></tr>
         <tr><td><code>userCredentialSchema</code></td><td>object</td><td>No</td><td>Per-user credential fields and output templates</td></tr>
+        <tr><td><code>requireUserCredentials</code></td><td>boolean</td><td>No</td><td>Default <code>false</code>. When <code>true</code>, the server is attached to a run only if the run's <code>mcpCredentialOverrides</code> carries its user credential. Not allowed with <code>type: "sse"</code></td></tr>
       </tbody>
     </table>
 
     <p><code>userCredentialSchema.fields[]</code> declares user form fields. Field keys must be unique and field type must be <code>text</code>, <code>password</code>, <code>url</code>, or <code>email</code>. <code>userCredentialSchema.outputs[]</code> declares composed outputs. HTTP/SSE servers may only emit <code>headers</code> outputs; stdio servers may only emit <code>env</code> outputs. Transport-target mismatches return <code>{"error":{"code":"SCHEMA_TARGET_MISMATCH"}}</code>.</p>
 
     <p>Output templates support plain substitution such as <code>{fieldKey}</code> and <code>prefix-{a}-{b}</code>, plus Basic auth templates such as <code>basic:{email}:{apiToken}</code>, emitted as <code>Basic &lt;base64(email:apiToken)&gt;</code>.</p>
+
+    <p><strong>Validation:</strong> <code>headers</code> and <code>env</code> must be string maps; every header must be one Node can send (token name, no CR, LF, NUL or other invalid character in the value) and env names and values must not contain NUL. Violations answer <code>400</code>, e.g. <code>{"error":"headers holds a name or value that cannot be sent as an HTTP header"}</code>. A non-boolean <code>requireUserCredentials</code> answers <code>{"error":"requireUserCredentials must be a boolean"}</code>; <code>true</code> with <code>type: "sse"</code> answers <code>{"error":"requireUserCredentials is not supported for sse transport"}</code>.</p>
+
+    <p><strong>Credential relay:</strong> a registered <code>http</code> server reaches the agent runtime as a loopback URL with a per-run token; the gateway forwards to the registered URL with the run's headers. An upstream refusal never starts an OAuth login inside the gateway: a refused <code>tools/call</code> becomes a tool error result (<code>MCP server "&lt;name&gt;" refused the credential</code>), a refused <code>initialize</code> leaves the server's tools out of the run, and other failures answer <code>MCP server "&lt;name&gt;" unavailable</code>. Only the MCP endpoint is forwarded; the GET event stream answers 405. Request-supplied servers and registered <code>sse</code> servers connect directly. The runtime's own log files are written to a per-run directory that is deleted after the run; <code>DEBUG_CLAUDE_AGENT_SDK</code> is ignored with a startup warning.</p>
+
+    <p><strong><code>requireUserCredentials</code>:</strong> a run gets a flagged server only when its <code>mcpCredentialOverrides</code> entry has at least one non-empty value for the transport's target (<code>headers</code> for http, <code>env</code> for stdio) and, with a <code>userCredentialSchema</code>, a non-empty value for every output key; an empty entry counts as missing. Otherwise the server, its tool pattern and any request-supplied server of the same name are left out of the run, and the gateway logs <code>mcp.server.omitted serverName=&lt;name&gt; reason=missing_user_credential</code>. Stored and returned only when sent; a <code>PUT</code> without it clears it; <code>/restart</code> keeps it.</p>
 
     <h3>Production Jira HTTP Example</h3>
 <pre><code>curl -X PUT http://localhost:3001/v1/mcp-servers/jira \
@@ -1326,7 +1414,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <span class="endpoint-path">/v1/mcp-servers</span>
       <span class="auth-tag required">Auth Required</span>
     </p>
-    <p>Lists all registered MCP servers, including <code>userCredentialSchema</code> when configured.</p>
+    <p>Lists all registered MCP servers, including <code>userCredentialSchema</code> and <code>requireUserCredentials</code> when configured.</p>
   </div>
 
   <div class="endpoint-section">
@@ -1335,7 +1423,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <span class="endpoint-path">/v1/mcp-servers/:name</span>
       <span class="auth-tag required">Auth Required</span>
     </p>
-    <p>Returns a single registered MCP server, including <code>userCredentialSchema</code> when configured.</p>
+    <p>Returns a single registered MCP server, including <code>userCredentialSchema</code> and <code>requireUserCredentials</code> when configured.</p>
   </div>
 
   <div class="endpoint-section">
@@ -1529,6 +1617,8 @@ curl http://localhost:3001/health</code></pre>
       <tr><td><code>MCP_TEST_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-test deadline for <code>POST /v1/mcp-servers/:name/test</code></td></tr>
       <tr><td><code>MCP_CALL_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-call deadline for <code>POST /v1/mcp-servers/:name/call</code></td></tr>
       <tr><td><code>MCP_UPLOAD_IDLE_TIMEOUT_MS</code></td><td><code>60000</code></td><td>No-progress timeout for one relayed upload (<code>POST /v1/mcp-servers/:name/uploads/*</code>); 504 <code>UPLOAD_TIMEOUT</code> on expiry, no overall deadline</td></tr>
+      <tr><td><code>GIT_MAX_CONCURRENCY</code></td><td><code>3</code></td><td>Git operations of <code>/v1/workspace/git/*</code> running at once across all repositories; further requests wait in arrival order, none is rejected</td></tr>
+      <tr><td><code>GIT_TIMEOUT_MS</code></td><td><code>120000</code></td><td>Deadline for one git command of <code>/v1/workspace/git/*</code>; on expiry 500 <code>git &lt;subcommand&gt; timed out after &lt;n&gt; s</code></td></tr>
     </tbody>
   </table>
 
@@ -1567,6 +1657,7 @@ curl http://localhost:3001/health</code></pre>
     <li><strong>tmux</strong> -- for the Anthropic OAuth login flow</li>
     <li><strong>rsync, wget, curl, jq, mc, python3</strong> -- general utilities</li>
     <li><strong>gosu</strong> -- privilege de-escalation (root to node user)</li>
+    <li><strong>tini</strong> -- init process (process 1): forwards stop signals to the gateway, reaps finished child processes, returns the gateway's exit code</li>
     <li><strong>Claude Code CLI</strong> -- installed on first startup via <code>curl -fsSL https://claude.ai/install.sh | bash</code></li>
   </ul>
 
@@ -1582,6 +1673,10 @@ curl http://localhost:3001/health</code></pre>
     <li>Restores SSH key config from bind-mount if keys exist in <code>~/.ssh/</code></li>
     <li>Drops to <code>node</code> user via <code>gosu</code> and starts the Express server</li>
   </ol>
+
+  <h3>Stopping the Container</h3>
+
+  <p>The image entrypoint is <code>["/usr/bin/tini", "--", "bash", "/app/entrypoint.sh"]</code>, so <code>docker stop</code>, <code>docker compose down</code> and host shutdowns deliver <code>SIGTERM</code> to the gateway, and the container's exit code is the gateway's. <code>docker-compose.yml</code> needs no <code>init:</code> setting. On the signal the gateway refuses new connections, saves pending changes at once, lets requests already received finish for up to 8 s (streams still open then are cut), saves all state again and exits. A second signal skips the wait. See <a href="#state-recovery">State Files, Recovery and Shutdown</a> for the exit codes.</p>
 
   <h3>Persistent Data</h3>
 
@@ -1761,7 +1856,51 @@ curl http://localhost:3001/health</code></pre>
       <div class="seq-msg"><div class="seq-line dashed"></div><span class="seq-label">status + body, verbatim</span><div class="seq-arrow">→</div></div>
       <div class="seq-to sf-slate">Client</div>
     </div>
+    <div class="seq-section">Workspace Git (POST /v1/workspace/git/clone|pull, GET /status)</div>
+    <div class="seq-row">
+      <div class="seq-from sf-slate">Client</div>
+      <div class="seq-msg"><div class="seq-line"></div><span class="seq-label">validate fields, path, branch, url (400)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-blue">Repo Turn</div>
+    </div>
+    <div class="seq-row">
+      <div class="seq-from sf-blue">Repo Turn</div>
+      <div class="seq-msg"><div class="seq-line"></div><span class="seq-label">one at a time per path, arrival order; then a global slot (GIT_MAX_CONCURRENCY, FIFO)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-amber">Git Slot</div>
+    </div>
+    <div class="seq-row">
+      <div class="seq-from sf-amber">Git Slot</div>
+      <div class="seq-msg"><div class="seq-line green"></div><span class="seq-label">temp SSH key, git without a shell (own process group, GIT_TIMEOUT_MS)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-green">git</div>
+    </div>
+    <div class="seq-row">
+      <div class="seq-from sf-green">git</div>
+      <div class="seq-msg"><div class="seq-line dashed"></div><span class="seq-label">result or git's message without credentials; event loop never blocked</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-slate">Client</div>
+    </div>
   </div>
+
+  <h3 id="state-recovery">State Files, Recovery and Shutdown</h3>
+
+  <p><code>sessions.json</code> (with the idle-timeout setting), <code>tools.json</code> and <code>mcp-servers.json</code> are written by <code>src/persistence.ts</code>: a temp file <code>&lt;file&gt;.tmp-*</code> (mode 0600, same directory) is written and flushed, then renamed over the file, so a kill, crash or full disk leaves either the complete old file or the complete new one. On start, a missing file is an empty start; a file that cannot be read or parsed, or that holds an entry the gateway cannot restore (<code>null</code>, a tool or MCP server without a string <code>name</code>, a session without a numeric <code>lastUsed</code>), is moved to <code>&lt;file&gt;.corrupt-&lt;UTC stamp&gt;</code> and reported, never overwritten. If it cannot be moved, it stays in place and saves for that area are switched off until a restart loads it. Each problem is reported by <a href="#ep-health"><code>/health</code></a> and logged, whatever the log level, as <code>ERROR persistence area=&lt;area&gt; problem=&lt;problem&gt; file=&lt;path&gt; [preservedAs=&lt;path&gt;] reason=&lt;fixed text&gt; [code=&lt;errno&gt;] (see /health)</code>; the line never contains file content.</p>
+
+  <h4>Shutdown sequence (<code>src/shutdown.ts</code>)</h4>
+  <ol>
+    <li>First <code>SIGTERM</code>/<code>SIGINT</code>: stop accepting connections, save every pending change at once.</li>
+    <li>Drain: requests already received, including streaming chat answers, run on and may change state.</li>
+    <li>When the last connection has closed, after 8 s, or on a second signal: close remaining connections and save all three files synchronously. Nothing can change between this save and the exit.</li>
+    <li>Exit <code>0</code> if every final save succeeded, <code>1</code> otherwise (an <code>ERROR persistence … problem=final-save-failed</code> line names the area; its file keeps its last complete save; check <code>docker logs</code>, disk space and permissions). <code>137</code> (killed by Docker after 10 s) is still possible while a git command blocks the gateway, until MVP-7614 is deployed; the files stay intact, but changes from the last moment can be lost.</li>
+  </ol>
+
+  <h4>Recovering a <code>.corrupt-*</code> copy</h4>
+  <ol>
+    <li>The container path <code>/home/node/.claude/&lt;file&gt;</code> is <code>./agent_home/.claude/&lt;file&gt;</code> on the host.</li>
+    <li>Stop the gateway first; otherwise its next save overwrites the restored file.</li>
+    <li>The copy is usually damaged, or it holds an entry the gateway cannot restore. Repair it (cut back to the last complete entry and close the array or object, or fix or remove the entry that is <code>null</code>, has no string <code>name</code> or, for a session, no numeric <code>lastUsed</code>; check with <code>jq</code>) and copy it over <code>&lt;file&gt;</code>. This replaces the changes made in that area since detection. A copy kept after a read error has its original permissions; fix them first.</li>
+    <li>Give the restored file <code>node:node</code> ownership (<code>chown 1000:1000</code>) and its original mode (for example <code>chmod 600</code> for <code>mcp-servers.json</code>).</li>
+    <li>Move the copy out of the directory or delete it; only this clears <code>degraded</code>.</li>
+    <li>Start the gateway and confirm with <code>curl -s http://localhost:3001/health | jq '.persistence, .persistenceIssues'</code>.</li>
+  </ol>
+  <p>Copies of <code>mcp-servers.json</code> contain MCP credentials: handle them as secrets, never attach state files or copies to tickets or evidence, and delete them once resolved.</p>
 
   <h2>Links</h2>
 

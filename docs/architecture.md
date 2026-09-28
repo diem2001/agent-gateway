@@ -39,7 +39,13 @@ The Agent Gateway is a stateless HTTP service that bridges REST clients with the
 ## Components
 
 ### server.ts -- Express Application
-Entry point. Configures middleware (JSON and text parsing, skipped for the upload relay path; a 300 s body deadline for every other request until it is answered; request logging; the upload path's pre-auth guard; auth), mounts all routers, and exposes health, logging, session, and settings endpoints directly. The kept `app.listen` handle (`server`) sets `requestTimeout` to 3600 s for the upload relay.
+Entry point. Configures middleware (JSON and text parsing, skipped for the upload relay path; a 300 s body deadline for every other request until it is answered; request logging; the upload path's pre-auth guard; auth), mounts all routers, and exposes health, logging, session, and settings endpoints directly. The kept `app.listen` handle (`server`) sets `requestTimeout` to 3600 s for the upload relay. At startup it also removes `DEBUG_CLAUDE_AGENT_SDK` from the environment (with a warning), sweeps leftover per-run runtime log directories, and starts the credential relay (`mcp-credential-relay.ts`).
+
+### persistence.ts -- State Files
+Shared by `sessions.ts`, `tools.ts` and `mcp-registry.ts`. Saves are debounced (100 ms) and atomic: a temp file `<file>.tmp-<pid>-<hex>` is created in the same directory (`wx`, mode 0600), written, flushed and renamed over the file; the new file then gets the previous file's mode. On start a missing file is an empty start; any other read error or invalid content moves the file to `<file>.corrupt-<UTC stamp>`; if that move fails, the file stays in place and every save of that area is suppressed for the process lifetime. Leftover temp files of the area are removed at start. The per-area issues (`corrupt-preserved`, `unreadable-not-preserved`, `write-failed`) feed the `persistence` / `persistenceIssues` fields of `/health`; see [State Files, Recovery and Shutdown](#state-files-recovery-and-shutdown).
+
+### shutdown.ts -- Clean Stop
+Installed by `server.ts` only when it is the process entry point. Handles `SIGTERM`/`SIGINT`: refuse new connections, save early, drain requests already received for up to 8 s, then save all three state files synchronously and exit 0 (all saved) or 1 (a save failed or was suppressed). A second signal ends the drain.
 
 ### auth.ts -- API Key Middleware
 Parses `API_KEYS` env var at startup into a `Map<key, label>` for O(1) lookup. Validates `Authorization: Bearer <key>` on all routes except `/health`. Attaches `clientLabel` to the request for audit logging.
@@ -55,7 +61,13 @@ Calls `query()` from `@anthropic-ai/claude-agent-sdk` with configured tools, per
 
 Default tools: `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebSearch`, `WebFetch`.
 
-If registered webhook tools exist, they are wrapped as in-process MCP servers via `createToolMcpServer()` and injected into the SDK query alongside the built-in tools. The webhook context (user_id, session_id, api_key_label) and the client's Bearer token are passed to each webhook call. External MCP servers from the MCP Server Registry are merged into the same `mcpServers` map (per-server credentials applied), so the agent can call their tools directly over the MCP protocol.
+If registered webhook tools exist, they are wrapped as in-process MCP servers via `createToolMcpServer()` and injected into the SDK query alongside the built-in tools. The webhook context (user_id, session_id, api_key_label) and the client's Bearer token are passed to each webhook call. External MCP servers from the MCP Server Registry are merged into the same `mcpServers` map (per-server credentials applied), so the agent can call their tools over the MCP protocol. A registered **http** server reaches the SDK as a credential-relay URL with a per-run token and no headers (see [Credential Relay Flow](#credential-relay-flow)); the tokens are revoked when the run ends. The SDK child environment points the runtime's own log files into a private per-run directory (`sdk-run-logs.ts`), deleted after the runtime child has exited.
+
+### mcp-credential-relay.ts -- Credential Relay
+A `node:http` listener on 127.0.0.1 (ephemeral port, never an Express route). `register()` binds a 128-bit token to a run's upstream URL and header snapshot; `revoke()` ends it: requests still uploading are closed, in-flight upstream requests are destroyed, and no upstream request is sent with its headers afterwards. Only `POST` and `DELETE` on the exact `/mcp/<token>` path are forwarded; see the flow below for header allowlists and refusal answers.
+
+### sdk-run-logs.ts -- Per-Run Runtime Logs
+Creates the per-run directory (0700, prefix `agent-gateway-run-` under the OS temp directory) and the SDK child environment additions `CLAUDE_CODE_DEBUG_LOGS_DIR=<dir>/debug/run.txt` and `XDG_CACHE_HOME=<dir>/cache`. A `spawnClaudeCodeProcess` hook spawns the runtime like the SDK's default and reports the child; the directory is deleted once the child has exited (after 10 s it is killed first). Also sweeps leftovers at startup (every `agent-gateway-run-*` directory in the OS temp directory, so one gateway per temp directory is assumed, as in the Docker image) and strips `DEBUG_CLAUDE_AGENT_SDK`.
 
 ### sessions.ts -- Session Management
 Maps client-provided session IDs to internal Claude SDK session IDs. Sessions are:
@@ -63,7 +75,7 @@ Maps client-provided session IDs to internal Claude SDK session IDs. Sessions ar
 - **Reused** when the same sessionId, systemPrompt, and model match
 - **Replaced** when systemPrompt or model changes (new Claude session, same client ID)
 - **Synced** via `updateSessionSdkId()` after each query -- the SDK may return a different session_id than the one provided, so the gateway updates the stored mapping to ensure subsequent queries resume the correct conversation
-- **Persisted** to disk (debounced) at `SESSION_PERSIST_PATH`
+- **Persisted** to disk (debounced, atomic; see `persistence.ts`) at `SESSION_PERSIST_PATH`
 - **Restored** from disk on startup (expired sessions filtered out)
 - **Cleaned** every 5 minutes if `SESSION_IDLE_TIMEOUT_MS > 0`
 
@@ -85,7 +97,7 @@ Stores NDJSON events in memory keyed by `queryId`. Used by `GET /v1/query/:query
 Provides safe file CRUD for three workspace sections: `memory`, `agents`, `skills`. All paths are resolved relative to `WORKSPACE_ROOT` (default `$HOME/.claude`). Includes path traversal protection via `safePath()` which validates against directory escape, absolute paths, null bytes, and symlink attacks.
 
 ### logging.ts -- Runtime Logging
-Three levels: `off`, `info`, `debug`. Level is adjustable at runtime via `PUT /v1/logging`. Request/response logging middleware logs method, URL, status code, and duration (body content only at debug level).
+Three levels: `off`, `info`, `debug`. Level is adjustable at runtime via `PUT /v1/logging`. Request/response logging middleware logs method, URL, status code, and duration (body content only at debug level). At debug level, `redactCredentialsForLog()` makes a log copy of the request body (then cut to 2000 characters) and of a JSON response chunk (then cut to 500 characters) in which the whole value of every `headers` and `env` key, at any depth, is `"[REDACTED]"` with the keys kept, every `sshKey` value is `"[REDACTED]"`, and every string `url` value has its credentials replaced by `***` (`redactUrlCredentials()`, also used for git error text). Redaction comes before the cut, and the client payload is never changed. `text/*` request bodies are logged as their length; a non-JSON answer on a `/v1/mcp-servers` route is not previewed. `globalErrorHandler` (mounted last by `server.ts`) logs body-parser errors as `request body rejected type=<type> status=<code>`, never their message, which quotes part of the body.
 
 ### routes/ssh.ts -- SSH Key Management
 **POST /v1/ssh-keys**: Uploads an SSH private key (and optional public key) to `~/.ssh/`. Derives the public key from private if not provided. Writes an SSH config with `StrictHostKeyChecking accept-new`. Validates filename to prevent path injection.
@@ -98,11 +110,17 @@ Three-step flow using tmux to interact with Claude CLI:
 
 ### routes/git.ts -- Workspace Git Endpoints
 Lets clients clone and refresh git repositories inside `WORKSPACE_ROOT/projects/<path>` so agents can `Read`/`Grep` real source trees as part of their context:
-- **POST /v1/workspace/git/clone**: Clones `url` into `path`, optionally on a specific `branch`. If the target already has a `.git` directory, falls back to `git pull` after aligning the checkout with `branch`. Accepts an inline `sshKey` body field for one-shot clones; the key is written to a temp file, used via `GIT_SSH_COMMAND`, and removed in `finally`.
+- **POST /v1/workspace/git/clone**: Clones `url` into `path`, optionally on a specific `branch`. If the target already has a `.git` directory, falls back to `git pull` after aligning the checkout with `branch`. Accepts an inline `sshKey` body field for one-shot clones; the key is written to a private temp directory, used via `GIT_SSH_COMMAND`, and removed in `finally`.
 - **POST /v1/workspace/git/pull**: Pulls updates for an existing repo. Returns `up-to-date` or `updated` based on commit-before / commit-after comparison.
 - **GET /v1/workspace/git/status?path=...**: Returns `branch`, `commit`, `dirty`, `lastCommitDate` for the repo at `path`.
 
-All paths are resolved through `resolveProjectPath()` which rejects absolute paths and `..` traversal.
+All paths are resolved through `resolveProjectPath()` which rejects absolute paths and `..` traversal. A `branch` starting with `-` is rejected with `400 {"error":"Invalid branch"}` before anything is queued (`git checkout` would read it as an option, and `--` cannot help there). A clone `url` containing a line break or NUL is rejected with `400 {"error":"Invalid url"}` (git refuses such URLs, and a line break would split the URL across lines of the error text), and a `url`, `path`, `branch` or `sshKey` that is present but not a string with `400 {"error":"<field> must be a string"}`, also before anything is queued. The handlers are `async` and never block the event loop: each request takes its repository's turn (`withRepoTurn`, keyed by the resolved path), then a global slot (`withGitSlot`), and only then writes the SSH key and runs git. The existence checks (clone's pull-instead, pull's 404, status's `exists:false`) run inside the turn, so a queued request sees the outcome of the one before it. Clone runs `git clone [-b <branch>] -- <url> <path>`; the branch fetch runs `git fetch origin -- +refs/heads/<branch>:refs/remotes/origin/<branch>`, so a branch value can act neither as an option nor as a refspec of its own. The clone success line logs the URL with credentials removed.
+
+### git-exec.ts -- Git Runner and Queues
+- **`runGit(args, cwd, env?)`**: `spawn("git", args)` without a shell, in its own process group, output capped at 10 MiB. On `GIT_TIMEOUT_MS` (default 120000) or overflow the whole group gets SIGTERM, then SIGKILL after 2 s, so a helper that still holds git's pipes (`git-remote-https`, `ssh`) cannot keep the request open. The child environment sets `GIT_TERMINAL_PROMPT=0`, pins `protocol.ext.allow=never` via `GIT_CONFIG_COUNT`, and drops `GIT_TRACE*`/`GIT_CURL_VERBOSE`.
+- **Error text**: a `GitError` carries git's own stderr with URL credentials removed, then cut to 4 KB. Tokens reach git unencoded and git echoes a URL it cannot parse as is, so a token may contain `/`, whitespace, quotes or `@`: on every line, everything from the first `scheme://` to the last `@` becomes `***` (`redactUrlCredentials`). This covers `http(s)://` URLs; for `ssh://`, `git://` and `file://` URLs (which do not use passwords) ssh/git may echo the user-info in a form without `scheme://`, which stays visible. This may also hide a host or path that shares the line with a URL; a timeout reads `git <subcommand> timed out after <n> s`. Node's `Command failed: <command line>` message is never used, because the command line can hold a token-bearing URL. `gitErrorText()` applies the same redaction to non-git errors.
+- **Queues**: `withRepoTurn` is a per-repository FIFO chain (idle entries removed); `withGitSlot` is a global FIFO semaphore of `GIT_MAX_CONCURRENCY` (default 3) slots that never rejects and hands a released slot to the oldest waiter, whether the operation succeeded, failed or timed out. `gitQueueSnapshot()` reports `{ running, waiting }` for tests.
+- **Limits**: git removes its `index.lock` on SIGTERM but not after the SIGKILL fallback; the next operation on that checkout then fails with git's lock error, and the lock is not removed automatically (agents may run git in the same checkout). Descendants killed after a timeout are re-parented to the gateway process, which does not reap them, until the container gets an init process.
 
 ### tools.ts -- Tool Registry
 Manages CRUD operations for webhook-backed tool definitions. Tools are stored in-memory in a `Map<name, ToolDefinition>` and persisted to disk (debounced) at `TOOLS_PERSIST_PATH` (default `./data/tools.json`, Docker override: `/home/node/.claude/tools.json`). Each tool definition includes: `name`, `description`, `input_schema` (JSON Schema), `webhook_url`, and optional `timeout_ms` (default 30s). Tools are loaded from disk on startup via `loadTools()`.
@@ -111,7 +129,25 @@ Manages CRUD operations for webhook-backed tool definitions. Tools are stored in
 Executes tool calls by POSTing to the tool's `webhook_url`. The request body contains `tool_use_id`, `tool_name`, `input`, and `context` (user_id, conversation_id, session_id, api_key_label). The client's Bearer token is forwarded in the `Authorization` header. Supports configurable timeouts per tool. Returns either `WebhookResponse` (with output + optional metadata) or `WebhookError` on failure (timeout, HTTP error, network error).
 
 ### tool-server.ts -- MCP Server Factory (webhook tools)
-Creates an in-process MCP server wrapping all registered webhook tools for injection into the Claude Agent SDK. Called once per query so the webhook context (session, user, auth) is correctly scoped. Each tool's JSON Schema properties are mapped to `z.unknown()` Zod shapes -- actual validation is the webhook's responsibility. Uses `createSdkMcpServer()` from the Agent SDK.
+Creates an in-process MCP server wrapping all registered webhook tools for injection into the Claude Agent SDK. Called once per query so the webhook context (session, user, auth) is correctly scoped. Each tool's registered `input_schema` is converted by `tool-input-schema.ts`: the model sees the declared field types, required fields and descriptions, and the SDK validates every call against them before the handler runs. Webhooks keep their own validation. Uses `createSdkMcpServer()` from the Agent SDK.
+
+### tool-input-schema.ts -- Webhook Tool Input Schemas
+Converts a webhook tool's `input_schema` (JSON Schema) into the Zod shape the SDK MCP server uses for `tools/list` (what the model is told) and for `tools/call` argument validation. Closed allowlist:
+
+| Registered construct | Advertised to the model | At `tools/call` |
+|---|---|---|
+| `type` `string` / `number` / `integer` / `boolean` | Same type (`integer` stays `integer`) | Another type is rejected |
+| `enum` (non-empty, unique string/number literals matching `type`) | Same values | A value outside the enum is rejected |
+| `type: object` with `properties` / `required` | Nested properties, `required` and descriptions, recursively | Nested violations are rejected; undeclared nested keys still reach the webhook |
+| `type: array` with one `items` schema | Array with the item schema | Item violations are rejected |
+| `required` (top level and nested) | Exactly the registered names that exist in `properties` | A missing required field is rejected |
+| `description` (string) | Same text | -- |
+| `additionalProperties` | Ignored (not advertised, not enforced) | Unchanged: undeclared top-level keys are dropped before the webhook, as before |
+| Anything else (`format`, `pattern`, bounds, `oneOf`/`anyOf`/`allOf`/`$ref`, `default`, `nullable`, `title`, a `type` array or unknown type, a missing `type`, tuple `items`, malformed keywords, nesting deeper than 32 levels) | That property only: "any value", keeping its description and required status | Any value is accepted; the webhook validates it as before |
+
+There are no defaults and no coercion: a valid call reaches the webhook with the model's values unchanged. A rejected call never reaches the webhook; the model receives a tool result with `isError: true` and the text `MCP error -32602: Input validation error: Invalid arguments for tool <name>: [...]`, a JSON list of issues, each naming the field `path` and the expectation (for example `"expected": "string"` with `"message": "Invalid input: expected string, received number"`). Webhook error responses are still relayed as `Tool webhook returned error: <status> <body>`.
+
+The SDK builds `tools/list` with its own bundled zod, so each property carries its advertised JSON fragment through zod's `_zod.toJSONSchema` override (otherwise descriptions are lost and `integer` is widened to `number`); the real-runtime contract test pins this across SDK upgrades. The registry is global, so a conversion is isolated per tool: a schema that cannot be converted (for example a malformed top-level `required`) makes that tool alone fall back to the previous untyped shape (every declared key accepts any value), with a `tools.schema.untyped_fallback tool=<name>` log line. Property names that can never reach the webhook are not advertised and are logged (`tools.schema.property_excluded`): `__proto__` at any level, and a top-level `constructor` (the SDK's MCP protocol rejects any call whose arguments hold that key). Tools are converted per query from `tools.json`, so existing registrations get typed schemas after a restart, without re-registering.
 
 ### routes/tools.ts -- Tool Registry Endpoints
 REST endpoints for webhook tool management:
@@ -128,10 +164,12 @@ Registry for *external* MCP servers — distinct from the webhook Tool Registry.
 
 `buildMcpServersForSdk()` produces the `mcpServers` map handed to the Agent SDK on every query: HTTP/SSE servers contribute `{type, url, headers}`; stdio servers contribute `{type, command, args, env}`. Disabled servers (`enabled: false`) are skipped. Per-server `allowedToolsPattern` globs (e.g. `mcp__jira__*`) are aggregated into the SDK's `allowedTools` filter so the agent can only call the tools the operator explicitly opted in to.
 
+`requireUserCredentials` (optional boolean, not allowed with `sse`) marks a server that needs the requesting user's own credential. `selectRegistryServersForRun()` in `mcp-overrides.ts` leaves such a server out of a run whose `mcpCredentialOverrides` entry has no non-empty value for the transport's target (or misses a `userCredentialSchema` output key); `agent.ts` then drops its SDK entry, its allowed-tool pattern and any request-supplied server of the same name, and logs `mcp.server.omitted serverName=<name> reason=missing_user_credential`.
+
 `userCredentialSchema` lets the registry advertise the form a user has to fill in to derive credentials at query time. `fields[]` declares form input definitions (`text`, `password`, `url`, `email`); `outputs[]` declares how those values compose into either `headers` (http/sse) or `env` (stdio) targets via plain substitution (`"{key}"`) or HTTP Basic encoding (`"basic:{email}:{apiToken}"`). Transport-target mismatches are rejected with `SCHEMA_TARGET_MISMATCH` at registration time.
 
 ### mcp-overrides.ts -- Per-Request Credential Overrides
-Validates the `mcpCredentialOverrides` body field on `POST /v1/query` against the current registry. Each override entry references a registered server by name; unknown names return `MCP_SERVER_NOT_FOUND`, disabled names return `MCP_SERVER_DISABLED`. HTTP/SSE servers may only carry `headers`; stdio servers may only carry `env`. Validated overrides are shallow-merged over the static registry config when the SDK invocation is built. Overrides are request-scoped only — they never write back to disk.
+Validates the `mcpCredentialOverrides` body field on `POST /v1/query` against the current registry. Each override entry references a registered server by name; unknown names return `MCP_SERVER_NOT_FOUND`, disabled names return `MCP_SERVER_DISABLED`. HTTP/SSE servers may only carry `headers`; stdio servers may only carry `env`. Validated overrides are shallow-merged over the static registry config when the SDK invocation is built. Overrides are request-scoped only — they never write back to disk. `credentialMapsError()` is the shared check for `headers`/`env` maps (string maps, headers Node can send, no NUL in env), used by the overrides, the registry `PUT`, `/test` and `/call`.
 
 ### credential-composer.ts -- Credential Template Substitution
 Lightweight template engine used both by the MCP registry's `userCredentialSchema.outputs[]` validation and by future per-user credential composition. Supports plain field substitution (`"{fieldKey}"`, `"prefix-{a}-{b}"`) and HTTP Basic auth shorthand (`"basic:{email}:{apiToken}"`, emitted as `Basic <base64(email:apiToken)>`). `getCredentialTemplateFieldKeys(template)` returns the set of `{...}` placeholders so the registry can reject templates that reference fields not declared in the same schema.
@@ -172,7 +210,7 @@ REST endpoints for the external MCP server registry:
    - `rate_limited` -- rate limit detected, retrying
    - `sdk_status` -- SDK status changes (compacting)
    - `sdk_compact_complete` -- context compaction completed
-9. For registered webhook tools, the in-process MCP server handler POSTs to the webhook URL and returns the result. For external MCP servers, the SDK speaks MCP directly to the upstream service over the configured transport
+9. For registered webhook tools, the in-process MCP server handler POSTs to the webhook URL and returns the result. For registered http MCP servers, the SDK speaks MCP to the credential relay, which forwards to the upstream with the run's headers; stdio, sse and request-supplied servers use their transport directly
 10. Events are written to response stream (NDJSON) and cached
 11. On completion, `done` event emitted with token usage, cost, context stats; SDK session ID synced via `updateSessionSdkId()`
 12. On error, `error` event emitted with message
@@ -232,6 +270,10 @@ When the agent invokes a registered webhook tool during a query:
 Agent SDK calls tool "my-tool" with input
     |
     v
+SDK MCP server validates input against the converted input_schema
+(tool-input-schema.ts); a violation returns isError to the agent, no webhook call
+    |
+    v
 MCP server handler (tool-server.ts)
     |
     v
@@ -274,7 +316,8 @@ buildMcpServersForSdk() merges static registry config with overrides:
     |
     v
 Agent SDK opens MCP transport per server:
-  - http/sse: connects on first tool call, uses merged headers
+  - http:    connects to the credential relay URL (no headers); the relay adds the merged headers
+  - sse:     connects directly, uses merged headers
   - stdio:   spawns command with merged env, talks MCP over stdin/stdout
     |
     v
@@ -285,6 +328,39 @@ Query completes -> overrides discarded; static registry config unchanged on disk
 ```
 
 `POST /v1/mcp-servers/:name/test` runs the same merge logic out-of-band so the operator can validate a credential set before persisting it. The test client accepts both `application/json` and streamable `text/event-stream` MCP responses (MVP-3689).
+
+## Credential Relay Flow
+
+Registered http MCP servers are reached only through the gateway's credential relay (MVP-7667). The runtime never holds their URL or credential, so an upstream refusal cannot start the runtime's MCP OAuth login and header values stay out of its command line and log files.
+
+```
+runQuery (agent.ts)
+    | credentialRelay.register({ serverName, url, headers: static + override }) -> http://127.0.0.1:<port>/mcp/<token>
+    v
+Claude runtime (SDK child)  -- POST/DELETE http://127.0.0.1:<port>/mcp/<token>, no credential
+    v
+relay listener (127.0.0.1, own node:http server)
+    | Host must be 127.0.0.1:<port>; only the exact /mcp/<token> path; anything else (/.well-known/*, /register,
+    | /authorize, /token, sub-paths, unknown or revoked token) -> local 404, never forwarded; GET -> 405
+    | request headers upstream: Accept, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID + bound headers
+    | (a runtime Authorization or Cookie is dropped); POST bodies buffered up to 25 MiB (larger -> JSON-RPC error)
+    v
+upstream MCP server (registered url)
+    | 2xx: streamed back with backpressure; only Content-Type and Mcp-Session-Id are returned
+    | 404 on a request with Mcp-Session-Id: a bodiless 404 (session miss)
+    | 401/403 -> "refused the credential"; 3xx, other non-2xx, unreachable, idle > 120 s -> "unavailable":
+    |   tools/call -> HTTP 200 JSON-RPC result isError:true naming the server
+    |   initialize / list requests -> HTTP 200 JSON-RPC error (the server contributes no tools)
+    |   notifications -> 202; batches -> an array of these answers; DELETE -> 204; no upstream body is echoed
+    v
+run ends (answer, error, abort) -> credentialRelay.revoke(token): the URL answers 404 on every method, requests still uploading are closed, in-flight upstream requests destroyed; nothing more is sent upstream
+```
+
+If the relay is not listening, registered http servers are left out of the run (`mcp.server.omitted serverName=<name> reason=relay_unavailable`), and a request-supplied server may not take their name. Every handler is wrapped so that a relay error answers "unavailable" and never ends the gateway process. Audit lines carry the server name and reason only (`mcp.relay.refused serverName=<name> reason=credential_refused|unavailable|body_too_large [status=<code>]`); the URL, path and token are never logged.
+
+Observed with Claude Code 2.0.77: after a session-miss 404 the runtime does not initialize a new session; it reports that tool call as failed, as it does with a direct connection.
+
+Not covered: request-supplied `mcpServers` (per-query servers such as chrome-devtools) and registered `sse` servers keep the direct path; stdio `env` values are passed to the runtime as before. While a run lasts, its relay tokens and stdio env values are in the runtime's `--mcp-config` argument; isolation between concurrent runs is owned by Epic MVP-7676.
 
 ## Upload Relay Flow
 
@@ -330,15 +406,53 @@ MCP server answer -> status (200-599) + Content-Type + Content-Length + body, ve
 
 **Timers:** the relay's idle timer (default 60 s) is the only per-upload bound; Node's `requestTimeout` is raised to 3600 s on the listen handle so it does not cut a slow upload, while `nonUploadBodyDeadline` keeps a 300 s bound on every other request body until its response is sent (it clears with the response, so after an early answer the rest of that body is no longer bounded by it). mcp-jira's own no-progress timer (120 s) and `requestTimeout` (3600 s) sit behind it.
 
+## State Files, Recovery and Shutdown
+
+**Files:** `sessions.json` (sessions and the idle-timeout setting), `tools.json` and `mcp-servers.json` under `/home/node/.claude/` in the container (`./agent_home/.claude/` on the host). `mcp-servers.json` is the only copy of the MCP server registry.
+
+**Saving:** every save writes a complete temp file next to the target and renames it over the target, so a kill, crash or `ENOSPC` leaves either the complete old file or the complete new one. A failed save keeps the previous file, logs an ERROR line and reports `write-failed` until a later save of that area succeeds.
+
+**Loading:**
+
+| File state at start | Result | `/health` |
+|---------------------|--------|-----------|
+| missing | empty area | no issue |
+| valid | loaded | no issue |
+| read error other than "not found", invalid JSON or wrong top-level shape | moved to `<file>.corrupt-<UTC stamp>` (bytes unchanged), empty area | `corrupt-preserved` while any `<file>.corrupt-*` exists |
+| as above, and the move fails | file untouched, saves for the area suppressed until a restart loads it | `unreadable-not-preserved` |
+
+**ERROR line** (via `console.error`, independent of the log level; never file content or error messages):
+
+```
+ERROR persistence area=<sessions|tools|mcpServers> problem=<corrupt-preserved|unreadable-not-preserved|write-failed|final-save-failed> file=<path> [preservedAs=<path>] reason=<fixed text> [code=<errno>] (see /health)
+```
+
+**Shutdown sequence:**
+
+```
+SIGTERM/SIGINT ──> server.close() (no new connections; idle ones closed)
+               ──> save all areas now (early save)
+               ──> drain: received requests and streams run on, changes saved as usual
+               ──> last connection closed | 8 s deadline | second signal
+               ──> destroy remaining sockets, save all areas synchronously
+               ──> exit 0 (all saved) | exit 1 (a save failed or was suppressed)
+```
+
+In the image `tini` is process 1 and forwards the signal, so the container exit code is the gateway's. Exit `137` (Docker's SIGKILL after 10 s) remains possible while a synchronous git command blocks the event loop (MVP-7614): the files stay intact, but debounced changes pending at that moment can be lost.
+
+**Recovering a `.corrupt-*` copy:** stop the gateway first (its next save would overwrite a restored file); repair the copy (it is usually damaged, or it holds an entry the gateway cannot restore: `null`, a tool or MCP server without a string `name`, a session without a numeric `lastUsed`) and copy it over `<file>`, which replaces changes made in that area since detection; restore `node:node` ownership (uid 1000) and the original mode (a copy kept after a read error has its original permissions); move the copy out of the directory or delete it, which alone clears `degraded`; confirm with `curl -s http://localhost:3001/health | jq .persistence`. Copies of `mcp-servers.json` contain MCP credentials: handle them as secrets and never attach state files or copies to tickets or evidence.
+
 ## Security Model
 
 - **API Key Auth**: All authenticated routes require a valid Bearer token from `API_KEYS`.
 - **Path Traversal Protection**: `safePath()` (workspace) and `resolveProjectPath()` (git) prevent directory escape via `../`, absolute paths, null bytes, and symlink resolution.
-- **SSH Key Validation**: Filename restricted to `[a-zA-Z0-9_-]` to prevent injection. Inline keys for git-clone are written to per-request temp files (`0600`) and removed in `finally`.
+- **SSH Key Validation**: Filename restricted to `[a-zA-Z0-9_-]` to prevent injection. Inline keys for the git routes are written, only once the request holds a git slot, to a private per-request temp directory (`0700`, key file created exclusively with `0600`) and removed in `finally`; the key path is quoted inside `GIT_SSH_COMMAND`.
+- **Git Arguments and Credentials**: git runs without a shell, with `--` before clone and fetch positionals, an explicit fetch refspec, leading-dash branches rejected and the `ext::` transport disabled. Error text and git log lines carry no user-info credentials of `http(s)://` URLs, whatever characters the token contains (on each line everything from the first `scheme://` to the last `@` is hidden; query-string tokens are not redacted). `ssh://`, `git://` and `file://` transports do not use URL passwords, and ssh/git may echo such a URL's user-info without `scheme://` or `@` (e.g. `Could not resolve hostname user:<password>`), which the redaction cannot recognize, and the debug log redacts `sshKey` values and, in every string under a `url` key, everything from `scheme://` to the last `@`.
 - **Tool Permissions**: Claude SDK runs with `bypassPermissions` -- the gateway trusts the SDK's tool execution.
 - **MCP Tool Allowlist**: `allowedToolsPattern` per registered MCP server limits which tools the agent may call, even when an external MCP server advertises more.
 - **Credential Boundaries**: `userCredentialSchema` enforces transport-appropriate output targets (`SCHEMA_TARGET_MISMATCH`); per-request overrides are never written back to `MCP_SERVERS_PERSIST_PATH`; test-client errors are sanitized so header/env values do not leak in error messages.
 - **Token Expiry Surfacing**: `/v1/auth/status` exposes `tokenExpired` + `expiresAt` so clients can warn users before queries fail with auth errors.
 - **Docker Isolation**: Container runs as `node` user (dropped from root via `gosu`), SSH keys, sessions, tools, and MCP server definitions persist on a named volume.
+- **State File Protection**: temp files are created with `O_EXCL` and mode 0600 (no symlink follow, never more readable than the owner while credentials are written); `.corrupt-*` copies keep the original bytes and permissions; ERROR lines and `/health` carry only area, problem, paths, a fixed reason and the errno.
 - **Localhost Binding**: Docker compose binds port 3001 to `127.0.0.1` only -- requires a reverse proxy for external access.
 - **Upload Relay**: target path and query come from the raw URL with dot segments, encoded slashes and backslashes refused; upstream host and port come only from the registry. Only `Authorization` is taken from `X-MCP-Credential-Headers`, which is never forwarded or logged; hop-by-hop headers never come from an override or a registration. Refusals on the upload path close the connection after at most 1 MiB / 5 s, so a caller without a key cannot make the gateway read a large body. The gateway enforces no size or concurrency cap of its own (reqlift's 100 MiB cap applies to reqlift callers; other key holders are bounded by the MCP server).

@@ -36,6 +36,8 @@ npm run test:e2e    # E2E session tests (requires running Gateway + GATEWAY_API_
 | `MCP_TEST_TIMEOUT_MS` | No | `10000` | Per-test deadline for `POST /v1/mcp-servers/:name/test` (in ms) |
 | `MCP_CALL_TIMEOUT_MS` | No | `10000` | Per-call deadline for `POST /v1/mcp-servers/:name/call` (in ms) |
 | `MCP_UPLOAD_IDLE_TIMEOUT_MS` | No | `60000` | No-progress timeout for one relayed upload (`POST /v1/mcp-servers/:name/uploads/*`), in ms; 504 `UPLOAD_TIMEOUT` on expiry, no overall deadline |
+| `GIT_MAX_CONCURRENCY` | No | `3` | Git operations of `/v1/workspace/git/*` that run at the same time across all repositories; further requests wait in arrival order, none is rejected |
+| `GIT_TIMEOUT_MS` | No | `120000` | Deadline for one git command of `/v1/workspace/git/*`, in ms; on expiry the command's process group is stopped and the request answers 500 `git <subcommand> timed out after <n> s` |
 
 ## API Key Format
 
@@ -87,9 +89,14 @@ src/
   tools.ts           # Tool registry CRUD + persistence (TOOLS_PERSIST_PATH)
   webhook.ts         # Webhook executor (POST to tool webhook_url with context)
   tool-server.ts     # MCP server factory (wraps registered tools for Agent SDK)
+  tool-input-schema.ts # Webhook tool input_schema -> typed, described SDK shape; per-property "any value" fallback, per-tool untyped fallback
   mcp-registry.ts    # External MCP server registry CRUD + persistence (MCP_SERVERS_PERSIST_PATH)
   mcp-upload-relay.ts # Streaming upload relay: raw-path rule, parser skip, pre-auth guard, X-MCP-Credential-Headers, relay core
+  mcp-credential-relay.ts # Loopback relay for registered http MCP servers: per-run token, header allowlists, refusal answers (no OAuth login in the runtime)
+  sdk-run-logs.ts    # Per-run directory for the Claude runtime's log files, deleted after the child exits; startup sweep; DEBUG_CLAUDE_AGENT_SDK strip
+  mcp-overrides.ts   # mcpCredentialOverrides validation, header/env checks, requireUserCredentials attachment rule
   gc-budget.ts       # Minor GC every 2 MiB relayed (needs node --expose-gc, set in entrypoint.sh and npm start)
+  git-exec.ts        # Non-blocking git runner (no shell, process-group timeout, redacted error text) + per-repository and global FIFO queues
   routes/
     ssh.ts           # POST /v1/ssh-keys
     auth.ts          # Anthropic OAuth flow (login, submit-code, status)
@@ -101,8 +108,18 @@ src/
     e2e-session.test.ts    # E2E session continuity tests
     routes.tools.test.ts   # Tool routes unit tests
     tool-server.test.ts    # MCP server factory tests
+    tool-input-schema.test.ts # Webhook tool schemas via JSON-RPC tools/list + tools/call (advertised types, rejection, fallback, depth, prototype names)
+    webhook-tool-schema-process.test.ts # Real-runtime probe: model-facing webhook tool schemas + pre-dispatch rejection, reqlift/diemcrm fixtures (needs `npm run build`)
     tools.test.ts          # Tool registry unit tests
     webhook.test.ts        # Webhook executor tests
+    sdk-login-guard-process.test.ts # Real-runtime probe: spawned gateway, OAuth-capable MCP stub, scripted Anthropic API (needs `npm run build`)
+    mcp-credential-relay.test.ts    # Credential relay unit tests
+    require-user-credentials.test.ts # requireUserCredentials + header/env validation
+    credential-redaction-rows.test.ts # Debug-log redaction for every credential entry point
+    git-exec.test.ts                # Git runner and queue unit tests
+    git-routes-contract.test.ts     # Git endpoint contract, queue, injection rows (fake git on PATH)
+    git-nonblocking-process.test.ts # Spawned gateway stays responsive during slow git (needs `npm run build`)
+    git-credential-logs-process.test.ts # No http(s) URL token or SSH key in git error text or logs at info/debug (needs `npm run build`)
   __tests__/
     git.test.ts            # Workspace git endpoints tests
 Dockerfile           # Node 22 + system tools + Claude Code CLI

@@ -1,0 +1,582 @@
+{
+  "_about": "Webhook tool definitions registered with the agent gateway by existing apps, copied verbatim (input_schema, description) for the MVP-7697 compatibility check. WEBHOOK_BASE is replaced with the test's loopback webhook stub.",
+  "sources": [
+    {
+      "app": "reqlift",
+      "file": "crates/reqlift-server/src/background/mod.rs (build_tool_definitions)",
+      "ref": "origin/main",
+      "sha": "b049b6188be3d782dcddf4345620fd61ca683f37",
+      "note": "format! descriptions resolved with the Confluence tool ids mcp__jira__update_confluence_page / mcp__jira__get_confluence_page"
+    },
+    {
+      "app": "diemcrm",
+      "file": "services/crm/app/Console/Commands/RegisterGatewayToolsCommand.php (toolDefinitions)",
+      "ref": "origin/master",
+      "sha": "4366204fa7c25cca9e4aade91a321162e186cf68"
+    }
+  ],
+  "tools": [
+    {
+      "name": "reqlift_create_draft",
+      "description": "Create a requirements draft (epic, story, or subtask) in Reqlift. IMPORTANT: Before using this tool, you MUST invoke the relevant skill (generate-epic or generate-stories) and get explicit user approval. Never call this tool without prior user confirmation.",
+      "webhook_url": "WEBHOOK_BASE/create_draft",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "repo_label": {
+            "type": "string",
+            "description": "Label of the target repo (e.g., 'agent-gateway', 'diemcrm')"
+          },
+          "draft_type": {
+            "type": "string",
+            "enum": [
+              "epic",
+              "story",
+              "subtask"
+            ],
+            "description": "Type of draft to create"
+          },
+          "title": {
+            "type": "string",
+            "description": "Title of the draft"
+          },
+          "description": {
+            "type": "string",
+            "description": "Detailed description or acceptance criteria (markdown)"
+          },
+          "parent_draft_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Parent draft UUID (required for story/subtask)"
+          },
+          "initiativeId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Gap-handoff only: the initiative this draft belongs to. The server derives and persists the initiative from the resolved analysis — this value is cross-checked, not trusted."
+          },
+          "featureGapId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Gap-handoff only (Story drafts): the originating feature_gap UUID. The server gates creation on the gap's verdict (epic/unset create; defer/clarify skip) and enforces one-Story-per-gap idempotency."
+          },
+          "gapAreaFeatureId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Gap-handoff only (Epic drafts): the gap-area inventory feature node (an area node) UUID. The server enforces one-Epic-per-(analysis,area) idempotency."
+          }
+        },
+        "required": [
+          "draft_type",
+          "title"
+        ]
+      }
+    },
+    {
+      "name": "reqlift_update_draft",
+      "description": "Update an existing requirements draft in Reqlift",
+      "webhook_url": "WEBHOOK_BASE/update_draft",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "draft_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the draft to update"
+          },
+          "title": {
+            "type": "string",
+            "description": "New title"
+          },
+          "description": {
+            "type": "string",
+            "description": "New description (markdown)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "review",
+              "approved",
+              "rejected"
+            ],
+            "description": "New status"
+          }
+        },
+        "required": [
+          "draft_id"
+        ]
+      }
+    },
+    {
+      "name": "reqlift_list_repos",
+      "description": "List available repos in Reqlift",
+      "webhook_url": "WEBHOOK_BASE/list_repos",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "reqlift_get_repo_context",
+      "description": "Get repo details including recent drafts from Reqlift",
+      "webhook_url": "WEBHOOK_BASE/get_repo_context",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "repo_label": {
+            "type": "string",
+            "description": "Label of the repo (e.g., 'agent-gateway', 'diemcrm')"
+          }
+        },
+        "required": [
+          "repo_label"
+        ]
+      }
+    },
+    {
+      "name": "reqlift_record_page",
+      "description": "Record one crawled page during a feature-inventory recon: its URL, navigation path, and an optional screenshot attachment. Returns the new pageId.",
+      "webhook_url": "WEBHOOK_BASE/record_page",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "analysisId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the analysis being inventoried"
+          },
+          "runId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional inventory-run UUID to bind the page to (a new run is opened if omitted)"
+          },
+          "url": {
+            "type": "string",
+            "description": "The page URL that was crawled"
+          },
+          "navPath": {
+            "type": "string",
+            "description": "The navigation path taken to reach the page (e.g. '/billing/invoices')"
+          },
+          "screenshotAttachmentId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional UUID of a chat attachment screenshot owned by the caller"
+          }
+        },
+        "required": [
+          "analysisId",
+          "url",
+          "navPath"
+        ]
+      }
+    },
+    {
+      "name": "reqlift_request_takeover",
+      "description": "Pause the recon run and ask a human to take over the live browser when you hit a 2FA / OTP / email-SMS verification or login challenge the demo credentials cannot satisfy. Pauses ONLY your own run (resolved from your session) and stops the crawl. After calling this, STOP — do not guess a code, do not retry, do not mark the run done; a person completes the challenge and releases the run, then you resume already signed in.",
+      "webhook_url": "WEBHOOK_BASE/request_takeover",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "analysisId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the analysis being inventoried"
+          },
+          "detail": {
+            "type": "string",
+            "description": "Optional short description of the challenge encountered (e.g. 'TOTP 2FA code prompt after login'); advisory only"
+          }
+        },
+        "required": [
+          "analysisId"
+        ]
+      }
+    },
+    {
+      "name": "reqlift_request_review",
+      "description": "Call this ONCE when you have finished crawling — the inventory is as complete as you can make it. It pauses your run for human review instead of completing it: a person reviews the inventory and either confirms to finalize the run or gives you steering instructions to continue. Pauses ONLY your own run (resolved from your session) and stops the crawl. After calling this, STOP — do not mark the run done, do not keep crawling; wait for the human. `detail` is an OPTIONAL short advisory summary only (e.g. 'crawled billing + settings; could not reach the admin area') — never paste page content, secrets, or credentials into it.",
+      "webhook_url": "WEBHOOK_BASE/request_review",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "analysisId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the analysis being inventoried"
+          },
+          "detail": {
+            "type": "string",
+            "description": "Optional SHORT advisory summary of what was crawled / what remains; advisory only — never include page content, secrets, or credentials"
+          }
+        },
+        "required": [
+          "analysisId"
+        ]
+      }
+    },
+    {
+      "name": "reqlift_record_feature",
+      "description": "Record (upsert) one discovered feature in the inventory, optionally under an area for the area->feature hierarchy. Upserts by (analysisId, navPath). Returns the featureId.",
+      "webhook_url": "WEBHOOK_BASE/record_feature",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "analysisId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the analysis being inventoried"
+          },
+          "navPath": {
+            "type": "string",
+            "description": "Navigation path that uniquely identifies the feature within the analysis (the upsert key)"
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable feature name"
+          },
+          "area": {
+            "type": "string",
+            "description": "Optional area/grouping name; the area node is resolved-or-created and becomes the feature's parent"
+          },
+          "description": {
+            "type": "string",
+            "description": "Optional feature description"
+          },
+          "customerVisible": {
+            "type": "boolean",
+            "description": "Whether the feature is visible to end customers (defaults to true)"
+          },
+          "confidence": {
+            "type": "string",
+            "description": "Optional discovery confidence (e.g. 'high', 'medium', 'low')"
+          }
+        },
+        "required": [
+          "analysisId",
+          "navPath",
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "reqlift_record_evidence",
+      "description": "Attach one captured state (screenshot + a11y snapshot) to a feature as evidence. Returns the evidenceId.",
+      "webhook_url": "WEBHOOK_BASE/record_evidence",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "featureId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the feature the evidence belongs to"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "view",
+              "field",
+              "validation",
+              "error",
+              "success",
+              "flow-step"
+            ],
+            "description": "The kind of captured state"
+          },
+          "stateLabel": {
+            "type": "string",
+            "description": "Short label for the captured state (e.g. 'Empty email validation')"
+          },
+          "screenshotAttachmentId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional UUID of a chat attachment screenshot owned by the caller"
+          },
+          "a11ySnapshot": {
+            "type": "object",
+            "description": "Optional accessibility snapshot (arbitrary JSON)"
+          },
+          "caption": {
+            "type": "string",
+            "description": "Optional caption describing the evidence"
+          }
+        },
+        "required": [
+          "featureId",
+          "kind",
+          "stateLabel"
+        ]
+      }
+    },
+    {
+      "name": "reqlift_record_gap",
+      "description": "Record (upsert) one per-target gap cell: a feature's coverage status against ONE bound initiative target repo, with evidence on both sides. Record one gap per (feature, target); status is covered|partial|missing; optionally set a feature-scoped verdict (epic|defer|clarify). Upserts by (featureId, targetRepoId). Returns {featureId, targetRepoId, status}.",
+      "webhook_url": "WEBHOOK_BASE/record_gap",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "analysisId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the analysis the gap belongs to"
+          },
+          "featureId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the inventory feature being assessed (must belong to the analysis)"
+          },
+          "targetRepoId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the target repo (must be a bound initiative target) the feature is assessed against"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "covered",
+              "partial",
+              "missing"
+            ],
+            "description": "Coverage of the feature in this target: covered, partial, or missing"
+          },
+          "targetCodeRef": {
+            "type": "string",
+            "description": "Optional code reference in the target repo supporting the status (e.g. 'src/billing/export.rs')"
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Optional free-text justification for the status (what was found / not found in the target)"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "epic",
+              "defer",
+              "clarify"
+            ],
+            "description": "Optional feature-scoped intent for the gap: epic (worth a draft), defer, or clarify"
+          }
+        },
+        "required": [
+          "analysisId",
+          "featureId",
+          "targetRepoId",
+          "status"
+        ]
+      }
+    },
+    {
+      "name": "reqlift_confluence_upsert_section",
+      "description": "Persist the READ-BACK managed-region snapshot for ONE area after writing it into the analysis's Confluence page. Call this LAST in the publish read-modify-write: after mcp__jira__update_confluence_page splices the managed block between the reqlift:managed markers, read the page back with mcp__jira__get_confluence_page and pass that region's exact storage text as snapshotContent with the SAME pageId you wrote to. The server re-validates pageId against the analysis's resolved Confluence page, normalizes+hashes the read-back, and upserts confluence_sync_state by (analysisId, regionKey). Returns {regionKey, snapshotHash}.",
+      "webhook_url": "WEBHOOK_BASE/confluence_upsert_section",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "analysisId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the analysis being published (must be the pinned analysisId)"
+          },
+          "pageId": {
+            "type": "string",
+            "description": "The Confluence page id you wrote to — MUST equal the analysis's resolved Confluence page (the pinned pageId); a mismatch is rejected"
+          },
+          "regionKey": {
+            "type": "string",
+            "description": "The area nav_path identifying the managed region (one of the pinned region keys); validated against the analysis, never truncated"
+          },
+          "snapshotContent": {
+            "type": "string",
+            "description": "The managed-region storage text READ BACK from the page after the write (between the reqlift:managed markers, including any embedded <ac:image><ri:attachment> references)"
+          }
+        },
+        "required": [
+          "analysisId",
+          "pageId",
+          "regionKey",
+          "snapshotContent"
+        ]
+      }
+    },
+    {
+      "name": "reqlift_confluence_report_region",
+      "description": "Report the CURRENT read-back storage text of ONE managed region so ReqLift can detect a Confluence-side (BA) edit. Call this per managed region after reading the page back with mcp__jira__get_confluence_page. Pass the managed-region storage text (between the reqlift:managed markers, including any embedded <ac:image><ri:attachment> references) as currentContent and the page's version number (the `version` field of the page read) as version, for the pinned analysisId + the pinned regionKey. The server re-hashes the read-back; on divergence from the last published snapshot it runs the deterministic diff and persists one pending reconciliation row per change. This is DETECT-ONLY — it never writes back to Confluence. Returns {regionKey, changes, conflict}.",
+      "webhook_url": "WEBHOOK_BASE/confluence_report_region",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "analysisId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the analysis being detected (must be the pinned analysisId)"
+          },
+          "regionKey": {
+            "type": "string",
+            "description": "The area nav_path identifying the managed region (one of the pinned region keys); validated against the analysis, never truncated"
+          },
+          "currentContent": {
+            "type": "string",
+            "description": "The managed-region storage text READ BACK from the page right now (between the reqlift:managed markers, including any embedded <ac:image><ri:attachment> references)"
+          },
+          "version": {
+            "type": "integer",
+            "description": "The Confluence page version number observed at read-back — a cheap pre-check and the detection cursor; the authoritative change check is the content hash"
+          }
+        },
+        "required": [
+          "analysisId",
+          "regionKey",
+          "currentContent",
+          "version"
+        ]
+      }
+    },
+    {
+      "name": "reqlift_confluence_resolve_reconciliation",
+      "description": "Flip ONE pending reconciliation row to adopted/rejected after applying the reviewer's decision. Call this LAST in the reconcile run: after (adopt) patching the master via reqlift_record_feature and re-publishing the region via reqlift_confluence_upsert_section, or (reject) re-asserting the master region. Pass the pinned analysisId + reconId + decision (adopt|reject). The server re-validates that the reconId belongs to the analysis and the caller can edit it, then flips status for that one row only (idempotent — an already-resolved row is a no-op). Returns {reconId, status}.",
+      "webhook_url": "WEBHOOK_BASE/confluence_resolve_reconciliation",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "analysisId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the analysis being reconciled (must be the pinned analysisId)"
+          },
+          "reconId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the reconciliation row being resolved (must be the pinned reconId); validated to belong to the analysis"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "adopt",
+              "reject"
+            ],
+            "description": "The reviewer's decision (must be the pinned decision): adopt makes the BA edit master, reject re-asserts master"
+          }
+        },
+        "required": [
+          "analysisId",
+          "reconId",
+          "decision"
+        ]
+      }
+    },
+    {
+      "name": "wsb_search_images",
+      "description": "Search for stock photos from Unsplash matching a query. Returns image URLs, alt text, and photographer credits.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search query describing the desired image content."
+          },
+          "orientation": {
+            "type": "string",
+            "enum": [
+              "landscape",
+              "squarish",
+              "portrait"
+            ],
+            "description": "Preferred image orientation. Defaults to landscape."
+          },
+          "count": {
+            "type": "integer",
+            "description": "Number of images to return. Defaults to 1."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "webhook_url": "WEBHOOK_BASE/api/webhooks/wsb/search-images",
+      "timeout_ms": 15000
+    },
+    {
+      "name": "wsb_compile_preview",
+      "description": "Compile a preview HTML from content and fragment selections to verify the output looks correct.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "object",
+            "description": "The content object with section data keyed by section name."
+          },
+          "fragments": {
+            "type": "object",
+            "description": "The fragment selections object mapping section names to variant/version strings."
+          }
+        },
+        "required": [
+          "content",
+          "fragments"
+        ]
+      },
+      "webhook_url": "WEBHOOK_BASE/api/webhooks/wsb/compile-preview",
+      "timeout_ms": 30000
+    },
+    {
+      "name": "wsb_get_fragments",
+      "description": "Get information about available template fragments, their sections and variants.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "variant": {
+            "type": "string",
+            "description": "Optional variant name to filter fragment info (e.g. \"brutalist\", \"flagship\")."
+          }
+        },
+        "required": []
+      },
+      "webhook_url": "WEBHOOK_BASE/api/webhooks/wsb/get-fragments",
+      "timeout_ms": 10000
+    },
+    {
+      "name": "wsb_validate_content",
+      "description": "Validate the structure and completeness of generated page content and fragment selections.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "page_json": {
+            "type": "object",
+            "description": "The page JSON object containing content and fragments fields to validate."
+          }
+        },
+        "required": [
+          "page_json"
+        ]
+      },
+      "webhook_url": "WEBHOOK_BASE/api/webhooks/wsb/validate-content",
+      "timeout_ms": 10000
+    },
+    {
+      "name": "wsb_rate_images",
+      "description": "Rate image candidates for visual quality, relevance, and style fit. Returns scores and a recommended pick.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "images": {
+            "type": "array",
+            "description": "Array of image URLs to rate.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "context": {
+            "type": "string",
+            "description": "Description of the section or context where the image will be used."
+          }
+        },
+        "required": [
+          "images"
+        ]
+      },
+      "webhook_url": "WEBHOOK_BASE/api/webhooks/wsb/rate-images",
+      "timeout_ms": 15000
+    }
+  ]
+}

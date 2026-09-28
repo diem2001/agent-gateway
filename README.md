@@ -52,13 +52,72 @@ OAuth credentials persist in the `./agent_home` bind-mount. Re-authentication on
 
 > **Warning:** If `ANTHROPIC_API_KEY` is set (even empty), Claude Code will prefer it over OAuth and fail with "Credit balance is too low" when the API account has no credits. Remove the variable entirely to use the subscription.
 
+### Stopping and recovery
+
+**Init process.** The image runs `tini` as process 1 (`ENTRYPOINT ["/usr/bin/tini", "--", "bash", "/app/entrypoint.sh"]`). It forwards `SIGTERM`/`SIGINT` from `docker stop`, `docker compose down` or a host shutdown to the gateway, reaps finished child processes, and exits with the gateway's exit code. `docker-compose.yml` needs no `init:` setting.
+
+**What a stop does:**
+
+1. The gateway stops accepting new connections and saves every pending change at once.
+2. Requests already received keep running for up to 8 s, including streaming chat answers. Changes they make are saved as usual.
+3. It saves the sessions (with the idle-timeout setting), the tools and the MCP servers once more and exits. Nothing can change between this save and the exit.
+
+A second `SIGTERM`/`SIGINT` skips the rest of the wait. An idle gateway stops within about a second; with open streams it stops after at most about 8 s, below Docker's 10 s grace period. Streams still open at 8 s are cut.
+
+| Exit code | Meaning | What to do |
+|-----------|---------|------------|
+| `0` | Every final save succeeded. | Nothing. |
+| `1` | At least one area's final save failed or was switched off (see `unreadable-not-preserved` below). An `ERROR persistence … problem=final-save-failed` line names the area. Its file keeps its last complete save; changes since then are lost. | Check `docker logs`, disk space and the permissions of `./agent_home/.claude`. |
+| `137` | Killed by Docker after 10 s. Still possible while a git command blocks the gateway (until MVP-7614 is deployed). The files stay intact; changes from the last moment before the block can be lost. | Nothing for the files. |
+
+**State files and `/health`.** `sessions.json`, `tools.json` and `mcp-servers.json` are saved atomically (a temp file `<file>.tmp-*` in the same directory, then a rename), so a kill, crash or full disk never leaves a half-written file. A file that cannot be read or used at start is never overwritten. `GET /health` reports problems in two additive fields; its HTTP status stays 200:
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "uptime": 1,
+  "sessions": 0,
+  "persistence": "degraded",
+  "persistenceIssues": [
+    {
+      "area": "mcpServers",
+      "problem": "corrupt-preserved",
+      "file": "/home/node/.claude/mcp-servers.json",
+      "preservedAs": ["/home/node/.claude/mcp-servers.json.corrupt-20260926T213634Z"]
+    }
+  ]
+}
+```
+
+`persistence` is `"ok"` exactly when `persistenceIssues` is empty. `area` is `sessions`, `tools` or `mcpServers`; several entries may be listed. The compose healthcheck only checks for a 2xx status, so the container stays "healthy" while `persistence` is `"degraded"`: monitoring must read the field (`curl -s http://localhost:3001/health | jq .persistence`).
+
+| `problem` | Meaning | Data at risk | Operator action | Clears when |
+|-----------|---------|--------------|-----------------|-------------|
+| `corrupt-preserved` | The file could not be read or parsed at start, or it held an entry the gateway cannot restore (`null`, a tool or MCP server without a string `name`, a session without a numeric `lastUsed`). It was moved to `<file>.corrupt-<UTC stamp>` with its bytes unchanged, and the area started empty, with none of its entries. | Everything in the copy, until it is restored. | Follow the recovery procedure below. | No `<file>.corrupt-*` exists any more (checked on every `/health` request, no restart needed). |
+| `unreadable-not-preserved` | The file could not be read, parsed or restored and could not be moved aside (usually permissions). The file is left untouched and saves for this area are switched off: API changes still answer success but are lost at the next restart. | Every change to this area since the start. | Fix the cause (usually ownership or permissions of `./agent_home/.claude`), then restart. | The next start loads the file. |
+| `write-failed` | The latest save of this area failed, for example because the disk is full. The previous file is intact. | Changes since the last successful save. | Check disk space and permissions. | The next successful save of this area. A save runs only after a change in this area or at a stop, so after the cause is fixed `degraded` stays until the next change here; a restart also clears it. |
+
+Every problem is also logged, whatever the log level, as one line: `ERROR persistence area=<sessions|tools|mcpServers> problem=<corrupt-preserved|unreadable-not-preserved|write-failed|final-save-failed> file=<path> [preservedAs=<path>] reason=<fixed text> [code=<errno>] (see /health)`. These lines never contain file content.
+
+**Recovering a `.corrupt-*` copy:**
+
+1. The container path `/home/node/.claude/<file>` is `./agent_home/.claude/<file>` on the host.
+2. Stop the gateway first (`docker compose stop agent-gateway`). Otherwise its next save overwrites the restored file.
+3. The copy is usually damaged (for example truncated), or it holds an entry the gateway cannot restore. To restore it, repair it (cut back to the last complete entry and close the array or object, or fix or remove the entry that is `null`, has no string `name` or, for a session, no numeric `lastUsed`; check with `jq . <copy>`) and copy it over `<file>`. This replaces the changes made in that area since the problem was detected. A copy kept after a read error has its original permissions; fix them first.
+4. Give the restored file `node:node` ownership (`chown 1000:1000 <file>`) and its original mode (for example `chmod 600 mcp-servers.json`).
+5. Move the copy out of `./agent_home/.claude/` or delete it. Only this clears `degraded`.
+6. Start the gateway and confirm: `curl -s http://localhost:3001/health | jq '.persistence, .persistenceIssues'`.
+
+Copies of `mcp-servers.json` contain MCP credentials (headers and env values). Handle them as secrets, never attach state files or their copies to tickets or evidence, and delete them once resolved.
+
 ## API Overview
 
 All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Health check (no auth) |
+| `GET` | `/health` | Health check (no auth); `persistence` / `persistenceIssues` report state-file problems ([Stopping and recovery](#stopping-and-recovery)) |
 | `POST` | `/v1/query` | Run an agent query (NDJSON stream) |
 | `GET` | `/v1/query/:queryId/events` | Replay/resume event stream |
 | `GET` | `/v1/sessions` | List active sessions |
@@ -101,9 +160,11 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `POST` | `/v1/mcp-servers/:name/call` | Directly execute a registered MCP server's tool (`tools/call`, no LLM) |
 | `POST` | `/v1/mcp-servers/:name/uploads/*` | Stream a raw file upload to a registered http/sse MCP server's `/uploads/*` route (no buffering) |
 | `GET` | `/v1/mcp-servers/:name/health` | Health check for a registered MCP server |
-| `POST` | `/v1/workspace/git/clone` | Clone a repository into the workspace |
-| `POST` | `/v1/workspace/git/pull` | Pull updates for a workspace repository |
+| `POST` | `/v1/workspace/git/clone` | Clone a repository into the workspace (pulls instead when it exists); `400 Invalid branch` for a branch starting with `-`, `400 Invalid url` for a URL with a line break, `400 <field> must be a string` for a non-string `url`/`path`/`branch`/`sshKey` |
+| `POST` | `/v1/workspace/git/pull` | Pull updates for a workspace repository; `400 Invalid branch` for a branch starting with `-`, `400 <field> must be a string` for a non-string `path`/`branch`/`sshKey` |
 | `GET` | `/v1/workspace/git/status` | Get git status for a workspace repository |
+
+**Workspace git:** git runs without blocking the gateway, so `/health` and running streams keep answering during a sync. Operations on the same repository run one at a time in arrival order; at most `GIT_MAX_CONCURRENCY` (default 3) run at once overall, and further requests wait in arrival order (none is rejected). Arguments are passed to git without a shell. A failed operation answers `500 {"error": "<git's message>"}` with URL credentials hidden: on each line, everything from the first `scheme://` to the last `@` is shown as `***`, so for `http://` and `https://` URLs the `user:password@` part stays hidden whatever characters the token contains (this can also hide a host or path that shares the line). `ssh://`, `git://` and `file://` transports do not use URL passwords, and ssh or git may repeat such a URL's `user:password` part in their own words (for example `Could not resolve hostname user:<password>`), which this redaction does not catch, so put tokens only into `http(s)://` URLs; a git command that exceeds `GIT_TIMEOUT_MS` (default 120 s) answers `500 {"error": "git <subcommand> timed out after <n> s"}`.
 
 ## Query Request Body
 
@@ -273,6 +334,8 @@ Express Server (auth middleware)
 
 External tools can be registered via the `/v1/tools` endpoints. Each tool defines a `webhook_url` that is called when the agent invokes the tool. Registered tools are wrapped as in-process MCP servers and injected into the Claude Agent SDK alongside the built-in tools.
 
+The tool's `input_schema` is what the model is told about its arguments: field types (`string`, `number`, `integer`, `boolean`, `object`, `array`), `enum` values, nested `properties`/`required`, array `items` and every `description` are passed through. The gateway rejects a call that violates them before the webhook is called; the model gets a tool error naming the field and the expected type, so it can correct itself. Unsupported JSON Schema constructs (`format`, `pattern`, `oneOf`, numeric bounds, ...) make that property alone accept any value, so registration never fails because of them. Values are never converted or defaulted, undeclared top-level arguments are still dropped, and webhooks keep their own validation. Details: [docs/architecture.md](docs/architecture.md#tool-input-schemats----webhook-tool-input-schemas).
+
 When the agent calls a registered tool, the gateway POSTs to the webhook URL with:
 
 ```json
@@ -376,12 +439,17 @@ Payload fields:
 | `enabled` | no | Defaults to `true` |
 | `allowedToolsPattern` | no | Glob restricting which MCP tools the agent may call (e.g. `mcp__jira__*`) |
 | `userCredentialSchema` | no | Per-user credential fields and output templates for `headers` or `env` overrides |
+| `requireUserCredentials` | no | Boolean, default `false`. When `true`, the server is attached to a run only if the run's `mcpCredentialOverrides` carries its user credential (see below). Not allowed together with `type: "sse"` |
 
 `userCredentialSchema.fields[]` defines the form that clients render for a user's credential wallet. Field `type` must be one of `text`, `password`, `url`, or `email`; `key` values must be unique. `userCredentialSchema.outputs[]` defines how those field values are composed at query time. HTTP/SSE servers may only emit `target: "headers"` outputs, and stdio servers may only emit `target: "env"` outputs. Mismatches are rejected with `SCHEMA_TARGET_MISMATCH`.
 
 Output templates support plain substitution (`"{fieldKey}"`, `"prefix-{a}-{b}"`) and HTTP Basic auth (`"basic:{email}:{apiToken}"`, emitted as `Basic <base64(email:apiToken)>`). The composer is transport-agnostic; the registry PUT validation enforces the transport-to-target rule before definitions are persisted.
 
-Registered MCP servers persist to `MCP_SERVERS_PERSIST_PATH` and are merged into `options.mcpServers` on every `/v1/query` call. The SDK connects (http/sse) or spawns (stdio) per query; use `POST /v1/mcp-servers/:name/restart` to force a fresh connection.
+`headers` and `env` must be string maps. Every header must be one Node can send (a token name; no CR, LF, NUL or other invalid character in the value), and env names and values must not contain NUL. The same check applies to `mcpCredentialOverrides`, the `/test` body and the `/call` `credentials`. A violation answers `400` in each route's error style (`MCP_OVERRIDE_INVALID` outside the registry `PUT`), and the message never echoes the value.
+
+`requireUserCredentials: true` marks a server that must run with the requesting user's own credential. A run gets such a server only when its `mcpCredentialOverrides` entry carries at least one non-empty value for the transport's target (`headers` for http, `env` for stdio) and, when the server has a `userCredentialSchema`, a non-empty value for every output key. An empty entry such as `{"aida": {}}` counts as missing. Otherwise the server is left out of that run: it is not in `options.mcpServers`, its tool pattern (custom `allowedToolsPattern` or `mcp__<name>__*`) is not in the default allowed tools, a request-supplied `mcpServers` entry with the same name is dropped, and the gateway logs `mcp.server.omitted serverName=<name> reason=missing_user_credential` (names only). The field is stored and returned only when sent; a `PUT` without it clears it, and `/restart` keeps it. `/test`, `/call` and `/uploads/*` are not affected.
+
+Registered MCP servers persist to `MCP_SERVERS_PERSIST_PATH` and are merged into `options.mcpServers` on every `/v1/query` call (except a `requireUserCredentials` server when the run lacks its user credential). The SDK connects (http/sse) or spawns (stdio) per query; use `POST /v1/mcp-servers/:name/restart` to force a fresh connection.
 
 Per-request MCP credential overrides can be attached to `POST /v1/query` without changing the existing request contract:
 
@@ -429,6 +497,12 @@ curl -X POST http://localhost:3001/v1/mcp-servers/jira/test \
 ```
 
 Success returns `{ "ok": true, "toolCount": 2, "tools": [{ "name": "..." }] }`. Unknown servers return `MCP_SERVER_NOT_FOUND`, upstream 401/403 returns `MCP_AUTH_FAILED`, transport failures return `MCP_NETWORK_ERROR`, and timeouts return `MCP_TIMEOUT`. Error messages are sanitized and do not echo header or env values.
+
+**Registered http servers go through the credential relay:** the Claude runtime inside the gateway gets a loopback URL (`http://127.0.0.1:<port>/mcp/<token>`, one token per run and server) instead of the registered URL and headers; the gateway's relay forwards to the registered server with the run's headers (static headers merged with the override). When the server refuses the token, the runtime never sees the refusal and never starts an OAuth login inside the gateway: a refused `tools/call` reaches the model as a tool error result (`MCP server "<name>" refused the credential`), a refused `initialize` leaves that server's tools out of the run, and redirects, other errors or an unreachable server answer `MCP server "<name>" unavailable`. The relay forwards only the MCP endpoint (never `/.well-known/*`, registration, authorize or token paths), answers the GET event stream with 405, and returns only `Content-Type` and `Mcp-Session-Id` to the runtime. Tokens are revoked when the run ends; after that the relay sends nothing more upstream for them, and a request still in progress is closed. If the relay could not start, registered http servers are left out of runs (`mcp.server.omitted ... reason=relay_unavailable`) instead of being connected directly. Request-supplied `mcpServers` and registered `sse` servers keep the direct path. With Claude Code 2.0.77, an upstream that lost its MCP session (404) makes the current tool call fail, as with a direct connection.
+
+**The runtime's own log files are not kept:** each run gets a private directory under the OS temp directory for the runtime's debug log and MCP logs (which record connection options, including header and env values); it is deleted once the runtime process has exited, and leftovers are removed at gateway startup. `DEBUG_CLAUDE_AGENT_SDK` is ignored: the gateway removes it at startup and logs a warning, because the SDK would write its full runtime arguments, including MCP configuration, to `~/.claude/debug/sdk-*.txt`.
+
+**Credentials in the debug log:** at `LOG_LEVEL=debug` the gateway logs request bodies (first 2000 characters) and response previews (first 500 characters). In both, the whole value of every `headers` and `env` key, at any depth, is logged as `"[REDACTED]"`; the keys stay visible (a map keeps its keys, any other shape becomes `"[REDACTED]"`). Every `sshKey` value is logged as `"[REDACTED]"`, and every string under a `url` key is logged with its credentials removed (`scheme://***@host/...`, everything from `scheme://` to the last `@`, whatever characters the token contains; git's own error text is covered only for `http(s)://` URLs, see **Workspace git**), which covers the token-bearing clone URLs and inline SSH keys of `/v1/workspace/git/*`. This covers `mcpServers[*]` and `mcpCredentialOverrides` of `POST /v1/query`, the `/test` and `/call` bodies, and registry definitions in `PUT /v1/mcp-servers/:name` bodies and in the answers of `PUT`, `GET /v1/mcp-servers/:name` and `GET /v1/mcp-servers`. Redaction runs before the preview is shortened, so no prefix of a value can appear. Only the log copy changes: the API still returns the real values, and the MCP client of a run still uses them. A `text/*` request body is logged as its length only, a registry answer that is not JSON is not previewed, and a request whose JSON cannot be parsed is logged as `request body rejected type=<parser error type> status=<code>` (the parser's message would quote part of the body).
 
 ### Direct tool call (`POST /v1/mcp-servers/:name/call`)
 

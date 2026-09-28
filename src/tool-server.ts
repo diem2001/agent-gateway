@@ -1,29 +1,9 @@
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
-// zod is a transitive dependency of @anthropic-ai/claude-agent-sdk (required for ZodRawShape)
-import { z } from "zod";
+import { buildToolInputShape } from "./tool-input-schema.js";
 import type { ToolDefinition } from "./tools.js";
 import type { WebhookContext, WebhookResponse } from "./webhook.js";
 import { executeWebhook } from "./webhook.js";
-
-/* ------------------------------------------------------------------ */
-/*  Helpers                                                             */
-/* ------------------------------------------------------------------ */
-
-/**
- * Build a ZodRawShape from a JSON Schema object.
- * Each declared property maps to z.unknown() — validation is the webhook's responsibility.
- */
-function buildZodShape(jsonSchema: Record<string, unknown>): Record<string, z.ZodUnknown> {
-  const shape: Record<string, z.ZodUnknown> = {};
-  const props = jsonSchema["properties"];
-  if (props && typeof props === "object" && !Array.isArray(props)) {
-    for (const key of Object.keys(props as Record<string, unknown>)) {
-      shape[key] = z.unknown();
-    }
-  }
-  return shape;
-}
 
 /* ------------------------------------------------------------------ */
 /*  Factory                                                             */
@@ -31,7 +11,10 @@ function buildZodShape(jsonSchema: Record<string, unknown>): Record<string, z.Zo
 
 /**
  * Creates an in-process MCP server wrapping all registered tools.
- * Each tool handler POSTs to its configured webhook URL.
+ * Each tool's registered input_schema is advertised to the model and validated
+ * before the handler runs (see tool-input-schema.ts); a call that violates it
+ * gets a tool error and never reaches the webhook. The webhook keeps its own
+ * validation. Each tool handler POSTs to its configured webhook URL.
  * Context (user_id, session_id, etc.) is baked into handler closures.
  *
  * Call once per query so the context is correctly scoped.
@@ -42,7 +25,7 @@ export function createToolMcpServer(
   authToken?: string,
 ): McpSdkServerConfigWithInstance {
   const sdkTools = tools.map((toolDef) => {
-    const inputSchema = buildZodShape(toolDef.input_schema);
+    const inputSchema = buildToolInputShape(toolDef.name, toolDef.input_schema);
 
     return {
       name: toolDef.name,
