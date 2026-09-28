@@ -164,7 +164,7 @@ Registry for *external* MCP servers — distinct from the webhook Tool Registry.
 
 `buildMcpServersForSdk()` produces the `mcpServers` map handed to the Agent SDK on every query: HTTP/SSE servers contribute `{type, url, headers}`; stdio servers contribute `{type, command, args, env}`. Disabled servers (`enabled: false`) are skipped. Per-server `allowedToolsPattern` globs (e.g. `mcp__jira__*`) are aggregated into the SDK's `allowedTools` filter so the agent can only call the tools the operator explicitly opted in to.
 
-`requireUserCredentials` (optional boolean, not allowed with `sse`) marks a server that needs the requesting user's own credential. `selectRegistryServersForRun()` in `mcp-overrides.ts` leaves such a server out of a run whose `mcpCredentialOverrides` entry has no non-empty value for the transport's target (or misses a `userCredentialSchema` output key); `agent.ts` then drops its SDK entry, its allowed-tool pattern and any request-supplied server of the same name, and logs `mcp.server.omitted serverName=<name> reason=missing_user_credential`.
+`requireUserCredentials` (optional boolean, not allowed with `sse`) marks a server that needs the requesting user's own credential. `selectRegistryServersForRun()` in `mcp-overrides.ts` leaves such a server out of a run whose `mcpCredentialOverrides` entry has no non-empty value for the transport's target (or misses a `userCredentialSchema` output key: `headers` keys are matched case-insensitively and every match must be non-empty, `env` keys exactly); `agent.ts` then drops its SDK entry, its allowed-tool pattern and any request-supplied server of the same name, and logs `mcp.server.omitted serverName=<name> reason=missing_user_credential`.
 
 `userCredentialSchema` lets the registry advertise the form a user has to fill in to derive credentials at query time. `fields[]` declares form input definitions (`text`, `password`, `url`, `email`); `outputs[]` declares how those values compose into either `headers` (http/sse) or `env` (stdio) targets via plain substitution (`"{key}"`) or HTTP Basic encoding (`"basic:{email}:{apiToken}"`). Transport-target mismatches are rejected with `SCHEMA_TARGET_MISMATCH` at registration time.
 
@@ -185,7 +185,7 @@ Forces a minor collection every 2 MiB relayed so dropped chunk buffers do not pi
 
 ### routes/mcp.ts -- MCP Server Registry Endpoints
 REST endpoints for the external MCP server registry:
-- **PUT /v1/mcp-servers/:name**: Register or update a server (validates transport, fields, output targets, template references)
+- **PUT /v1/mcp-servers/:name**: Register or update a server (validates transport, fields, output targets, template references). Creating a new entry first requires the name rule `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$` (else 400 `MCP_SERVER_NAME_INVALID`); updates and deletes of existing entries are never refused because of their name
 - **GET /v1/mcp-servers**: List all registered servers
 - **GET /v1/mcp-servers/:name**: Get a single server definition
 - **DELETE /v1/mcp-servers/:name**: Remove a server
