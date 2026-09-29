@@ -18,6 +18,7 @@ import { materializeUserSkills, cleanupUserSkillBundle } from "./user-skills.js"
 import { requestMcpAllowedToolPatterns, type RequestMcpServers } from "./mcp-request-servers.js";
 import { credentialRelay } from "./mcp-credential-relay.js";
 import { createRunLogDir, removeRunLogDirAfterExit, spawnRuntimeWithHandle } from "./sdk-run-logs.js";
+import { classifyRunFailure, isAbortError } from "./run-failure.js";
 
 export interface QueryParams {
   prompt?: string;
@@ -47,6 +48,8 @@ export interface QueryParams {
    * `undefined` ⇒ global-only load, `skills_loaded.user_id = null`.
    */
   userId?: string;
+  /** Only for the log reference in the unknown-failure message (run-failure.ts). */
+  queryId?: string;
 }
 
 export interface QueryResult {
@@ -127,7 +130,15 @@ async function* buildContentMessageStream(
   };
 }
 
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId }: QueryParams): Promise<QueryResult> {
+/**
+ * One attempt. A failed attempt throws a `RunFailure` (run-failure.ts) with a
+ * safe public message: a result with `is_error: true`, or any error the SDK
+ * iterator throws. The runtime writes its diagnostic to stdout before it exits
+ * 1, so the loop sees it before the SDK throws "process exited with code 1";
+ * it is kept here and classified, never forwarded. Client aborts (AbortError)
+ * are rethrown unchanged.
+ */
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId }: QueryParams): Promise<QueryResult> {
   const registeredTools = getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
   // A registry server with requireUserCredentials is left out of a run without
@@ -250,6 +261,10 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
 
   let fullResponse = "";
   let resultData: Record<string, unknown> | null = null;
+  // Classifier inputs (run-failure.ts): the runtime version and error-flagged
+  // assistant messages. Ordinary assistant text is never classified.
+  let installedVersion: unknown;
+  const assistantErrors: { error: unknown; text: string }[] = [];
   const pendingTools = new Map<string, { name: string }>();
   const toolTimings = new Map<string, number>();
 
@@ -260,7 +275,12 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const msg = message as any;
 
-    if (msg.type === "assistant" && msg.message?.content) {
+    if (msg.type === "assistant" && msg.error != null) {
+      // A runtime-authored error message (e.g. "API Error: 400 <raw provider
+      // body>"): a classifier input only, never part of the response.
+      const blocks: { text?: unknown }[] = Array.isArray(msg.message?.content) ? msg.message.content : [];
+      assistantErrors.push({ error: msg.error, text: blocks.map((block) => (typeof block.text === "string" ? block.text : "")).join("\n") });
+    } else if (msg.type === "assistant" && msg.message?.content) {
       for (const block of msg.message.content) {
         if (block.text) fullResponse += block.text;
         if (block.type === "tool_use") {
@@ -323,11 +343,15 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
       // message, NOT the gateway's own materialized list — that is what makes this
       // the real loaded-set surface.
       if (msg.subtype === "init") {
+        installedVersion = msg.claude_code_version;
         const loadedSkills: string[] = Array.isArray(msg.skills) ? msg.skills : [];
         onEvent({ type: "skills_loaded", user_id: userId ?? null, skills: loadedSkills });
       }
     } else if (msg.type === "result") { resultData = msg; }
   }
+  } catch (err) {
+    if (isAbortError(err)) throw err;
+    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors, thrown: err }, queryId);
   } finally {
     // Every end (answer, error, abort): the relay URLs stop working and their
     // in-flight upstream requests are destroyed.
@@ -335,6 +359,12 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     // Request-scoped bundle: remove it once this query() call has drained.
     cleanupUserSkillBundle(userSkills.pluginRoot);
     void removeRunLogDirAfterExit(runLogs.dir, runtimeChild);
+  }
+
+  // A result flagged is_error is a failure even when its subtype says "success"
+  // and the runtime exited 0.
+  if (resultData?.is_error === true) {
+    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors }, queryId);
   }
 
   return { response: fullResponse, resultData };

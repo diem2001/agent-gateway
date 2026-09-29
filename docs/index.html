@@ -327,6 +327,21 @@ curl -s http://localhost:3001/health | jq .persistence</code></pre>
     <p>Override server names must exist and be enabled. Unknown names return <code>MCP_SERVER_NOT_FOUND</code>; disabled names return <code>MCP_SERVER_DISABLED</code>. Overrides are merged for that one request only and are never persisted to the MCP registry.</p>
     <p>A single query may also attach an unregistered MCP server via <code>mcpServers</code> (the SDK <code>mcpServers</code> map — <code>{ command, args?, env? }</code> for stdio or <code>{ url, type? }</code> for http/sse). The gateway injects it into <code>options.mcpServers</code> and auto-allows its <code>mcp__&lt;name&gt;__*</code> tools, so no explicit <code>allowedTools</code> is needed. Request servers are merged at the lowest precedence (the gateway's <code>agent-gateway-tools</code> and registered servers always win; the reserved name <code>agent-gateway-tools</code> and malformed entries return <code>400</code>) and are never persisted. reqlift recon uses this to attach a per-run chrome-devtools server.</p>
 
+    <h3>Failed Queries</h3>
+    <p>A failed query ends with exactly one <a href="#ndjson"><code>error</code></a> event and no <code>done</code>; it confirms no session. The event keeps its shape <code>{"seq", "type": "error", "content"}</code>, and <code>content</code> is a safe, actionable message for the end user. The Claude runtime reports a provider rejection on its stdout before it exits with code 1; the gateway classifies that diagnostic instead of passing on the runtime's exit message. Raw diagnostics (provider responses, runtime output, stack traces, headers, prompts) never appear in <code>content</code>, in any other event or in the gateway log.</p>
+    <table class="param-table">
+      <thead>
+        <tr><th>Cause</th><th>Retried</th><th><code>content</code></th></tr>
+      </thead>
+      <tbody>
+        <tr><td>The provider rejects the gateway's Claude runtime as too old for the model</td><td>No</td><td>The AI runtime on the gateway server is too old for the selected model (installed 2.0.77, required 2.1.280 or newer). Ask your gateway administrator to update the gateway runtime. Retrying will not help until the administrator has done this. <em>(Each version is named only when it is known; without them the parenthesis is shortened or left out.)</em></td></tr>
+        <tr><td>Authentication with the provider failed (401/403)</td><td>No</td><td>The gateway could not authenticate with the AI provider. Ask your gateway administrator to check the gateway's authentication. Retrying will not help until the administrator has done this.</td></tr>
+        <tr><td>Rate limit or overload (429/529), after the retry budget</td><td>Yes (see Retry Layer)</td><td>The AI provider is busy right now. Please try again in a few minutes.</td></tr>
+        <tr><td>Anything else, including a missing or unreadable diagnostic</td><td>No</td><td>The AI request failed on the gateway for an unknown reason. Please try again. If it keeps failing, ask your gateway administrator to check the gateway logs (reference: &lt;queryId&gt;).</td></tr>
+      </tbody>
+    </table>
+    <p>A client abort keeps the SDK's abort text. The gateway log gets one line per failure with safe fields only: <code>Error queryId=&lt;id&gt; kind=&lt;runtime_version_unsupported|authentication|transient|unknown&gt; apiStatus=&lt;n|none&gt; providerType=&lt;known type|other|none&gt; installed=&lt;version|none&gt; required=&lt;version|none&gt;</code>.</p>
+
     <h3>Multimodal Content (<code>content[]</code>)</h3>
     <p>Send text and images in a single query by passing a <code>content</code> array of content blocks. The array maps directly to the Anthropic API content-block format and is forwarded to the Claude Agent SDK as a structured user message — image blocks are passed through to Anthropic <strong>unmodified</strong>.</p>
 <pre><code>type ContentBlock =
@@ -1466,7 +1481,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <div class="event-card">
     <h4>rate_limited</h4>
-    <p>Rate limit detected. The gateway will retry automatically. Emitted both when the retry layer detects an error and when the SDK stream reports a rate limit event.</p>
+    <p>Rate limit detected. The gateway will retry automatically. Emitted both when the retry layer retries (a rate limit or overload, or an empty answer) and when the SDK stream reports a rate limit event. Permanent failures are not retried and emit no <code>rate_limited</code>.</p>
 <pre><code>// Retry layer (error-based)
 {"seq": 3, "type": "rate_limited", "status": "retrying", "attempt": 1, "waitMs": 1000}
 
@@ -1502,7 +1517,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <div class="event-card">
     <h4>done</h4>
-    <p>Query completed successfully. Includes token usage, cost, and context window statistics. Always the last event on success.</p>
+    <p>Query completed successfully. Includes token usage, cost, and context window statistics. Always the last event on success; a failed query never emits it.</p>
 <pre><code>{
   "seq": 7,
   "type": "done",
@@ -1522,8 +1537,8 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <div class="event-card">
     <h4>error</h4>
-    <p>Query failed with an error. Always the last event on failure.</p>
-<pre><code>{"seq": 3, "type": "error", "content": "Connection refused: ssh root@example.com"}</code></pre>
+    <p>Query failed. Always the last event on failure, emitted exactly once, and never together with <code>done</code>. <code>content</code> is a safe, actionable message: the runtime is too old for the model, provider authentication failed, the provider is busy (after the retry budget), or an unknown failure with a log reference. It never contains raw diagnostics. See <a href="#ep-query">Failed Queries</a> for the exact texts.</p>
+<pre><code>{"seq": 3, "type": "error", "content": "The AI provider is busy right now. Please try again in a few minutes."}</code></pre>
   </div>
 
   <!-- ============================================================ -->
@@ -1545,7 +1560,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <div class="vflow-num n-amber">2</div>
       <div class="vflow-body">
         <h4 class="c-amber">Gateway resolves session</h4>
-        <p>If a session exists with the same ID, systemPrompt, and model, the existing Claude session is resumed using the SDK's <code>resume</code> option with the stored SDK session ID. If the prompt or model changed, a new Claude session is created under the same client ID using the <code>sessionId</code> option. After each query completes, the gateway syncs the stored SDK session ID with the actual session_id returned by the SDK, ensuring subsequent queries resume the correct conversation.</p>
+        <p>If a session exists with the same ID and an earlier successful query confirmed its SDK session, the existing Claude session is resumed using the SDK's <code>resume</code> option with the stored SDK session ID. After each successful query, the gateway syncs the stored SDK session ID with the actual session_id returned by the SDK, ensuring subsequent queries resume the correct conversation. A failed query confirms nothing: the next query with the same client ID starts a fresh Claude session under a new SDK session ID (using the <code>sessionId</code> option), so it neither resumes nor appends to the failed attempt.</p>
       </div>
     </div>
     <div class="vflow-step">
@@ -1780,7 +1795,7 @@ curl http://localhost:3001/health</code></pre>
       <div class="vflow-num n-red">5</div>
       <div class="vflow-body">
         <h4 class="c-red">Retry Layer</h4>
-        <p>On rate limits or empty responses: exponential backoff (1s, 2s, 4s), up to 3 retries, 60s total budget. Emits <code>rate_limited</code> events to the client.</p>
+        <p>On rate limits, overloads or empty answers: exponential backoff (1s, 2s, 4s), up to 3 retries, 60s total budget. Emits <code>rate_limited</code> events to the client. Permanent failures (runtime too old, authentication, unknown) end at once with one <code>error</code> event. A retry resumes only a session an earlier successful answer established; otherwise it starts fresh under a new SDK session ID.</p>
       </div>
     </div>
     <div class="vflow-step">

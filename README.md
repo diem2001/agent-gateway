@@ -221,6 +221,19 @@ curl -N -X POST http://localhost:3001/v1/query \
   }'
 ```
 
+### Failed queries
+
+A failed query ends with exactly one `error` event and no `done`, and it confirms no session. The event keeps its shape `{"seq": n, "type": "error", "content": "..."}`; `content` is a safe, actionable message for the end user. The Claude runtime reports a provider rejection on its stdout before it exits with code 1; the gateway classifies that diagnostic instead of passing on the runtime's exit message (`Claude Code process exited with code 1`). Raw diagnostics (provider responses, runtime output, stack traces, headers, prompts) never appear in `content`, in any other event or in the gateway log.
+
+| Cause | Retried | `content` |
+|-------|---------|-----------|
+| The provider rejects the gateway's Claude runtime as too old for the model | no | `The AI runtime on the gateway server is too old for the selected model (installed 2.0.77, required 2.1.280 or newer). Ask your gateway administrator to update the gateway runtime. Retrying will not help until the administrator has done this.` |
+| Authentication with the provider failed (401/403) | no | `The gateway could not authenticate with the AI provider. Ask your gateway administrator to check the gateway's authentication. Retrying will not help until the administrator has done this.` |
+| Rate limit or overload (429/529) after the retry budget (3 retries, 60 s) | yes | `The AI provider is busy right now. Please try again in a few minutes.` |
+| Anything else, including a missing or unreadable diagnostic | no | `The AI request failed on the gateway for an unknown reason. Please try again. If it keeps failing, ask your gateway administrator to check the gateway logs (reference: <queryId>).` |
+
+In the version message each version is named only when it is known and valid (`x.y.z`): with only the installed one the parenthesis reads `(installed 2.0.77; a newer version is required)`, with only the required one `(required 2.1.280 or newer)`, and without either it is left out. The reference is left out when the `queryId` is not 1–128 characters of `A-Z a-z 0-9 . _ : -`. A client abort keeps the SDK's abort text. The next query with the same `sessionId` after a failed first query starts a fresh conversation. The gateway logs one line per failure with safe fields only: `Error queryId=<id> kind=<runtime_version_unsupported|authentication|transient|unknown> apiStatus=<n|none> providerType=<known type|other|none> installed=<version|none> required=<version|none>`.
+
 ## Authentication
 
 API keys are configured via the `API_KEYS` environment variable:

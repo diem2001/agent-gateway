@@ -63,6 +63,20 @@ Default tools: `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebSearch`, `We
 
 If registered webhook tools exist, they are wrapped as in-process MCP servers via `createToolMcpServer()` and injected into the SDK query alongside the built-in tools. The webhook context (user_id, session_id, api_key_label) and the client's Bearer token are passed to each webhook call. External MCP servers from the MCP Server Registry are merged into the same `mcpServers` map (per-server credentials applied), so the agent can call their tools over the MCP protocol. A registered **http** server reaches the SDK as a credential-relay URL with a per-run token and no headers (see [Credential Relay Flow](#credential-relay-flow)); the tokens are revoked when the run ends. The SDK child environment points the runtime's own log files into a private per-run directory (`sdk-run-logs.ts`), deleted after the runtime child has exited.
 
+**Run failures:** on a provider rejection the Claude runtime writes its diagnostic to stdout (a `system/init` message with `claude_code_version`, an assistant message with a non-null SDK `error` and the text `API Error: <status> <raw provider body>`, and a `result` with `is_error: true`, often with `subtype: "success"`) and then exits 1; the SDK yields those messages and only then throws `Claude Code process exited with code 1`. `agent.ts` keeps the classifier inputs of the attempt (the init version, error-flagged assistant messages, the result) and, on that throw or on a completed result with `is_error: true`, throws a `RunFailure` from `run-failure.ts` instead. Every other error thrown during iteration (for example an SDK JSON `SyntaxError`, whose message quotes runtime stdout) is wrapped too; only a client abort (`AbortError`) passes through unchanged. Error-flagged assistant text is never added to the answer, and ordinary assistant text is never classified.
+
+### run-failure.ts -- Run Failure Classification
+`classifyRunFailure()` turns one failed attempt into a `RunFailure` (an `Error` without `cause`) with `kind`, a fixed safe public `message`, `retryable`, operator-safe `logFields` and `resultSummary` (the result's usage, cost, duration, turn count, subtype, `is_error` and `session_id`, never its text or `errors`). Inputs are only the init `claude_code_version`, the result text when `is_error` is true, `result.errors[]`, the text and enum of error-flagged assistant messages, and the thrown error. A text is parsed only after an `API Error: <status>` prefix and only up to 16 KiB, reading fixed paths (`error.type`, `error.code`, `error.error.type`, `error.error.code`, `error.message`); version patterns run only on the first 1 KiB of `error.message`, and a version is used only when it matches `^\d{1,5}\.\d{1,5}\.\d{1,5}$`. The classifier is total (an internal exception gives `unknown`).
+
+| kind | recognized by | retried |
+|------|---------------|---------|
+| `runtime_version_unsupported` | provider code `claude_code_version_too_old` | no |
+| `authentication` | assistant `error: "authentication_failed"`, provider type `authentication_error` or `permission_error` | no |
+| `transient` | status 429/529, provider type `rate_limit_error`/`overloaded_error`, assistant `error: "rate_limit"`, or (without any diagnostic) a thrown message matching the historic pattern (`rate.limit`, `429`, `throttl` or `overloaded`, case-insensitive; not for a JSON `SyntaxError`) | yes |
+| `unknown` | everything else, including absent, malformed or oversized diagnostics and `billing_error`/`invalid_request`/`server_error` without a recognized code | no |
+
+Permanent kinds beat `transient`, and `transient` beats `unknown`. The exact public messages are listed in the README ("Failed queries"). The installed version comes only from the init message and the required one only from an explicit "`<version>` or newer" or ">= `<version>`" in `error.message`.
+
 ### mcp-credential-relay.ts -- Credential Relay
 A `node:http` listener on 127.0.0.1 (ephemeral port, never an Express route). `register()` binds a 128-bit token to a run's upstream URL and header snapshot; `revoke()` ends it: requests still uploading are closed, in-flight upstream requests are destroyed, and no upstream request is sent with its headers afterwards. Only `POST` and `DELETE` on the exact `/mcp/<token>` path are forwarded; see the flow below for header allowlists and refusal answers.
 
@@ -72,9 +86,9 @@ Creates the per-run directory (0700, prefix `agent-gateway-run-` under the OS te
 ### sessions.ts -- Session Management
 Maps client-provided session IDs to internal Claude SDK session IDs. Sessions are:
 - **Created** on first query with a given sessionId
-- **Reused** when the same sessionId, systemPrompt, and model match
-- **Replaced** when systemPrompt or model changes (new Claude session, same client ID)
-- **Synced** via `updateSessionSdkId()` after each query -- the SDK may return a different session_id than the one provided, so the gateway updates the stored mapping to ensure subsequent queries resume the correct conversation
+- **Resumed** when the stored session has a confirmed SDK session ID (`sdkSessionId`)
+- **Restarted** when it has none (its first query failed): the next query gets a new SDK session ID (persisted under the same client ID) and starts fresh, because Claude Code 2.0.77 would append to the failed attempt's transcript if the old ID were reused
+- **Synced** via `updateSessionSdkId()` after each successful query -- the SDK may return a different session_id than the one provided, so the gateway updates the stored mapping to ensure subsequent queries resume the correct conversation. A failed query confirms nothing
 - **Persisted** to disk (debounced, atomic; see `persistence.ts`) at `SESSION_PERSIST_PATH`
 - **Restored** from disk on startup (expired sessions filtered out)
 - **Cleaned** every 5 minutes if `SESSION_IDLE_TIMEOUT_MS > 0`
@@ -85,10 +99,10 @@ Session continuity uses two SDK options:
 
 ### retry.ts -- Retry with Exponential Backoff
 Wraps `runQuery` with up to 3 retries. Retries on:
-- Rate limit errors (429, "overloaded", "throttled")
-- Empty or whitespace-only responses
+- Transient failures (`RunFailure.retryable`: rate limit or overload, see `run-failure.ts`)
+- Empty or whitespace-only answers of a run that did not fail
 
-Uses exponential backoff (1s, 2s, 4s) with a 60-second total budget. Emits `rate_limited` events so clients can show retry status. Respects `AbortController` for cancellation.
+Permanent failures (`runtime_version_unsupported`, `authentication`, `unknown`) are thrown at once. Uses exponential backoff (1s, 2s, 4s) with a 60-second total budget. Emits `rate_limited` events so clients can show retry status. Respects `AbortController` for cancellation. A retry resumes only an established session (the request resumed one, or an earlier attempt of a request with a session ID ended with a result that is not `is_error` and has a `session_id`); otherwise it starts fresh with a new SDK session ID. Retry log lines carry the query ID, `kind` and attempt, never an error message.
 
 ### event-cache.ts -- Event Cache
 Stores NDJSON events in memory keyed by `queryId`. Used by `GET /v1/query/:queryId/events` for replay and real-time streaming. Entries are marked "done" when the query completes. A background timer (every 60s) garbage-collects entries older than `EVENT_CACHE_TTL_MS` (default 30 minutes).
@@ -213,7 +227,7 @@ REST endpoints for the external MCP server registry:
 9. For registered webhook tools, the in-process MCP server handler POSTs to the webhook URL and returns the result. For registered http MCP servers, the SDK speaks MCP to the credential relay, which forwards to the upstream with the run's headers; stdio, sse and request-supplied servers use their transport directly
 10. Events are written to response stream (NDJSON) and cached
 11. On completion, `done` event emitted with token usage, cost, context stats; SDK session ID synced via `updateSessionSdkId()`
-12. On error, `error` event emitted with message
+12. On failure, exactly one `error` event `{seq, type, content}` emitted by one helper in `query.ts`: `content` is the `RunFailure` message (the SDK's text for a client abort); no `done` and no `updateSessionSdkId()`. The log line is `Error queryId=<id> kind=<kind> apiStatus=<n|none> providerType=<type|other|none> installed=<v|none> required=<v|none>`
 13. Event cache entry marked "done"; per-request overrides are dropped (never persisted)
 
 ## Session Lifecycle
@@ -222,9 +236,9 @@ REST endpoints for the external MCP server registry:
 Client sends sessionId="abc"
     |
     v
-Session exists with same prompt + model?
+Session exists with a confirmed SDK session?
     |                    |
-   YES                  NO
+   YES                  NO (new, or its first query failed)
     |                    |
     v                    v
 Reuse stored SDK      Create new Claude
@@ -240,10 +254,11 @@ Resume conversation   Start fresh
     +--------+-----------+
              |
              v
-    After query completes:
+    After a successful query:
     updateSessionSdkId() syncs
     stored ID with SDK's actual
-    session_id (snake_case field)
+    session_id (snake_case field).
+    A failed query confirms nothing.
 ```
 
 Sessions persist across server restarts via `SESSION_PERSIST_PATH`. The cleanup timer evicts sessions idle longer than `SESSION_IDLE_TIMEOUT_MS`.

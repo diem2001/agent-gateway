@@ -3,6 +3,7 @@ import { log, logDebug } from "./logging.js";
 import { createCacheEntry, getCacheEntry, markDone, type StreamEvent } from "./event-cache.js";
 import { runQueryWithRetry } from "./retry.js";
 import { getSession, updateSessionSdkId } from "./sessions.js";
+import { RunFailure, classifyRunFailure, formatLogFields, isAbortError } from "./run-failure.js";
 import {
   validateMcpCredentialOverrides,
   type McpCredentialOverrides,
@@ -130,6 +131,23 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     for (const listener of cacheEntry.listeners) { listener(line); }
   }
 
+  /**
+   * The one terminal `error` event of a failed request: `{seq, type, content}`,
+   * where `content` is a safe, actionable message (run-failure.ts) or, for a
+   * client abort, the SDK's abort text. A failed request gets no `done` and
+   * confirms no session.
+   */
+  function emitError(err: unknown): void {
+    if (isAbortError(err)) {
+      log("query", `Error queryId=${queryId} kind=aborted`);
+      emit({ type: "error", content: (err as Error).message });
+      return;
+    }
+    const failure = err instanceof RunFailure ? err : classifyRunFailure({ thrown: err }, queryId);
+    log("query", `Error queryId=${queryId} ${formatLogFields(failure.logFields)}`);
+    emit({ type: "error", content: failure.message });
+  }
+
   const abortController = new AbortController();
   res.on("close", () => { if (!res.writableEnded) abortController.abort(); });
 
@@ -197,9 +215,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
 
     log("query", `Completed queryId=${queryId} tokens=${inputTokens}+${outputTokens} cost=$${costUsd} duration=${Date.now() - startTime}ms`);
   } catch (err) {
-    const error = err as Error;
-    log("query", `Error queryId=${queryId}: ${error.message}`);
-    emit({ type: "error", content: error.message });
+    emitError(err);
   }
 
   markDone(queryId);
