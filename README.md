@@ -178,9 +178,28 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `sessionId` | string | no | Resume an existing session |
 | `systemPrompt` | string | no | Appended to the Claude Code preset system prompt |
 | `model` | string | no | Model id |
-| `allowedTools` | string[] | no | Override the default tool set |
+| `allowedTools` | string[] | no | Override the default tool set. This pre-approves tools; it does **not** remove others, so it is no security boundary (use `enforcedTools`) |
+| `enforcedTools` | string[] | no | The exact tools the run may call; every other tool is refused before it runs (see below) |
 
 \* Provide **either** `prompt` **or** `content`. If both are present, `content` takes precedence. If neither is present, the request is rejected with HTTP 400.
+
+### Enforced tool set (`enforcedTools`)
+
+`enforcedTools` restricts one run to an exact set of tools. Name each tool the way the SDK names it: built-ins as `Bash`, `Read`, …; MCP tools as `mcp__<server>__<tool>`. The gateway's registered webhook tools are served by the SDK server `agent-gateway-tools`, so a registered tool `reqlift_confluence_report_region` is `mcp__agent-gateway-tools__reqlift_confluence_report_region`. There are no wildcards.
+
+```json
+{
+  "queryId": "q-1",
+  "prompt": "Read the page and report each area.",
+  "enforcedTools": ["mcp__jira__get_confluence_page", "mcp__agent-gateway-tools__reqlift_confluence_report_region"]
+}
+```
+
+- **Refused before it runs.** Any tool call outside the set reaches no handler: no webhook request, no MCP `tools/call`, no shell command, no fetch. The model gets an error tool result (`Refused: this tool is not allowed for this run.` when the gateway's hook refuses it, or the runtime's own "not available" answer for a tool it was not offered), and the gateway logs `audit tool.denied toolName=<name> queryId=<id>` (the name only). The run itself goes on and can end normally; deciding that a refusal fails the job is the caller's business.
+- **How it is enforced** (layers, because one alone has a gap on the pinned SDK 0.1.77): no user or project settings are loaded (`settingSources: []`, so nothing in the writable HOME — settings, hooks, permission rules, `.mcp.json`, user-scope MCP servers — can widen the run); `permissionMode: "dontAsk"` with `allowedTools` set to exactly the set (an unlisted tool is denied); only the listed built-ins are offered (`tools`); `agent-gateway-tools` carries only the listed registered tools, and a registry or request MCP server is attached only when the set names one of its tools; a `PreToolUse` hook denies every other name and never answers "allow"; no per-user skill bundle is loaded.
+- **Acknowledgment.** The first NDJSON event of such a run is `{"seq":0,"type":"tool_policy","enforced":true,"tools":[…]}`, echoing the set. It is sent once, before any retry, and every retry attempt keeps the same set. A caller can require it and drop the run when it is missing (reqlift does): an older gateway ignores the field and would send no acknowledgment.
+- **Validation (400 before streaming):** the value must be an array (also `null` is refused) of at most 64 distinct names, each 1–128 characters of `A-Z a-z 0-9 _ -`; not together with `allowedTools`; `Task` and `Agent` are refused (whether a sub-agent inherits the set is not proven); an `mcp__…` name that fits more than one attachable server (registry names may contain `__`) is refused as ambiguous. `[]` means "no tool at all", never the default set.
+- **Without `enforcedTools` nothing changes:** the run keeps `bypassPermissions`, the user and project settings, every registered server and the default tool list, and `allowedTools` keeps its current meaning.
 
 ### Multimodal Content (`content[]`)
 

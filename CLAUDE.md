@@ -90,6 +90,7 @@ src/
   tools.ts           # Tool registry CRUD + persistence (TOOLS_PERSIST_PATH)
   webhook.ts         # Webhook executor (POST to tool webhook_url with context)
   tool-server.ts     # MCP server factory (wraps registered tools for Agent SDK)
+  tool-policy.ts     # enforcedTools: request validation, built-in/server selection, deny-only PreToolUse hook (per-run enforced tool set)
   tool-input-schema.ts # Webhook tool input_schema -> typed, described SDK shape; per-property "any value" fallback, per-tool untyped fallback
   mcp-registry.ts    # External MCP server registry CRUD + persistence (MCP_SERVERS_PERSIST_PATH)
   mcp-upload-relay.ts # Streaming upload relay: raw-path rule, parser skip, pre-auth guard, X-MCP-Credential-Headers, relay core
@@ -115,6 +116,9 @@ src/
     webhook.test.ts        # Webhook executor tests
     sdk-login-guard-process.test.ts # Real-runtime probe: spawned gateway, OAuth-capable MCP stub, scripted Anthropic API (needs `npm run build`)
     run-failure.test.ts             # Failure classifier table: kinds, exact messages, version bounds, hostile inputs
+    tool-policy.test.ts             # enforcedTools validation table + the hook never allows
+    query-enforced-tools-outcome.test.ts # enforcedTools through query/agent/retry with the SDK mocked: options layers, tool_policy first and once, unchanged options without it
+    tool-policy-process.test.ts     # Real-runtime probe: refused webhook/MCP/Bash/WebFetch calls reach no handler; hostile HOME, faulty hook, retry, [] (needs `npm run build`)
     query-failure-outcome.test.ts   # Failed runs through query/agent/retry with the SDK mocked: one error event, no done, retry and resume rules
     query-failure-diagnostics-process.test.ts # Real-runtime probe: provider rejections reach the client as safe messages, sessions after a failed first request (needs `npm run build`)
     mcp-credential-relay.test.ts    # Credential relay unit tests

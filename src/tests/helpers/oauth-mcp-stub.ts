@@ -30,6 +30,8 @@ export interface OAuthStubOptions {
    * initialize again.
    */
   loseSessionOn?: string;
+  /** The tools this stub lists (default: [`STUB_TOOL_NAME`]). MVP-7637 */
+  toolNames?: string[];
 }
 
 export interface OAuthStubRequest {
@@ -51,6 +53,8 @@ export interface OAuthMcpStub {
   authorizations: () => (string | undefined)[];
   /** Tool names this stub lists. None matches /auth/i. */
   toolNames: readonly string[];
+  /** The tool name of every `tools/call` that reached this stub, in order. */
+  toolCalls: string[];
   /** The text of a successful `tools/call` result begins with this. */
   toolResultPrefix: string;
   close: () => Promise<void>;
@@ -69,6 +73,8 @@ interface RpcMessage {
 
 export async function startOAuthMcpStub(options: OAuthStubOptions = {}): Promise<OAuthMcpStub> {
   const refuse = options.refuse ?? "none";
+  const toolNames = options.toolNames ?? [STUB_TOOL_NAME];
+  const toolCalls: string[] = [];
   const responseMode = options.responseMode ?? "json";
   const requests: OAuthStubRequest[] = [];
   const counters = { registration: 0, authorize: 0, token: 0, metadata: 0, mcp: 0 };
@@ -111,16 +117,15 @@ export async function startOAuthMcpStub(options: OAuthStubOptions = {}): Promise
           jsonrpc: "2.0",
           id: message.id,
           result: {
-            tools: [
-              {
-                name: STUB_TOOL_NAME,
-                description: "Look up a record by id.",
-                inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
-              },
-            ],
+            tools: toolNames.map((name) => ({
+              name,
+              description: "Look up a record by id.",
+              inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+            })),
           },
         };
       case "tools/call": {
+        toolCalls.push(String(message.params?.name ?? ""));
         const size = options.toolResultBytes ?? 0;
         const text = STUB_TOOL_RESULT_PREFIX + (size > 0 ? " " + "x".repeat(size) : "");
         return { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text }] } };
@@ -262,7 +267,8 @@ export async function startOAuthMcpStub(options: OAuthStubOptions = {}): Promise
     requests,
     counters,
     authorizations: () => requests.filter((r) => r.path === MCP_PATH).map((r) => r.headers.authorization),
-    toolNames: [STUB_TOOL_NAME],
+    toolNames,
+    toolCalls,
     toolResultPrefix: STUB_TOOL_RESULT_PREFIX,
     close: async () => {
       for (const socket of sockets) socket.destroy();

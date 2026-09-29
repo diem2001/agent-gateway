@@ -290,7 +290,8 @@ curl -s http://localhost:3001/health | jq .persistence</code></pre>
         <tr><td><code>sessionId</code></td><td>string</td><td>No</td><td>Session ID for conversation continuity</td></tr>
         <tr><td><code>systemPrompt</code></td><td>string</td><td>No</td><td>System prompt to configure agent behavior</td></tr>
         <tr><td><code>model</code></td><td>string</td><td>No</td><td>Claude model to use (e.g., <code>claude-sonnet-4-20250514</code>)</td></tr>
-        <tr><td><code>allowedTools</code></td><td>string[]</td><td>No</td><td>Restrict tools (default: all 10 tools)</td></tr>
+        <tr><td><code>allowedTools</code></td><td>string[]</td><td>No</td><td>Pre-approve tools (default: all 10 tools). This does not remove other tools, so it is no security boundary; use <code>enforcedTools</code></td></tr>
+        <tr><td><code>enforcedTools</code></td><td>string[]</td><td>No</td><td>The exact tools the run may call, as the SDK names them (<code>Bash</code>, <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>; registered webhook tools are <code>mcp__agent-gateway-tools__&lt;name&gt;</code>). Every other tool is refused before it runs; the stream starts with a <code>tool_policy</code> event. See below</td></tr>
         <tr><td><code>useSession</code></td><td>boolean</td><td>No</td><td>Set to <code>false</code> to skip session management</td></tr>
         <tr><td><code>sshTarget</code></td><td>string</td><td>No</td><td>SSH target for context (informational)</td></tr>
         <tr><td><code>user_id</code></td><td>string</td><td>No</td><td>User identifier passed to tool webhook context</td></tr>
@@ -326,6 +327,16 @@ curl -s http://localhost:3001/health | jq .persistence</code></pre>
   }'</code></pre>
     <p>Override server names must exist and be enabled. Unknown names return <code>MCP_SERVER_NOT_FOUND</code>; disabled names return <code>MCP_SERVER_DISABLED</code>. Overrides are merged for that one request only and are never persisted to the MCP registry.</p>
     <p>A single query may also attach an unregistered MCP server via <code>mcpServers</code> (the SDK <code>mcpServers</code> map — <code>{ command, args?, env? }</code> for stdio or <code>{ url, type? }</code> for http/sse). The gateway injects it into <code>options.mcpServers</code> and auto-allows its <code>mcp__&lt;name&gt;__*</code> tools, so no explicit <code>allowedTools</code> is needed. Request servers are merged at the lowest precedence (the gateway's <code>agent-gateway-tools</code> and registered servers always win; the reserved name <code>agent-gateway-tools</code> and malformed entries return <code>400</code>) and are never persisted. reqlift recon uses this to attach a per-run chrome-devtools server.</p>
+
+    <h3>Enforced Tool Set (<code>enforcedTools</code>)</h3>
+    <p>With <code>enforcedTools</code> a run may call exactly the listed tools (no wildcards). A call to any other tool reaches no handler — no webhook request, no MCP <code>tools/call</code>, no shell command, no fetch — and the model gets an error tool result (<code>Refused: this tool is not allowed for this run.</code>, or the runtime's "not available" answer for a tool it was not offered). The gateway logs <code>audit tool.denied toolName=&lt;name&gt; queryId=&lt;id&gt;</code>. The run goes on; whether a refusal fails the job is the caller's decision.</p>
+    <p>Enforcement is layered: no user or project settings from HOME (<code>settingSources: []</code>), <code>permissionMode: "dontAsk"</code> with <code>allowedTools</code> exactly the set, only the listed built-ins offered, <code>agent-gateway-tools</code> and registry/request MCP servers attached only for listed tools, a deny-only <code>PreToolUse</code> hook, and no per-user skill bundle. The first event is <code>{"seq":0,"type":"tool_policy","enforced":true,"tools":[…]}</code>, sent once before any retry; retries keep the set.</p>
+    <p>Validation (400 before streaming): an array (<code>null</code> is refused) of at most 64 distinct names of 1–128 characters <code>A-Z a-z 0-9 _ -</code>; not with <code>allowedTools</code>; no <code>Task</code> or <code>Agent</code>; no <code>mcp__…</code> name that fits two attachable servers. <code>[]</code> means no tool at all. Without the field a run is unchanged.</p>
+<pre><code>curl -N -X POST http://localhost:3001/v1/query \
+  -H "Authorization: Bearer sk-gw-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"queryId": "q-1", "prompt": "Read the page and report each area.",
+       "enforcedTools": ["mcp__jira__get_confluence_page", "mcp__agent-gateway-tools__reqlift_confluence_report_region"]}'</code></pre>
 
     <h3>Failed Queries</h3>
     <p>A failed query ends with exactly one <a href="#ndjson"><code>error</code></a> event and no <code>done</code>; it confirms no session. The event keeps its shape <code>{"seq", "type": "error", "content"}</code>, and <code>content</code> is a safe, actionable message for the end user. The Claude runtime reports a provider rejection on its stdout before it exits with code 1; the gateway classifies that diagnostic instead of passing on the runtime's exit message. Raw diagnostics (provider responses, runtime output, stack traces, headers, prompts) never appear in <code>content</code>, in any other event or in the gateway log.</p>
@@ -1456,6 +1467,14 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
   <h2 id="ndjson">NDJSON Event Reference</h2>
 
   <p>All events include a <code>seq</code> field (incrementing integer starting at 0) and a <code>type</code> field. Events are streamed as newline-delimited JSON (<code>application/x-ndjson</code>).</p>
+
+  <div class="event-card">
+    <h4>tool_policy</h4>
+    <p>Only for a query sent with <code>enforcedTools</code>: always the first event (<code>seq</code> 0), sent once per query (never again on a retry). <code>tools</code> echoes the enforced set, so the caller can confirm this gateway enforced it. A refused tool call then appears as a normal <code>tool_use</code> followed by a <code>tool_result</code> whose <code>output</code> is the refusal text.</p>
+<pre><code>{"seq": 0, "type": "tool_policy", "enforced": true, "tools": ["mcp__jira__get_confluence_page", "mcp__agent-gateway-tools__reqlift_confluence_report_region"]}
+{"seq": 1, "type": "tool_use", "toolName": "Bash", "toolUseId": "tu_1", "input": "touch /tmp/x", "startedAt": 1711461600000, "parentToolUseId": null}
+{"seq": 2, "type": "tool_result", "toolName": "Bash", "toolUseId": "tu_1", "output": "Refused: this tool is not allowed for this run.", "durationMs": 3}</code></pre>
+  </div>
 
   <div class="event-card">
     <h4>text</h4>

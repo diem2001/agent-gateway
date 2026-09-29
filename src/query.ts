@@ -9,9 +9,12 @@ import {
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
 import {
+  RESERVED_MCP_SERVER_NAME,
   validateRequestMcpServers,
   type RequestMcpServers,
 } from "./mcp-request-servers.js";
+import { getEnabledMcpServers } from "./mcp-registry.js";
+import { validateEnforcedTools } from "./tool-policy.js";
 
 /**
  * A single block of multimodal request content. Maps directly to the Anthropic
@@ -35,6 +38,12 @@ interface QueryRequestBody {
    * chrome-devtools MCP server. See `mcp-request-servers.ts`.
    */
   mcpServers?: RequestMcpServers;
+  /**
+   * The exact tool set this run may call (MVP-7637, see tool-policy.ts). When
+   * present, every other tool is refused before it runs and the stream starts
+   * with a `tool_policy` event echoing the set. Absent ⇒ unchanged behavior.
+   */
+  enforcedTools?: string[];
 }
 
 /**
@@ -92,6 +101,8 @@ export const queryRouter = Router();
 
 queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   const { queryId, sessionId, prompt, content, systemPrompt, model, allowedTools, useSession, sshTarget, user_id, conversation_id, mcpCredentialOverrides, mcpServers } = req.body as QueryRequestBody;
+  // An explicit `null` stays `null` here and is refused; only a missing field is absent.
+  const enforcedToolsValue: unknown = (req.body as QueryRequestBody).enforcedTools;
   if (!queryId) { res.status(400).json({ error: "queryId and prompt or content are required" }); return; }
   const resolved = resolveContentBlocks(content, prompt);
   if ("error" in resolved) { res.status(400).json({ error: resolved.error }); return; }
@@ -106,6 +117,16 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     res.status(400).json({ error: mcpServersValidation.error });
     return;
   }
+  const enforcedValidation = validateEnforcedTools(enforcedToolsValue, allowedTools, [
+    RESERVED_MCP_SERVER_NAME,
+    ...getEnabledMcpServers().map((def) => def.name),
+    ...Object.keys(mcpServersValidation.servers ?? {}),
+  ]);
+  if (enforcedValidation.error) {
+    res.status(400).json({ error: enforcedValidation.error });
+    return;
+  }
+  const enforcedTools = enforcedValidation.tools;
 
   const webhookContext = {
     api_key_label: req.clientLabel,
@@ -153,6 +174,10 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
 
   const startTime = Date.now();
 
+  // The acknowledgment comes first and only once: the retry path below never
+  // re-emits it, and every attempt gets the same set.
+  if (enforcedTools) emit({ type: "tool_policy", enforced: true, tools: enforcedTools });
+
   try {
     // Resolve session: map client sessionId → SDK sessionId for resume
     let effectiveSessionId = useSession !== false ? sessionId : undefined;
@@ -176,6 +201,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
       mcpCredentialOverrides: overrideValidation.overrides,
       requestMcpServers: mcpServersValidation.servers,
       userId: user_id || undefined,
+      enforcedTools,
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

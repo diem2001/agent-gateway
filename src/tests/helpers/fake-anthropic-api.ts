@@ -34,6 +34,16 @@
  * - "fail-first": the version rejection for the first attempt only.
  * - "rate-limited": 429 `rate_limit_error` with `x-should-retry: false` for
  *   every main request; "rate-limited-once" only for the first attempt.
+ * - "rate-limited-after-tool-once" (MVP-7637): in the first attempt, the main
+ *   request that carries a tool result gets that 429, so the gateway retries
+ *   after the scripted call.
+ *
+ * Exact scripted tool (MVP-7637): with `exactTool`, a main request of the
+ * conversation (not a warmup, no tool result yet) is answered with one
+ * `tool_use` of exactly that name and input — whether or not the runtime
+ * offered it, so a test can script a call to a tool that was not offered.
+ * Main requests here are the non-warmup requests that carry the query prompt
+ * (`exactTool.prompt`), since an enforced run may offer no tool at all.
  */
 
 import http from "node:http";
@@ -102,7 +112,8 @@ export type FakeApiMode =
   | "malformed"
   | "fail-first"
   | "rate-limited"
-  | "rate-limited-once";
+  | "rate-limited-once"
+  | "rate-limited-after-tool-once";
 
 interface ScriptedFailure {
   status: number;
@@ -163,6 +174,8 @@ export async function startFakeAnthropicApi(options: {
   dripIntervalMs?: number;
   /** Strings the "private-material" rejection carries in its message. */
   privateMaterial?: string[];
+  /** Script one call to exactly this tool (see the header). */
+  exactTool?: { name: string; input: Record<string, unknown>; prompt: string };
 }): Promise<FakeAnthropicApi> {
   const mode = options.mode ?? "normal";
   const requests: RecordedMessagesRequest[] = [];
@@ -211,8 +224,16 @@ export async function startFakeAnthropicApi(options: {
       const session = typeof body.metadata?.user_id === "string" ? (/_session_([^_]*)$/.exec(body.metadata.user_id)?.[1] ?? "") : "";
       const record: RecordedMessagesRequest = { model, stream, tools, toolResults, userTexts, warmup, session };
       requests.push(record);
-      const main = tools.length > 0 && !warmup;
-      const firstSession = requests.find((r) => r.tools.length > 0 && !r.warmup)?.session;
+      const exact = options.exactTool;
+      const carriesPrompt = exact !== undefined && userTexts.some((text) => text.includes(exact.prompt));
+      const main = exact ? carriesPrompt && !warmup : tools.length > 0 && !warmup;
+      const isMain = (r: RecordedMessagesRequest) => (exact ? r.userTexts.some((text) => text.includes(exact.prompt)) && !r.warmup : r.tools.length > 0 && !r.warmup);
+      const firstSession = requests.find(isMain)?.session;
+      if (mode === "rate-limited-after-tool-once" && main && toolResults.length > 0 && record.session === firstSession) {
+        res.writeHead(429, { "Content-Type": "application/json", "x-should-retry": "false" });
+        res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Number of requests has exceeded your rate limit." } }));
+        return;
+      }
 
       const failure = main ? scriptedFailure(mode, record.session === firstSession, userTexts.join(" "), options.privateMaterial ?? []) : null;
       if (failure) {
@@ -232,9 +253,11 @@ export async function startFakeAnthropicApi(options: {
       const target = tools.find((name) => name.endsWith(`__${options.toolName}`));
       type Block = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } | { type: "text"; text: string };
       const content: Block[] =
-        target && toolResults.length === 0
-          ? [{ type: "tool_use", id: `toolu_7667_${++toolUseSeq}`, name: target, input: { id: "R-1" } }]
-          : [{ type: "text", text: FINAL_ANSWER }];
+        exact && main && toolResults.length === 0
+          ? [{ type: "tool_use", id: `toolu_7637_${++toolUseSeq}`, name: exact.name, input: exact.input }]
+          : !exact && target && toolResults.length === 0
+            ? [{ type: "tool_use", id: `toolu_7667_${++toolUseSeq}`, name: target, input: { id: "R-1" } }]
+            : [{ type: "text", text: FINAL_ANSWER }];
       const stopReason = content[0].type === "tool_use" ? "tool_use" : "end_turn";
       const messageId = `msg_7667_${requests.length}`;
       const usage = { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
@@ -303,7 +326,10 @@ export async function startFakeAnthropicApi(options: {
     baseUrl: `http://127.0.0.1:${port}`,
     requests,
     agentRequests: () => requests.filter((r) => r.tools.length > 0),
-    mainRequests: () => requests.filter((r) => r.tools.length > 0 && !r.warmup),
+    mainRequests: () =>
+      requests.filter((r) =>
+        options.exactTool ? r.userTexts.some((text) => text.includes(options.exactTool!.prompt)) && !r.warmup : r.tools.length > 0 && !r.warmup,
+      ),
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));

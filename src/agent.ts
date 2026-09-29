@@ -19,6 +19,7 @@ import { requestMcpAllowedToolPatterns, type RequestMcpServers } from "./mcp-req
 import { credentialRelay } from "./mcp-credential-relay.js";
 import { createRunLogDir, removeRunLogDirAfterExit, spawnRuntimeWithHandle } from "./sdk-run-logs.js";
 import { classifyRunFailure, isAbortError } from "./run-failure.js";
+import { builtInTools, createToolPolicyHook, namesServer } from "./tool-policy.js";
 
 export interface QueryParams {
   prompt?: string;
@@ -50,6 +51,12 @@ export interface QueryParams {
   userId?: string;
   /** Only for the log reference in the unknown-failure message (run-failure.ts). */
   queryId?: string;
+  /**
+   * The exact tool set this run may call (MVP-7637, see tool-policy.ts),
+   * validated by the query route. `undefined` ⇒ the options are unchanged.
+   * An empty array means no tool at all, never the default set.
+   */
+  enforcedTools?: string[];
 }
 
 export interface QueryResult {
@@ -138,8 +145,12 @@ async function* buildContentMessageStream(
  * it is kept here and classified, never forwarded. Client aborts (AbortError)
  * are rethrown unchanged.
  */
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId }: QueryParams): Promise<QueryResult> {
-  const registeredTools = getAllTools();
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools }: QueryParams): Promise<QueryResult> {
+  const enforced = enforcedTools !== undefined;
+  // An enforced run gets only the registered tools its set names.
+  const registeredTools = enforced
+    ? getAllTools().filter((t) => enforcedTools.includes(`mcp__agent-gateway-tools__${t.name}`))
+    : getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
   // A registry server with requireUserCredentials is left out of a run without
   // the user's credential: no SDK entry, no allowed-tool pattern, and a request
@@ -157,9 +168,16 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     log("audit", `mcp.server.omitted serverName=${name} reason=${reason}`);
   }
   const omittedServers = omitted.map(({ name }) => name);
-  const runRequestMcpServers = requestMcpServers
+  let runRequestMcpServers = requestMcpServers
     ? Object.fromEntries(Object.entries(requestMcpServers).filter(([name]) => !omittedServers.includes(name)))
     : undefined;
+  if (enforced) {
+    // An enforced run attaches only the servers its set names a tool of.
+    runRegistryServers = runRegistryServers.filter((def) => namesServer(enforcedTools, def.name));
+    if (runRequestMcpServers) {
+      runRequestMcpServers = Object.fromEntries(Object.entries(runRequestMcpServers).filter(([name]) => namesServer(enforcedTools, name)));
+    }
+  }
   const mcpToolPatterns = getMcpAllowedToolPatterns(runRegistryServers);
   const requestMcpToolPatterns = requestMcpAllowedToolPatterns(runRequestMcpServers);
   const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
@@ -173,6 +191,16 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     cwd: HOME,
     settingSources: ["user", "project"],
   };
+  if (enforced) {
+    // The layers of tool-policy.ts: no HOME settings, deny anything not listed,
+    // offer only the listed built-ins, and a deny-only hook as second layer.
+    options.settingSources = [];
+    options.permissionMode = "dontAsk";
+    options.allowedTools = [...enforcedTools];
+    options.tools = builtInTools(enforcedTools);
+    options.hooks = { PreToolUse: [{ hooks: [createToolPolicyHook(enforcedTools, queryId)] }] };
+    log("query", `enforced tool set: ${enforcedTools.length} tool(s)`);
+  }
 
   // Per-user skill loading (DEC-GW-002): materialize the requesting user's stored
   // skills into a request-scoped local-plugin bundle and point `plugins` at it for
@@ -180,7 +208,8 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // those are deliberately left untouched. No userId ⇒ no plugins ⇒ global-only
   // load, byte-for-byte unchanged. Caps overflow is reported here and surfaced as a
   // `skills_truncated` event below (DEC-GW-004) before the query proceeds.
-  const userSkills = materializeUserSkills(userId);
+  // An enforced run loads no plugin bundle (tool-policy.ts).
+  const userSkills = enforced ? materializeUserSkills(undefined) : materializeUserSkills(userId);
   if (userSkills.pluginRoot) {
     options.plugins = [{ type: "local", path: userSkills.pluginRoot }];
     log("query", `user skills: loading plugin bundle for userId=${userId} at ${userSkills.pluginRoot}`);
