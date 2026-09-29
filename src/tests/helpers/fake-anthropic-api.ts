@@ -15,12 +15,34 @@
  * open from its first turn (MVP-7616 shutdown drain).
  * "drip" streams a text answer as `dripChunks` separate `text_delta` events,
  * one every `dripIntervalMs` (default 100 ms); everything else is "normal".
+ *
+ * Failure modes (MVP-7685) answer main requests (agent requests that are not
+ * the runtime's "Warmup" requests) with a scripted provider rejection; the
+ * runtime reports it on stdout and exits 1. Claude Code 2.0.77 repeats a failed
+ * streaming request once without streaming, so one gateway attempt makes two
+ * main requests; "the first attempt" means every main request of the first
+ * runtime session seen (from the request's `metadata.user_id`).
+ * - "version-too-old": 400 `invalid_request_error` with code
+ *   `claude_code_version_too_old` and "requires ... VERSION_REQUIRED or newer";
+ *   "version-too-old-no-versions" is the same without a version in the text.
+ * - "private-material": the version rejection whose message also carries the
+ *   `privateMaterial` strings, an echo of the request's user text and a
+ *   stack trace (none of it may reach a client or a log).
+ * - "auth-rejected": 401 `authentication_error` with `x-should-retry: false`
+ *   (without it the runtime retries a 401 for minutes).
+ * - "malformed": 400 with a plain-text (non-JSON) body.
+ * - "fail-first": the version rejection for the first attempt only.
+ * - "rate-limited": 429 `rate_limit_error` with `x-should-retry: false` for
+ *   every main request; "rate-limited-once" only for the first attempt.
  */
 
 import http from "node:http";
 import net, { type AddressInfo } from "node:net";
 
 export const FINAL_ANSWER = "PROBE-7667-FINAL-ANSWER";
+/** The minimum version named by the version rejection fixtures. */
+export const VERSION_REQUIRED = "2.1.280";
+export const MALFORMED_BODY = "upstream proxy failure PROBE-7685-MALFORMED {\"error\": <html>";
 
 export interface RecordedToolResult {
   toolUseId: string;
@@ -33,6 +55,12 @@ export interface RecordedMessagesRequest {
   stream: boolean;
   tools: string[];
   toolResults: RecordedToolResult[];
+  /** Text of every user message in the request, in order (a resumed session repeats earlier turns). */
+  userTexts: string[];
+  /** A runtime "Warmup" request (sub-agent cache priming at start-up), not part of the conversation. */
+  warmup: boolean;
+  /** The runtime session of the request (`..._session_<id>` in `metadata.user_id`), or "" when absent. */
+  session: string;
 }
 
 export interface FakeAnthropicApi {
@@ -41,6 +69,8 @@ export interface FakeAnthropicApi {
   requests: RecordedMessagesRequest[];
   /** Requests that offered at least one tool: the agent loop, not side requests. */
   agentRequests: () => RecordedMessagesRequest[];
+  /** Agent requests without the runtime's warmup requests: the conversation's own requests. */
+  mainRequests: () => RecordedMessagesRequest[];
   close: () => Promise<void>;
 }
 
@@ -59,7 +89,67 @@ function blockText(content: unknown): string {
   return "";
 }
 
-export type FakeApiMode = "normal" | "error" | "hang-after-tool" | "drip" | "hang";
+export type FakeApiMode =
+  | "normal"
+  | "error"
+  | "hang-after-tool"
+  | "drip"
+  | "hang"
+  | "version-too-old"
+  | "version-too-old-no-versions"
+  | "private-material"
+  | "auth-rejected"
+  | "malformed"
+  | "fail-first"
+  | "rate-limited"
+  | "rate-limited-once";
+
+interface ScriptedFailure {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+}
+
+function providerError(status: number, error: Record<string, unknown>, headers: Record<string, string> = {}): ScriptedFailure {
+  return { status, headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify({ type: "error", error }) };
+}
+
+function versionRejection(message: string): ScriptedFailure {
+  return providerError(400, { type: "invalid_request_error", code: "claude_code_version_too_old", message });
+}
+
+const VERSION_MESSAGE = `This model requires Claude Code version ${VERSION_REQUIRED} or newer. Please update Claude Code.`;
+
+/** The scripted rejection for a main request (`firstAttempt`: it belongs to the first runtime session), or null to answer normally. */
+function scriptedFailure(mode: FakeApiMode, firstAttempt: boolean, userText: string, privateMaterial: string[]): ScriptedFailure | null {
+  switch (mode) {
+    case "version-too-old":
+      return versionRejection(VERSION_MESSAGE);
+    case "version-too-old-no-versions":
+      return versionRejection("This version of Claude Code is no longer supported for this model. Please update Claude Code.");
+    case "private-material":
+      return versionRejection(
+        [
+          VERSION_MESSAGE,
+          ...privateMaterial,
+          `Request was: ${userText}`,
+          "Error: upstream rejected\n    at handle (/srv/provider/src/gate.js:41:13)\n    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)",
+        ].join(" "),
+      );
+    case "auth-rejected":
+      return providerError(401, { type: "authentication_error", message: "invalid x-api-key" }, { "x-should-retry": "false" });
+    case "malformed":
+      return { status: 400, headers: { "Content-Type": "text/plain" }, body: MALFORMED_BODY };
+    case "fail-first":
+      return firstAttempt ? versionRejection(VERSION_MESSAGE) : null;
+    case "rate-limited":
+      return providerError(429, { type: "rate_limit_error", message: "Number of requests has exceeded your rate limit." }, { "x-should-retry": "false" });
+    case "rate-limited-once":
+      return firstAttempt ? providerError(429, { type: "rate_limit_error", message: "Number of requests has exceeded your rate limit." }, { "x-should-retry": "false" }) : null;
+    default:
+      return null;
+  }
+}
 
 /** Text of drip chunk `index` (0-based). */
 export function dripChunk(index: number): string {
@@ -71,6 +161,8 @@ export async function startFakeAnthropicApi(options: {
   mode?: FakeApiMode;
   dripChunks?: number;
   dripIntervalMs?: number;
+  /** Strings the "private-material" rejection carries in its message. */
+  privateMaterial?: string[];
 }): Promise<FakeAnthropicApi> {
   const mode = options.mode ?? "normal";
   const requests: RecordedMessagesRequest[] = [];
@@ -87,7 +179,7 @@ export async function startFakeAnthropicApi(options: {
         res.end(JSON.stringify({ type: "error", error: { type: "not_found_error", message: "not found" } }));
         return;
       }
-      let body: { model?: string; stream?: boolean; tools?: { name?: string }[]; messages?: MessageParam[] } = {};
+      let body: { model?: string; stream?: boolean; tools?: { name?: string }[]; messages?: MessageParam[]; metadata?: { user_id?: unknown } } = {};
       try {
         body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       } catch {
@@ -101,8 +193,12 @@ export async function startFakeAnthropicApi(options: {
 
       const tools = (body.tools ?? []).map((t) => String(t.name ?? ""));
       const toolResults: RecordedToolResult[] = [];
+      const userTexts: string[] = [];
       for (const message of body.messages ?? []) {
-        if (message.role !== "user" || !Array.isArray(message.content)) continue;
+        if (message.role !== "user") continue;
+        const text = blockText(message.content);
+        if (text) userTexts.push(text);
+        if (!Array.isArray(message.content)) continue;
         for (const block of message.content) {
           if (block.type === "tool_result") {
             toolResults.push({ toolUseId: String(block.tool_use_id ?? ""), isError: block.is_error === true, text: blockText(block.content) });
@@ -111,7 +207,19 @@ export async function startFakeAnthropicApi(options: {
       }
       const model = body.model ?? "unknown";
       const stream = body.stream === true;
-      requests.push({ model, stream, tools, toolResults });
+      const warmup = userTexts.length > 0 && userTexts.every((text) => text === "Warmup");
+      const session = typeof body.metadata?.user_id === "string" ? (/_session_([^_]*)$/.exec(body.metadata.user_id)?.[1] ?? "") : "";
+      const record: RecordedMessagesRequest = { model, stream, tools, toolResults, userTexts, warmup, session };
+      requests.push(record);
+      const main = tools.length > 0 && !warmup;
+      const firstSession = requests.find((r) => r.tools.length > 0 && !r.warmup)?.session;
+
+      const failure = main ? scriptedFailure(mode, record.session === firstSession, userTexts.join(" "), options.privateMaterial ?? []) : null;
+      if (failure) {
+        res.writeHead(failure.status, failure.headers);
+        res.end(failure.body);
+        return;
+      }
 
       if (mode === "error" && tools.length > 0) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -195,6 +303,7 @@ export async function startFakeAnthropicApi(options: {
     baseUrl: `http://127.0.0.1:${port}`,
     requests,
     agentRequests: () => requests.filter((r) => r.tools.length > 0),
+    mainRequests: () => requests.filter((r) => r.tools.length > 0 && !r.warmup),
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
