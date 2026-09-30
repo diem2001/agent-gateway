@@ -162,8 +162,8 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>GET</strong></td><td><code>/health</code></td><td>No</td><td>Health check, including state-file problems (<code>persistence</code>, <code>persistenceIssues</code>)</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/query</code></td><td>Yes</td><td>Run agent query (NDJSON stream)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/query/:queryId/events</code></td><td>Yes</td><td>Replay/resume event stream</td></tr>
-      <tr><td><strong>GET</strong></td><td><code>/v1/sessions</code></td><td>Yes</td><td>List active sessions</td></tr>
-      <tr><td><strong>DELETE</strong></td><td><code>/v1/sessions/:id</code></td><td>Yes</td><td>Delete a session</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/sessions</code></td><td>Yes</td><td>List the calling label's active sessions</td></tr>
+      <tr><td><strong>DELETE</strong></td><td><code>/v1/sessions/:id</code></td><td>Yes</td><td>Delete one of the calling label's sessions</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/settings</code></td><td>Yes</td><td>Get session settings</td></tr>
       <tr><td><strong>PUT</strong></td><td><code>/v1/settings</code></td><td>Yes</td><td>Update session settings</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/logging</code></td><td>Yes</td><td>Get log level</td></tr>
@@ -430,7 +430,7 @@ curl -N "http://localhost:3001/v1/query/q-001/events?after=5" \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Lists all active sessions with their model and last-used timestamp.</p>
+    <p>Lists the active sessions of the calling API-key label with their model and last-used timestamp. Sessions of another label are not listed; sessions from before the isolation update (no recorded owner) are listed for every label. <code>count</code> is the number listed.</p>
 
     <h3>Response</h3>
 <pre><code>{
@@ -456,7 +456,7 @@ curl -N "http://localhost:3001/v1/query/q-001/events?after=5" \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Deletes a session by ID. Returns <code>404</code> if the session does not exist.</p>
+    <p>Deletes a session by ID. Returns <code>404</code> if the session does not exist or belongs to another API-key label (it is left in place). Sessions from before the isolation update can be deleted by every label. A conversation's sandbox home on disk is not removed by this call.</p>
 
     <h3>Response</h3>
 <pre><code>{"deleted": true}</code></pre>
@@ -1603,8 +1603,8 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <h3>Managing Sessions via API</h3>
   <ul>
-    <li><code>GET /v1/sessions</code> -- list all active sessions with model and lastUsed timestamp</li>
-    <li><code>DELETE /v1/sessions/:id</code> -- remove a specific session</li>
+    <li><code>GET /v1/sessions</code> -- list the calling label's active sessions with model and lastUsed timestamp</li>
+    <li><code>DELETE /v1/sessions/:id</code> -- remove one of the calling label's sessions (another label's answers 404)</li>
     <li><code>PUT /v1/settings</code> -- configure <code>sessionIdleTimeoutMs</code></li>
   </ul>
 

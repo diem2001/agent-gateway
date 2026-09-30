@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { log } from "./logging.js";
 import { createPersistentStore } from "./persistence.js";
 
@@ -6,13 +6,30 @@ import { createPersistentStore } from "./persistence.js";
 /*  Types                                                               */
 /* ------------------------------------------------------------------ */
 
+/** The caller a conversation belongs to: the API-key label and the `user_id` of the request (null when it had none). */
+export interface SessionOwner {
+  label: string;
+  userId: string | null;
+}
+
 export interface Session {
   sessionId: string;
   sdkSessionId?: string;  // Set after first successful SDK response
   systemPrompt: string;
   model: string;
   lastUsed: number;
+  /**
+   * Who created the conversation (MVP-7678). A conversation can only be continued by the exact same owner;
+   * `null` and a present `user_id` are different owners. Entries from before the isolation update have none
+   * and are refused on resume.
+   */
+  owner?: SessionOwner;
+  /** Random name of the conversation's sandbox home below the storage root. Entries without one are legacy. */
+  sandboxDirId?: string;
 }
+
+/** The shape of a `sandboxDirId`: 12 random bytes in hex. */
+export const SANDBOX_DIR_ID = /^[0-9a-f]{24}$/;
 
 export interface SessionSettings {
   sessionIdleTimeoutMs: number;
@@ -50,8 +67,25 @@ function isPersistedData(data: unknown): boolean {
   if (data.sessions === undefined || data.sessions === null) return true;
   return (
     isObject(data.sessions) &&
-    Object.values(data.sessions).every((session) => isObject(session) && typeof session.lastUsed === "number")
+    Object.values(data.sessions).every(
+      (session) => isObject(session) && typeof session.lastUsed === "number" && hasValidIsolationFields(session),
+    )
   );
+}
+
+/**
+ * The fields added by the isolation update are optional (older files load), but a present one must be
+ * usable: an owner with a label and a string or null user id, a directory id of the expected shape.
+ * An entry that fails this sets the whole file aside like any other unexpected content (MVP-7616).
+ */
+function hasValidIsolationFields(session: Record<string, unknown>): boolean {
+  if (session.owner !== undefined) {
+    const owner = session.owner;
+    if (!isObject(owner) || typeof owner.label !== "string" || owner.label.length === 0) return false;
+    if (owner.userId !== null && typeof owner.userId !== "string") return false;
+  }
+  if (session.sandboxDirId !== undefined && !(typeof session.sandboxDirId === "string" && SANDBOX_DIR_ID.test(session.sandboxDirId))) return false;
+  return true;
 }
 
 const store = createPersistentStore({
@@ -112,6 +146,35 @@ export function flushSessions(): boolean {
 export interface GetSessionResult {
   sessionId: string;
   isNew: boolean;
+  /** The conversation's sandbox home name; absent for a request without a session and for a legacy entry. */
+  sandboxDirId?: string;
+}
+
+export type Admission = { kind: "new" } | { kind: "resume"; sandboxDirId: string } | { kind: "refused"; reason: "legacy" | "other_owner" };
+
+let legacyRefusals = 0;
+
+function sameOwner(a: SessionOwner, b: SessionOwner): boolean {
+  return a.label === b.label && a.userId === b.userId;
+}
+
+/**
+ * Decides, without changing anything, whether `caller` may use the conversation `clientId`: no such
+ * conversation means a new one; the exact owner resumes; any other caller is refused; an entry from before
+ * the update (no recorded owner or home) is refused for everyone, because the gateway has no record of who
+ * it belongs to. Must run before `getSession`, which updates the entry.
+ */
+export function admitSession(clientId: string, caller: SessionOwner): Admission {
+  const existing = sessions.get(clientId);
+  if (!existing) return { kind: "new" };
+  if (!existing.owner || !existing.sandboxDirId) {
+    legacyRefusals++;
+    // Counts only: no conversation id, no caller.
+    log("audit", `sessions.legacy.refused total=${legacyRefusals}`);
+    return { kind: "refused", reason: "legacy" };
+  }
+  if (!sameOwner(existing.owner, caller)) return { kind: "refused", reason: "other_owner" };
+  return { kind: "resume", sandboxDirId: existing.sandboxDirId };
 }
 
 export function getSession(
@@ -119,6 +182,7 @@ export function getSession(
   systemPrompt: string,
   model: string,
   useSession = true,
+  caller?: SessionOwner,
 ): GetSessionResult {
   if (!useSession) {
     return { sessionId: randomUUID(), isNew: true };
@@ -133,7 +197,7 @@ export function getSession(
     if (existing.sdkSessionId) {
       persistSessions();
       // SDK has acknowledged this session — safe to resume
-      return { sessionId: existing.sdkSessionId, isNew: false };
+      return { sessionId: existing.sdkSessionId, isNew: false, sandboxDirId: existing.sandboxDirId };
     }
     // Session exists but SDK never confirmed it (e.g. first query failed) — start
     // fresh under a NEW SDK session ID: the runtime would append to the failed
@@ -141,34 +205,42 @@ export function getSession(
     existing.sessionId = randomUUID();
     persistSessions();
     log("sessions", `Session ${sessionId} has no confirmed SDK session — starting new query`);
-    return { sessionId: existing.sessionId, isNew: true };
+    return { sessionId: existing.sessionId, isNew: true, sandboxDirId: existing.sandboxDirId };
   }
 
-  // Create new session
+  // Create new session: it records its owner and a random sandbox home name.
   const claudeSessionId = randomUUID();
+  const sandboxDirId = randomBytes(12).toString("hex");
   sessions.set(sessionId, {
     sessionId: claudeSessionId,
     systemPrompt,
     model,
     lastUsed: Date.now(),
+    ...(caller ? { owner: { label: caller.label, userId: caller.userId }, sandboxDirId } : {}),
   });
   persistSessions();
 
   log("sessions", `Created session ${sessionId}`);
-  return { sessionId: claudeSessionId, isNew: true };
+  return { sessionId: claudeSessionId, isNew: true, sandboxDirId: caller ? sandboxDirId : undefined };
 }
 
 /* ------------------------------------------------------------------ */
 /*  CRUD                                                                */
 /* ------------------------------------------------------------------ */
 
-export function listSessions(): Array<{
+/** A caller sees its own label's conversations and the ownerless legacy entries (as before the update). */
+function visibleTo(session: Session, callerLabel: string | undefined): boolean {
+  return callerLabel === undefined || !session.owner || session.owner.label === callerLabel;
+}
+
+export function listSessions(callerLabel?: string): Array<{
   id: string;
   model: string;
   lastUsed: number;
 }> {
   const result: Array<{ id: string; model: string; lastUsed: number }> = [];
   for (const [id, session] of sessions) {
+    if (!visibleTo(session, callerLabel)) continue;
     result.push({ id, model: session.model, lastUsed: session.lastUsed });
   }
   return result;
@@ -183,7 +255,10 @@ export function updateSessionSdkId(clientId: string, sdkSessionId: string): void
   }
 }
 
-export function deleteSession(sessionId: string): boolean {
+/** Deletes the entry; a conversation of another label is reported as not found (and stays). */
+export function deleteSession(sessionId: string, callerLabel?: string): boolean {
+  const existing = sessions.get(sessionId);
+  if (existing && !visibleTo(existing, callerLabel)) return false;
   const deleted = sessions.delete(sessionId);
   if (deleted) {
     persistSessions();

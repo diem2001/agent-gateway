@@ -93,16 +93,28 @@ export function descendants(pid: number): number[] {
 
 export async function spawnGateway(
   cleanups: Cleanup[],
-  options: { fakeGitBin?: string; env?: Record<string, string>; rootPrefix?: string; distServer?: string } = {},
+  options: {
+    fakeGitBin?: string;
+    env?: Record<string, string>;
+    rootPrefix?: string;
+    distServer?: string;
+    /** Called with the directories before the gateway starts (state files, planted content). */
+    seed?: (dirs: SpawnedGateway["dirs"]) => void;
+    /** A restart: the directories of an earlier gateway (its cleanup removes them), with a new process and port. */
+    reuse?: SpawnedGateway;
+  } = {},
 ): Promise<SpawnedGateway> {
   assertFreshBuild();
   const port = await freePort();
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), options.rootPrefix ?? "mvp7614-gw-"));
+  const root = options.reuse?.root ?? fs.mkdtempSync(path.join(os.tmpdir(), options.rootPrefix ?? "mvp7614-gw-"));
   const base = { home: path.join(root, "home"), tmp: path.join(root, "tmp"), cwd: path.join(root, "cwd"), persist: path.join(root, "persist") };
-  for (const dir of Object.values(base)) fs.mkdirSync(dir);
   const workspace = path.join(base.home, ".claude");
-  const dirs = { ...base, workspace, projects: path.join(workspace, "projects") };
-  fs.mkdirSync(dirs.projects, { recursive: true });
+  const dirs = options.reuse?.dirs ?? { ...base, workspace, projects: path.join(workspace, "projects") };
+  if (!options.reuse) {
+    for (const dir of Object.values(base)) fs.mkdirSync(dir);
+    fs.mkdirSync(dirs.projects, { recursive: true });
+    options.seed?.(dirs);
+  }
 
   const childEnv: NodeJS.ProcessEnv = {};
   for (const key of ALLOWED_ENV_KEYS) {
@@ -143,7 +155,7 @@ export async function spawnGateway(
       child.kill("SIGKILL");
       await exited;
     }
-    fs.rmSync(root, { recursive: true, force: true });
+    if (!options.reuse) fs.rmSync(root, { recursive: true, force: true });
   });
 
   const started = Date.now();

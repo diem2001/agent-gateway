@@ -2,7 +2,6 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import type { SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import { log, logDebug } from "./logging.js";
@@ -381,14 +380,16 @@ function prepareRunsRoot(root: string): string {
 }
 
 /**
- * The persistent home of a conversation: `<root>/sessions/<name>/home`, created on first use. The
- * name is a hash of the session id; the directories above the home are private to the gateway, the
- * home itself is the agent's (it must stay a real directory owned by the gateway user).
+ * The persistent home of a conversation: `<root>/sessions/<name>/home`, created on first use. The name
+ * is the random id recorded with the conversation; the directories above the home are private to the
+ * gateway, the home itself is the agent's (it must stay a real directory owned by the gateway user).
+ * Deleting a conversation leaves its home in place: cleanup and retention belong to MVP-7402.
  */
-function sessionHome(root: string, sessionKey: string): string {
+function sessionHome(root: string, dirId: string): string {
+  if (!/^[0-9a-f]{24}$/.test(dirId)) throw new SandboxPrepError("content_invalid");
   const sessions = path.join(root, "sessions");
   ensurePrivateDir(sessions);
-  const dir = path.join(sessions, createHash("sha256").update(sessionKey).digest("hex").slice(0, 32));
+  const dir = path.join(sessions, dirId);
   ensurePrivateDir(dir);
   const home = path.join(dir, "home");
   let stat = lstatOrNull(home);
@@ -513,6 +514,35 @@ function launchBwrap(
 }
 
 /* ------------------------------------------------------------------ */
+/*  One active request per conversation                                 */
+/* ------------------------------------------------------------------ */
+
+const lockedConversations = new Set<string>();
+
+export interface ConversationLock {
+  release: () => void;
+}
+
+/**
+ * The trusted-side lock of one conversation home: a second request for a conversation that is still
+ * answering gets null (and is refused with 0 runtime starts). Held for the whole request, retries
+ * included; `SandboxRun.dispose` has waited for the sandbox process to exit before it is released, so
+ * two sandboxes never share one home at the same time.
+ */
+export function tryLockConversation(dirId: string): ConversationLock | null {
+  if (lockedConversations.has(dirId)) return null;
+  lockedConversations.add(dirId);
+  let released = false;
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      lockedConversations.delete(dirId);
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /*  One run's sandbox                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -524,10 +554,10 @@ export interface SandboxRunOptions {
   /** This run's user-skill bundle (read-only at its own path), or null. */
   userSkillsDir?: string | null;
   /**
-   * The SDK session id of a conversation that resumes: its home directory persists under the storage
-   * root between requests. Without one, the home is private to this run and removed with it.
+   * The conversation's recorded sandbox home name: its home persists under `<root>/sessions/<name>/home`
+   * between requests. Without one, the home is private to this run and removed with it.
    */
-  sessionKey?: string;
+  sessionDirId?: string;
   signal?: AbortSignal;
   /** Tests: a workspace root other than the gateway's own. */
   workspaceRoot?: string;
@@ -639,8 +669,8 @@ export class SandboxRun {
     fs.chmodSync(runDir, 0o700);
     const trustedDir = path.join(runDir, "trusted");
     fs.mkdirSync(trustedDir, { mode: 0o700 });
-    const homeDir = this.options.sessionKey ? sessionHome(config.sandboxRoot, this.options.sessionKey) : path.join(runDir, "home");
-    if (!this.options.sessionKey) fs.mkdirSync(homeDir, { mode: 0o700 });
+    const homeDir = this.options.sessionDirId ? sessionHome(config.sandboxRoot, this.options.sessionDirId) : path.join(runDir, "home");
+    if (!this.options.sessionDirId) fs.mkdirSync(homeDir, { mode: 0o700 });
 
     const workspaceRoot = this.options.workspaceRoot ?? getWorkspaceRoot();
     const needles = knownSecretValues(process.env, path.join(workspaceRoot, ".credentials.json"), registryExtraSecrets());

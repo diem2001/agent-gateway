@@ -120,8 +120,8 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `GET` | `/health` | Health check (no auth); `persistence` / `persistenceIssues` report state-file problems ([Stopping and recovery](#stopping-and-recovery)) |
 | `POST` | `/v1/query` | Run an agent query (NDJSON stream) |
 | `GET` | `/v1/query/:queryId/events` | Replay/resume event stream |
-| `GET` | `/v1/sessions` | List active sessions |
-| `DELETE` | `/v1/sessions/:id` | Delete a session |
+| `GET` | `/v1/sessions` | List the calling API-key label's active sessions |
+| `DELETE` | `/v1/sessions/:id` | Delete one of the calling label's sessions (another label's: 404) |
 | `GET` | `/v1/settings` | Get session settings |
 | `PUT` | `/v1/settings` | Update session settings |
 | `GET` | `/v1/logging` | Get current log level |

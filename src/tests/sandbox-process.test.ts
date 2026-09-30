@@ -11,6 +11,7 @@ import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -167,7 +168,7 @@ interface ProbeResult {
 
 interface ProbeOptions {
   config?: IsolationConfig;
-  sessionKey?: string;
+  sessionDirId?: string;
   workspaceRoot?: string;
   signal?: AbortSignal;
   /** Do not wait for the probe to exit (the caller ends it). */
@@ -182,7 +183,7 @@ async function probe(script: string, options: ProbeOptions = {}): Promise<ProbeR
     queryId: "q-probe",
     runLogDir: runLogs.dir,
     runLogEnv: runLogs.env,
-    sessionKey: options.sessionKey,
+    sessionDirId: options.sessionDirId,
     signal: options.signal ?? controller.signal,
     workspaceRoot: options.workspaceRoot ?? ws,
     config: options.config ?? config(),
@@ -224,6 +225,11 @@ async function probe(script: string, options: ProbeOptions = {}): Promise<ProbeR
 
 /** A launcher that drops --disable-userns from the arguments it is given on descriptor 3, then runs the real bwrap. */
 const NO_DISABLE_USERNS_BWRAP = `#!/bin/bash\nexec /usr/bin/bwrap --args 4 "\${@:3}" 4< <(perl -0777 -pe 's/--disable-userns\\0//' <&3)\n`;
+
+/** A conversation's recorded sandbox home name (24 hex characters), derived from a readable label. */
+function dirId(label: string): string {
+  return createHash("sha256").update(label).digest("hex").slice(0, 24);
+}
 
 function markersIn(text: string): string[] {
   return ALL_MARKERS.filter((m) => text.includes(m));
@@ -456,12 +462,12 @@ describe("what the sandbox sees of the trusted workspace", () => {
 
 describe("homes of conversations", () => {
   it("a conversation's home persists between runs; a run without a conversation leaves nothing behind", async () => {
-    const first = await probe(`echo first > /home/node/state.txt; echo DONE=1`, { sessionKey: "conv-A" });
+    const first = await probe(`echo first > /home/node/state.txt; echo DONE=1`, { sessionDirId: dirId("conv-A") });
     expect(first.lines.get("DONE")).toBe("1");
-    const second = await probe(`echo SEEN=$(cat /home/node/state.txt 2>&1)`, { sessionKey: "conv-A" });
+    const second = await probe(`echo SEEN=$(cat /home/node/state.txt 2>&1)`, { sessionDirId: dirId("conv-A") });
     expect(second.lines.get("SEEN")).toBe("first");
     // Another conversation does not see it.
-    const other = await probe(`echo SEEN=$(cat /home/node/state.txt 2>&1 | grep -c first)`, { sessionKey: "conv-B" });
+    const other = await probe(`echo SEEN=$(cat /home/node/state.txt 2>&1 | grep -c first)`, { sessionDirId: dirId("conv-B") });
     expect(other.lines.get("SEEN")).toBe("0");
     // A run without a conversation: its home is removed with its run directory.
     const before = fs.readdirSync(path.join(sandboxRoot, "runs"));
@@ -471,14 +477,13 @@ describe("homes of conversations", () => {
   });
 
   it("a link planted by the agent in its own home at a mount point is replaced, never followed", async () => {
-    const hash = (await import("node:crypto")).createHash("sha256").update("conv-plant").digest("hex").slice(0, 32);
-    const homeDir = path.join(sandboxRoot, "sessions", hash, "home");
+    const homeDir = path.join(sandboxRoot, "sessions", dirId("conv-plant"), "home");
     fs.mkdirSync(path.join(homeDir, ".claude"), { recursive: true });
     for (const dir of [path.dirname(homeDir), homeDir]) fs.chmodSync(dir, 0o700);
     const victim = write(path.join(tmp, "victim", "keep.txt"), "keep");
     fs.symlinkSync(path.join(tmp, "victim"), path.join(homeDir, ".claude", "skills"));
     fs.mkdirSync(path.join(homeDir, ".claude", "CLAUDE.md"));
-    const r = await probe(`echo SKILL=$(cat /home/node/.claude/skills/ok/SKILL.md); echo MEMORY=$(cat /home/node/.claude/CLAUDE.md)`, { sessionKey: "conv-plant" });
+    const r = await probe(`echo SKILL=$(cat /home/node/.claude/skills/ok/SKILL.md); echo MEMORY=$(cat /home/node/.claude/CLAUDE.md)`, { sessionDirId: dirId("conv-plant") });
     expect(r.exitCode, r.stdout).toBe(0);
     expect(r.lines.get("SKILL")).toBe("SKILL-OK");
     expect(r.lines.get("MEMORY")).toBe("GLOBAL-MEMORY-OK");
@@ -547,15 +552,14 @@ describe("failing closed", () => {
     const fake = path.join(tmp, "bwrap-without-disable-userns");
     fs.writeFileSync(fake, NO_DISABLE_USERNS_BWRAP, { mode: 0o755 });
     const runLogs = createRunLogDir();
-    const run = new SandboxRun({ queryId: "q-probe", runLogDir: runLogs.dir, runLogEnv: runLogs.env, sessionKey: "conv-nouserns", workspaceRoot: ws, config: config({ bwrapPath: fake }), proxy });
+    const run = new SandboxRun({ queryId: "q-probe", runLogDir: runLogs.dir, runLogEnv: runLogs.env, sessionDirId: dirId("conv-nouserns"), workspaceRoot: ws, config: config({ bwrapPath: fake }), proxy });
     const child = run.spawnHook({ command: "/bin/sh", args: ["-c", "echo started > /home/node/started", SDK_CLI], env: {}, signal: new AbortController().signal });
     child.stdin.end();
     await new Promise<void>((resolve) => child.on("exit", () => resolve()));
     expect(run.startFailure?.problem).toBe("userns_not_blocked");
     expect(run.startFailure?.kind).toBe("isolation_unavailable");
     expect(isolationStatus()).toBe("unavailable");
-    const hash = (await import("node:crypto")).createHash("sha256").update("conv-nouserns").digest("hex").slice(0, 32);
-    expect(fs.existsSync(path.join(sandboxRoot, "sessions", hash, "home", "started"))).toBe(false);
+    expect(fs.existsSync(path.join(sandboxRoot, "sessions", dirId("conv-nouserns"), "home", "started"))).toBe(false);
     await run.dispose();
     fs.rmSync(runLogs.dir, { recursive: true, force: true });
   });

@@ -174,6 +174,12 @@ export function dripChunk(index: number): string {
   return `drip-${index} `;
 }
 
+export interface ExactToolScript {
+  name: string;
+  input: Record<string, unknown>;
+  prompt: string;
+}
+
 export async function startFakeAnthropicApi(options: {
   toolName: string;
   mode?: FakeApiMode;
@@ -181,10 +187,15 @@ export async function startFakeAnthropicApi(options: {
   dripIntervalMs?: number;
   /** Strings the "private-material" rejection carries in its message. */
   privateMaterial?: string[];
-  /** Script one call to exactly this tool (see the header). */
-  exactTool?: { name: string; input: Record<string, unknown>; prompt: string };
+  /**
+   * Script one call to exactly this tool (see the header). An array scripts several conversations at once:
+   * a request is answered by the entry whose `prompt` its user text carries (MVP-7678, concurrent conversations).
+   */
+  exactTool?: ExactToolScript | ExactToolScript[];
 }): Promise<FakeAnthropicApi> {
   const mode = options.mode ?? "normal";
+  const exactTools: ExactToolScript[] = options.exactTool === undefined ? [] : Array.isArray(options.exactTool) ? options.exactTool : [options.exactTool];
+  const carries = (texts: string[], script: ExactToolScript): boolean => texts.some((text) => text.includes(script.prompt));
   const requests: RecordedMessagesRequest[] = [];
   const sockets = new Set<net.Socket>();
   let toolUseSeq = 0;
@@ -214,17 +225,28 @@ export async function startFakeAnthropicApi(options: {
       const tools = (body.tools ?? []).map((t) => String(t.name ?? ""));
       const toolResults: RecordedToolResult[] = [];
       const userTexts: string[] = [];
+      // Where the latest user text and each tool result sit in the conversation: a resumed conversation
+      // repeats its earlier turns, and a scripted call belongs to the latest prompt only (MVP-7678).
+      let lastPromptAt = -1;
+      const resultAt: number[] = [];
+      let messageIndex = -1;
       for (const message of body.messages ?? []) {
+        messageIndex++;
         if (message.role !== "user") continue;
         const text = blockText(message.content);
-        if (text) userTexts.push(text);
+        if (text) {
+          userTexts.push(text);
+          lastPromptAt = messageIndex;
+        }
         if (!Array.isArray(message.content)) continue;
         for (const block of message.content) {
           if (block.type === "tool_result") {
             toolResults.push({ toolUseId: String(block.tool_use_id ?? ""), isError: block.is_error === true, text: blockText(block.content) });
+            resultAt.push(messageIndex);
           }
         }
       }
+      const resultsAfterLatestPrompt = resultAt.filter((at) => at > lastPromptAt).length;
       const model = body.model ?? "unknown";
       const stream = body.stream === true;
       const warmup = userTexts.length > 0 && userTexts.every((text) => text === "Warmup");
@@ -246,10 +268,10 @@ export async function startFakeAnthropicApi(options: {
         anthropicBeta: header("anthropic-beta"),
       };
       requests.push(record);
-      const exact = options.exactTool;
-      const carriesPrompt = exact !== undefined && userTexts.some((text) => text.includes(exact.prompt));
-      const main = exact ? carriesPrompt && !warmup : tools.length > 0 && !warmup;
-      const isMain = (r: RecordedMessagesRequest) => (exact ? r.userTexts.some((text) => text.includes(exact.prompt)) && !r.warmup : r.tools.length > 0 && !r.warmup);
+      const latestText = userTexts.at(-1) ?? "";
+      const exact = exactTools.find((script) => latestText.includes(script.prompt));
+      const main = exactTools.length > 0 ? exact !== undefined && !warmup : tools.length > 0 && !warmup;
+      const isMain = (r: RecordedMessagesRequest) => (exactTools.length > 0 ? exactTools.some((script) => carries(r.userTexts, script)) && !r.warmup : r.tools.length > 0 && !r.warmup);
       const firstSession = requests.find(isMain)?.session;
       if (mode === "rate-limited-after-tool-once" && main && toolResults.length > 0 && record.session === firstSession) {
         res.writeHead(429, { "Content-Type": "application/json", "x-should-retry": "false" });
@@ -275,7 +297,7 @@ export async function startFakeAnthropicApi(options: {
       const target = tools.find((name) => name.endsWith(`__${options.toolName}`));
       type Block = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } | { type: "text"; text: string };
       const content: Block[] =
-        exact && main && toolResults.length === 0
+        exact && main && resultsAfterLatestPrompt === 0
           ? [{ type: "tool_use", id: `toolu_7637_${++toolUseSeq}`, name: exact.name, input: exact.input }]
           : !exact && target && toolResults.length === 0
             ? [{ type: "tool_use", id: `toolu_7667_${++toolUseSeq}`, name: target, input: { id: "R-1" } }]
@@ -349,9 +371,7 @@ export async function startFakeAnthropicApi(options: {
     requests,
     agentRequests: () => requests.filter((r) => r.tools.length > 0),
     mainRequests: () =>
-      requests.filter((r) =>
-        options.exactTool ? r.userTexts.some((text) => text.includes(options.exactTool!.prompt)) && !r.warmup : r.tools.length > 0 && !r.warmup,
-      ),
+      requests.filter((r) => (exactTools.length > 0 ? exactTools.some((script) => carries(r.userTexts, script)) && !r.warmup : r.tools.length > 0 && !r.warmup)),
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));

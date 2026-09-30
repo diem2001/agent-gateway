@@ -86,7 +86,7 @@ src/
   auth.ts            # API key middleware (Bearer token)
   query.ts           # POST /v1/query, GET /v1/query/:queryId/events
   agent.ts           # Claude Agent SDK wrapper, event emission, MCP server injection
-  sessions.ts        # Session CRUD, persistence, idle cleanup, SDK session ID sync
+  sessions.ts        # Session CRUD, persistence, idle cleanup, SDK session ID sync; owner (API-key label + user_id or null) and random sandboxDirId per conversation, admitSession (exact owner, legacy refused), caller-scoped list/delete
   retry.ts           # Exponential backoff retry (transient failures, empty responses); resumes only established sessions
   run-failure.ts     # Classifies a failed run (runtime stdout diagnostic, thrown error) into a safe public error message + safe log fields
   event-cache.ts     # In-memory NDJSON event cache with TTL
@@ -122,6 +122,7 @@ src/
     webhook-tool-schema-process.test.ts # Real-runtime probe: model-facing webhook tool schemas + pre-dispatch rejection, reqlift/diemcrm fixtures (needs `npm run build`)
     tools.test.ts          # Tool registry unit tests
     webhook.test.ts        # Webhook executor tests
+    session-ownership.test.ts / session-isolation-process.test.ts # Owner rule, legacy refusal, list/delete scoping, persistence, query refusals (mocked run); real runtime: legacy transcripts, concurrent owners, restart resume, one active request per conversation (needs `npm run build`)
     sandbox.test.ts / sandbox-content.test.ts # Isolation config, exact argv, env allowlist, failure texts; no-follow validation, git config allowlist, known-value scan, mount plan
     sandbox-process.test.ts # Real bwrap: env, /proc, trusted files, planted links, git masks, read-only content, fail-closed rows, cancel and SIGKILL, plus the real runtime through the gateway (needs `npm run build`)
     model-proxy.test.ts / model-proxy-process.test.ts # Trusted model proxy: token, path, header and refresh rules; real runtime through it

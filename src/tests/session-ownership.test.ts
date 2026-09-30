@@ -1,0 +1,309 @@
+/**
+ * Conversation ownership and legacy refusal (MVP-7678, sessions.ts, query.ts): the exact-owner rule
+ * (label and user id, null and a present user id being different owners), admission without any
+ * change to the entry, legacy entries, caller-scoped list and delete, the recorded sandbox home
+ * name, persistence across a restart, and the query route's refusals (fixed texts, 0 runs, no
+ * session change). The agent run is mocked here; the real-runtime rows are in
+ * session-isolation-process.test.ts.
+ */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import express from "express";
+import request from "supertest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+let dir: string;
+let logs: string[];
+const runQuery = vi.fn();
+
+beforeEach(() => {
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), "session-ownership-"));
+  process.env.SESSION_PERSIST_PATH = path.join(dir, "sessions.json");
+  process.env.TOOLS_PERSIST_PATH = path.join(dir, "tools.json");
+  process.env.MCP_SERVERS_PERSIST_PATH = path.join(dir, "mcp-servers.json");
+  logs = [];
+  vi.spyOn(console, "log").mockImplementation((...args) => {
+    logs.push(args.map(String).join(" "));
+  });
+  runQuery.mockReset();
+  vi.resetModules();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  delete process.env.SESSION_PERSIST_PATH;
+  delete process.env.TOOLS_PERSIST_PATH;
+  delete process.env.MCP_SERVERS_PERSIST_PATH;
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+async function sessionsModule(): Promise<typeof import("../sessions.js")> {
+  return await import("../sessions.js");
+}
+
+const A = { label: "reqlift", userId: "user-1" };
+const B = { label: "diemai", userId: "user-1" };
+
+describe("the owner rule", () => {
+  it("a new conversation records its owner and a random sandbox home name", async () => {
+    const m = await sessionsModule();
+    expect(m.admitSession("c1", A)).toEqual({ kind: "new" });
+    const created = m.getSession("c1", "sys", "model", true, A);
+    expect(created.isNew).toBe(true);
+    expect(created.sandboxDirId).toMatch(/^[0-9a-f]{24}$/);
+    const other = m.getSession("c2", "sys", "model", true, A);
+    expect(other.sandboxDirId).not.toBe(created.sandboxDirId);
+    expect(m.flushSessions()).toBe(true);
+    const saved = JSON.parse(fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8")) as { sessions: Record<string, { owner: unknown; sandboxDirId: string }> };
+    expect(saved.sessions.c1.owner).toEqual(A);
+    expect(saved.sessions.c1.sandboxDirId).toBe(created.sandboxDirId);
+  });
+
+  it("the exact owner resumes, with the same sandbox home", async () => {
+    const m = await sessionsModule();
+    const created = m.getSession("c1", "sys", "model", true, A);
+    m.updateSessionSdkId("c1", "sdk-1");
+    expect(m.admitSession("c1", { ...A })).toEqual({ kind: "resume", sandboxDirId: created.sandboxDirId });
+    const resumed = m.getSession("c1", "sys", "model", true, A);
+    expect(resumed).toEqual({ sessionId: "sdk-1", isNew: false, sandboxDirId: created.sandboxDirId });
+  });
+
+  it.each([
+    ["another API-key label with the same user id", { label: "diemai", userId: "user-1" }],
+    ["the same label with another user id", { label: "reqlift", userId: "user-2" }],
+    ["the same label without a user id (null is not a user)", { label: "reqlift", userId: null }],
+    ["another label without a user id", { label: "diemai", userId: null }],
+  ])("%s is refused as another owner", async (_label, caller) => {
+    const m = await sessionsModule();
+    m.getSession("c1", "sys", "model", true, A);
+    m.updateSessionSdkId("c1", "sdk-1");
+    expect(m.admitSession("c1", caller)).toEqual({ kind: "refused", reason: "other_owner" });
+  });
+
+  it("a conversation created without a user id is not continued with one", async () => {
+    const m = await sessionsModule();
+    m.getSession("c1", "sys", "model", true, { label: "reqlift", userId: null });
+    expect(m.admitSession("c1", { label: "reqlift", userId: null }).kind).toBe("resume");
+    expect(m.admitSession("c1", { label: "reqlift", userId: "user-1" })).toEqual({ kind: "refused", reason: "other_owner" });
+  });
+
+  it("admission changes nothing: a refused caller leaves the entry exactly as it was", async () => {
+    const m = await sessionsModule();
+    m.getSession("c1", "original system prompt", "model-a", true, A);
+    m.updateSessionSdkId("c1", "sdk-1");
+    m.flushSessions();
+    const before = fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(m.admitSession("c1", B)).toEqual({ kind: "refused", reason: "other_owner" });
+    m.flushSessions();
+    expect(fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8")).toBe(before);
+  });
+
+  it("a request without a session (useSession false) has no owner and no home", async () => {
+    const m = await sessionsModule();
+    const result = m.getSession("ignored", "sys", "model", false, A);
+    expect(result.isNew).toBe(true);
+    expect(result.sandboxDirId).toBeUndefined();
+    expect(m.getSessionCount()).toBe(0);
+  });
+});
+
+describe("legacy conversations (created before the update)", () => {
+  function seed(file: string): void {
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        sessions: {
+          legacyConfirmed: { sessionId: "gw-1", sdkSessionId: "sdk-old", systemPrompt: "", model: "m", lastUsed: Date.now() },
+          legacyUnconfirmed: { sessionId: "gw-2", systemPrompt: "", model: "m", lastUsed: Date.now() },
+          ownerOnly: { sessionId: "gw-3", systemPrompt: "", model: "m", lastUsed: Date.now(), owner: { label: "reqlift", userId: null } },
+          dirOnly: { sessionId: "gw-4", systemPrompt: "", model: "m", lastUsed: Date.now(), sandboxDirId: "0123456789abcdef01234567" },
+        },
+        settings: { sessionIdleTimeoutMs: 0 },
+      }),
+    );
+  }
+
+  it("every entry without a recorded owner and home is refused for every caller, confirmed or not, with a count-only audit line", async () => {
+    seed(process.env.SESSION_PERSIST_PATH!);
+    const m = await sessionsModule();
+    m.loadSessions();
+    expect(m.getSessionCount()).toBe(4);
+    let total = 0;
+    for (const id of ["legacyConfirmed", "legacyUnconfirmed", "ownerOnly", "dirOnly"]) {
+      for (const caller of [A, B, { label: "reqlift", userId: null }]) {
+        expect(m.admitSession(id, caller), `${id} / ${JSON.stringify(caller)}`).toEqual({ kind: "refused", reason: "legacy" });
+        total++;
+      }
+    }
+    const audit = logs.filter((l) => l.includes("sessions.legacy.refused"));
+    expect(audit).toHaveLength(total);
+    expect(audit.at(-1)).toBe(`[audit] sessions.legacy.refused total=${total}`);
+    // Counts only: no conversation id, no label.
+    expect(audit.join("\n")).not.toMatch(/legacy[A-Z]|ownerOnly|dirOnly|reqlift|diemai/);
+  });
+
+  it("legacy entries stay listable and deletable for every label, as before", async () => {
+    seed(process.env.SESSION_PERSIST_PATH!);
+    const m = await sessionsModule();
+    m.loadSessions();
+    // Entries with no recorded owner are visible to every label; `ownerOnly` has an owner and is its label's.
+    expect(m.listSessions("anyone").map((s) => s.id).sort()).toEqual(["dirOnly", "legacyConfirmed", "legacyUnconfirmed"]);
+    expect(m.listSessions("reqlift").map((s) => s.id).sort()).toEqual(["dirOnly", "legacyConfirmed", "legacyUnconfirmed", "ownerOnly"]);
+    expect(m.deleteSession("legacyConfirmed", "anyone")).toBe(true);
+    expect(m.deleteSession("legacyConfirmed", "anyone")).toBe(false);
+  });
+
+  it("a new conversation with a legacy id is not possible until the legacy entry is deleted; then it is new", async () => {
+    seed(process.env.SESSION_PERSIST_PATH!);
+    const m = await sessionsModule();
+    m.loadSessions();
+    expect(m.admitSession("legacyConfirmed", A).kind).toBe("refused");
+    m.deleteSession("legacyConfirmed", A.label);
+    expect(m.admitSession("legacyConfirmed", A)).toEqual({ kind: "new" });
+    const fresh = m.getSession("legacyConfirmed", "", "m", true, A);
+    expect(fresh.isNew).toBe(true);
+    // A fresh random home: nothing of the old conversation is reused.
+    expect(fresh.sandboxDirId).not.toBe("0123456789abcdef01234567");
+  });
+});
+
+describe("list and delete are scoped to the caller's label", () => {
+  it("a label lists only its own conversations; another label's delete answers not found and changes nothing", async () => {
+    const m = await sessionsModule();
+    m.getSession("mine", "", "m", true, A);
+    m.getSession("theirs", "", "m", true, B);
+    m.getSession("mine-without-user", "", "m", true, { label: "reqlift", userId: null });
+    expect(m.listSessions("reqlift").map((s) => s.id).sort()).toEqual(["mine", "mine-without-user"]);
+    expect(m.listSessions("diemai").map((s) => s.id)).toEqual(["theirs"]);
+    expect(m.listSessions("nobody")).toEqual([]);
+    expect(m.deleteSession("theirs", "reqlift")).toBe(false);
+    expect(m.getSessionCount()).toBe(3);
+    expect(m.deleteSession("theirs", "diemai")).toBe(true);
+    expect(m.getSessionCount()).toBe(2);
+    // Unscoped (no label) keeps the old behavior for internal callers.
+    expect(m.listSessions()).toHaveLength(2);
+  });
+});
+
+describe("restart", () => {
+  it("owner and sandbox home name survive a restart, and the same owner resumes", async () => {
+    const m1 = await sessionsModule();
+    const created = m1.getSession("c1", "sys", "model", true, A);
+    m1.updateSessionSdkId("c1", "sdk-1");
+    expect(m1.flushSessions()).toBe(true);
+    vi.resetModules();
+    const m2 = await sessionsModule();
+    m2.loadSessions();
+    expect(m2.admitSession("c1", A)).toEqual({ kind: "resume", sandboxDirId: created.sandboxDirId });
+    expect(m2.admitSession("c1", B)).toEqual({ kind: "refused", reason: "other_owner" });
+  });
+});
+
+describe("the query route", () => {
+  async function app(): Promise<{ app: express.Express; sessions: typeof import("../sessions.js") }> {
+    vi.doMock("../agent.js", () => ({ runQuery: (...args: unknown[]) => runQuery(...args), DEFAULT_TOOLS: [] }));
+    const sessions = await sessionsModule();
+    const { queryRouter } = await import("../query.js");
+    const server = express();
+    server.use(express.json());
+    server.use((req, _res, next) => {
+      req.clientLabel = (req.headers["x-test-label"] as string) ?? "reqlift";
+      next();
+    });
+    server.use(queryRouter);
+    return { app: server, sessions };
+  }
+
+  const ok = { response: "answer", resultData: { session_id: "sdk-new", usage: {}, modelUsage: {} } };
+
+  async function ask(server: express.Express, body: Record<string, unknown>, label = "reqlift") {
+    const res = await request(server).post("/v1/query").set("x-test-label", label).send({ model: "m", prompt: "hi", ...body });
+    const events = res.text.split("\n").filter((l) => l.startsWith("{")).map((l) => JSON.parse(l) as { type: string; content?: string });
+    return { res, events };
+  }
+
+  it("a new conversation runs with its recorded sandbox home name, the same owner resumes with it, anyone else is refused without a run", async () => {
+    runQuery.mockResolvedValue(ok);
+    const { app: server, sessions } = await app();
+    const first = await ask(server, { queryId: "q1", sessionId: "c1", user_id: "user-1" });
+    expect(first.events.at(-1)?.type).toBe("done");
+    expect(runQuery).toHaveBeenCalledTimes(1);
+    const firstDir = (runQuery.mock.calls[0][0] as { sandboxDirId?: string }).sandboxDirId;
+    expect(firstDir).toMatch(/^[0-9a-f]{24}$/);
+
+    const again = await ask(server, { queryId: "q2", sessionId: "c1", user_id: "user-1" });
+    expect(again.events.at(-1)?.type).toBe("done");
+    expect(runQuery).toHaveBeenCalledTimes(2);
+    expect((runQuery.mock.calls[1][0] as { sandboxDirId?: string; isResume?: boolean })).toMatchObject({ sandboxDirId: firstDir, isResume: true });
+
+    const snapshot = JSON.stringify(sessions.listSessions());
+    for (const [label, body] of [
+      ["diemai", { user_id: "user-1" }],
+      ["reqlift", { user_id: "user-2" }],
+      ["reqlift", {}],
+    ] as const) {
+      const refused = await ask(server, { queryId: `q-${label}`, sessionId: "c1", ...body }, label);
+      expect(refused.events).toEqual([{ seq: 0, type: "error", content: "This conversation cannot be continued from your account. Please start a new conversation." }]);
+    }
+    // 0 runs for the refusals, and the conversation is untouched.
+    expect(runQuery).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(sessions.listSessions())).toBe(snapshot);
+  });
+
+  it("a legacy conversation is refused with the fixed text, no run, no change; with the exact NDJSON shape (one error event, no done)", async () => {
+    fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, JSON.stringify({ sessions: { old: { sessionId: "gw", sdkSessionId: "sdk-old", systemPrompt: "", model: "m", lastUsed: 1_700_000_000_000 } } }));
+    const { app: server, sessions } = await app();
+    sessions.loadSessions();
+    const refused = await ask(server, { queryId: "q-legacy", sessionId: "old", user_id: "user-1" });
+    expect(refused.res.status).toBe(200);
+    expect(refused.events).toEqual([
+      { seq: 0, type: "error", content: "This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help." },
+    ]);
+    expect(runQuery).not.toHaveBeenCalled();
+    expect(sessions.getSessionCount()).toBe(1);
+  });
+
+  it("a second request for a conversation that is still answering is refused as busy with no run, and the first request is unaffected", async () => {
+    let finish: (v: unknown) => void = () => {};
+    runQuery.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    const { app: server } = await app();
+    const firstDone = ask(server, { queryId: "q1", sessionId: "busy", user_id: "user-1" });
+    await vi.waitFor(() => expect(runQuery).toHaveBeenCalledTimes(1));
+    const second = await ask(server, { queryId: "q2", sessionId: "busy", user_id: "user-1" });
+    expect(second.events).toEqual([{ seq: 0, type: "error", content: "This conversation is still answering an earlier request. Please wait until it has finished, then try again." }]);
+    expect(runQuery).toHaveBeenCalledTimes(1);
+    // Another conversation of the same owner is not blocked.
+    runQuery.mockResolvedValueOnce(ok);
+    const other = await ask(server, { queryId: "q3", sessionId: "other", user_id: "user-1" });
+    expect(other.events.at(-1)?.type).toBe("done");
+    finish(ok);
+    expect((await firstDone).events.at(-1)?.type).toBe("done");
+    // Free again once the run ended: the next request is accepted.
+    runQuery.mockResolvedValueOnce(ok);
+    const third = await ask(server, { queryId: "q4", sessionId: "busy", user_id: "user-1" });
+    expect(third.events.at(-1)?.type).toBe("done");
+  });
+
+  it("the lock is released when the run fails, and before the error reaches the client", async () => {
+    runQuery.mockRejectedValueOnce(new Error("boom"));
+    const { app: server } = await app();
+    const failed = await ask(server, { queryId: "q1", sessionId: "c-fail", user_id: "user-1" });
+    expect(failed.events.at(-1)?.type).toBe("error");
+    runQuery.mockResolvedValueOnce(ok);
+    const next = await ask(server, { queryId: "q2", sessionId: "c-fail", user_id: "user-1" });
+    expect(next.events.at(-1)?.type).toBe("done");
+  });
+
+  it("a request without a session id or with useSession false needs no admission and starts a private run", async () => {
+    runQuery.mockResolvedValue(ok);
+    const { app: server, sessions } = await app();
+    const a = await ask(server, { queryId: "q1" });
+    const b = await ask(server, { queryId: "q2", sessionId: "c1", useSession: false, user_id: "user-1" });
+    expect(a.events.at(-1)?.type).toBe("done");
+    expect(b.events.at(-1)?.type).toBe("done");
+    for (const call of runQuery.mock.calls) expect((call[0] as { sandboxDirId?: string }).sandboxDirId).toBeUndefined();
+    expect(sessions.getSessionCount()).toBe(0);
+  });
+});

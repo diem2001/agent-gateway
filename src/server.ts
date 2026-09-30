@@ -173,12 +173,15 @@ app.put("/v1/logging", (req, res) => {
 /*  Routes: Session management (authenticated)                          */
 /* ------------------------------------------------------------------ */
 
-app.get("/v1/sessions", (_req, res) => {
-  res.json({ sessions: listSessions(), count: getSessionCount() });
+// Scoped to the caller's API-key label (MVP-7678): a label sees and deletes its own conversations and the
+// ownerless ones from before the update; another label's conversation answers 404.
+app.get("/v1/sessions", (req, res) => {
+  const visible = listSessions(req.clientLabel);
+  res.json({ sessions: visible, count: visible.length });
 });
 
 app.delete("/v1/sessions/:id", (req, res) => {
-  const deleted = deleteSession(req.params.id);
+  const deleted = deleteSession(req.params.id, req.clientLabel);
   if (!deleted) {
     res.status(404).json({ error: "Session not found" });
     return;

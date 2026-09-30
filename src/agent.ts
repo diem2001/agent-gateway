@@ -51,6 +51,8 @@ export interface QueryParams {
   userId?: string;
   /** Only for the log reference in the unknown-failure message (run-failure.ts). */
   queryId?: string;
+  /** The conversation's recorded sandbox home name (sessions.ts); without one the run has a private home. */
+  sandboxDirId?: string;
   /**
    * The exact tool set this run may call (MVP-7637, see tool-policy.ts),
    * validated by the query route. `undefined` ⇒ the options are unchanged.
@@ -145,7 +147,7 @@ async function* buildContentMessageStream(
  * it is kept here and classified, never forwarded. Client aborts (AbortError)
  * are rethrown unchanged.
  */
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools }: QueryParams): Promise<QueryResult> {
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools, sandboxDirId }: QueryParams): Promise<QueryResult> {
   const enforced = enforcedTools !== undefined;
   // An enforced run gets only the registered tools its set names.
   const registeredTools = enforced
@@ -245,8 +247,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     runLogDir: runLogs.dir,
     runLogEnv: runLogs.env,
     userSkillsDir: userSkills.pluginRoot,
-    // The conversation the client named (stable across requests, unlike the runtime's own session id).
-    sessionKey: webhookContext?.session_id,
+    sessionDirId: sandboxDirId,
     signal: abortController.signal,
   });
   options.env = { ...runtimeEnvFrom(process.env), ...runLogs.env };
@@ -401,8 +402,10 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     for (const token of relayTokens) credentialRelay.revoke(token);
     // Request-scoped bundle: remove it once this query() call has drained.
     cleanupUserSkillBundle(userSkills.pluginRoot);
-    void sandbox.dispose();
+    // The sandbox process is gone before this run returns, so the conversation's lock (query.ts) is
+    // released only after its home has no process left.
     void removeRunLogDirAfterExit(runLogs.dir, sandbox.child);
+    await sandbox.dispose();
   }
 
   // A sandbox that failed to start while the SDK ended without an error: nothing ran.

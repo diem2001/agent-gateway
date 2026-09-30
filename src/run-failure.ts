@@ -19,7 +19,10 @@ export type RunFailureKind =
   | "unknown"
   | "isolation_unavailable"
   | "isolation_timeout"
-  | "run_deadline";
+  | "run_deadline"
+  | "session_other_owner"
+  | "session_legacy"
+  | "session_busy";
 
 /** Everything agent.ts may pass to the classifier for one attempt. */
 export interface RunDiagnostics {
@@ -277,3 +280,8 @@ export function fixedFailure(kind: RunFailureKind, message: string): RunFailure 
   const fields: RunFailureLogFields = { kind, apiStatus: "none", providerType: "none", installed: "none", required: "none" };
   return new RunFailure(kind, message, fields, null);
 }
+
+/** Conversation admission refusals (MVP-7678). The "other owner" text does not confirm that the conversation exists. */
+export const SESSION_OTHER_OWNER_MESSAGE = "This conversation cannot be continued from your account. Please start a new conversation.";
+export const SESSION_LEGACY_MESSAGE = "This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help.";
+export const SESSION_BUSY_MESSAGE = "This conversation is still answering an earlier request. Please wait until it has finished, then try again.";
