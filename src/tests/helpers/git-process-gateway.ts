@@ -93,7 +93,7 @@ export function descendants(pid: number): number[] {
 
 export async function spawnGateway(
   cleanups: Cleanup[],
-  options: { fakeGitBin?: string; env?: Record<string, string>; rootPrefix?: string } = {},
+  options: { fakeGitBin?: string; env?: Record<string, string>; rootPrefix?: string; distServer?: string } = {},
 ): Promise<SpawnedGateway> {
   assertFreshBuild();
   const port = await freePort();
@@ -122,7 +122,7 @@ export async function spawnGateway(
     ...options.env,
   });
 
-  const child = spawn(process.execPath, ["--expose-gc", DIST_SERVER], {
+  const child = spawn(process.execPath, ["--expose-gc", options.distServer ?? DIST_SERVER], {
     cwd: dirs.cwd,
     env: childEnv,
     stdio: ["ignore", "pipe", "pipe"],

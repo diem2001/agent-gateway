@@ -130,12 +130,16 @@ export function getSession(
     existing.lastUsed = Date.now();
     existing.systemPrompt = systemPrompt;
     existing.model = model;
-    persistSessions();
     if (existing.sdkSessionId) {
+      persistSessions();
       // SDK has acknowledged this session — safe to resume
       return { sessionId: existing.sdkSessionId, isNew: false };
     }
-    // Session exists but SDK never confirmed it (e.g. first query failed) — start fresh
+    // Session exists but SDK never confirmed it (e.g. first query failed) — start
+    // fresh under a NEW SDK session ID: the runtime would append to the failed
+    // attempt's transcript if the old ID were reused.
+    existing.sessionId = randomUUID();
+    persistSessions();
     log("sessions", `Session ${sessionId} has no confirmed SDK session — starting new query`);
     return { sessionId: existing.sessionId, isNew: true };
   }

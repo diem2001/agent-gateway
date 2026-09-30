@@ -178,9 +178,28 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `sessionId` | string | no | Resume an existing session |
 | `systemPrompt` | string | no | Appended to the Claude Code preset system prompt |
 | `model` | string | no | Model id |
-| `allowedTools` | string[] | no | Override the default tool set |
+| `allowedTools` | string[] | no | Override the default tool set. This pre-approves tools; it does **not** remove others, so it is no security boundary (use `enforcedTools`) |
+| `enforcedTools` | string[] | no | The exact tools the run may call; every other tool is refused before it runs (see below) |
 
 \* Provide **either** `prompt` **or** `content`. If both are present, `content` takes precedence. If neither is present, the request is rejected with HTTP 400.
+
+### Enforced tool set (`enforcedTools`)
+
+`enforcedTools` restricts one run to an exact set of tools. Name each tool the way the SDK names it: built-ins as `Bash`, `Read`, …; MCP tools as `mcp__<server>__<tool>`. The gateway's registered webhook tools are served by the SDK server `agent-gateway-tools`, so a registered tool `reqlift_confluence_report_region` is `mcp__agent-gateway-tools__reqlift_confluence_report_region`. There are no wildcards.
+
+```json
+{
+  "queryId": "q-1",
+  "prompt": "Read the page and report each area.",
+  "enforcedTools": ["mcp__jira__get_confluence_page", "mcp__agent-gateway-tools__reqlift_confluence_report_region"]
+}
+```
+
+- **Refused before it runs.** Any tool call outside the set reaches no handler: no webhook request, no MCP `tools/call`, no shell command, no fetch. The model gets an error tool result (`Refused: this tool is not allowed for this run.` when the gateway's hook refuses it, or the runtime's own "not available" answer for a tool it was not offered), and the gateway logs `audit tool.denied toolName=<name> queryId=<id>` (the name only). The run itself goes on and can end normally; deciding that a refusal fails the job is the caller's business.
+- **How it is enforced** (layers, because one alone has a gap on the pinned SDK 0.1.77): no user or project settings are loaded (`settingSources: []`, so nothing in the writable HOME — settings, hooks, permission rules, `.mcp.json`, user-scope MCP servers — can widen the run); `permissionMode: "dontAsk"` with `allowedTools` set to exactly the set (an unlisted tool is denied); only the listed built-ins are offered (`tools`); `agent-gateway-tools` carries only the listed registered tools, and a registry or request MCP server is attached only when the set names one of its tools; a `PreToolUse` hook denies every other name and never answers "allow"; no per-user skill bundle is loaded.
+- **Acknowledgment.** The first NDJSON event of such a run is `{"seq":0,"type":"tool_policy","enforced":true,"tools":[…]}`, echoing the set. It is sent once, before any retry, and every retry attempt keeps the same set. A caller can require it and drop the run when it is missing (reqlift does): an older gateway ignores the field and would send no acknowledgment.
+- **Validation (400 before streaming):** the value must be an array (also `null` is refused) of at most 64 distinct names, each 1–128 characters of `A-Z a-z 0-9 _ -`; not together with `allowedTools`; `Task` and `Agent` are refused (whether a sub-agent inherits the set is not proven); an `mcp__…` name that fits more than one attachable server (registry names may contain `__`) is refused as ambiguous. `[]` means "no tool at all", never the default set.
+- **Without `enforcedTools` nothing changes:** the run keeps `bypassPermissions`, the user and project settings, every registered server and the default tool list, and `allowedTools` keeps its current meaning.
 
 ### Multimodal Content (`content[]`)
 
@@ -220,6 +239,19 @@ curl -N -X POST http://localhost:3001/v1/query \
     ]
   }'
 ```
+
+### Failed queries
+
+A failed query ends with exactly one `error` event and no `done`, and it confirms no session. The event keeps its shape `{"seq": n, "type": "error", "content": "..."}`; `content` is a safe, actionable message for the end user. The Claude runtime reports a provider rejection on its stdout before it exits with code 1; the gateway classifies that diagnostic instead of passing on the runtime's exit message (`Claude Code process exited with code 1`). Raw diagnostics (provider responses, runtime output, stack traces, headers, prompts) never appear in `content`, in any other event or in the gateway log.
+
+| Cause | Retried | `content` |
+|-------|---------|-----------|
+| The provider rejects the gateway's Claude runtime as too old for the model | no | `The AI runtime on the gateway server is too old for the selected model (installed 2.0.77, required 2.1.280 or newer). Ask your gateway administrator to update the gateway runtime. Retrying will not help until the administrator has done this.` |
+| Authentication with the provider failed (401/403) | no | `The gateway could not authenticate with the AI provider. Ask your gateway administrator to check the gateway's authentication. Retrying will not help until the administrator has done this.` |
+| Rate limit or overload (429/529) after the retry budget (3 retries, 60 s) | yes | `The AI provider is busy right now. Please try again in a few minutes.` |
+| Anything else, including a missing or unreadable diagnostic | no | `The AI request failed on the gateway for an unknown reason. Please try again. If it keeps failing, ask your gateway administrator to check the gateway logs (reference: <queryId>).` |
+
+In the version message each version is named only when it is known and valid (`x.y.z`): with only the installed one the parenthesis reads `(installed 2.0.77; a newer version is required)`, with only the required one `(required 2.1.280 or newer)`, and without either it is left out. The reference is left out when the `queryId` is not 1–128 characters of `A-Z a-z 0-9 . _ : -`. A client abort keeps the SDK's abort text. The next query with the same `sessionId` after a failed first query starts a fresh conversation. The gateway logs one line per failure with safe fields only: `Error queryId=<id> kind=<runtime_version_unsupported|authentication|transient|unknown> apiStatus=<n|none> providerType=<known type|other|none> installed=<version|none> required=<version|none>`.
 
 ## Authentication
 
@@ -601,7 +633,7 @@ is forwarded as `POST <origin of the registered url>/uploads/jira/issue/MVP-1?fi
 - Node's server-wide `requestTimeout` is 3600 s so a slow upload is not cut at 5 minutes; every other route keeps a 300 s deadline for its request body until the gateway has answered (after an early answer, such as a 401, Node's own timeouts no longer apply to the rest of that body).
 - If the sender disconnects, the upstream request is aborted at once (mcp-jira then stores nothing). If the MCP server answers before the whole body was sent (an early refusal), sending stops and that answer is passed through.
 - Every answer on this route carries `Connection: close`. When the gateway answers while the sender is still sending (any refusal, including the 401), it reads and discards at most 1 MiB more and closes the connection when the sender closes it or 5 s after the answer.
-- The relay returns to the event loop after every forwarded chunk, so an early answer is read before more is written, even when a fast sender (curl) has already delivered MBs. mcp-jira refuses a missing credential at once, reads at most 1 MiB more and then closes the connection; its answer (for example `401 UPLOAD_UNAUTHENTICATED`) reaches the sender unchanged. Only an MCP server that resets the connection immediately after an early answer, without reading any more of the body, can still surface as 502 "unconfirmed".
+- The relay returns to the event loop after every forwarded chunk, so an early answer is normally read before more is written, even when a fast sender (curl) has already delivered MBs. An MCP server can still reset the connection before the gateway has read its early answer: mcp-jira refuses a missing credential at once, reads at most 1 MiB more and then closes with the rest of the body unread, which makes the kernel reset the connection, and on a busy host the reset sometimes arrives first. The gateway's next write to the MCP server then fails; the gateway stops sending and keeps reading for at most 1 s, so an answer that had already arrived (for example `401 UPLOAD_UNAUTHENTICATED`) still reaches the sender unchanged. Without an answer the sender gets 502 "unconfirmed", as for any drop before an answer. Measured under deliberate CPU load with http MCP servers, both an MCP server that closes this way and one that keeps the connection open until the sender stops delivered every early refusal unchanged. Limits: https MCP servers were not measured; reading after the failed write relies on Node stream internals, and if a Node version no longer allows it, the gateway falls back to 502 "unconfirmed" for this case and the upload relay process tests fail.
 
 **Resources and logging:**
 

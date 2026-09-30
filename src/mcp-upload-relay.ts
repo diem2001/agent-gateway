@@ -18,6 +18,7 @@
 
 import http, { type ClientRequest, type IncomingMessage } from "node:http";
 import https from "node:https";
+import type { Socket } from "node:net";
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { DEFAULT_GC_BUDGET, GcBudget } from "./gc-budget.js";
 import { log } from "./logging.js";
@@ -27,6 +28,12 @@ export const DEFAULT_UPLOAD_IDLE_TIMEOUT_MS = 60_000;
 /** Upper bound on the sender body read and discarded after a refusal. */
 export const DEFAULT_DRAIN_LIMIT_BYTES = 1024 * 1024;
 export const DEFAULT_DRAIN_LIMIT_MS = 5_000;
+/**
+ * How long the relay keeps reading after a body write hit the MCP server's
+ * reset, for an answer the server sent before it closed (see
+ * `UploadRelay.keepReadingAfterWriteReset`).
+ */
+export const ANSWER_AFTER_RESET_MS = 1_000;
 /** Node's own `requestTimeout` default, kept for every route except the relay. */
 export const NON_UPLOAD_BODY_DEADLINE_MS = 300_000;
 /** Server-wide `requestTimeout`, so a slow but progressing upload is not cut at 5 minutes. */
@@ -397,6 +404,7 @@ class UploadRelay {
   private answered = false;
   private settled = false;
   private forwarding = true;
+  private resetTimer: NodeJS.Timeout | null = null;
   private bytes = 0;
   /** Frees the dropped chunk buffers every 2 MiB (needs `--expose-gc`). */
   private readonly gcBudget = new GcBudget(DEFAULT_GC_BUDGET);
@@ -426,7 +434,10 @@ class UploadRelay {
     }
     this.upstream = upstream;
     const connectEvent = upstreamRequest.options.protocol === "https:" ? "secureConnect" : "connect";
-    upstream.on("socket", (socket) => socket.once(connectEvent, () => (this.connected = true)));
+    upstream.on("socket", (socket) => {
+      socket.once(connectEvent, () => (this.connected = true));
+      this.keepReadingAfterWriteReset(socket);
+    });
     upstream.on("finish", () => (this.bodySent = true));
     upstream.on("response", (upstreamRes) => this.onResponse(upstreamRes));
     upstream.on("error", () => this.failBeforeAnswer());
@@ -441,9 +452,11 @@ class UploadRelay {
    * (after `drain` when the upstream socket is full). When the sender is fast,
    * Node holds MBs of its body; without this yield every write completes
    * synchronously and the next chunk follows via nextTick, so the upstream
-   * socket is never read. An MCP server that answers early and closes after a
-   * bounded drain (mcp-jira reads at most 1 MiB) would then reset the
-   * connection under the next write, and its answer would be lost as a 502.
+   * socket is never read and an early answer is only seen once the body is
+   * sent. The yield does not close the race with an MCP server that answers
+   * early and then resets the connection (mcp-jira reads at most 1 MiB, then
+   * closes with the rest unread): the reset can still arrive between a read
+   * and the next write. `keepReadingAfterWriteReset` covers that case.
    */
   private readonly onData = (chunk: Buffer): void => {
     this.bytes += chunk.length;
@@ -460,6 +473,38 @@ class UploadRelay {
       if (this.forwarding) this.req.resume();
     });
   };
+
+  /**
+   * An MCP server that answers early and then closes with body data unread
+   * makes its kernel reset the connection. When the reset arrives before the
+   * relay read the answer, the next body write fails; Node then marks the
+   * socket's readable side errored and destroys it, which drops the answer
+   * although it already arrived, and the sender would get a 502.
+   *
+   * So a write that fails with EPIPE or ECONNRESET before any answer does not
+   * destroy the socket at once: forwarding stops, the readable side's error
+   * mark is cleared and the socket keeps reading for at most
+   * ANSWER_AFTER_RESET_MS. An answer that arrives is relayed as usual. Without
+   * one, the next read reports the reset (or the bound passes) and the socket
+   * is destroyed with the original write error, which ends as the usual 502
+   * "unconfirmed". The body is never sent again.
+   *
+   * Node has no public API for reading after a failed write: this wraps the
+   * socket's `destroy()` and clears `_readableState.errored`. If that field
+   * cannot be cleared (a future Node), the socket is destroyed at once, which
+   * is the behavior without this method. The upload relay process tests show
+   * whether it still works.
+   */
+  private keepReadingAfterWriteReset(socket: Socket): void {
+    const destroy = socket.destroy.bind(socket);
+    socket.destroy = (error?: Error): Socket => {
+      if (this.resetTimer !== null || this.answered || this.settled || !isWriteReset(error)) return destroy(error);
+      if (!clearReadableError(socket)) return destroy(error);
+      this.stopForwarding();
+      this.resetTimer = setTimeout(() => destroy(error), ANSWER_AFTER_RESET_MS);
+      return socket;
+    };
+  }
 
   private readonly onEnd = (): void => {
     this.upstream?.end();
@@ -483,6 +528,7 @@ class UploadRelay {
   private settle(status: number | null, result: RelayResult): boolean {
     if (this.settled) return false;
     this.settled = true;
+    if (this.resetTimer) clearTimeout(this.resetTimer);
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.stopForwarding();
@@ -594,6 +640,24 @@ class UploadRelay {
   private senderGone(): void {
     if (!this.settle(null, "client_aborted")) return;
     this.upstream?.destroy();
+  }
+}
+
+/** A body write that failed because the MCP server closed or reset the connection. */
+function isWriteReset(error: Error | undefined): boolean {
+  const { code, syscall } = (error ?? {}) as NodeJS.ErrnoException;
+  return syscall === "write" && (code === "EPIPE" || code === "ECONNRESET");
+}
+
+/** Clears the error mark Node set on the socket's readable side; false when it cannot. */
+function clearReadableError(socket: Socket): boolean {
+  try {
+    const state = (socket as unknown as { _readableState?: { errored: unknown } })._readableState;
+    if (!state) return false;
+    state.errored = null;
+    return state.errored === null;
+  } catch {
+    return false;
   }
 }
 

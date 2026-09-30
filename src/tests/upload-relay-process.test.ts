@@ -20,6 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { ANSWER_AFTER_RESET_MS } from "../mcp-upload-relay.js";
 import {
   MiB,
   answerCreated,
@@ -263,6 +264,55 @@ async function rawStatusStub(status: string): Promise<RawStatusStub> {
   return { url: `http://127.0.0.1:${port}/mcp`, accepted: () => accepted, closed: () => closed };
 }
 
+/**
+ * A raw TCP upstream that, as soon as the request head arrived, writes
+ * `firstBytes` and then resets the connection (`resetAndDestroy()`) without
+ * reading any of the body. The reset reaches the gateway right behind the
+ * answer, so in most attempts the gateway's next body write fails before it
+ * read the answer: the case an MCP server with an early answer and an abrupt
+ * close (mcp-jira) produces only now and then.
+ */
+async function rawResetStub(firstBytes: string): Promise<RawStatusStub> {
+  let accepted = 0;
+  let closed = 0;
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    accepted += 1;
+    sockets.add(socket);
+    socket.on("close", () => {
+      closed += 1;
+      sockets.delete(socket);
+    });
+    socket.on("error", () => undefined);
+    let head = Buffer.alloc(0);
+    let answered = false;
+    socket.on("data", (data: Buffer) => {
+      if (answered) return;
+      head = Buffer.concat([head, data]);
+      if (head.indexOf("\r\n\r\n") === -1) return;
+      answered = true;
+      socket.write(firstBytes, () => socket.resetAndDestroy());
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const { port } = server.address() as AddressInfo;
+  cleanups.push(
+    () =>
+      new Promise<void>((resolve) => {
+        for (const socket of sockets) socket.destroy();
+        server.close(() => resolve());
+      }),
+  );
+  return { url: `http://127.0.0.1:${port}/mcp`, accepted: () => accepted, closed: () => closed };
+}
+
+async function waitUntilClosed(upstream: RawStatusStub): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (upstream.closed() < upstream.accepted() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 function relay(gateway: SpawnedGateway, options: Omit<SendOptions, "port" | "path"> & { path?: string }) {
   return sendUpload({
     port: gateway.port,
@@ -408,9 +458,12 @@ describe("upload relay in a real gateway process", () => {
       // mcp-jira refuses a missing credential before it reads the body, then
       // discards at most 1 MiB and closes the socket with the rest unread, so the
       // kernel resets the connection. A fast sender (one write, like curl) fills
-      // the gateway with MBs at once; the relay must still read the early
-      // answer before that reset, and the sender must get it unchanged, not a
-      // 502. Found by the Outcome Probe against the real mcp-jira.
+      // the gateway with MBs at once. Whether the reset arrives before or after
+      // the relay read the answer depends on scheduling (on a loaded host it
+      // sometimes arrives first, and the next body write fails); either way the
+      // sender must get the answer unchanged, not a 502. Found by the Outcome
+      // Probe against the real mcp-jira. The deterministic form of the
+      // write-after-reset case is the next test.
       const refusal = JSON.stringify({ error: { code: "UPLOAD_UNAUTHENTICATED", message: "An Authorization header is required." } });
       const upstream = await stub(({ req, res }) => {
         res.writeHead(401, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(refusal), Connection: "close" });
@@ -446,6 +499,79 @@ describe("upload relay in a real gateway process", () => {
     },
     60_000,
   );
+
+  it.each([5 * MiB, 20 * MiB])(
+    "an MCP server that answers 401 and resets at once without reading the body: a fast %i-byte sender gets the answer verbatim",
+    async (total) => {
+      // The reset lands right behind the answer, so the relay's next body write
+      // usually fails before it read the answer. The answer is already in the
+      // gateway's socket and must still reach the sender unchanged.
+      const refusal = JSON.stringify({ error: { code: "UPLOAD_UNAUTHENTICATED", message: "An Authorization header is required." } });
+      const upstream = await rawResetStub(
+        `HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(refusal)}\r\nConnection: close\r\n\r\n${refusal}`,
+      );
+      const gateway = await spawnGateway({ LOG_LEVEL: "info" });
+      await registerJira(gateway, upstream);
+
+      const statuses: number[] = [];
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const result = await relay(gateway, { total, oneWrite: true });
+        statuses.push(result.status);
+        if (result.status !== 401) report(`attempt ${attempt}: HTTP ${result.status} ${result.text}`);
+        else expect(result.text).toBe(refusal);
+      }
+      report(`answer then reset, ${total} bytes: statuses ${statuses.join(",")}`);
+      expect(statuses).toEqual(Array(10).fill(401));
+
+      await waitUntilClosed(upstream);
+      expect(upstream.closed()).toBe(upstream.accepted());
+      expect(gateway.child.exitCode).toBeNull();
+      expect((await request(gateway.port, "GET", "/health")).status).toBe(200);
+    },
+    60_000,
+  );
+
+  it.each(["101", "600", "000"])(
+    "an upstream answer with status %s followed at once by a reset becomes 502 'cannot relay' and the gateway keeps serving",
+    async (status) => {
+      const upstream = await rawResetStub(`HTTP/1.1 ${status} Odd\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}`);
+      const gateway = await spawnGateway({ LOG_LEVEL: "info" });
+      await registerJira(gateway, upstream);
+
+      const result = await relay(gateway, { total: 5 * MiB, oneWrite: true });
+      expect(result.status).toBe(502);
+      const body = JSON.parse(result.text);
+      expect(body.error.code).toBe("UPLOAD_UPSTREAM_FAILED");
+      expect(body.error.message).toBe(
+        "The MCP server jira sent an answer the gateway cannot relay; the outcome is unconfirmed. Check the target's attachments before retrying",
+      );
+
+      await waitUntilClosed(upstream);
+      expect(upstream.closed()).toBe(upstream.accepted());
+      expect(gateway.child.exitCode).toBeNull();
+      expect((await request(gateway.port, "GET", "/health")).status).toBe(200);
+      expect(gateway.output()).not.toContain("ERR_HTTP_INVALID_STATUS_CODE");
+    },
+    20_000,
+  );
+
+  it("a 100 Continue followed at once by a reset is no answer: 502 'unconfirmed' within the wait bound", async () => {
+    const upstream = await rawResetStub("HTTP/1.1 100 Continue\r\n\r\n");
+    const gateway = await spawnGateway({ LOG_LEVEL: "info" });
+    await registerJira(gateway, upstream);
+
+    const result = await relay(gateway, { total: 5 * MiB, oneWrite: true });
+    expect(result.status).toBe(502);
+    const body = JSON.parse(result.text);
+    expect(body.error.code).toBe("UPLOAD_UPSTREAM_FAILED");
+    expect(body.error.message).toContain("dropped before it answered; the outcome is unconfirmed");
+    expect(result.finishedAt - result.startedAt).toBeLessThan(ANSWER_AFTER_RESET_MS + 1500);
+
+    await waitUntilClosed(upstream);
+    expect(upstream.closed()).toBe(upstream.accepted());
+    expect(gateway.child.exitCode).toBeNull();
+    expect((await request(gateway.port, "GET", "/health")).status).toBe(200);
+  }, 20_000);
 
   it.each(["099", "000", "101", "600", "999"])(
     "an upstream answer with status %s becomes 502 UPLOAD_UPSTREAM_FAILED and the gateway keeps serving",

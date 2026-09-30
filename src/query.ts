@@ -3,14 +3,18 @@ import { log, logDebug } from "./logging.js";
 import { createCacheEntry, getCacheEntry, markDone, type StreamEvent } from "./event-cache.js";
 import { runQueryWithRetry } from "./retry.js";
 import { getSession, updateSessionSdkId } from "./sessions.js";
+import { RunFailure, classifyRunFailure, formatLogFields, isAbortError } from "./run-failure.js";
 import {
   validateMcpCredentialOverrides,
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
 import {
+  RESERVED_MCP_SERVER_NAME,
   validateRequestMcpServers,
   type RequestMcpServers,
 } from "./mcp-request-servers.js";
+import { getEnabledMcpServers } from "./mcp-registry.js";
+import { validateEnforcedTools } from "./tool-policy.js";
 
 /**
  * A single block of multimodal request content. Maps directly to the Anthropic
@@ -34,6 +38,12 @@ interface QueryRequestBody {
    * chrome-devtools MCP server. See `mcp-request-servers.ts`.
    */
   mcpServers?: RequestMcpServers;
+  /**
+   * The exact tool set this run may call (MVP-7637, see tool-policy.ts). When
+   * present, every other tool is refused before it runs and the stream starts
+   * with a `tool_policy` event echoing the set. Absent ⇒ unchanged behavior.
+   */
+  enforcedTools?: string[];
 }
 
 /**
@@ -91,6 +101,8 @@ export const queryRouter = Router();
 
 queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   const { queryId, sessionId, prompt, content, systemPrompt, model, allowedTools, useSession, sshTarget, user_id, conversation_id, mcpCredentialOverrides, mcpServers } = req.body as QueryRequestBody;
+  // An explicit `null` stays `null` here and is refused; only a missing field is absent.
+  const enforcedToolsValue: unknown = (req.body as QueryRequestBody).enforcedTools;
   if (!queryId) { res.status(400).json({ error: "queryId and prompt or content are required" }); return; }
   const resolved = resolveContentBlocks(content, prompt);
   if ("error" in resolved) { res.status(400).json({ error: resolved.error }); return; }
@@ -105,6 +117,16 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     res.status(400).json({ error: mcpServersValidation.error });
     return;
   }
+  const enforcedValidation = validateEnforcedTools(enforcedToolsValue, allowedTools, [
+    RESERVED_MCP_SERVER_NAME,
+    ...getEnabledMcpServers().map((def) => def.name),
+    ...Object.keys(mcpServersValidation.servers ?? {}),
+  ]);
+  if (enforcedValidation.error) {
+    res.status(400).json({ error: enforcedValidation.error });
+    return;
+  }
+  const enforcedTools = enforcedValidation.tools;
 
   const webhookContext = {
     api_key_label: req.clientLabel,
@@ -130,10 +152,31 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     for (const listener of cacheEntry.listeners) { listener(line); }
   }
 
+  /**
+   * The one terminal `error` event of a failed request: `{seq, type, content}`,
+   * where `content` is a safe, actionable message (run-failure.ts) or, for a
+   * client abort, the SDK's abort text. A failed request gets no `done` and
+   * confirms no session.
+   */
+  function emitError(err: unknown): void {
+    if (isAbortError(err)) {
+      log("query", `Error queryId=${queryId} kind=aborted`);
+      emit({ type: "error", content: (err as Error).message });
+      return;
+    }
+    const failure = err instanceof RunFailure ? err : classifyRunFailure({ thrown: err }, queryId);
+    log("query", `Error queryId=${queryId} ${formatLogFields(failure.logFields)}`);
+    emit({ type: "error", content: failure.message });
+  }
+
   const abortController = new AbortController();
   res.on("close", () => { if (!res.writableEnded) abortController.abort(); });
 
   const startTime = Date.now();
+
+  // The acknowledgment comes first and only once: the retry path below never
+  // re-emits it, and every attempt gets the same set.
+  if (enforcedTools) emit({ type: "tool_policy", enforced: true, tools: enforcedTools });
 
   try {
     // Resolve session: map client sessionId → SDK sessionId for resume
@@ -158,6 +201,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
       mcpCredentialOverrides: overrideValidation.overrides,
       requestMcpServers: mcpServersValidation.servers,
       userId: user_id || undefined,
+      enforcedTools,
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -197,9 +241,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
 
     log("query", `Completed queryId=${queryId} tokens=${inputTokens}+${outputTokens} cost=$${costUsd} duration=${Date.now() - startTime}ms`);
   } catch (err) {
-    const error = err as Error;
-    log("query", `Error queryId=${queryId}: ${error.message}`);
-    emit({ type: "error", content: error.message });
+    emitError(err);
   }
 
   markDone(queryId);

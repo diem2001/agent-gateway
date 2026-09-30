@@ -18,6 +18,8 @@ import { materializeUserSkills, cleanupUserSkillBundle } from "./user-skills.js"
 import { requestMcpAllowedToolPatterns, type RequestMcpServers } from "./mcp-request-servers.js";
 import { credentialRelay } from "./mcp-credential-relay.js";
 import { createRunLogDir, removeRunLogDirAfterExit, spawnRuntimeWithHandle } from "./sdk-run-logs.js";
+import { classifyRunFailure, isAbortError } from "./run-failure.js";
+import { builtInTools, createToolPolicyHook, namesServer } from "./tool-policy.js";
 
 export interface QueryParams {
   prompt?: string;
@@ -47,6 +49,14 @@ export interface QueryParams {
    * `undefined` ⇒ global-only load, `skills_loaded.user_id = null`.
    */
   userId?: string;
+  /** Only for the log reference in the unknown-failure message (run-failure.ts). */
+  queryId?: string;
+  /**
+   * The exact tool set this run may call (MVP-7637, see tool-policy.ts),
+   * validated by the query route. `undefined` ⇒ the options are unchanged.
+   * An empty array means no tool at all, never the default set.
+   */
+  enforcedTools?: string[];
 }
 
 export interface QueryResult {
@@ -127,8 +137,20 @@ async function* buildContentMessageStream(
   };
 }
 
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId }: QueryParams): Promise<QueryResult> {
-  const registeredTools = getAllTools();
+/**
+ * One attempt. A failed attempt throws a `RunFailure` (run-failure.ts) with a
+ * safe public message: a result with `is_error: true`, or any error the SDK
+ * iterator throws. The runtime writes its diagnostic to stdout before it exits
+ * 1, so the loop sees it before the SDK throws "process exited with code 1";
+ * it is kept here and classified, never forwarded. Client aborts (AbortError)
+ * are rethrown unchanged.
+ */
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools }: QueryParams): Promise<QueryResult> {
+  const enforced = enforcedTools !== undefined;
+  // An enforced run gets only the registered tools its set names.
+  const registeredTools = enforced
+    ? getAllTools().filter((t) => enforcedTools.includes(`mcp__agent-gateway-tools__${t.name}`))
+    : getAllTools();
   const registeredToolNames = registeredTools.map((t) => t.name);
   // A registry server with requireUserCredentials is left out of a run without
   // the user's credential: no SDK entry, no allowed-tool pattern, and a request
@@ -146,9 +168,16 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     log("audit", `mcp.server.omitted serverName=${name} reason=${reason}`);
   }
   const omittedServers = omitted.map(({ name }) => name);
-  const runRequestMcpServers = requestMcpServers
+  let runRequestMcpServers = requestMcpServers
     ? Object.fromEntries(Object.entries(requestMcpServers).filter(([name]) => !omittedServers.includes(name)))
     : undefined;
+  if (enforced) {
+    // An enforced run attaches only the servers its set names a tool of.
+    runRegistryServers = runRegistryServers.filter((def) => namesServer(enforcedTools, def.name));
+    if (runRequestMcpServers) {
+      runRequestMcpServers = Object.fromEntries(Object.entries(runRequestMcpServers).filter(([name]) => namesServer(enforcedTools, name)));
+    }
+  }
   const mcpToolPatterns = getMcpAllowedToolPatterns(runRegistryServers);
   const requestMcpToolPatterns = requestMcpAllowedToolPatterns(runRequestMcpServers);
   const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
@@ -162,6 +191,16 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     cwd: HOME,
     settingSources: ["user", "project"],
   };
+  if (enforced) {
+    // The layers of tool-policy.ts: no HOME settings, deny anything not listed,
+    // offer only the listed built-ins, and a deny-only hook as second layer.
+    options.settingSources = [];
+    options.permissionMode = "dontAsk";
+    options.allowedTools = [...enforcedTools];
+    options.tools = builtInTools(enforcedTools);
+    options.hooks = { PreToolUse: [{ hooks: [createToolPolicyHook(enforcedTools, queryId)] }] };
+    log("query", `enforced tool set: ${enforcedTools.length} tool(s)`);
+  }
 
   // Per-user skill loading (DEC-GW-002): materialize the requesting user's stored
   // skills into a request-scoped local-plugin bundle and point `plugins` at it for
@@ -169,7 +208,8 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // those are deliberately left untouched. No userId ⇒ no plugins ⇒ global-only
   // load, byte-for-byte unchanged. Caps overflow is reported here and surfaced as a
   // `skills_truncated` event below (DEC-GW-004) before the query proceeds.
-  const userSkills = materializeUserSkills(userId);
+  // An enforced run loads no plugin bundle (tool-policy.ts).
+  const userSkills = enforced ? materializeUserSkills(undefined) : materializeUserSkills(userId);
   if (userSkills.pluginRoot) {
     options.plugins = [{ type: "local", path: userSkills.pluginRoot }];
     log("query", `user skills: loading plugin bundle for userId=${userId} at ${userSkills.pluginRoot}`);
@@ -250,6 +290,10 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
 
   let fullResponse = "";
   let resultData: Record<string, unknown> | null = null;
+  // Classifier inputs (run-failure.ts): the runtime version and error-flagged
+  // assistant messages. Ordinary assistant text is never classified.
+  let installedVersion: unknown;
+  const assistantErrors: { error: unknown; text: string }[] = [];
   const pendingTools = new Map<string, { name: string }>();
   const toolTimings = new Map<string, number>();
 
@@ -260,7 +304,12 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const msg = message as any;
 
-    if (msg.type === "assistant" && msg.message?.content) {
+    if (msg.type === "assistant" && msg.error != null) {
+      // A runtime-authored error message (e.g. "API Error: 400 <raw provider
+      // body>"): a classifier input only, never part of the response.
+      const blocks: { text?: unknown }[] = Array.isArray(msg.message?.content) ? msg.message.content : [];
+      assistantErrors.push({ error: msg.error, text: blocks.map((block) => (typeof block.text === "string" ? block.text : "")).join("\n") });
+    } else if (msg.type === "assistant" && msg.message?.content) {
       for (const block of msg.message.content) {
         if (block.text) fullResponse += block.text;
         if (block.type === "tool_use") {
@@ -323,11 +372,15 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
       // message, NOT the gateway's own materialized list — that is what makes this
       // the real loaded-set surface.
       if (msg.subtype === "init") {
+        installedVersion = msg.claude_code_version;
         const loadedSkills: string[] = Array.isArray(msg.skills) ? msg.skills : [];
         onEvent({ type: "skills_loaded", user_id: userId ?? null, skills: loadedSkills });
       }
     } else if (msg.type === "result") { resultData = msg; }
   }
+  } catch (err) {
+    if (isAbortError(err)) throw err;
+    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors, thrown: err }, queryId);
   } finally {
     // Every end (answer, error, abort): the relay URLs stop working and their
     // in-flight upstream requests are destroyed.
@@ -335,6 +388,12 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     // Request-scoped bundle: remove it once this query() call has drained.
     cleanupUserSkillBundle(userSkills.pluginRoot);
     void removeRunLogDirAfterExit(runLogs.dir, runtimeChild);
+  }
+
+  // A result flagged is_error is a failure even when its subtype says "success"
+  // and the runtime exited 0.
+  if (resultData?.is_error === true) {
+    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors }, queryId);
   }
 
   return { response: fullResponse, resultData };

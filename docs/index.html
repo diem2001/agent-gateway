@@ -290,7 +290,8 @@ curl -s http://localhost:3001/health | jq .persistence</code></pre>
         <tr><td><code>sessionId</code></td><td>string</td><td>No</td><td>Session ID for conversation continuity</td></tr>
         <tr><td><code>systemPrompt</code></td><td>string</td><td>No</td><td>System prompt to configure agent behavior</td></tr>
         <tr><td><code>model</code></td><td>string</td><td>No</td><td>Claude model to use (e.g., <code>claude-sonnet-4-20250514</code>)</td></tr>
-        <tr><td><code>allowedTools</code></td><td>string[]</td><td>No</td><td>Restrict tools (default: all 10 tools)</td></tr>
+        <tr><td><code>allowedTools</code></td><td>string[]</td><td>No</td><td>Pre-approve tools (default: all 10 tools). This does not remove other tools, so it is no security boundary; use <code>enforcedTools</code></td></tr>
+        <tr><td><code>enforcedTools</code></td><td>string[]</td><td>No</td><td>The exact tools the run may call, as the SDK names them (<code>Bash</code>, <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>; registered webhook tools are <code>mcp__agent-gateway-tools__&lt;name&gt;</code>). Every other tool is refused before it runs; the stream starts with a <code>tool_policy</code> event. See below</td></tr>
         <tr><td><code>useSession</code></td><td>boolean</td><td>No</td><td>Set to <code>false</code> to skip session management</td></tr>
         <tr><td><code>sshTarget</code></td><td>string</td><td>No</td><td>SSH target for context (informational)</td></tr>
         <tr><td><code>user_id</code></td><td>string</td><td>No</td><td>User identifier passed to tool webhook context</td></tr>
@@ -326,6 +327,31 @@ curl -s http://localhost:3001/health | jq .persistence</code></pre>
   }'</code></pre>
     <p>Override server names must exist and be enabled. Unknown names return <code>MCP_SERVER_NOT_FOUND</code>; disabled names return <code>MCP_SERVER_DISABLED</code>. Overrides are merged for that one request only and are never persisted to the MCP registry.</p>
     <p>A single query may also attach an unregistered MCP server via <code>mcpServers</code> (the SDK <code>mcpServers</code> map — <code>{ command, args?, env? }</code> for stdio or <code>{ url, type? }</code> for http/sse). The gateway injects it into <code>options.mcpServers</code> and auto-allows its <code>mcp__&lt;name&gt;__*</code> tools, so no explicit <code>allowedTools</code> is needed. Request servers are merged at the lowest precedence (the gateway's <code>agent-gateway-tools</code> and registered servers always win; the reserved name <code>agent-gateway-tools</code> and malformed entries return <code>400</code>) and are never persisted. reqlift recon uses this to attach a per-run chrome-devtools server.</p>
+
+    <h3>Enforced Tool Set (<code>enforcedTools</code>)</h3>
+    <p>With <code>enforcedTools</code> a run may call exactly the listed tools (no wildcards). A call to any other tool reaches no handler — no webhook request, no MCP <code>tools/call</code>, no shell command, no fetch — and the model gets an error tool result (<code>Refused: this tool is not allowed for this run.</code>, or the runtime's "not available" answer for a tool it was not offered). The gateway logs <code>audit tool.denied toolName=&lt;name&gt; queryId=&lt;id&gt;</code>. The run goes on; whether a refusal fails the job is the caller's decision.</p>
+    <p>Enforcement is layered: no user or project settings from HOME (<code>settingSources: []</code>), <code>permissionMode: "dontAsk"</code> with <code>allowedTools</code> exactly the set, only the listed built-ins offered, <code>agent-gateway-tools</code> and registry/request MCP servers attached only for listed tools, a deny-only <code>PreToolUse</code> hook, and no per-user skill bundle. The first event is <code>{"seq":0,"type":"tool_policy","enforced":true,"tools":[…]}</code>, sent once before any retry; retries keep the set.</p>
+    <p>Validation (400 before streaming): an array (<code>null</code> is refused) of at most 64 distinct names of 1–128 characters <code>A-Z a-z 0-9 _ -</code>; not with <code>allowedTools</code>; no <code>Task</code> or <code>Agent</code>; no <code>mcp__…</code> name that fits two attachable servers. <code>[]</code> means no tool at all. Without the field a run is unchanged.</p>
+<pre><code>curl -N -X POST http://localhost:3001/v1/query \
+  -H "Authorization: Bearer sk-gw-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"queryId": "q-1", "prompt": "Read the page and report each area.",
+       "enforcedTools": ["mcp__jira__get_confluence_page", "mcp__agent-gateway-tools__reqlift_confluence_report_region"]}'</code></pre>
+
+    <h3>Failed Queries</h3>
+    <p>A failed query ends with exactly one <a href="#ndjson"><code>error</code></a> event and no <code>done</code>; it confirms no session. The event keeps its shape <code>{"seq", "type": "error", "content"}</code>, and <code>content</code> is a safe, actionable message for the end user. The Claude runtime reports a provider rejection on its stdout before it exits with code 1; the gateway classifies that diagnostic instead of passing on the runtime's exit message. Raw diagnostics (provider responses, runtime output, stack traces, headers, prompts) never appear in <code>content</code>, in any other event or in the gateway log.</p>
+    <table class="param-table">
+      <thead>
+        <tr><th>Cause</th><th>Retried</th><th><code>content</code></th></tr>
+      </thead>
+      <tbody>
+        <tr><td>The provider rejects the gateway's Claude runtime as too old for the model</td><td>No</td><td>The AI runtime on the gateway server is too old for the selected model (installed 2.0.77, required 2.1.280 or newer). Ask your gateway administrator to update the gateway runtime. Retrying will not help until the administrator has done this. <em>(Each version is named only when it is known; without them the parenthesis is shortened or left out.)</em></td></tr>
+        <tr><td>Authentication with the provider failed (401/403)</td><td>No</td><td>The gateway could not authenticate with the AI provider. Ask your gateway administrator to check the gateway's authentication. Retrying will not help until the administrator has done this.</td></tr>
+        <tr><td>Rate limit or overload (429/529), after the retry budget</td><td>Yes (see Retry Layer)</td><td>The AI provider is busy right now. Please try again in a few minutes.</td></tr>
+        <tr><td>Anything else, including a missing or unreadable diagnostic</td><td>No</td><td>The AI request failed on the gateway for an unknown reason. Please try again. If it keeps failing, ask your gateway administrator to check the gateway logs (reference: &lt;queryId&gt;).</td></tr>
+      </tbody>
+    </table>
+    <p>A client abort keeps the SDK's abort text. The gateway log gets one line per failure with safe fields only: <code>Error queryId=&lt;id&gt; kind=&lt;runtime_version_unsupported|authentication|transient|unknown&gt; apiStatus=&lt;n|none&gt; providerType=&lt;known type|other|none&gt; installed=&lt;version|none&gt; required=&lt;version|none&gt;</code>.</p>
 
     <h3>Multimodal Content (<code>content[]</code>)</h3>
     <p>Send text and images in a single query by passing a <code>content</code> array of content blocks. The array maps directly to the Anthropic API content-block format and is forwarded to the Claude Agent SDK as a structured user message — image blocks are passed through to Anthropic <strong>unmodified</strong>.</p>
@@ -1000,7 +1026,7 @@ curl -X POST "http://localhost:3001/v1/mcp-servers/jira/uploads/jira/issue/MVP-1
       <li><code>MCP_UPLOAD_IDLE_TIMEOUT_MS</code> is a no-progress timeout, not an overall deadline: a slow upload completes while it progresses. Node's server-wide <code>requestTimeout</code> is 3600 s; every other route keeps a 300 s deadline for its request body until the gateway has answered.</li>
       <li>A sender disconnect aborts the upstream request at once. An early answer of the MCP server (before the whole body was sent) stops forwarding and is passed through.</li>
       <li>Every answer on this route carries <code>Connection: close</code>. When the gateway answers while the sender is still sending (any refusal, including the 401), it discards at most 1 MiB more and closes the connection when the sender closes it or 5 s after the answer.</li>
-      <li>The relay returns to the event loop after every forwarded chunk, so an early answer is read before more is written, even from a fast sender such as curl. mcp-jira refuses a missing credential at once and closes after reading at most 1 MiB more; its answer (for example <code>401 UPLOAD_UNAUTHENTICATED</code>) reaches the sender unchanged. Only an MCP server that resets the connection immediately after an early answer, without reading more of the body, can still surface as 502 "unconfirmed".</li>
+      <li>The relay returns to the event loop after every forwarded chunk, so an early answer is normally read before more is written, even from a fast sender such as curl. An MCP server can still reset the connection before the gateway has read its early answer: mcp-jira refuses a missing credential at once and closes after reading at most 1 MiB more, with the rest of the body unread, which makes the kernel reset the connection. The gateway's next write then fails; it stops sending and keeps reading for at most 1 s, so an answer that had already arrived (for example <code>401 UPLOAD_UNAUTHENTICATED</code>) still reaches the sender unchanged; without an answer the sender gets 502 "unconfirmed". Measured under deliberate CPU load with http MCP servers, both this close and a connection kept open until the sender stops delivered every early refusal unchanged. Limits: https MCP servers were not measured; reading after the failed write relies on Node stream internals, and if a Node version no longer allows it the gateway falls back to 502 "unconfirmed" for this case and the upload relay process tests fail.</li>
       <li>No size or concurrency cap in the gateway: reqlift's 100 MiB cap applies to reqlift callers only; other key holders are bounded by the MCP server (Jira's attachment limit). Memory stays flat per upload: the test suite asserts a 50 MB relay raises the peak resident memory by less than 10 MB, with <code>node --expose-gc</code> (set in <code>entrypoint.sh</code>) forcing a minor GC every 2 MiB relayed.</li>
       <li>Nothing is written to disk. The request log line carries the URL (target and file name), never file bytes or the credential; one audit line per relay: <code>mcp.upload.relayed serverName=… status=… bytes=… result=ok|upstream_answer|upstream_failed|timeout|client_aborted</code>.</li>
     </ul>
@@ -1443,6 +1469,14 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
   <p>All events include a <code>seq</code> field (incrementing integer starting at 0) and a <code>type</code> field. Events are streamed as newline-delimited JSON (<code>application/x-ndjson</code>).</p>
 
   <div class="event-card">
+    <h4>tool_policy</h4>
+    <p>Only for a query sent with <code>enforcedTools</code>: always the first event (<code>seq</code> 0), sent once per query (never again on a retry). <code>tools</code> echoes the enforced set, so the caller can confirm this gateway enforced it. A refused tool call then appears as a normal <code>tool_use</code> followed by a <code>tool_result</code> whose <code>output</code> is the refusal text.</p>
+<pre><code>{"seq": 0, "type": "tool_policy", "enforced": true, "tools": ["mcp__jira__get_confluence_page", "mcp__agent-gateway-tools__reqlift_confluence_report_region"]}
+{"seq": 1, "type": "tool_use", "toolName": "Bash", "toolUseId": "tu_1", "input": "touch /tmp/x", "startedAt": 1711461600000, "parentToolUseId": null}
+{"seq": 2, "type": "tool_result", "toolName": "Bash", "toolUseId": "tu_1", "output": "Refused: this tool is not allowed for this run.", "durationMs": 3}</code></pre>
+  </div>
+
+  <div class="event-card">
     <h4>text</h4>
     <p>Assistant text output (streamed incrementally).</p>
 <pre><code>{"seq": 0, "type": "text", "content": "Let me check..."}</code></pre>
@@ -1466,7 +1500,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <div class="event-card">
     <h4>rate_limited</h4>
-    <p>Rate limit detected. The gateway will retry automatically. Emitted both when the retry layer detects an error and when the SDK stream reports a rate limit event.</p>
+    <p>Rate limit detected. The gateway will retry automatically. Emitted both when the retry layer retries (a rate limit or overload, or an empty answer) and when the SDK stream reports a rate limit event. Permanent failures are not retried and emit no <code>rate_limited</code>.</p>
 <pre><code>// Retry layer (error-based)
 {"seq": 3, "type": "rate_limited", "status": "retrying", "attempt": 1, "waitMs": 1000}
 
@@ -1502,7 +1536,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <div class="event-card">
     <h4>done</h4>
-    <p>Query completed successfully. Includes token usage, cost, and context window statistics. Always the last event on success.</p>
+    <p>Query completed successfully. Includes token usage, cost, and context window statistics. Always the last event on success; a failed query never emits it.</p>
 <pre><code>{
   "seq": 7,
   "type": "done",
@@ -1522,8 +1556,8 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <div class="event-card">
     <h4>error</h4>
-    <p>Query failed with an error. Always the last event on failure.</p>
-<pre><code>{"seq": 3, "type": "error", "content": "Connection refused: ssh root@example.com"}</code></pre>
+    <p>Query failed. Always the last event on failure, emitted exactly once, and never together with <code>done</code>. <code>content</code> is a safe, actionable message: the runtime is too old for the model, provider authentication failed, the provider is busy (after the retry budget), or an unknown failure with a log reference. It never contains raw diagnostics. See <a href="#ep-query">Failed Queries</a> for the exact texts.</p>
+<pre><code>{"seq": 3, "type": "error", "content": "The AI provider is busy right now. Please try again in a few minutes."}</code></pre>
   </div>
 
   <!-- ============================================================ -->
@@ -1545,7 +1579,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <div class="vflow-num n-amber">2</div>
       <div class="vflow-body">
         <h4 class="c-amber">Gateway resolves session</h4>
-        <p>If a session exists with the same ID, systemPrompt, and model, the existing Claude session is resumed using the SDK's <code>resume</code> option with the stored SDK session ID. If the prompt or model changed, a new Claude session is created under the same client ID using the <code>sessionId</code> option. After each query completes, the gateway syncs the stored SDK session ID with the actual session_id returned by the SDK, ensuring subsequent queries resume the correct conversation.</p>
+        <p>If a session exists with the same ID and an earlier successful query confirmed its SDK session, the existing Claude session is resumed using the SDK's <code>resume</code> option with the stored SDK session ID. After each successful query, the gateway syncs the stored SDK session ID with the actual session_id returned by the SDK, ensuring subsequent queries resume the correct conversation. A failed query confirms nothing: the next query with the same client ID starts a fresh Claude session under a new SDK session ID (using the <code>sessionId</code> option), so it neither resumes nor appends to the failed attempt.</p>
       </div>
     </div>
     <div class="vflow-step">
@@ -1780,7 +1814,7 @@ curl http://localhost:3001/health</code></pre>
       <div class="vflow-num n-red">5</div>
       <div class="vflow-body">
         <h4 class="c-red">Retry Layer</h4>
-        <p>On rate limits or empty responses: exponential backoff (1s, 2s, 4s), up to 3 retries, 60s total budget. Emits <code>rate_limited</code> events to the client.</p>
+        <p>On rate limits, overloads or empty answers: exponential backoff (1s, 2s, 4s), up to 3 retries, 60s total budget. Emits <code>rate_limited</code> events to the client. Permanent failures (runtime too old, authentication, unknown) end at once with one <code>error</code> event. A retry resumes only a session an earlier successful answer established; otherwise it starts fresh under a new SDK session ID.</p>
       </div>
     </div>
     <div class="vflow-step">
