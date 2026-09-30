@@ -32,6 +32,7 @@ import { installShutdownHandlers } from "./shutdown.js";
 import mcpRoutes from "./routes/mcp.js";
 import gitRoutes from "./routes/git.js";
 import { credentialRelay } from "./mcp-credential-relay.js";
+import { ModelProxyConfigError, gatewayModelProxy } from "./model-proxy.js";
 import { stripSdkDebugEnv, sweepRunLogDirs } from "./sdk-run-logs.js";
 import {
   SERVER_REQUEST_TIMEOUT_MS,
@@ -71,6 +72,21 @@ sweepRunLogDirs();
 credentialRelay.start().catch((e: unknown) => {
   log("server", `Credential relay failed to start: ${e instanceof Error ? e.message : String(e)}`);
 });
+
+// Trusted model proxy (MVP-7678): the only holder of the provider credential.
+// An invalid MODEL_PROXY_IDLE_TIMEOUT_MS stops startup; nothing falls back silently.
+try {
+  void gatewayModelProxy();
+} catch (e) {
+  if (!(e instanceof ModelProxyConfigError)) throw e;
+  log("server", `FATAL config key=${e.key} reason=must be a positive whole number of milliseconds`);
+  process.exit(1);
+}
+gatewayModelProxy()
+  .start()
+  .catch((e: unknown) => {
+    log("server", `Model proxy failed to start: ${e instanceof Error ? e.message : String(e)}`);
+  });
 
 // Logging middleware (before auth so we log rejected requests too)
 app.use(requestLoggingMiddleware);

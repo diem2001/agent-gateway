@@ -71,6 +71,13 @@ export interface RecordedMessagesRequest {
   warmup: boolean;
   /** The runtime session of the request (`..._session_<id>` in `metadata.user_id`), or "" when absent. */
   session: string;
+  /** Path (no query) and query parameter names of the request (MVP-7678: what a proxy in front forwards). */
+  path: string;
+  query: string[];
+  /** The credential headers exactly as received (MVP-7678: which credential reached the provider). */
+  apiKey: string | null;
+  authorization: string | null;
+  anthropicBeta: string | null;
 }
 
 export interface FakeAnthropicApi {
@@ -222,7 +229,22 @@ export async function startFakeAnthropicApi(options: {
       const stream = body.stream === true;
       const warmup = userTexts.length > 0 && userTexts.every((text) => text === "Warmup");
       const session = typeof body.metadata?.user_id === "string" ? (/_session_([^_]*)$/.exec(body.metadata.user_id)?.[1] ?? "") : "";
-      const record: RecordedMessagesRequest = { model, stream, tools, toolResults, userTexts, warmup, session };
+      const url = new URL(req.url ?? "/", "http://fake.invalid");
+      const header = (name: string): string | null => (typeof req.headers[name] === "string" ? (req.headers[name] as string) : null);
+      const record: RecordedMessagesRequest = {
+        model,
+        stream,
+        tools,
+        toolResults,
+        userTexts,
+        warmup,
+        session,
+        path: url.pathname,
+        query: [...url.searchParams.keys()],
+        apiKey: header("x-api-key"),
+        authorization: header("authorization"),
+        anthropicBeta: header("anthropic-beta"),
+      };
       requests.push(record);
       const exact = options.exactTool;
       const carriesPrompt = exact !== undefined && userTexts.some((text) => text.includes(exact.prompt));

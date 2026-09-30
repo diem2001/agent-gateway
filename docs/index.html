@@ -757,7 +757,7 @@ curl -X PUT http://localhost:3001/v1/settings \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Checks whether the Claude CLI inside the container has a valid Anthropic login. This is separate from the gateway's API key auth -- it determines whether the SDK can make API calls to Anthropic. The response is augmented with <code>expiresAt</code> (epoch ms read from <code>~/.claude.json</code> <code>claudeAiOauth.expiresAt</code>) and <code>tokenExpired</code> (boolean, <code>true</code> if <code>Date.now() &gt; expiresAt</code>) so clients can warn users before queries start failing with auth errors.</p>
+    <p>Reports whether the gateway has a valid Anthropic login, read from the credential files in the container (or <code>ANTHROPIC_API_KEY</code>). This is separate from the gateway's API key auth -- it determines whether the SDK can make API calls to Anthropic. The response is augmented with <code>expiresAt</code> (epoch ms read from <code>~/.claude.json</code> <code>claudeAiOauth.expiresAt</code>) and <code>tokenExpired</code> (boolean, <code>true</code> if <code>Date.now() &gt; expiresAt</code>) so clients can warn users before queries start failing with auth errors.</p>
 
     <h3>Response (logged in, fresh token)</h3>
 <pre><code>{

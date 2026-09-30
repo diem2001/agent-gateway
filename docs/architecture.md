@@ -118,9 +118,12 @@ Three levels: `off`, `info`, `debug`. Level is adjustable at runtime via `PUT /v
 
 ### routes/auth.ts -- Anthropic OAuth
 Three-step flow using tmux to interact with Claude CLI:
-1. **POST /v1/auth/login**: Starts Claude CLI in a tmux session, captures the OAuth authorization URL.
+1. **POST /v1/auth/login**: Starts the Claude CLI bundled with the SDK in the image (never `~/.local/bin/claude`, which agents could write) in a tmux session, captures the OAuth authorization URL.
 2. **POST /v1/auth/submit-code**: Sends the authorization code to the tmux session, polls for login success.
-3. **GET /v1/auth/status**: Checks if Claude CLI reports a valid login. The response is augmented with `expiresAt` (epoch ms from `~/.claude.json` `claudeAiOauth.expiresAt`) and `tokenExpired` (boolean, `Date.now() > expiresAt`) so clients can warn users before queries start failing with auth errors.
+3. **GET /v1/auth/status**: Reads the login state from the trusted files (`~/.claude/.credentials.json`, `~/.claude.json`) or `ANTHROPIC_API_KEY`; the bundled CLI has no `auth status` command. The response carries `loggedIn`, `email`, `expiresAt` (epoch ms from `claudeAiOauth.expiresAt`) and `tokenExpired` (boolean, `Date.now() > expiresAt`) so clients can warn users before queries start failing with auth errors.
+
+### model-proxy.ts -- Trusted model proxy (MVP-7678)
+A loopback listener (127.0.0.1, ephemeral port, not an Express route). An agent run gets `ANTHROPIC_BASE_URL` pointing at it and a random run token as its only `ANTHROPIC_API_KEY`. The proxy accepts the token only in `x-api-key` (constant-time, revoked when the run ends), allows only `POST /v1/messages` and `POST /v1/messages/count_tokens` (query `beta=true` or none, body up to 32 MiB, canonical paths only), drops the caller's credential headers, adds the gateway's credential (`ANTHROPIC_API_KEY`, otherwise the OAuth access token of `.credentials.json`, refreshed once at a time on the trusted side) and forwards to `ANTHROPIC_BASE_URL` (default `https://api.anthropic.com`). Status, `x-should-retry` and rate-limit headers pass through; `set-cookie` does not. It never logs headers, bodies, paths or tokens. `MODEL_PROXY_IDLE_TIMEOUT_MS` (default 600000) bounds a silent provider request.
 
 ### routes/git.ts -- Workspace Git Endpoints
 Lets clients clone and refresh git repositories inside `WORKSPACE_ROOT/projects/<path>` so agents can `Read`/`Grep` real source trees as part of their context:
