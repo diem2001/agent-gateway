@@ -1,0 +1,45 @@
+#include <tunables/global>
+
+# AppArmor profile for the agent-gateway container (MVP-7678).
+# docker-default plus what the per-run bubblewrap sandbox needs: user namespaces, mount and pivot_root.
+# Load it on the host before starting the container:
+#   sudo apparmor_parser -r security/agent-gateway-apparmor
+# and start the stack with AGENT_GATEWAY_APPARMOR_PROFILE=agent-gateway-isolation (default: unconfined).
+profile agent-gateway-isolation flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  capability,
+  file,
+  umount,
+  mount,
+  pivot_root,
+  userns,
+
+  signal (receive) peer=unconfined,
+  signal (send,receive) peer=mvp7678-agent-gateway,
+
+  deny @{PROC}/* w,
+  # docker-default denies writes below every /proc entry that is not a pid
+  # directory, which also blocks the sysctl write that bubblewrap
+  # --disable-userns needs (/proc/sys/user/max_user_namespaces). The same
+  # intent, without matching /proc/sys/user:
+  deny @{PROC}/[^1-9s]*/** w,
+  deny @{PROC}/scsi/** w,
+  deny @{PROC}/sysvipc/** w,
+  deny @{PROC}/sys/[^ku]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  ptrace (trace,read,tracedby,readby) peer=mvp7678-agent-gateway,
+}

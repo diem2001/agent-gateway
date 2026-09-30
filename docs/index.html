@@ -1692,22 +1692,20 @@ curl http://localhost:3001/health</code></pre>
     <li><strong>openssh-client</strong> -- for SSH connectivity to remote servers</li>
     <li><strong>tmux</strong> -- for the Anthropic OAuth login flow</li>
     <li><strong>rsync, wget, curl, jq, mc, python3</strong> -- general utilities</li>
-    <li><strong>gosu</strong> -- privilege de-escalation (root to node user)</li>
+    <li><strong>bubblewrap, util-linux</strong> -- the per-run agent sandbox and its start check (<code>unshare</code>)</li>
     <li><strong>tini</strong> -- init process (process 1): forwards stop signals to the gateway, reaps finished child processes, returns the gateway's exit code</li>
-    <li><strong>Claude Code CLI</strong> -- installed on first startup via <code>curl -fsSL https://claude.ai/install.sh | bash</code></li>
+    <li><strong>Claude Code CLI</strong> -- the copy bundled with the Agent SDK (runs the agents and the OAuth login); nothing is downloaded at startup</li>
   </ul>
 
   <h3>Entrypoint Behavior</h3>
 
-  <p>The container starts as root and performs setup before dropping to the <code>node</code> user:</p>
+  <p>The whole container runs as the <code>node</code> user (<code>user: node</code> in <code>docker-compose.yml</code>; <code>./agent_home</code> must be owned by uid 1000). There is no root step:</p>
 
   <ol>
-    <li>Creates workspace directories (<code>~/.claude/memory</code>, <code>~/.claude/agents</code>, <code>~/.claude/skills</code>, <code>~/.ssh</code>, <code>~/.local/bin</code>)</li>
+    <li>Creates workspace directories (<code>~/.claude/memory</code>, <code>~/.claude/agents</code>, <code>~/.claude/skills</code>, <code>~/.ssh</code>)</li>
     <li>Writes default Claude settings with broad tool permissions (if not already present)</li>
-    <li>Installs Claude Code CLI via <code>curl</code> install script (if not already installed)</li>
-    <li>Ensures <code>PATH</code> includes <code>~/.local/bin</code> in <code>.bashrc</code></li>
     <li>Restores SSH key config from bind-mount if keys exist in <code>~/.ssh/</code></li>
-    <li>Drops to <code>node</code> user via <code>gosu</code> and starts the Express server</li>
+    <li>Starts the Express server</li>
   </ol>
 
   <h3>Stopping the Container</h3>

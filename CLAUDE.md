@@ -36,6 +36,10 @@ npm run test:e2e    # E2E session tests (requires running Gateway + GATEWAY_API_
 | `MCP_TEST_TIMEOUT_MS` | No | `10000` | Per-test deadline for `POST /v1/mcp-servers/:name/test` (in ms) |
 | `MCP_CALL_TIMEOUT_MS` | No | `10000` | Per-call deadline for `POST /v1/mcp-servers/:name/call` (in ms) |
 | `MCP_UPLOAD_IDLE_TIMEOUT_MS` | No | `60000` | No-progress timeout for one relayed upload (`POST /v1/mcp-servers/:name/uploads/*`), in ms; 504 `UPLOAD_TIMEOUT` on expiry, no overall deadline |
+| `ISOLATION_STARTUP_TIMEOUT_MS` | No | `10000` | A sandbox must pass its start check within this many ms, otherwise it is killed and the run fails with the transient isolation text; an invalid value (non-numeric, 0, negative) stops startup |
+| `AGENT_RUN_TIMEOUT_MS` | No | `7200000` | Deadline of one query request, retries and backoff included; expiry ends the run with the deadline text and saves nothing; an invalid value stops startup |
+| `AGENT_SANDBOX_ROOT` | No | `$HOME/.agent-sandbox` | Trusted storage of the sandbox homes (never mounted as a whole); must be an absolute path to a private directory without symlinks, else every run fails closed |
+| `AGENT_SANDBOX_BWRAP` | No | `/usr/bin/bwrap` | Path of the isolation runtime; must be an absolute path |
 | `MODEL_PROXY_IDLE_TIMEOUT_MS` | No | `600000` | No-progress timeout per proxied provider request (trusted model proxy); an invalid value (non-numeric, 0, negative) stops startup |
 | `GIT_MAX_CONCURRENCY` | No | `3` | Git operations of `/v1/workspace/git/*` that run at the same time across all repositories; further requests wait in arrival order, none is rejected |
 | `GIT_TIMEOUT_MS` | No | `120000` | Deadline for one git command of `/v1/workspace/git/*`, in ms; on expiry the command's process group is stopped and the request answers 500 `git <subcommand> timed out after <n> s` |
@@ -97,6 +101,8 @@ src/
   mcp-upload-relay.ts # Streaming upload relay: raw-path rule, parser skip, pre-auth guard, X-MCP-Credential-Headers, relay core
   mcp-credential-relay.ts # Loopback relay for registered http MCP servers: per-run token, header allowlists, refusal answers (no OAuth login in the runtime)
   sdk-run-logs.ts    # Per-run directory for the Claude runtime's log files, deleted after the child exits; startup sweep; DEBUG_CLAUDE_AGENT_SDK strip
+  sandbox.ts         # Per-run bubblewrap sandbox: config keys, exact bwrap argv, env allowlist, launch wrapper (nested-userns check), fail-closed IsolationFailure, /health isolation state, boot self-check
+  sandbox-content.ts # What a sandbox may see: no-follow validation of every bind source, allowlist-generated git configs, known-secret-value scan, mount plan, mount-point sanitizing
   model-proxy.ts     # Trusted loopback model proxy: run token in x-api-key, POST /v1/messages[/count_tokens] only, injects the gateway's provider credential (API key or OAuth with single-flight refresh); readAuthStatus for /v1/auth/status
   mcp-overrides.ts   # mcpCredentialOverrides validation, header/env checks, requireUserCredentials attachment rule (headers output keys case-insensitive, every match non-empty; env keys exact)
   gc-budget.ts       # Minor GC every 2 MiB relayed (needs node --expose-gc, set in entrypoint.sh and npm start)
@@ -116,6 +122,9 @@ src/
     webhook-tool-schema-process.test.ts # Real-runtime probe: model-facing webhook tool schemas + pre-dispatch rejection, reqlift/diemcrm fixtures (needs `npm run build`)
     tools.test.ts          # Tool registry unit tests
     webhook.test.ts        # Webhook executor tests
+    sandbox.test.ts / sandbox-content.test.ts # Isolation config, exact argv, env allowlist, failure texts; no-follow validation, git config allowlist, known-value scan, mount plan
+    sandbox-process.test.ts # Real bwrap: env, /proc, trusted files, planted links, git masks, read-only content, fail-closed rows, cancel and SIGKILL, plus the real runtime through the gateway (needs `npm run build`)
+    model-proxy.test.ts / model-proxy-process.test.ts # Trusted model proxy: token, path, header and refresh rules; real runtime through it
     sdk-login-guard-process.test.ts # Real-runtime probe: spawned gateway, OAuth-capable MCP stub, scripted Anthropic API (needs `npm run build`)
     run-failure.test.ts             # Failure classifier table: kinds, exact messages, version bounds, hostile inputs
     tool-policy.test.ts             # enforcedTools validation table + the hook never allows
@@ -134,7 +143,7 @@ src/
     git-credential-logs-process.test.ts # No http(s) URL token or SSH key in git error text or logs at info/debug (needs `npm run build`)
   __tests__/
     git.test.ts            # Workspace git endpoints tests
-Dockerfile           # Node 22 + system tools + Claude Code CLI
+Dockerfile           # Node 22 + system tools + bubblewrap (runs as node; the Claude Code CLI is the SDK's bundled copy)
 docker-compose.yml   # Single-service compose with volume
 entrypoint.sh        # Root setup, SSH key restore, drop to node user
 ```

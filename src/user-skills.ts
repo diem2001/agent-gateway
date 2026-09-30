@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { getUserSkillsDir, listFiles } from "./workspace.js";
+import { getUserSkillsDir, getWorkspaceRoot, listFiles } from "./workspace.js";
+import { checkTrusted, copyFileNoFollow } from "./sandbox-content.js";
 import { log } from "./logging.js";
 
 /**
@@ -82,6 +83,19 @@ export function materializeUserSkills(userId: string | undefined): MaterializedU
 
   const baseDir = getUserSkillsDir(userId);
   if (!baseDir || !fs.existsSync(baseDir)) return empty;
+  // No link in the path of the user's skill directory, no link inside it (MVP-7678): the
+  // bundle is built from regular files of this one directory only.
+  let workspaceRoot: string;
+  try {
+    workspaceRoot = fs.realpathSync(getWorkspaceRoot());
+  } catch {
+    return empty;
+  }
+  const trusted = checkTrusted(baseDir, "dir", workspaceRoot);
+  if (!trusted.ok) {
+    log("audit", `user-skills.skipped reason=${trusted.reason}`);
+    return empty;
+  }
 
   // Stable order so caps drop deterministically and the loaded set is reproducible.
   const entries = listFiles(baseDir)
@@ -139,7 +153,9 @@ export function materializeUserSkills(userId: string | undefined): MaterializedU
     const srcPath = path.join(baseDir, entry.path);
     const destDir = path.join(skillsDir, slug);
     fs.mkdirSync(destDir, { recursive: true });
-    fs.copyFileSync(srcPath, path.join(destDir, "SKILL.md"));
+    if (!copyFileNoFollow(srcPath, path.join(destDir, "SKILL.md"))) {
+      log("audit", "user-skills.skipped reason=unreadable");
+    }
   }
 
   if (dropped.length > 0) {

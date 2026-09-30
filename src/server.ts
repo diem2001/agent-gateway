@@ -33,6 +33,7 @@ import mcpRoutes from "./routes/mcp.js";
 import gitRoutes from "./routes/git.js";
 import { credentialRelay } from "./mcp-credential-relay.js";
 import { ModelProxyConfigError, gatewayModelProxy } from "./model-proxy.js";
+import { IsolationConfigError, isolationStatus, loadIsolationConfig, runIsolationSelfCheck, sweepSandboxRuns } from "./sandbox.js";
 import { stripSdkDebugEnv, sweepRunLogDirs } from "./sdk-run-logs.js";
 import {
   SERVER_REQUEST_TIMEOUT_MS,
@@ -73,20 +74,31 @@ credentialRelay.start().catch((e: unknown) => {
   log("server", `Credential relay failed to start: ${e instanceof Error ? e.message : String(e)}`);
 });
 
-// Trusted model proxy (MVP-7678): the only holder of the provider credential.
-// An invalid MODEL_PROXY_IDLE_TIMEOUT_MS stops startup; nothing falls back silently.
+// Isolation (MVP-7678): every new configuration key is validated now; an invalid value stops
+// startup with one fixed line, nothing falls back silently.
 try {
+  loadIsolationConfig();
   void gatewayModelProxy();
 } catch (e) {
-  if (!(e instanceof ModelProxyConfigError)) throw e;
-  log("server", `FATAL config key=${e.key} reason=must be a positive whole number of milliseconds`);
+  if (e instanceof IsolationConfigError) log("server", e.logLine);
+  else if (e instanceof ModelProxyConfigError) log("server", `FATAL config key=${e.key} reason=must be a positive whole number of milliseconds`);
+  else throw e;
   process.exit(1);
 }
+// Leftover run directories of a crashed gateway.
+try {
+  sweepSandboxRuns();
+} catch {
+  // A missing or unusable storage root is reported by the self-check below.
+}
+// The trusted model proxy is the only holder of the provider credential; then a real sandbox
+// start sets /health `isolation`.
 gatewayModelProxy()
   .start()
   .catch((e: unknown) => {
     log("server", `Model proxy failed to start: ${e instanceof Error ? e.message : String(e)}`);
-  });
+  })
+  .then(() => runIsolationSelfCheck());
 
 // Logging middleware (before auth so we log rejected requests too)
 app.use(requestLoggingMiddleware);
@@ -125,6 +137,9 @@ app.get("/health", (_req, res) => {
     version: VERSION,
     uptime: Math.round(process.uptime()),
     sessions: getSessionCount(),
+    // Additive (MVP-7678): "ok" once a sandbox has started and passed its check, "unavailable" after a
+    // permanent start problem until a later start succeeds, "starting" until the boot self-check is done.
+    isolation: isolationStatus(),
     // Additive (MVP-7616): "degraded" plus the issue list while any state file
     // is preserved aside, unwritable or failing to save.
     ...persistenceReport(),

@@ -58,9 +58,9 @@ const TARGET = "/v1/mcp-servers/jira/uploads/jira/issue/MVP-1?filename=shot.png"
  */
 function entrypointNodeFlags(): string[] {
   const script = fs.readFileSync(path.join(REPO_ROOT, "entrypoint.sh"), "utf8");
-  const lines = [...script.matchAll(/^exec gosu node node (.*?)\s*\/app\/dist\/server\.js\s*$/gm)];
+  const lines = [...script.matchAll(/^exec node (.*?)\s*\/app\/dist\/server\.js\s*$/gm)];
   if (lines.length !== 1) {
-    throw new Error("entrypoint.sh must have exactly one `exec gosu node node [flags] /app/dist/server.js` line");
+    throw new Error("entrypoint.sh must have exactly one `exec node [flags] /app/dist/server.js` line");
   }
   return lines[0][1].split(/\s+/).filter(Boolean);
 }
