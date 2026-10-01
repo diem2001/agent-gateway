@@ -16,6 +16,7 @@ import {
   lstatOrNull,
   planTrustedContent,
   prepareMountPoints,
+  sanitizeRuntimeConfig,
   randomDirName,
   type MountPlan,
   type SandboxMount,
@@ -696,6 +697,11 @@ export class SandboxRun {
       roBinds.push(this.options.userSkillsDir);
     }
 
+    try {
+      sanitizeRuntimeConfig(homeDir);
+    } catch {
+      throw new SandboxPrepError("content_invalid");
+    }
     prepareMountPoints(homeDir, plan.mounts, plan.hidden);
     const emptyFile = path.join(trustedDir, "empty");
     fs.writeFileSync(emptyFile, "", { mode: 0o444 });

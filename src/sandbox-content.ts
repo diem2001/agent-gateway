@@ -212,6 +212,86 @@ export function prepareMountPoints(homeDir: string, mounts: { src: string; dest:
 }
 
 /* ------------------------------------------------------------------ */
+/*  The runtime's per-user state file                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `~/.claude.json` is the runtime's own state file, written by the runtime at every start and read again at the next
+ * one, whatever the setting sources: its `mcpServers` (and the per-project `mcpServers` below `projects`) start a
+ * command, so a file the agent writes in its own home would start one on the next turn even when the run grants it
+ * no execution tool (MVP-7679, Gate A). The runtime crashes when the file is read-only, so the trusted side
+ * rewrites it before every start instead: only these keys survive, each with a plain value.
+ */
+export const RUNTIME_STATE_KEYS: readonly string[] = [
+  "cachedStatsigGates",
+  "firstStartTime",
+  "sonnet45MigrationComplete",
+  "opus45MigrationComplete",
+  "thinkingMigrationComplete",
+  "userID",
+  "numStartups",
+  "hasCompletedOnboarding",
+];
+
+const STATE_FILE = ".claude.json";
+const STATE_VALUE_MAX = 256;
+
+function plainStateValue(key: string, value: unknown): unknown {
+  if (key === "cachedStatsigGates") {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    const gates: Record<string, boolean> = {};
+    for (const [name, flag] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof flag === "boolean" && /^[A-Za-z0-9_.-]{1,64}$/.test(name)) gates[name] = flag;
+    }
+    return gates;
+  }
+  if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) return value;
+  if (typeof value === "string" && value.length <= STATE_VALUE_MAX) return value;
+  return undefined;
+}
+
+/**
+ * Rewrites the home's runtime state file to its allowlisted keys and removes the backup copies, without following
+ * any link. Runs before the sandbox of a conversation exists (the conversation lock guarantees no process of its
+ * previous run is left). Throws when a file cannot be rewritten or removed: the caller fails closed.
+ */
+export function sanitizeRuntimeConfig(homeDir: string): void {
+  const state = path.join(homeDir, STATE_FILE);
+  const stat = lstatOrNull(state);
+  if (stat) {
+    let kept: Record<string, unknown> | null = null;
+    if (stat.isFile() && !stat.isSymbolicLink() && ownedByGatewayUser(stat)) {
+      const raw = readFileNoFollow(state);
+      if (raw) {
+        try {
+          const parsed: unknown = JSON.parse(raw.toString("utf8"));
+          if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+            kept = {};
+            for (const key of RUNTIME_STATE_KEYS) {
+              const value = plainStateValue(key, (parsed as Record<string, unknown>)[key]);
+              if (value !== undefined) kept[key] = value;
+            }
+          }
+        } catch {
+          kept = null;
+        }
+      }
+    }
+    if (kept === null) {
+      fs.rmSync(state, { recursive: true, force: true });
+    } else {
+      const temp = path.join(homeDir, `${STATE_FILE}.sanitize-${randomDirName()}`);
+      fs.writeFileSync(temp, `${JSON.stringify(kept)}\n`, { flag: "wx", mode: 0o600 });
+      fs.renameSync(temp, state);
+    }
+  }
+  // Backups and temporary copies of the state file: the runtime restores a damaged state from them.
+  for (const entry of fs.readdirSync(homeDir)) {
+    if (entry !== STATE_FILE && entry.startsWith(`${STATE_FILE}.`)) fs.rmSync(path.join(homeDir, entry), { recursive: true, force: true });
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Allowlist-generated git configuration                               */
 /* ------------------------------------------------------------------ */
 
