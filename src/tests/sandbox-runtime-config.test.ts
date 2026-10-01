@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { RUNTIME_STATE_KEYS, sanitizeRuntimeConfig } from "../sandbox-content.js";
+import { RUNTIME_STATE_KEYS, planTrustedContent, sanitizeRuntimeConfig } from "../sandbox-content.js";
 
 let home: string;
 let outside: string;
@@ -170,14 +170,13 @@ describe("the runtime's second global config file, <home>/.claude/.config.json (
   const dotClaude = () => path.join(home, ".claude");
   const dotConfig = () => path.join(dotClaude(), ".config.json");
 
-  it("a planted file is removed, the rest of .claude stays", () => {
+  it("a planted file is removed, the session transcripts stay", () => {
     fs.mkdirSync(path.join(dotClaude(), "projects"), { recursive: true });
-    fs.writeFileSync(path.join(dotClaude(), "settings.json"), "{}");
     fs.writeFileSync(path.join(dotClaude(), "projects", "t.jsonl"), "x");
     fs.writeFileSync(dotConfig(), JSON.stringify({ mcpServers: { evil: MALICIOUS_SERVER } }));
     sanitizeRuntimeConfig(home);
     expect(fs.existsSync(dotConfig())).toBe(false);
-    expect(fs.readdirSync(dotClaude()).sort()).toEqual(["projects", "settings.json"]);
+    expect(fs.readdirSync(dotClaude()).sort()).toEqual(["projects"]);
     expect(fs.readFileSync(path.join(dotClaude(), "projects", "t.jsonl"), "utf8")).toBe("x");
   });
 
@@ -211,5 +210,94 @@ describe("the runtime's second global config file, <home>/.claude/.config.json (
   it("a home without .claude is left alone", () => {
     sanitizeRuntimeConfig(home);
     expect(fs.readdirSync(home)).toEqual([]);
+  });
+});
+
+/**
+ * The allow-list (QA rework 2): the inventory below is written down here, independent of the production lookup. It
+ * lists what the runtime (2.0.77) reads from `~/.claude` as configuration or extension, plus names no runtime reads
+ * today. What the runtime itself writes there (measured on the real gateway: transcripts, todos, plans) is the only
+ * thing that may survive the trusted start.
+ */
+describe("nothing agent-writable under ~/.claude is left in place as configuration at the next start (allow-list, inventory-based)", () => {
+  const dotClaude = () => path.join(home, ".claude");
+  const WRITABLE_DATA = ["memory", "plans", "projects", "todos"];
+  const CONFIG_AND_EXTENSION_INVENTORY = [
+    "commands", "agents", "skills", "output-styles", "plugins", "hooks", "rules", "statusline.sh", "keybindings.json", "settings.json", "settings.local.json",
+    "CLAUDE.md", "CLAUDE.local.md", ".config.json", ".mcp.json", ".claude.json", "mcp.json", "shell-snapshots", "ide", "local", "statsig", "future-extension-dir-7679",
+  ];
+
+  it("every entry outside the writable data set is removed (files, directories, links), the data set is kept", () => {
+    fs.mkdirSync(dotClaude());
+    fs.writeFileSync(path.join(outside, "keep.txt"), "keep");
+    for (const name of CONFIG_AND_EXTENSION_INVENTORY) {
+      if (name.includes(".") && !name.startsWith(".")) fs.writeFileSync(path.join(dotClaude(), name), "x");
+      else fs.mkdirSync(path.join(dotClaude(), name, "nested"), { recursive: true });
+    }
+    fs.symlinkSync(outside, path.join(dotClaude(), "linked-extension-dir"));
+    for (const name of WRITABLE_DATA) fs.mkdirSync(path.join(dotClaude(), name), { recursive: true });
+    fs.writeFileSync(path.join(dotClaude(), "projects", "t.jsonl"), "x");
+    sanitizeRuntimeConfig(home);
+    expect(fs.readdirSync(dotClaude()).sort()).toEqual(WRITABLE_DATA);
+    expect(fs.readFileSync(path.join(dotClaude(), "projects", "t.jsonl"), "utf8")).toBe("x");
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+  });
+
+  it("a writable-data name that is not a real directory (a link, a file) is removed, never followed", () => {
+    fs.mkdirSync(dotClaude());
+    fs.symlinkSync(outside, path.join(dotClaude(), "projects"));
+    fs.writeFileSync(path.join(dotClaude(), "todos"), "x");
+    sanitizeRuntimeConfig(home);
+    expect(fs.readdirSync(dotClaude())).toEqual([]);
+    expect(fs.existsSync(outside)).toBe(true);
+  });
+
+  describe("the mount plan binds trusted EMPTY content wherever the workspace has no trusted entry", () => {
+    const EXTENSION_ENTRIES = ["commands", "agents", "skills", "output-styles", "plugins", "hooks", "CLAUDE.md"];
+    const planFor = (workspace: string) => {
+      const trustedDir = fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-runtime-config-trusted-"));
+      return { plan: planTrustedContent({ workspaceRoot: workspace, trustedDir, needles: [] }), trustedDir };
+    };
+
+    it("an empty workspace: every extension entry is mounted from an empty source", () => {
+      const { plan, trustedDir } = planFor(outside);
+      try {
+        for (const name of EXTENSION_ENTRIES) {
+          const mount = plan.mounts.find((m) => m.dest === `/home/node/.claude/${name}`);
+          expect(mount, name).toBeDefined();
+          const stat = fs.lstatSync(mount!.src);
+          if (name === "CLAUDE.md") expect(stat.isFile() && stat.size === 0, name).toBe(true);
+          else expect(stat.isDirectory() && fs.readdirSync(mount!.src).length === 0, name).toBe(true);
+          expect(mount!.src.startsWith(outside), `${name}: not a workspace path`).toBe(false);
+        }
+      } finally {
+        fs.rmSync(trustedDir, { recursive: true, force: true });
+      }
+    });
+
+    it("an entry that is a link in the workspace is replaced by an empty source, not skipped", () => {
+      fs.mkdirSync(path.join(outside, "elsewhere"));
+      fs.symlinkSync(path.join(outside, "elsewhere"), path.join(outside, "commands"));
+      const { plan, trustedDir } = planFor(outside);
+      try {
+        const mount = plan.mounts.find((m) => m.dest === "/home/node/.claude/commands");
+        expect(mount).toBeDefined();
+        expect(fs.readdirSync(mount!.src)).toEqual([]);
+      } finally {
+        fs.rmSync(trustedDir, { recursive: true, force: true });
+      }
+    });
+
+    it("a trusted workspace entry is still the source when it exists", () => {
+      fs.mkdirSync(path.join(outside, "commands"));
+      fs.writeFileSync(path.join(outside, "commands", "c.md"), "x");
+      const { plan, trustedDir } = planFor(outside);
+      try {
+        const mount = plan.mounts.find((m) => m.dest === "/home/node/.claude/commands");
+        expect(fs.realpathSync(mount!.src)).toBe(fs.realpathSync(path.join(outside, "commands")));
+      } finally {
+        fs.rmSync(trustedDir, { recursive: true, force: true });
+      }
+    });
   });
 });
