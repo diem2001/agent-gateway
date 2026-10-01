@@ -306,7 +306,7 @@ Sessions persist across server restarts via `SESSION_PERSIST_PATH`. The cleanup 
 
 **Container profile.** One container, running as `node`: `cap_drop: ALL`, `no-new-privileges`, `pids_limit`, a committed seccomp profile, `systempaths=unconfined` (needed for the sandbox's fresh `/proc`) and an AppArmor profile (committed, loaded by the operator) or none. Host prerequisite: unprivileged user namespaces allowed. The Docker socket is never mounted and no port is added.
 
-**Known residuals (MVP-7679).** MCP configuration values of non-relayed servers are readable inside the owning run's sandbox (the SDK passes the whole configuration on the runtime's command line); the network is shared (loopback listeners need a run token, egress is not restricted); `GET /v1/query/:id/events` and the OAuth login routes are caller-level, not agent-level, surfaces.
+**Known residuals (MVP-7679).** Content an agent planted in a mounted tree before the update is not fully neutralized (files over 1 MiB, `~/.ssh` key contents and `tools.json` webhook values are not in the scan; trusted `git` and `/v1/auth/login` read configuration planted in `/home/node`); an id refusal reveals that the id exists and the first caller to use an unknown id claims it; conversation homes are never removed (MVP-7402), have no size cap, and `pids_limit` is shared. MCP configuration values of non-relayed servers are readable inside the owning run's sandbox (the SDK passes the whole configuration on the runtime's command line); the network is shared (loopback listeners need a run token, egress is not restricted); `GET /v1/query/:id/events` and the OAuth login routes are caller-level, not agent-level, surfaces.
 
 ## Tool Surfaces: Webhook Registry vs MCP Server Registry
 

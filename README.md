@@ -136,8 +136,8 @@ The sandbox environment is an allowlist built from nothing (`HOME`, `USER`, `PAT
 | `ISOLATION_STARTUP_TIMEOUT_MS` | `10000` | Raise it on a very loaded host where `/health` or users report "could not start a protected workspace in time"; the sandbox itself starts in about 10 ms. |
 | `AGENT_RUN_TIMEOUT_MS` | `7200000` (120 min) | Lower it to stop runaway agents sooner, raise it for tasks that legitimately run longer. It covers the whole request including retries and backoff. |
 | `MODEL_PROXY_IDLE_TIMEOUT_MS` | `600000` | The time a provider request may stay silent before it is cut. Raise it only for extremely slow answers. |
-| `AGENT_SANDBOX_ROOT` | `$HOME/.agent-sandbox` | Only to move the storage of the conversation homes. It must be an absolute path to a private directory owned by the gateway user; it is never mounted as a whole. |
-| `AGENT_SANDBOX_BWRAP` | `/usr/bin/bwrap` | Only if the isolation runtime lives elsewhere. |
+| `AGENT_SANDBOX_ROOT` | `$HOME/.agent-sandbox` | Only to move the storage of the conversation homes. It must be an absolute path to a private directory owned by the gateway user; it is never mounted as a whole. `docker-compose.yml` does not forward it from the shell: add it under `environment:`. |
+| `AGENT_SANDBOX_BWRAP` | `/usr/bin/bwrap` | Only if the isolation runtime lives elsewhere. Like `AGENT_SANDBOX_ROOT`, it is not forwarded by `docker-compose.yml`. |
 
 An invalid value (not a positive whole number, or a relative path) stops the gateway at startup with one fixed line, `FATAL config key=<KEY> reason=<fixed text>`; nothing falls back silently.
 
@@ -149,23 +149,24 @@ An invalid value (not a positive whole number, or a relative path) stops the gat
 |-------------|---------|----------------|------------------------|----------------|
 | `starting` | The boot self-check is still running (a few hundred ms). | Nothing yet. | Wait. | The self-check finishing. |
 | `ok` | A sandbox started and passed its check. | Normal answers. | Nothing. | Stays until a permanent problem occurs. |
-| `unavailable` | The boot self-check or a start failed for a permanent reason. The log has one line `ERROR isolation problem=<word> reason=<fixed text> (see /health)`. | Every query ends with "The gateway cannot start a protected workspace ...". Nothing runs unsandboxed. | Read the `problem` word (`binary_missing`, `invalid_root`, `namespace_denied`, `proc_denied`, `userns_not_blocked`, `canary_visible`, `pid_namespace_shared`, `mount_failed`, `content_invalid`, `proxy_unavailable`, `start_failed`) and fix the container profile, the storage directory or the host setting it names. | The next sandbox start that succeeds. |
+| `unavailable` | The boot self-check or a start failed for a permanent reason. The log has one line `ERROR isolation problem=<word> reason=<fixed text> (see /health)`. | Every query ends with "The gateway cannot start a protected workspace ...". Nothing runs unsandboxed. | Read the `problem` word (`binary_missing`, `invalid_root`, `namespace_denied`, `proc_denied`, `userns_not_blocked`, `canary_visible`, `pid_namespace_shared`, `mount_failed`, `content_invalid`, `proxy_unavailable`, `start_failed`) and fix the container profile, the storage directory or the host setting it names. | The next sandbox start that succeeds: a query starts one, and a gateway restart repeats the boot self-check. `proxy_unavailable` is cleared only by a gateway restart. |
 
-A slow start ("could not start a protected workspace in time") does not change `isolation`.
+A slow start of a user's run ("could not start a protected workspace in time") does not change `isolation`. A slow start during the boot self-check does: it reads `unavailable` with `problem=start_failed` until a later start succeeds.
 
 ### Container security profile and host prerequisites
 
 `docker-compose.yml` runs the container as `node` (uid 1000; `./agent_home` must be owned by it) with `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 512`, the committed seccomp profile `security/agent-gateway-seccomp.json` (Docker's default profile plus `clone`, `unshare`, `setns`, `mount`, `umount2`, `pivot_root` for a process without capabilities) and `systempaths=unconfined`. The sandbox needs namespaces and a fresh `/proc` inside the container; Docker's default profile and masked `/proc` paths block both. This loosens the boundary between the container and the host, which is why every other control above is on. **Host prerequisites:** unprivileged user namespaces must be allowed (`kernel.apparmor_restrict_unprivileged_userns=0` on Ubuntu 24.04 and later, and `user.max_user_namespaces` above 0).
 
-AppArmor: Docker's default AppArmor profile also blocks the sandbox's mounts. By default the compose file runs without an AppArmor profile (`apparmor=unconfined`). To keep a profile, load the committed one on the host and select it: `sudo apparmor_parser -r security/agent-gateway-apparmor`, then `AGENT_GATEWAY_APPARMOR_PROFILE=agent-gateway-isolation docker compose up -d`.
+AppArmor: Docker's default AppArmor profile also blocks the sandbox's mounts. By default the compose file runs without an AppArmor profile (`apparmor=unconfined`). To keep a profile, load the committed one on the host and select it: `sudo apparmor_parser -r security/agent-gateway-apparmor`, then `AGENT_GATEWAY_APPARMOR_PROFILE=agent-gateway-isolation docker compose up -d`. Tested once (2026-10-01, Ubuntu 24.04, kernel 6.8, Docker 29.2): a task-owned container under a copy of this profile loaded with a different name (the rules are identical, only the profile name and the two self-references differ) ran in enforce mode with `isolation: ok`, and a cancelled run, `docker stop` during a run and a SIGKILL of the gateway process behaved as without a profile. The committed file under its own name, other kernels and a long-running production use are not tested. `PROBE_APPARMOR_PROFILE=<loaded profile> npm run probe:docker-isolation` repeats the check.
 
 ### Updating a running gateway
 
-1. **Risk acceptance (operator):** accepting the container profile above is a prerequisite for redeploying the shared gateway; it is recorded on the Epic MVP-7676.
+1. **Risk acceptance (operator):** accepting the container profile above is a prerequisite for redeploying the shared gateway; it is recorded on the Epic MVP-7676. It must name the loosened defaults: no AppArmor profile (`apparmor=unconfined`) unless the committed one is selected, and `systempaths=unconfined`.
 2. **Every conversation started before this update is refused after it.** On the production gateway that counted 8,339 stored conversations on 2026-09-30, of which 3,834 had a saved transcript and 1,216 were used in the last 14 days. Callers get the "started before a gateway security update" text and must start a new conversation (reqlift does not recover by itself; replaying from its own database is a caller follow-up). Alternative that was not implemented: admit them after a secret scan and bind each to its first caller; that keeps old conversations, but whoever knows an id first can claim it.
-3. Recreate the container so the new image, user and security options apply: `docker compose up -d --build`.
-4. Check: `curl -s http://localhost:3001/health | jq .isolation` must print `"ok"` (the container is then also `healthy`).
-5. The first message of a conversation can be slower when it starts an `npx` MCP server: that run's home is empty, so the package is downloaded again (about 7 s for a small server); later messages of the same conversation reuse it.
+3. Check that `./agent_home` and everything below it is owned by uid 1000 (`sudo chown -R 1000:1000 agent_home`). The old entrypoint ran `chown -R` as root; the new one does not, and a root-owned file is left out of runs with an `audit` log line only. Also review what agents planted there before the update (see the first item of the residuals below).
+4. Recreate the container so the new image, user and security options apply: `docker compose up -d --build`.
+5. Check: `curl -s http://localhost:3001/health | jq .isolation` must print `"ok"` (the container is then also `healthy`).
+6. The first message of a conversation can be slower when it starts an `npx` MCP server: that run's home is empty, so the package is downloaded again (about 7 s for a small server); later messages of the same conversation reuse it.
 
 ### Behavior changes
 
@@ -177,6 +178,9 @@ AppArmor: Docker's default AppArmor profile also blocks the sandbox's mounts. By
 
 ### Known residuals (owned by MVP-7679, never reported as solved here)
 
+- **Content planted before the update.** The secret scan skips files over 1 MiB, and its value list does not include the contents of `~/.ssh` private keys or the `tools.json` webhook authentication values, so a copy or hard link of those made by an agent before the update, inside a mounted tree, would not be hidden. The trusted `git` calls and `/v1/auth/login` (tmux) run with `HOME=/home/node` and read configuration an agent planted there before the update (`~/.gitconfig`, repository hooks, `core.fsmonitor`, `~/.tmux.conf`). New runs cannot plant any of this; the operator reviews or removes it before the first deploy.
+- A refusal ("cannot be continued from your account") versus a fresh conversation reveals that an id exists, and the first caller to use an unknown id claims it.
+- Conversation homes are never removed (MVP-7402), there is no size cap on a home or a private `/tmp`, and `pids_limit` is shared by all runs: an availability risk, not a credential exposure.
 - The SDK puts the whole MCP configuration on the runtime's own command line, and stdio MCP servers inherit its environment. Header and env values of a **non-relayed** server (a stdio server's `env`, an SSE server's headers, `mcpCredentialOverrides` aimed at them, and values given in the request body's `mcpServers`) are therefore readable inside that run's own sandbox. The gateway writes one `audit` line per such server (`mcp.server.credential_in_runtime_args serverName=<name> type=<type>`). Registered http servers go through the relay and are not affected.
 - The network is shared: a sandbox can reach loopback listeners (the proxy and relay need a run token) and other network peers. Egress control belongs to MVP-7679.
 - `GET /v1/query/:id/events` replays any query to any API key, and `/v1/auth/login` plus `submit-code` run the CLI in the gateway's own context.

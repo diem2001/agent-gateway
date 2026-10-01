@@ -20,7 +20,8 @@ services:
       - seccomp=./security/agent-gateway-seccomp.json
       # Docker's AppArmor default blocks the sandbox's mounts. Load security/agent-gateway-apparmor on the
       # host (sudo apparmor_parser -r ...) and set AGENT_GATEWAY_APPARMOR_PROFILE=agent-gateway-isolation;
-      # without it the container runs without an AppArmor profile.
+      # without it the container runs without an AppArmor profile. The profile was tested once under a renamed
+      # copy only (see README, Container security profile); the unconfined default is the verified configuration.
       - apparmor=${AGENT_GATEWAY_APPARMOR_PROFILE:-unconfined}
       # Docker masks paths of /proc, which makes the sandbox's own /proc mount fail.
       - systempaths=unconfined
