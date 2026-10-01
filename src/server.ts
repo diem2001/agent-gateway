@@ -2,7 +2,7 @@ import "dotenv/config";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import express from "express";
-import { loadApiKeys, authMiddleware } from "./auth.js";
+import { loadApiKeys, authMiddleware, getApiKeyLabels } from "./auth.js";
 import {
   log,
   logAlways,
@@ -36,6 +36,8 @@ import { credentialRelay } from "./mcp-credential-relay.js";
 import { ModelProxyConfigError, gatewayModelProxy } from "./model-proxy.js";
 import { IsolationConfigError, isolationStatus, loadIsolationConfig, runIsolationSelfCheck, sweepSandboxRuns } from "./sandbox.js";
 import { stripSdkDebugEnv, sweepRunLogDirs } from "./sdk-run-logs.js";
+import { ToolPolicyConfigError, loadToolPolicy } from "./tool-grant.js";
+import { McpToolTimeoutConfigError, mcpToolTimeoutMs } from "./tool-mediation.js";
 import {
   SERVER_REQUEST_TIMEOUT_MS,
   nonUploadBodyDeadline,
@@ -80,8 +82,11 @@ credentialRelay.start().catch((e: unknown) => {
 try {
   loadIsolationConfig();
   void gatewayModelProxy();
+  // MVP-7679: the trusted tool policy and the deadline of mediated MCP calls, validated like the keys above.
+  loadToolPolicy(process.env, getApiKeyLabels());
+  mcpToolTimeoutMs();
 } catch (e) {
-  if (e instanceof IsolationConfigError) logAlways("server", e.logLine);
+  if (e instanceof IsolationConfigError || e instanceof ToolPolicyConfigError || e instanceof McpToolTimeoutConfigError) logAlways("server", e.logLine);
   else if (e instanceof ModelProxyConfigError) logAlways("server", `FATAL config key=${e.key} reason=must be a positive whole number of milliseconds`);
   else throw e;
   process.exit(1);

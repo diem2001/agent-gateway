@@ -24,7 +24,7 @@ import { REPO_ROOT, gatewayRequest, spawnGateway, type Cleanup, type SpawnedGate
 import { startOAuthMcpStub, type OAuthMcpStub } from "./helpers/oauth-mcp-stub.js";
 
 const PROMPT = "PROBE-7637 run the scripted tool";
-const REASON = "Refused: this tool is not allowed for this run.";
+const REASON = "TOOL_DENIED: This tool is not allowed for this request. Do not retry; continue without it or tell the user.";
 const READ_WEBHOOK = "mcp__agent-gateway-tools__probe_read";
 const WRITE_WEBHOOK = "mcp__agent-gateway-tools__probe_write";
 const MCP_READ = "mcp__jira__get_page";
