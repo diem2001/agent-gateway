@@ -229,3 +229,36 @@ describe("the startup line per label", () => {
     expect(lines.filter((l) => l.includes("tool.policy"))).toEqual([]);
   });
 });
+
+describe("labels are own properties only", () => {
+  it.each(["constructor", "toString", "hasOwnProperty", "__proto__"])("the label %s without its own entry gets the default, never an inherited object", (label) => {
+    setToolPolicy(parse({ default: { deny: ["Bash"] } }));
+    const grant = computeToolGrant({ label });
+    expect(grant.allows("Bash")).toBe(false);
+    expect(grant.allows("Read")).toBe(true);
+  });
+
+  it("a label named __proto__ with its own entry gets that entry and does not change the prototype of the label map", () => {
+    const policy = parseToolPolicy(JSON.stringify({ default: { deny: ["Bash"] }, labels: JSON.parse('{"__proto__": {"allow": ["Read"]}}') }), ["__proto__"]);
+    setToolPolicy(policy);
+    expect(computeToolGrant({ label: "__proto__" }).builtIns()).toEqual(["Read"]);
+    expect(computeToolGrant({ label: "other" }).allows("Bash")).toBe(false);
+    expect(({} as Record<string, unknown>).allow).toBeUndefined();
+  });
+});
+
+describe("explicitlyAllowsServer", () => {
+  it("is true only when the policy's allow list names the server", () => {
+    setToolPolicy(parse({ labels: { reqlift: { allow: ["Read", "mcp__chrome-devtools__*"] }, diemcrm: { deny: ["Bash"] } } }));
+    expect(computeToolGrant({ label: "reqlift" }).explicitlyAllowsServer("chrome-devtools")).toBe(true);
+    expect(computeToolGrant({ label: "reqlift" }).explicitlyAllowsServer("other")).toBe(false);
+    expect(computeToolGrant({ label: "diemcrm" }).explicitlyAllowsServer("chrome-devtools")).toBe(false);
+    expect(computeToolGrant({ label: "nobody" }).explicitlyAllowsServer("chrome-devtools")).toBe(false);
+  });
+
+  it("a caller narrowing that excludes the server turns it off", () => {
+    setToolPolicy(parse({ default: { allow: ["mcp__chrome-devtools__*"] } }));
+    expect(computeToolGrant({ label: "reqlift", narrowing: ["mcp__other__*"] }).explicitlyAllowsServer("chrome-devtools")).toBe(false);
+    expect(computeToolGrant({ label: "reqlift", narrowing: ["mcp__chrome-devtools__*"] }).explicitlyAllowsServer("chrome-devtools")).toBe(true);
+  });
+});

@@ -66,6 +66,9 @@ export interface CredentialRelayOptions {
 }
 
 export const RELAY_IDLE_TIMEOUT_MS = 120_000;
+/** Connections the loopback listener holds at once, and requests one binding processes at once. */
+export const RELAY_MAX_CONNECTIONS = 512;
+export const RELAY_MAX_IN_FLIGHT_PER_BINDING = 32;
 /** The gateway's JSON body limit. */
 export const RELAY_MAX_BODY_BYTES = 25 * 1024 * 1024;
 export const RELAY_MAX_RESPONSE_BYTES = BRIDGE_MAX_BUFFER_BYTES;
@@ -84,6 +87,8 @@ interface ActiveBinding extends RelayBinding {
   inFlight: Set<{ destroy: () => void }>;
   /** Set by revoke(); a revoked binding never sends another upstream request. */
   revoked: boolean;
+  /** Messages being processed (answered or not yet) for this binding. */
+  active: number;
   bridge?: McpBridge;
 }
 
@@ -230,6 +235,13 @@ export class CredentialRelay {
     if (this.server) return;
     const server = http.createServer((req, res) => this.handle(req, res));
     server.on("clientError", (_err, socket) => socket.destroy());
+    // A process in an agent sandbox can reach this port: bound what it can hold open, and never let a listener
+    // error (for example running out of file descriptors) end the gateway.
+    server.maxConnections = RELAY_MAX_CONNECTIONS;
+    server.headersTimeout = 15_000;
+    server.requestTimeout = 0;
+    server.keepAliveTimeout = 5_000;
+    server.on("error", () => log("audit", "mcp.relay.listener_error"));
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(0, "127.0.0.1", () => {
@@ -252,7 +264,7 @@ export class CredentialRelay {
   register(binding: RelayBinding): { token: string; url: string } {
     if (!this.isListening()) throw new Error("credential relay is not listening");
     const token = randomBytes(16).toString("base64url");
-    const active: ActiveBinding = { ...binding, headers: { ...binding.headers }, inFlight: new Set(), revoked: false };
+    const active: ActiveBinding = { ...binding, headers: { ...binding.headers }, inFlight: new Set(), revoked: false, active: 0 };
     if (binding.kind === "sse" && !binding.bridge) {
       active.bridge = new SseBridge({ serverName: binding.serverName, url: binding.url, headers: active.headers, idleTimeoutMs: this.idleTimeoutMs, maxBufferBytes: this.maxResponseBytes });
     }
@@ -416,6 +428,16 @@ export class CredentialRelay {
       return;
     }
 
+    // Requests in flight per binding are bounded: nothing an agent process sends can pile up unbounded work.
+    if (binding.active >= RELAY_MAX_IN_FLIGHT_PER_BINDING) {
+      this.answerFailure(res, binding, value, { kind: "unreachable", name: binding.serverName }, "too_many_requests");
+      return;
+    }
+    binding.active++;
+    res.once("close", () => {
+      binding.active--;
+    });
+
     const isToolCall = value.method === "tools/call";
     const deadlineMs = isToolCall ? this.toolTimeoutMs() : this.idleTimeoutMs;
     if (binding.bridge) {
@@ -557,13 +579,12 @@ export class CredentialRelay {
       upstream.destroy();
       refuse(timeoutFailure(this.idleTimeoutMs));
     });
-    if (value.method === "tools/call") {
-      // The overall deadline of a mediated tool call: a slow but progressing upstream is cut off too.
-      overallTimer = setTimeout(() => {
-        upstream.destroy();
-        refuse(timeoutFailure(deadlineMs));
-      }, deadlineMs);
-    }
+    // The overall deadline of the exchange: a slow but progressing upstream is cut off too (a mediated tool call
+    // gets AGENT_MCP_TOOL_TIMEOUT_MS, every other message the no-progress limit as a whole).
+    overallTimer = setTimeout(() => {
+      upstream.destroy();
+      refuse(timeoutFailure(deadlineMs));
+    }, deadlineMs);
     upstream.on("error", () => refuse({ kind: "unreachable", name: binding.serverName }));
     res.on("close", () => {
       if (!settled) {

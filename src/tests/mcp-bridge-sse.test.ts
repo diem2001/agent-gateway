@@ -313,3 +313,18 @@ describe("the SSE bridge: revocation", () => {
     expect(stub.requests.length).toBe(before);
   });
 });
+
+describe("the SSE bridge: request ids", () => {
+  it("a request id that is still waiting is refused with TOOL_DENIED; the first request is still answered", async () => {
+    const stub = await sse({ mode: "hang-on-call" });
+    const { url } = await bound(stub, {}, { toolTimeoutMs: 1500 });
+    await post(url, rpc("initialize", 1));
+    const first = post(url, rpc("tools/call", 7, { name: "lookup_record", arguments: {} }));
+    while (stub.toolCalls.length === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+    const duplicate = await post(url, rpc("tools/call", 7, { name: "lookup_record", arguments: {} }));
+    expect(JSON.stringify(duplicate.json)).toContain("TOOL_DENIED");
+    // The first one is not disturbed by the duplicate: it ends at its own deadline.
+    expect(JSON.stringify((await first).json)).toContain("TOOL_TIMEOUT");
+    expect(stub.toolCalls).toEqual(["lookup_record"]);
+  });
+});

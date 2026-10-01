@@ -195,6 +195,27 @@ describe("request servers", () => {
     expect(everything).not.toContain("SYNTH-REQUEST-SSE-7679");
   });
 
+  it("a request http server whose URL carries a user name, password or query goes through the relay too (nothing credential-like on the runtime's command line)", async () => {
+    const app = await createApp();
+    await post(app, {
+      mcpServers: {
+        userinfo: { url: `http://svc-user:SYNTH-URL-PASSWORD-7679@127.0.0.1:${new URL(upstream.origin).port}/mcp` },
+        tokenised: { type: "sse", url: `${upstream.origin}/sse?token=SYNTH-URL-QUERY-TOKEN-7679` },
+        plain: { url: `${upstream.origin}/plain` },
+      },
+    });
+    expect(options().mcpServers).toEqual({
+      userinfo: { type: "http", url: expect.stringMatching(RELAY_URL) },
+      tokenised: { type: "http", url: expect.stringMatching(RELAY_URL) },
+      plain: { type: "http", url: `${upstream.origin}/plain` },
+    });
+    const everything = JSON.stringify(capturedOptions[0], (key, value) => (key === "abortController" || key === "spawnClaudeCodeProcess" ? undefined : value));
+    expect(everything).not.toContain("SYNTH-URL-PASSWORD-7679");
+    expect(everything).not.toContain("SYNTH-URL-QUERY-TOKEN-7679");
+    expect(bindingFor("tokenised").url).toContain("SYNTH-URL-QUERY-TOKEN-7679");
+    expect(bindingFor("tokenised").kind).toBe("sse");
+  });
+
   it("when the relay is not listening, request servers with headers and registered http/SSE servers are left out, never connected directly", async () => {
     await register({ name: "jira", type: "http", url: `${upstream.origin}/jira`, headers: { Authorization: "Basic SHARED" } });
     await register({ name: "feed", type: "sse", url: `${upstream.origin}/feed`, headers: { "X-Api-Key": "SHARED" } });

@@ -6,7 +6,7 @@
 import http, { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import net, { type AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CredentialRelay, type RelayGrant } from "../mcp-credential-relay.js";
+import { CredentialRelay, RELAY_MAX_IN_FLIGHT_PER_BINDING, type RelayGrant } from "../mcp-credential-relay.js";
 import { startOAuthMcpStub, type OAuthMcpStub, type OAuthStubOptions } from "./helpers/oauth-mcp-stub.js";
 
 const ALLOW_ALL: RelayGrant = { allowsTool: () => true, coversServer: true };
@@ -881,5 +881,49 @@ describe("relay redirects are never followed", () => {
     expect(JSON.parse(call.text).result.content[0].text).toBe(REDIRECTED);
     expect(JSON.parse(init.text).error.message).toBe(REDIRECTED);
     expect(target.bodies).toEqual([]);
+  });
+});
+
+describe("relay limits (a process in the sandbox can reach the loopback port)", () => {
+  it(`at most ${RELAY_MAX_IN_FLIGHT_PER_BINDING} messages of one binding are processed at once; the next one is answered at once without an upstream request`, async () => {
+    const upstream = await rawUpstream((req) => req.resume());
+    const r = await relay({ idleTimeoutMs: 20_000, toolTimeoutMs: 20_000 });
+    const { url } = r.register({ grant: ALLOW_ALL, serverName: "records", url: upstream.url, headers: {} });
+    const waiting = Array.from({ length: RELAY_MAX_IN_FLIGHT_PER_BINDING }, (_, i) => send(url, { body: rpc("tools/call", 1000 + i, { name: "x", arguments: {} }) }).catch(() => undefined));
+    while (upstream.hits() < RELAY_MAX_IN_FLIGHT_PER_BINDING) await new Promise((resolve) => setTimeout(resolve, 10));
+    const started = Date.now();
+    const extra = await send(url, { body: rpc("tools/call", 2000, { name: "x", arguments: {} }) });
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(JSON.parse(extra.text).result.content[0].text).toBe(UNAVAILABLE);
+    expect(upstream.hits()).toBe(RELAY_MAX_IN_FLIGHT_PER_BINDING);
+    // Another binding of the same relay is not affected.
+    const other = await stub();
+    const second = r.register({ grant: ALLOW_ALL, serverName: "records", url: other.url, headers: {} });
+    expect(JSON.parse((await send(second.url, { body: rpc("ping", 1) })).text).result).toEqual({});
+    r.close();
+    await Promise.all(waiting);
+  });
+
+  it("a message other than tools/call is cut at the no-progress limit as a whole even when the upstream keeps sending", async () => {
+    const upstream = await rawUpstream((req, res) => {
+      req.resume();
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      const timer = setInterval(() => res.write(": keep-alive\n\n"), 50);
+      res.on("close", () => clearInterval(timer));
+    });
+    const r = await relay({ idleTimeoutMs: 400, toolTimeoutMs: 20_000 });
+    const { url } = r.register({ grant: ALLOW_ALL, serverName: "records", url: upstream.url, headers: {} });
+    const started = Date.now();
+    const res = await send(url, { body: rpc("tools/list", 1) });
+    expect(Date.now() - started).toBeLessThan(3000);
+    expect(JSON.parse(res.text).error.message).toContain("TOOL_TIMEOUT");
+  });
+
+  it("the listener error path is logged, not thrown (nothing in the relay may end the gateway)", async () => {
+    const r = await relay();
+    const server = (r as unknown as { server: http.Server }).server;
+    expect(() => server.emit("error", Object.assign(new Error("accept EMFILE"), { code: "EMFILE" }))).not.toThrow();
+    expect(logs.join("\n")).toContain("mcp.relay.listener_error");
+    expect(server.maxConnections).toBe(512);
   });
 });

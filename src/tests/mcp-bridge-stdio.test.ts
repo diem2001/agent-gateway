@@ -312,6 +312,28 @@ describe("failures", () => {
   });
 });
 
+describe("request ids and load", () => {
+  it("a request id that is still waiting is refused; the first one ends at its own deadline", async () => {
+    const { bridge: b } = bridge("hang");
+    await b.request(msg("initialize", 1), 5000);
+    const first = b.request(msg("tools/call", 7, { name: "echo_env", arguments: {} }), 600);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const duplicate = await b.request(msg("tools/call", 7, { name: "echo_env", arguments: {} }), 600);
+    expect(duplicate).toEqual({ kind: "failure", failure: { kind: "denied" } });
+    expect(await first).toEqual({ kind: "failure", failure: { kind: "timeout", name: "local", timeoutMs: 600 } });
+  });
+
+  it("too many waiting requests are refused at once", async () => {
+    const { bridge: b } = bridge("hang");
+    await b.request(msg("initialize", 1), 5000);
+    const waiting = Array.from({ length: 32 }, (_, i) => b.request(msg("tools/call", 100 + i, { name: "echo_env", arguments: {} }), 2000));
+    const overflow = await b.request(msg("tools/call", 999, { name: "echo_env", arguments: {} }), 2000);
+    expect(overflow).toEqual({ kind: "failure", failure: { kind: "unreachable", name: "local" } });
+    b.close();
+    await Promise.all(waiting);
+  });
+});
+
 describe("close", () => {
   it("kills the server and removes its sandbox directory; later requests are unreachable; close is idempotent", async () => {
     const { bridge: b, state } = bridge("normal");

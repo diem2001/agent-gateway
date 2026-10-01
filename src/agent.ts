@@ -124,12 +124,22 @@ export function toolUseEventInput(
   return formatToolInput(toolName, input);
 }
 
-/** Whether a request-supplied server config is an http/SSE server that carries at least one header. */
+/**
+ * Whether a request-supplied server config is an http/SSE server that carries a credential: at least one header, or a
+ * user name, password or query in its URL (those would otherwise sit on the runtime's command line).
+ */
 function carriesHeaders(config: unknown): boolean {
   if (typeof config !== "object" || config === null) return false;
   const entry = config as { type?: unknown; url?: unknown; headers?: unknown };
   if (entry.type !== "http" && entry.type !== "sse") return false;
-  return typeof entry.url === "string" && typeof entry.headers === "object" && entry.headers !== null && Object.keys(entry.headers).length > 0;
+  if (typeof entry.url !== "string") return false;
+  if (typeof entry.headers === "object" && entry.headers !== null && Object.keys(entry.headers).length > 0) return true;
+  try {
+    const url = new URL(entry.url);
+    return url.username !== "" || url.password !== "" || url.search !== "";
+  } catch {
+    return false;
+  }
 }
 
 /** The relay's view of the run's grant for one server. */
@@ -253,7 +263,20 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // A server with no granted tool is not attached at all (no wasted calls, nothing to refuse later).
   runRegistryServers = runRegistryServers.filter((def) => grant.allowsServer(def.name));
   if (runRequestMcpServers) {
-    runRequestMcpServers = Object.fromEntries(Object.entries(runRequestMcpServers).filter(([name]) => grant.allowsServer(name)));
+    // A request-supplied `command` is code the caller picked: it is attached only when the trusted policy lets this
+    // label execute commands (`Bash`) or names that server explicitly, so a policy that denies `Bash` cannot be
+    // sidestepped with a request server. (The caller's own narrowing can only shrink the grant, never decide this.)
+    const policyGrant = computeToolGrant({ label: callerLabel });
+    runRequestMcpServers = Object.fromEntries(
+      Object.entries(runRequestMcpServers).filter(([name, config]) => {
+        if (!grant.allowsServer(name)) return false;
+        if (typeof (config as { command?: unknown }).command === "string" && !policyGrant.allows("Bash") && !policyGrant.explicitlyAllowsServer(name)) {
+          log("audit", `mcp.server.omitted serverName=${name} reason=command_not_granted`);
+          return false;
+        }
+        return true;
+      }),
+    );
   }
   const mcpToolPatterns = getMcpAllowedToolPatterns(runRegistryServers);
   const requestMcpToolPatterns = requestMcpAllowedToolPatterns(runRequestMcpServers);

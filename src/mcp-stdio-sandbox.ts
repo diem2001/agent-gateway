@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { log } from "./logging.js";
-import { BRIDGE_MAX_BUFFER_BYTES, type BridgeResult, type JsonRpcObject, type McpBridge } from "./mcp-bridge.js";
+import { BRIDGE_MAX_BUFFER_BYTES, BRIDGE_MAX_PENDING, type BridgeResult, type JsonRpcObject, type McpBridge } from "./mcp-bridge.js";
 import { SANDBOX_HOME } from "./sandbox-content.js";
 import { buildBwrapArgv, detectProcMasks, detectRootLayout, launchBwrap, loadIsolationConfig, prepareRunsRoot, type IsolationConfig } from "./sandbox.js";
 import type { ToolFailure } from "./tool-mediation.js";
@@ -94,12 +94,20 @@ export class StdioBridge implements McpBridge {
       return this.write(message) ? { kind: "accepted" } : { kind: "failure", failure: { kind: "unreachable", name: serverName } };
     }
     const key = JSON.stringify(message.id);
+    // A request id that is still waiting, or too many waiting requests, is refused: the map stays consistent.
+    if (this.pending.has(key)) return { kind: "failure", failure: { kind: "denied" } };
+    if (this.pending.size >= BRIDGE_MAX_PENDING) return { kind: "failure", failure: { kind: "unreachable", name: serverName } };
     return new Promise<BridgeResult>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(key);
-        resolve({ kind: "failure", failure: { kind: "timeout", name: serverName, timeoutMs: deadlineMs } });
-      }, deadlineMs);
-      this.pending.set(key, { message, resolve, timer, isInitialize: message.method === "initialize" });
+      const entry: Pending = {
+        message,
+        resolve,
+        isInitialize: message.method === "initialize",
+        timer: setTimeout(() => {
+          if (this.pending.get(key) === entry) this.pending.delete(key);
+          resolve({ kind: "failure", failure: { kind: "timeout", name: serverName, timeoutMs: deadlineMs } });
+        }, deadlineMs),
+      };
+      this.pending.set(key, entry);
       if (!this.write(message)) this.settle(key, { kind: "failure", failure: { kind: "unreachable", name: serverName } });
     });
   }

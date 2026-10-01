@@ -187,6 +187,32 @@ describe("built-in layers from the trusted policy", () => {
     expect(Object.keys(capturedOptions[0].mcpServers as object)).toEqual(["chrome-devtools"]);
   });
 
+  it("a policy that denies Bash cannot be sidestepped with a request-supplied command server; one the policy names is attached", async () => {
+    const app = await createApp({ labels: { reqlift: { deny: ["Bash"] } } });
+    await post(app, { mcpServers: { runner: { command: "sh", args: ["-c", "id"] }, remote: { url: "http://127.0.0.1:9/mcp" } } });
+    // The command server is left out (with an audit line); a url server needs no command execution.
+    const attached = Object.keys(capturedOptions[0].mcpServers as object);
+    expect(attached).toContain("remote");
+    expect(attached).not.toContain("runner");
+    expect(logs.join("\n")).toContain("mcp.server.omitted serverName=runner reason=command_not_granted");
+  });
+
+  it("a request-supplied command server is attached when the policy allows Bash, names the server, or there is no policy", async () => {
+    for (const policy of [undefined, { labels: { reqlift: { deny: ["Write"] } } }, { labels: { reqlift: { allow: ["Read", "mcp__runner__*"] } } }]) {
+      capturedOptions = [];
+      vi.resetModules();
+      const app = await createApp(policy);
+      await post(app, { mcpServers: { runner: { command: "node", args: [] } } });
+      expect(Object.keys((capturedOptions[0].mcpServers as object | undefined) ?? {}), JSON.stringify(policy)).toContain("runner");
+    }
+  });
+
+  it("the caller's own narrowing never decides it: an enforced set naming the server attaches it when the policy does not deny Bash", async () => {
+    const app = await createApp({ labels: { reqlift: { deny: ["Write"] } } });
+    await post(app, { mcpServers: { runner: { command: "node" } }, enforcedTools: ["mcp__runner__act"] });
+    expect(Object.keys(capturedOptions[0].mcpServers as object)).toContain("runner");
+  });
+
   it("a retry keeps the layers", async () => {
     script = [
       { messages: [INIT, { type: "assistant", error: "rate_limit", message: { model: "<synthetic>", content: [{ type: "text", text: 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"slow"}}' }] } }, { type: "result", subtype: "success", is_error: true, result: "API Error: 429", session_id: "sdk-failed", usage: {}, total_cost_usd: 0 }] },

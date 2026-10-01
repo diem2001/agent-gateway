@@ -121,7 +121,7 @@ export function parseToolPolicy(raw: string | undefined, labels: readonly string
   for (const key of Object.keys(parsed)) {
     if (key !== "default" && key !== "labels") throw new ToolPolicyConfigError("unknown field");
   }
-  const policy: ToolPolicy = { labels: {} };
+  const policy: ToolPolicy = { labels: Object.create(null) as Record<string, PolicyEntry> };
   if (parsed.default !== undefined) policy.default = parseEntry(parsed.default);
   if (parsed.labels !== undefined) {
     if (!isObject(parsed.labels)) throw new ToolPolicyConfigError("must be a JSON object");
@@ -151,7 +151,8 @@ export function getToolPolicy(): ToolPolicy | null {
 /** The policy entry that applies to `label`: its own entry, else `default`, else none. */
 export function policyEntryFor(label: string): PolicyEntry | undefined {
   if (!activePolicy) return undefined;
-  return activePolicy.labels[label] ?? activePolicy.default;
+  // An own property only: a label such as `constructor` must not resolve to an inherited object.
+  return (Object.hasOwn(activePolicy.labels, label) ? activePolicy.labels[label] : undefined) ?? activePolicy.default;
 }
 
 /** Startup: parses the environment value (throws `ToolPolicyConfigError`) and logs one line per label. */
@@ -227,6 +228,15 @@ export class ToolGrant {
       if (this.policy.allow && !this.policy.allow.some((p) => namesServer(p, server))) return false;
     }
     return this.narrowing === undefined || this.narrowing.some((p) => namesServer(p, server));
+  }
+
+  /**
+   * Whether the trusted policy NAMES `server` in its `allow` list (a pattern for the whole server or one of its tools),
+   * and the caller's own narrowing does not exclude it. A policy without an `allow` list names nothing.
+   */
+  explicitlyAllowsServer(server: string): boolean {
+    if (!this.policy?.allow?.some((p) => namesServer(p, server))) return false;
+    return this.allowsServer(server);
   }
 
   /** Whether every tool of `server` is granted (so a method outside `tools/call` may be forwarded too). */

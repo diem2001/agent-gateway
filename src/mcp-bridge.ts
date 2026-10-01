@@ -33,6 +33,8 @@ export interface McpBridge {
 
 /** One buffer of the bridges (a stream event, a line, a response) is refused above this. */
 export const BRIDGE_MAX_BUFFER_BYTES = 25 * 1024 * 1024;
+/** Requests one bridge waits for at once. */
+export const BRIDGE_MAX_PENDING = 32;
 
 const transportFor = (url: URL): typeof http | typeof https => (url.protocol === "https:" ? https : http);
 
@@ -90,12 +92,18 @@ export class SseBridge implements McpBridge {
       return posted.kind === "failure" ? posted : { kind: "accepted" };
     }
     const key = JSON.stringify(message.id);
+    // A request id that is still waiting, or too many waiting requests, is refused: the maps stay consistent.
+    if (this.pending.has(key)) return { kind: "failure", failure: { kind: "denied" } };
+    if (this.pending.size >= BRIDGE_MAX_PENDING) return { kind: "failure", failure: { kind: "unreachable", name: this.options.serverName } };
     const answered = new Promise<BridgeResult>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(key);
-        resolve({ kind: "failure", failure: { kind: "timeout", name: this.options.serverName, timeoutMs: deadlineMs } });
-      }, deadlineMs);
-      this.pending.set(key, { resolve, timer });
+      const entry: Pending = {
+        resolve,
+        timer: setTimeout(() => {
+          if (this.pending.get(key) === entry) this.pending.delete(key);
+          resolve({ kind: "failure", failure: { kind: "timeout", name: this.options.serverName, timeoutMs: deadlineMs } });
+        }, deadlineMs),
+      };
+      this.pending.set(key, entry);
     });
     const posted = await this.post(endpoint, message);
     if (posted.kind === "failure") {
@@ -176,14 +184,17 @@ export class SseBridge implements McpBridge {
         agent: false,
         headers: { ...this.options.headers, Accept: "text/event-stream", "Cache-Control": "no-cache" },
       });
-      this.stream = { req };
+      // Handlers of this stream act only while it is still the bridge's current stream: a late `close` of an
+      // earlier one must not tear down its successor.
+      const mine: { req: http.ClientRequest; res?: IncomingMessage } = { req };
+      this.stream = mine;
       req.on("error", () => {
         if (!done) finish({ kind: "unreachable", name: serverName });
-        else this.onStreamEnded();
+        else this.onStreamEnded(mine);
       });
       req.on("response", (res) => {
         try {
-          if (this.stream) this.stream.res = res;
+          mine.res = res;
           const status = res.statusCode ?? 0;
           if (status >= 300 && status < 400) {
             res.resume();
@@ -206,7 +217,7 @@ export class SseBridge implements McpBridge {
             finish({ kind: "invalid_response", name: serverName });
             return;
           }
-          this.readStream(res, finish);
+          this.readStream(res, mine, finish);
         } catch {
           finish({ kind: "unreachable", name: serverName });
         }
@@ -215,13 +226,14 @@ export class SseBridge implements McpBridge {
     });
   }
 
-  private readStream(res: IncomingMessage, finishConnect: (failure: ToolFailure | null) => void): void {
+  private readStream(res: IncomingMessage, mine: { req: http.ClientRequest; res?: IncomingMessage }, finishConnect: (failure: ToolFailure | null) => void): void {
     const { serverName } = this.options;
     let buffer = "";
     res.setEncoding("utf8");
-    res.on("error", () => this.onStreamEnded());
-    res.on("close", () => this.onStreamEnded());
+    res.on("error", () => this.onStreamEnded(mine));
+    res.on("close", () => this.onStreamEnded(mine));
     res.on("data", (chunk: string) => {
+      if (this.stream !== mine) return;
       try {
         buffer += chunk;
         if (buffer.length > this.maxBufferBytes) {
@@ -248,8 +260,8 @@ export class SseBridge implements McpBridge {
     });
   }
 
-  private onStreamEnded(): void {
-    if (this.closed) return;
+  private onStreamEnded(which: { req: http.ClientRequest; res?: IncomingMessage }): void {
+    if (this.closed || this.stream !== which) return;
     this.endStream();
     this.failAllPending({ kind: "unreachable", name: this.options.serverName });
   }
