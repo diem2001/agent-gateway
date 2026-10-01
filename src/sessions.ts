@@ -36,7 +36,13 @@ export interface SessionSettings {
 }
 
 interface PersistedData {
+  /** Ownerless legacy entries (from before the isolation update), keyed by the raw client id. */
   sessions: Record<string, Session>;
+  /**
+   * Conversations per API-key label (MVP-7679): `sessionsByLabel[<label>][<client id>]`. A separate additive map, so
+   * a client id can never collide with a legacy raw id, and one label's ids are invisible to another.
+   */
+  sessionsByLabel?: Record<string, Record<string, Session>>;
   settings: SessionSettings;
 }
 
@@ -44,7 +50,27 @@ interface PersistedData {
 /*  State                                                               */
 /* ------------------------------------------------------------------ */
 
+/** Ownerless legacy entries by raw client id: refused for every caller, listed and deletable as before. */
 const sessions = new Map<string, Session>();
+/** Conversations per API-key label. Every entry has an owner and a sandbox home. */
+const sessionsByLabel = new Map<string, Map<string, Session>>();
+
+function labelMap(label: string, create: boolean): Map<string, Session> | undefined {
+  let map = sessionsByLabel.get(label);
+  if (!map && create) {
+    map = new Map();
+    sessionsByLabel.set(label, map);
+  }
+  return map;
+}
+
+function labelEntry(label: string, clientId: string): Session | undefined {
+  return sessionsByLabel.get(label)?.get(clientId);
+}
+
+function allSessions(): Session[] {
+  return [...sessions.values(), ...[...sessionsByLabel.values()].flatMap((map) => [...map.values()])];
+}
 
 let sessionIdleTimeoutMs =
   parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || "0", 10) || 0;
@@ -64,12 +90,28 @@ function isObject(value: unknown): value is Record<string, unknown> {
  */
 function isPersistedData(data: unknown): boolean {
   if (!isObject(data)) return false;
-  if (data.sessions === undefined || data.sessions === null) return true;
-  return (
-    isObject(data.sessions) &&
-    Object.values(data.sessions).every(
-      (session) => isObject(session) && typeof session.lastUsed === "number" && hasValidIsolationFields(session),
-    )
+  const sessionsOk =
+    data.sessions === undefined ||
+    data.sessions === null ||
+    (isObject(data.sessions) &&
+      Object.values(data.sessions).every((session) => isObject(session) && typeof session.lastUsed === "number" && hasValidIsolationFields(session)));
+  if (!sessionsOk) return false;
+  const byLabel = data.sessionsByLabel;
+  if (byLabel === undefined || byLabel === null) return true;
+  if (!isObject(byLabel)) return false;
+  // Every per-label entry must be a complete conversation of that label.
+  return Object.entries(byLabel).every(
+    ([label, map]) =>
+      isObject(map) &&
+      Object.values(map).every(
+        (session) =>
+          isObject(session) &&
+          typeof session.lastUsed === "number" &&
+          hasValidIsolationFields(session) &&
+          isObject(session.owner) &&
+          session.owner.label === label &&
+          typeof session.sandboxDirId === "string",
+      ),
   );
 }
 
@@ -93,6 +135,7 @@ const store = createPersistentStore({
   file: PERSIST_PATH,
   snapshot: (): PersistedData => ({
     sessions: Object.fromEntries(sessions),
+    sessionsByLabel: Object.fromEntries([...sessionsByLabel].map(([label, map]) => [label, Object.fromEntries(map)])),
     settings: { sessionIdleTimeoutMs },
   }),
   isValid: isPersistedData,
@@ -115,18 +158,23 @@ export function loadSessions(): void {
     sessionIdleTimeoutMs = data.settings.sessionIdleTimeoutMs;
   }
 
-  // Restore sessions (filter expired ones)
+  const expired = (session: Session): boolean => sessionIdleTimeoutMs > 0 && now - session.lastUsed >= sessionIdleTimeoutMs;
+
+  // Restore sessions (filter expired ones). An entry with an owner and a home (written by the isolation update)
+  // moves into its label's map; an ownerless one stays a legacy entry under its raw id.
   for (const [id, session] of Object.entries(data.sessions || {})) {
-    if (
-      sessionIdleTimeoutMs > 0 &&
-      now - session.lastUsed >= sessionIdleTimeoutMs
-    ) {
-      continue;
+    if (expired(session)) continue;
+    if (session.owner && session.sandboxDirId) labelMap(session.owner.label, true)!.set(id, session);
+    else sessions.set(id, session);
+  }
+  // Per-label entries win over a moved entry of the same label and id.
+  for (const [label, map] of Object.entries(data.sessionsByLabel || {})) {
+    for (const [id, session] of Object.entries(map)) {
+      if (!expired(session)) labelMap(label, true)!.set(id, session);
     }
-    sessions.set(id, session);
   }
 
-  log("sessions", `Restored ${sessions.size} session(s) from disk`);
+  log("sessions", `Restored ${getSessionCount()} session(s) from disk`);
 }
 
 /** Debounced atomic save (src/persistence.ts). */
@@ -159,22 +207,28 @@ function sameOwner(a: SessionOwner, b: SessionOwner): boolean {
 }
 
 /**
- * Decides, without changing anything, whether `caller` may use the conversation `clientId`: no such
- * conversation means a new one; the exact owner resumes; any other caller is refused; an entry from before
- * the update (no recorded owner or home) is refused for everyone, because the gateway has no record of who
- * it belongs to. Must run before `getSession`, which updates the entry.
+ * Decides, without changing anything, whether `caller` may use the conversation `clientId`: conversations are
+ * keyed by (API-key label, client id), so another label's conversation is not visible and the caller gets a new
+ * one; within the label the exact owner (same `user_id`) resumes and any other user is refused; an entry from
+ * before the isolation update (no recorded owner or home, raw id) is refused for everyone, because the gateway has
+ * no record of who it belongs to. Must run before `getSession`, which updates the entry.
  */
 export function admitSession(clientId: string, caller: SessionOwner): Admission {
-  const existing = sessions.get(clientId);
-  if (!existing) return { kind: "new" };
-  if (!existing.owner || !existing.sandboxDirId) {
+  const own = labelEntry(caller.label, clientId);
+  if (own) {
+    if (!own.owner || !own.sandboxDirId) return { kind: "refused", reason: "legacy" };
+    if (!sameOwner(own.owner, caller)) return { kind: "refused", reason: "other_owner" };
+    return { kind: "resume", sandboxDirId: own.sandboxDirId };
+  }
+  // Another label's conversation with the same id is invisible here: this caller gets a new conversation of its
+  // own. Only an ownerless legacy entry under the raw id is visible (and refused: nobody knows its owner).
+  if (sessions.has(clientId)) {
     legacyRefusals++;
     // Counts only: no conversation id, no caller.
     log("audit", `sessions.legacy.refused total=${legacyRefusals}`);
     return { kind: "refused", reason: "legacy" };
   }
-  if (!sameOwner(existing.owner, caller)) return { kind: "refused", reason: "other_owner" };
-  return { kind: "resume", sandboxDirId: existing.sandboxDirId };
+  return { kind: "new" };
 }
 
 export function getSession(
@@ -188,7 +242,7 @@ export function getSession(
     return { sessionId: randomUUID(), isNew: true };
   }
 
-  const existing = sessions.get(sessionId);
+  const existing = caller ? labelEntry(caller.label, sessionId) : sessions.get(sessionId);
 
   if (existing) {
     existing.lastUsed = Date.now();
@@ -208,16 +262,18 @@ export function getSession(
     return { sessionId: existing.sessionId, isNew: true, sandboxDirId: existing.sandboxDirId };
   }
 
-  // Create new session: it records its owner and a random sandbox home name.
+  // Create new session: it records its owner and a random sandbox home name, below its label.
   const claudeSessionId = randomUUID();
   const sandboxDirId = randomBytes(12).toString("hex");
-  sessions.set(sessionId, {
+  const entry: Session = {
     sessionId: claudeSessionId,
     systemPrompt,
     model,
     lastUsed: Date.now(),
     ...(caller ? { owner: { label: caller.label, userId: caller.userId }, sandboxDirId } : {}),
-  });
+  };
+  if (caller) labelMap(caller.label, true)!.set(sessionId, entry);
+  else sessions.set(sessionId, entry);
   persistSessions();
 
   log("sessions", `Created session ${sessionId}`);
@@ -228,26 +284,33 @@ export function getSession(
 /*  CRUD                                                                */
 /* ------------------------------------------------------------------ */
 
-/** A caller sees its own label's conversations and the ownerless legacy entries (as before the update). */
-function visibleTo(session: Session, callerLabel: string | undefined): boolean {
-  return callerLabel === undefined || !session.owner || session.owner.label === callerLabel;
-}
-
+/**
+ * A caller sees its own label's conversations and the ownerless legacy entries (as before the update), by raw id.
+ * Another label's conversation is not listed.
+ */
 export function listSessions(callerLabel?: string): Array<{
   id: string;
   model: string;
   lastUsed: number;
 }> {
   const result: Array<{ id: string; model: string; lastUsed: number }> = [];
-  for (const [id, session] of sessions) {
-    if (!visibleTo(session, callerLabel)) continue;
+  const seen = new Set<string>();
+  const add = (id: string, session: Session): void => {
+    if (seen.has(id)) return;
+    seen.add(id);
     result.push({ id, model: session.model, lastUsed: session.lastUsed });
+  };
+  if (callerLabel === undefined) {
+    for (const map of sessionsByLabel.values()) for (const [id, session] of map) add(id, session);
+  } else {
+    for (const [id, session] of sessionsByLabel.get(callerLabel) ?? []) add(id, session);
   }
+  for (const [id, session] of sessions) add(id, session);
   return result;
 }
 
-export function updateSessionSdkId(clientId: string, sdkSessionId: string): void {
-  const existing = sessions.get(clientId);
+export function updateSessionSdkId(clientId: string, sdkSessionId: string, label?: string): void {
+  const existing = label !== undefined ? labelEntry(label, clientId) : sessions.get(clientId);
   if (existing && existing.sdkSessionId !== sdkSessionId) {
     existing.sdkSessionId = sdkSessionId;
     persistSessions();
@@ -255,11 +318,15 @@ export function updateSessionSdkId(clientId: string, sdkSessionId: string): void
   }
 }
 
-/** Deletes the entry; a conversation of another label is reported as not found (and stays). */
+/**
+ * Deletes the caller's own entry of that id; failing that, an ownerless legacy entry. Another label's
+ * conversation is reported as not found (and stays). Without a label (tests) the legacy map is used.
+ */
 export function deleteSession(sessionId: string, callerLabel?: string): boolean {
-  const existing = sessions.get(sessionId);
-  if (existing && !visibleTo(existing, callerLabel)) return false;
-  const deleted = sessions.delete(sessionId);
+  let deleted = false;
+  const own = callerLabel !== undefined ? labelMap(callerLabel, false) : undefined;
+  if (own?.delete(sessionId)) deleted = true;
+  else if (sessions.delete(sessionId)) deleted = true;
   if (deleted) {
     persistSessions();
     log("sessions", `Deleted session ${sessionId}`);
@@ -268,7 +335,7 @@ export function deleteSession(sessionId: string, callerLabel?: string): boolean 
 }
 
 export function getSessionCount(): number {
-  return sessions.size;
+  return allSessions().length;
 }
 
 /* ------------------------------------------------------------------ */
@@ -307,10 +374,19 @@ setInterval(() => {
       cleaned++;
     }
   }
+  for (const [label, map] of sessionsByLabel) {
+    for (const [id, session] of map) {
+      if (now - session.lastUsed > sessionIdleTimeoutMs) {
+        map.delete(id);
+        cleaned++;
+      }
+    }
+    if (map.size === 0) sessionsByLabel.delete(label);
+  }
   if (cleaned > 0) {
     log(
       "sessions",
-      `Cleaned ${cleaned} idle session(s). Active: ${sessions.size}`,
+      `Cleaned ${cleaned} idle session(s). Active: ${getSessionCount()}`,
     );
     persistSessions();
   }

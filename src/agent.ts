@@ -19,7 +19,10 @@ import { credentialRelay } from "./mcp-credential-relay.js";
 import { createRunLogDir, removeRunLogDirAfterExit } from "./sdk-run-logs.js";
 import { SandboxRun, runtimeEnvFrom } from "./sandbox.js";
 import { RunFailure, classifyRunFailure, isAbortError } from "./run-failure.js";
-import { builtInTools, createToolPolicyHook, namesServer } from "./tool-policy.js";
+import { builtInTools, createToolPolicyHook } from "./tool-policy.js";
+import { WEBHOOK_SERVER_NAME, computeToolGrant, mcpToolName, type ToolGrant } from "./tool-grant.js";
+import { secretValuesForMasking } from "./tool-mediation.js";
+import type { ToolDefinition } from "./tools.js";
 
 export interface QueryParams {
   prompt?: string;
@@ -59,6 +62,10 @@ export interface QueryParams {
    * An empty array means no tool at all, never the default set.
    */
   enforcedTools?: string[];
+  /** The caller's API-key label: the trusted tool policy, webhook tool ownership and the grant are resolved from it. */
+  label?: string;
+  /** The run's effective tool grant (query.ts); computed here from `label` and the caller's narrowing when absent. */
+  grant?: ToolGrant;
 }
 
 export interface QueryResult {
@@ -114,6 +121,25 @@ export function toolUseEventInput(
   return formatToolInput(toolName, input);
 }
 
+/** A tool name as it may appear in an audit line. */
+function loggableName(name: string): string {
+  return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name) ? name : "(unrecognized)";
+}
+
+/**
+ * The bearer a webhook tool receives (MVP-7679): the calling client's gateway key goes only to tools its own label
+ * registered. A legacy tool without an owner keeps today's forwarding until it is registered again, with one audit
+ * line per call; a tool of another label never receives it.
+ */
+function webhookBearer(tool: ToolDefinition, callerLabel: string, token: string | undefined): string | undefined {
+  if (tool.owner === callerLabel) return token;
+  if (tool.owner === undefined) {
+    if (token) log("audit", `tool.webhook.legacy_forward toolName=${loggableName(tool.name)}`);
+    return token;
+  }
+  return undefined;
+}
+
 export const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite"];
 
 /**
@@ -147,12 +173,17 @@ async function* buildContentMessageStream(
  * it is kept here and classified, never forwarded. Client aborts (AbortError)
  * are rethrown unchanged.
  */
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools, sandboxDirId }: QueryParams): Promise<QueryResult> {
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools, sandboxDirId, label, grant: givenGrant }: QueryParams): Promise<QueryResult> {
   const enforced = enforcedTools !== undefined;
-  // An enforced run gets only the registered tools its set names.
-  const registeredTools = enforced
-    ? getAllTools().filter((t) => enforcedTools.includes(`mcp__agent-gateway-tools__${t.name}`))
-    : getAllTools();
+  // The trusted grant of this run: policy for the caller's label intersected with the caller's own narrowing.
+  const callerLabel = label ?? webhookContext?.api_key_label ?? "";
+  const grant = givenGrant ?? computeToolGrant({ label: callerLabel, narrowing: enforcedTools ?? allowedTools });
+  // The set an enforced run is held to: what the caller named, minus what the trusted policy does not grant.
+  const enforcedSet = enforced ? enforcedTools.filter((name) => grant.allows(name)) : undefined;
+  // A run is offered only the registered tools of its own label plus legacy ownerless ones, and only granted ones.
+  const registeredTools = getAllTools().filter(
+    (t) => (t.owner === undefined || t.owner === callerLabel) && grant.allows(mcpToolName(WEBHOOK_SERVER_NAME, t.name)),
+  );
   const registeredToolNames = registeredTools.map((t) => t.name);
   // A registry server with requireUserCredentials is left out of a run without
   // the user's credential: no SDK entry, no allowed-tool pattern, and a request
@@ -173,16 +204,17 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   let runRequestMcpServers = requestMcpServers
     ? Object.fromEntries(Object.entries(requestMcpServers).filter(([name]) => !omittedServers.includes(name)))
     : undefined;
-  if (enforced) {
-    // An enforced run attaches only the servers its set names a tool of.
-    runRegistryServers = runRegistryServers.filter((def) => namesServer(enforcedTools, def.name));
-    if (runRequestMcpServers) {
-      runRequestMcpServers = Object.fromEntries(Object.entries(runRequestMcpServers).filter(([name]) => namesServer(enforcedTools, name)));
-    }
+  // A server with no granted tool is not attached at all (no wasted calls, nothing to refuse later).
+  runRegistryServers = runRegistryServers.filter((def) => grant.allowsServer(def.name));
+  if (runRequestMcpServers) {
+    runRequestMcpServers = Object.fromEntries(Object.entries(runRequestMcpServers).filter(([name]) => grant.allowsServer(name)));
   }
   const mcpToolPatterns = getMcpAllowedToolPatterns(runRegistryServers);
   const requestMcpToolPatterns = requestMcpAllowedToolPatterns(runRequestMcpServers);
-  const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
+  // `allowedTools` is the runtime's pre-approval list; the caller's list is a narrowing and was applied to the grant.
+  const effectiveTools = allowedTools
+    ? allowedTools.filter((name) => grant.allows(name))
+    : [...DEFAULT_TOOLS.filter((name) => grant.allows(name)), ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
   const HOME = process.env.HOME || "/home/node";
   const options: Record<string, unknown> = {
     allowedTools: effectiveTools,
@@ -191,17 +223,26 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     abortController,
     includePartialMessages: true,
     cwd: HOME,
-    settingSources: ["user", "project"],
+    // Only the user source (MVP-7679, Gate A): the project source reads a `.mcp.json` the agent can write in its
+    // own home and would start whatever command it names on the next turn. Global skills, configured agents and
+    // the read-only generated settings are user-source content and keep loading.
+    settingSources: ["user"],
   };
   if (enforced) {
     // The layers of tool-policy.ts: no HOME settings, deny anything not listed,
     // offer only the listed built-ins, and a deny-only hook as second layer.
     options.settingSources = [];
     options.permissionMode = "dontAsk";
-    options.allowedTools = [...enforcedTools];
-    options.tools = builtInTools(enforcedTools);
-    options.hooks = { PreToolUse: [{ hooks: [createToolPolicyHook(enforcedTools, queryId)] }] };
-    log("query", `enforced tool set: ${enforcedTools.length} tool(s)`);
+    options.allowedTools = [...enforcedSet!];
+    options.tools = builtInTools(enforcedSet!);
+    options.hooks = { PreToolUse: [{ hooks: [createToolPolicyHook(enforcedSet!, queryId)] }] };
+    log("query", `enforced tool set: ${enforcedSet!.length} tool(s)`);
+  } else if (grant.restrictsBuiltIns) {
+    // The policy or the caller restricts the built-ins: the runtime is offered only the granted ones, and the others
+    // are named as denied. A built-in that is not offered is refused by the runtime itself, for the main agent, a
+    // configured agent, a skill, a sub-agent and a resumed conversation alike (Gate A).
+    options.tools = grant.builtIns();
+    options.disallowedTools = grant.deniedBuiltIns();
   }
 
   // Per-user skill loading (DEC-GW-002): materialize the requesting user's stored
@@ -232,7 +273,16 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   const mcpServers: Record<string, unknown> = { ...(runRequestMcpServers ?? {}) };
 
   if (registeredTools.length > 0 && webhookContext) {
-    mcpServers["agent-gateway-tools"] = createToolMcpServer(registeredTools, webhookContext, clientAuthToken);
+    const hosted = new Set(registeredToolNames);
+    mcpServers[WEBHOOK_SERVER_NAME] = createToolMcpServer(
+      registeredTools,
+      webhookContext,
+      (tool) => webhookBearer(tool, callerLabel, clientAuthToken),
+      {
+        isGranted: (name) => hosted.has(name) && grant.allows(mcpToolName(WEBHOOK_SERVER_NAME, name)),
+        secrets: () => secretValuesForMasking(clientAuthToken ? [clientAuthToken] : []),
+      },
+    );
   }
 
   // The runtime's own log files (they hold MCP connection options) go to a
@@ -375,7 +425,8 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
             const truncated = output.length > 3000 ? output.substring(0, 3000) + "\n... (truncated)" : output;
             const durationMs = toolTimings.has(toolUseId) ? Date.now() - toolTimings.get(toolUseId)! : null;
             toolTimings.delete(toolUseId);
-            onEvent({ type: "tool_result", toolName, toolUseId, output: truncated, durationMs });
+            // A failed call is flagged (additive field): absent on success, so successful events are unchanged.
+            onEvent({ type: "tool_result", toolName, toolUseId, output: truncated, durationMs, ...(block.is_error === true ? { success: false } : {}) });
           }
         }
       }

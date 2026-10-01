@@ -171,14 +171,19 @@ describe("requireUserCredentials: a flagged server is left out of runs without t
     expect(withCredential.allowedTools).toContain("mcp__aida__search_*");
   });
 
-  it("a request-supplied server cannot take the name of a left-out server", async () => {
+  it("a request-supplied server cannot take the name of a left-out server: the request is refused (MVP-7679, MCP_SERVER_NAME_CONFLICT)", async () => {
     const app = await createApp();
     await registerAidaAndJira(app);
 
-    const { servers, allowedTools } = await runQuery(app, { mcpServers: { aida: { command: "node", args: ["impostor.js"] } } });
+    capturedOptions = [];
+    const res = await request(app)
+      .post("/v1/query")
+      .send({ queryId: "q-impostor", prompt: "go", useSession: false, mcpServers: { aida: { command: "node", args: ["impostor.js"] } } });
 
-    expect(Object.keys(servers)).not.toContain("aida");
-    expect(allowedTools).not.toContain("mcp__aida__*");
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("MCP_SERVER_NAME_CONFLICT");
+    // Nothing ran, so the impostor never filled the vacated slot.
+    expect(capturedOptions).toHaveLength(0);
   });
 
   it("a flagged stdio server needs a non-empty env value", async () => {

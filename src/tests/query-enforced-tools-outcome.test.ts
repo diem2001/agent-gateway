@@ -170,7 +170,8 @@ describe("enforcedTools (MVP-7637)", () => {
     expect(res.status).toBe(200);
     const options = capturedOptions[0];
     expect(options.permissionMode).toBe("bypassPermissions");
-    expect(options.settingSources).toEqual(["user", "project"]);
+    // MVP-7679: only the user source (the project source reads a `.mcp.json` the agent can write), so no `tools`.
+    expect(options.settingSources).toEqual(["user"]);
     expect(options.allowedTools).toEqual([
       "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite",
       "probe_read", "probe_write", "mcp__jira__*", "mcp__other__*",
@@ -184,12 +185,17 @@ describe("enforcedTools (MVP-7637)", () => {
     expect(events(res.text).some((e) => e.type === "tool_policy")).toBe(false);
   });
 
-  it("the caller's allowedTools keeps its meaning without enforcedTools", async () => {
+  it("the caller's allowedTools is a narrowing of the trusted grant, not an unenforced pre-approval (MVP-7679)", async () => {
     const app = await createApp();
     await request(app).post("/v1/query").send({ queryId: "q-allowed", prompt: "go", useSession: false, allowedTools: ["Read"] });
     expect(capturedOptions[0].allowedTools).toEqual(["Read"]);
     expect(capturedOptions[0].permissionMode).toBe("bypassPermissions");
-    expect(capturedOptions[0].tools).toBeUndefined();
+    // The runtime is offered only Read; every other built-in is named as denied.
+    expect(capturedOptions[0].tools).toEqual(["Read"]);
+    expect((capturedOptions[0].disallowedTools as string[]).includes("Bash")).toBe(true);
+    expect((capturedOptions[0].disallowedTools as string[]).includes("Read")).toBe(false);
+    // No registry server and no webhook tool is granted by a list that names none of them.
+    expect(capturedOptions[0].mcpServers).toBeUndefined();
   });
 
   it.each([
