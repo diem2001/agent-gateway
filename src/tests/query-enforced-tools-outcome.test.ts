@@ -63,6 +63,8 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  const { credentialRelay } = await import("../mcp-credential-relay.js");
+  await credentialRelay.close();
   vi.doUnmock("@anthropic-ai/claude-agent-sdk");
   delete process.env.TOOLS_PERSIST_PATH;
   delete process.env.MCP_SERVERS_PERSIST_PATH;
@@ -81,6 +83,9 @@ async function createApp() {
   for (const name of ["jira", "other"]) {
     registerMcpServer({ name, description: name, enabled: true, type: "stdio", command: "node", args: ["-e", ""], createdAt: now, updatedAt: now });
   }
+  // Registered servers are reached only through the trusted relay (MVP-7679), so it must be listening.
+  const { credentialRelay } = await import("../mcp-credential-relay.js");
+  await credentialRelay.start();
   const { queryRouter } = await import("../query.js");
   const app = express();
   app.use(express.json());

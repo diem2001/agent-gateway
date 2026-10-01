@@ -112,6 +112,7 @@ describe("registered http and SSE servers through relay URLs (real runtime)", ()
     await registerServer(r, "jira", { type: "http", url: jira.url, headers: { Authorization: JIRA_SHARED } });
 
     const feedRun = await ask(r, { prompt: "M1-FEED", sessionId: "m1", useSession: true });
+    const sharedCalls = jira.authorizations().length;
     const jiraRun = await ask(r, { prompt: "M1-JIRA", useSession: false, mcpCredentialOverrides: { jira: { headers: { authorization: JIRA_USER } } } });
 
     expect(offeredFor(r, "M1-FEED")).toEqual(expect.arrayContaining(["mcp__feed__lookup_record", "mcp__jira__get_page", "mcp__jira__update_page"]));
@@ -123,8 +124,10 @@ describe("registered http and SSE servers through relay URLs (real runtime)", ()
     // override (not the shared value, whatever its casing) at the http server.
     expect(feed.requests.length).toBeGreaterThanOrEqual(4);
     expect(feed.requests.every((q) => q.headers["x-api-key"] === FEED_KEY)).toBe(true);
-    expect(jira.authorizations().every((a) => a === JIRA_USER)).toBe(true);
-    expect(jira.authorizations().length).toBeGreaterThan(0);
+    // The first run had no override (the shared credential), the second one only the user's value: never both together.
+    expect(jira.authorizations().slice(0, sharedCalls).every((a) => a === JIRA_SHARED)).toBe(true);
+    expect(jira.authorizations().slice(sharedCalls).length).toBeGreaterThan(0);
+    expect(jira.authorizations().slice(sharedCalls).every((a) => a === JIRA_USER)).toBe(true);
     // No credential anywhere the model or the agent can read, and none in the gateway log.
     const surfaces = [JSON.stringify(r.api.requests.map((q) => q.body)), JSON.stringify(feedRun.events), JSON.stringify(jiraRun.events), r.gateway.output()];
     for (const secret of [FEED_KEY, "SYNTH-JIRA-SHARED-7679", "SYNTH-JIRA-USER-7679"]) {
@@ -143,8 +146,8 @@ describe("registered http and SSE servers through relay URLs (real runtime)", ()
     expect(found).toEqual([]);
   });
 
-  it("a refused SSE credential reaches the model as TOOL_AUTH_UNAVAILABLE with success:false and starts no login", async () => {
-    const feed = await sse({ getStatus: 401 });
+  it("a credential refused at call time reaches the model as TOOL_AUTH_UNAVAILABLE with success:false and starts no login", async () => {
+    const feed = await sse({ callStatus: 401 });
     const r = await rig([call("M2-401", "mcp__feed__lookup_record")]);
     await registerServer(r, "feed", { type: "sse", url: feed.url, headers: { "X-Api-Key": FEED_KEY } });
     const { events } = await ask(r, { prompt: "M2-401", useSession: false });
@@ -229,9 +232,38 @@ describe("registered http and SSE servers through relay URLs (real runtime)", ()
  * runtime is process 2 inside the sandbox) and sends it hostile messages, printing one JSON line per case.
  */
 const ATTACK = String.raw`python3 - <<'PY'
-import json, re, sys, urllib.request, urllib.error
-cmd = open('/proc/2/cmdline', 'rb').read().replace(b'\0', b' ').decode()
-url = re.search(r'http://127\.0\.0\.1:\d+/mcp/[A-Za-z0-9_-]+', cmd).group(0)
+import json, os, re, sys, urllib.request, urllib.error
+pattern = re.compile(rb'http://127\.0\.0\.1:\d+/mcp/[A-Za-z0-9_-]+')
+def find_url():
+    # Where an agent process can read the relay URL of its run: the runtime's command line and environment, and
+    # the runtime's own log files in the run's log directory and in the home.
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        for name in ('cmdline', 'environ'):
+            try:
+                m = pattern.search(open('/proc/%s/%s' % (pid, name), 'rb').read())
+            except Exception:
+                continue
+            if m:
+                return m.group(0).decode()
+    for root in ('/tmp', '/home/node'):
+        for base, dirs, files in os.walk(root):
+            for f in files:
+                try:
+                    p = os.path.join(base, f)
+                    if os.path.getsize(p) > 5000000:
+                        continue
+                    m = pattern.search(open(p, 'rb').read())
+                except Exception:
+                    continue
+                if m:
+                    return m.group(0).decode()
+    return None
+url = find_url()
+if url is None:
+    print(json.dumps({'case': 'no-url', 'status': 0, 'body': ''}))
+    sys.exit(0)
 open('/home/node/relay-url', 'w').write(url)
 def send(label, raw, headers=None):
     h = {'Content-Type': 'application/json'}

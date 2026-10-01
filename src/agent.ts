@@ -18,6 +18,7 @@ import {
 import { materializeUserSkills, cleanupUserSkillBundle } from "./user-skills.js";
 import { requestMcpAllowedToolPatterns, type RequestMcpServers } from "./mcp-request-servers.js";
 import { credentialRelay, type RelayGrant } from "./mcp-credential-relay.js";
+import { StdioBridge } from "./mcp-stdio-sandbox.js";
 import { createRunLogDir, removeRunLogDirAfterExit } from "./sdk-run-logs.js";
 import { SandboxRun, runtimeEnvFrom } from "./sandbox.js";
 import { RunFailure, classifyRunFailure, isAbortError } from "./run-failure.js";
@@ -141,10 +142,20 @@ function hasOverrideValues(override: McpCredentialOverride | undefined, target: 
   return Object.values(override?.[target] ?? {}).some((value) => value.length > 0);
 }
 
-/** A server whose credential schema composes headers needs the user's values for them. */
-function schemaWantsHeaders(def: { userCredentialSchema?: { outputs: { target: string }[] } }): boolean {
-  return (def.userCredentialSchema?.outputs ?? []).some((output) => output.target === "headers");
+/** A server whose credential schema composes values for `target` needs the user's values for them. */
+function schemaWantsTarget(def: { userCredentialSchema?: { outputs: { target: string }[] } }, target: "headers" | "env"): boolean {
+  return (def.userCredentialSchema?.outputs ?? []).some((output) => output.target === target);
 }
+
+/** Whether a request-supplied server config is a stdio server that carries at least one env value. */
+function carriesEnv(config: unknown): boolean {
+  if (typeof config !== "object" || config === null) return false;
+  const entry = config as { command?: unknown; env?: unknown };
+  return typeof entry.command === "string" && typeof entry.env === "object" && entry.env !== null && Object.keys(entry.env).length > 0;
+}
+
+/** The relay binding of a stdio server has no upstream URL: its bridge talks to the tool sandbox. */
+const STDIO_PLACEHOLDER_URL = "stdio://tool-sandbox";
 
 /** A tool name as it may appear in an audit line. */
 function loggableName(name: string): string {
@@ -216,12 +227,12 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   const selection = selectRegistryServersForRun(getEnabledMcpServers(), mcpCredentialOverrides);
   const omitted = selection.omitted.map((name) => ({ name, reason: "missing_user_credential" }));
   let runRegistryServers = selection.attached;
-  // Registered http and SSE servers are reached only through the trusted relay; if it
+  // Every registered server is reached only through the trusted relay (http, SSE and stdio alike); if it
   // is not listening they are left out, never connected directly (fail closed).
   const relayUp = credentialRelay.isListening();
   if (!relayUp) {
-    for (const def of runRegistryServers) if (def.type === "http" || def.type === "sse") omitted.push({ name: def.name, reason: "relay_unavailable" });
-    runRegistryServers = runRegistryServers.filter((def) => def.type !== "http" && def.type !== "sse");
+    for (const def of runRegistryServers) omitted.push({ name: def.name, reason: "relay_unavailable" });
+    runRegistryServers = [];
   }
   for (const { name, reason } of omitted) {
     log("audit", `mcp.server.omitted serverName=${name} reason=${reason}`);
@@ -230,10 +241,10 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   let runRequestMcpServers = requestMcpServers
     ? Object.fromEntries(Object.entries(requestMcpServers).filter(([name]) => !omittedServers.includes(name)))
     : undefined;
-  // A request server that carries headers needs the relay too; without it the server is left out (fail closed).
+  // A request server that carries headers or env needs the relay too; without it the server is left out (fail closed).
   if (runRequestMcpServers && !relayUp) {
     for (const [name, config] of Object.entries(runRequestMcpServers)) {
-      if (carriesHeaders(config)) {
+      if (carriesHeaders(config) || carriesEnv(config)) {
         log("audit", `mcp.server.omitted serverName=${name} reason=relay_unavailable`);
         delete runRequestMcpServers[name];
       }
@@ -339,6 +350,23 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   options.spawnClaudeCodeProcess = sandbox.spawnHook;
 
   const relayTokens: string[] = [];
+  // Request stdio servers with env run in their own tool sandbox behind the relay.
+  for (const [name, config] of Object.entries(mcpServers)) {
+    if (!carriesEnv(config)) continue;
+    const entry = config as { command: string; args?: string[]; env: Record<string, string> };
+    const bridge = new StdioBridge({ serverName: name, command: entry.command, args: entry.args ?? [], env: { ...entry.env }, queryId });
+    const { token, url } = credentialRelay.register({
+      serverName: name,
+      url: STDIO_PLACEHOLDER_URL,
+      headers: {},
+      kind: "stdio",
+      bridge,
+      grant: relayGrantFor(grant, name),
+      credentialSource: "user",
+    });
+    relayTokens.push(token);
+    mcpServers[name] = { type: "http", url };
+  }
   // Request servers with headers: the runtime gets a relay URL, the header values stay with the relay.
   for (const [name, config] of Object.entries(mcpServers)) {
     if (!carriesHeaders(config)) continue;
@@ -364,9 +392,26 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     // The runtime gets a loopback relay URL with a per-run token and no header; the relay holds this
     // run's URL, header snapshot and grant until the run ends.
     for (const [name, config] of Object.entries(effectiveMcpServers)) {
-      if (!("type" in config) || (config.type !== "http" && config.type !== "sse")) continue;
       const def = runRegistryServers.find((d) => d.name === name)!;
       const override = mcpCredentialOverrides?.[name];
+      if (!("type" in config)) {
+        // A registered stdio server (with or without env) runs in its own tool sandbox; args and env stay with the bridge.
+        const bridge = new StdioBridge({ serverName: name, command: config.command, args: config.args ?? [], env: { ...(config.env ?? {}) }, queryId });
+        const { token, url } = credentialRelay.register({
+          serverName: name,
+          url: STDIO_PLACEHOLDER_URL,
+          headers: {},
+          kind: "stdio",
+          bridge,
+          grant: relayGrantFor(grant, name),
+          credentialSource: hasOverrideValues(override, "env") ? "user" : "gateway",
+          noUserCredential: schemaWantsTarget(def, "env") && !hasUserCredential(def, override),
+        });
+        relayTokens.push(token);
+        effectiveMcpServers[name] = { type: "http", url };
+        continue;
+      }
+      if (config.type !== "http" && config.type !== "sse") continue;
       const { token, url } = credentialRelay.register({
         serverName: name,
         url: config.url,
@@ -374,7 +419,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
         kind: config.type,
         grant: relayGrantFor(grant, name),
         credentialSource: hasOverrideValues(override, "headers") ? "user" : "gateway",
-        noUserCredential: schemaWantsHeaders(def) && !hasUserCredential(def, override),
+        noUserCredential: schemaWantsTarget(def, "headers") && !hasUserCredential(def, override),
       });
       relayTokens.push(token);
       effectiveMcpServers[name] = { type: "http", url };
@@ -386,17 +431,6 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     for (const [serverName, override] of Object.entries(mcpCredentialOverrides)) {
       const keys = summarizeOverrideKeys(override);
       log("audit", `mcp.override.applied serverName=${serverName} keys=${keys.join(",") || "none"}`);
-    }
-  }
-
-  // Known residual (MVP-7678, owned by MVP-7679): the SDK hands the whole MCP configuration to the runtime as a
-  // command-line argument and stdio children inherit its environment, so a header or env value of a server that is
-  // not relayed is readable inside this run's own sandbox. One audit line per such server: name and type only.
-  for (const [name, config] of Object.entries(mcpServers)) {
-    const entry = config as { type?: unknown; headers?: unknown; env?: unknown };
-    const carries = (value: unknown): boolean => typeof value === "object" && value !== null && Object.keys(value).length > 0;
-    if (carries(entry.headers) || carries(entry.env)) {
-      log("audit", `mcp.server.credential_in_runtime_args serverName=${name} type=${typeof entry.type === "string" ? entry.type : "stdio"}`);
     }
   }
 

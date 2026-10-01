@@ -44,8 +44,8 @@ export interface RelayBinding {
   /** Static registry headers merged with the run's override (one case-insensitive merge, the override wins). */
   headers: Record<string, string>;
   grant: RelayGrant;
-  /** "http" (default): Streamable HTTP upstream. "sse": the SSE transport, served by the SSE bridge. */
-  kind?: "http" | "sse";
+  /** "http" (default): Streamable HTTP upstream. "sse": the SSE transport, served by the SSE bridge. "stdio": a tool sandbox (a bridge is given). */
+  kind?: "http" | "sse" | "stdio";
   /** Where the run's credential for this server came from; it picks the text of a refused credential. */
   credentialSource?: "user" | "gateway";
   /** The server needs a per-user credential and the run carries none: `tools/call` is answered without a request. */

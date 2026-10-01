@@ -601,9 +601,9 @@ describe("a run's credentials do not remain in the Claude runtime's own log file
   ];
 
   for (const end of ENDS) {
-    it(`the run ends ${end.name}: no file holds the http header or the stdio env value`, async () => {
+    it(`the run ends ${end.name}: no file holds the http header, the request header or the stdio env value`, async () => {
       const stub = await mcpStub({});
-      // A request-supplied http server keeps the direct path: its header reaches the runtime and its logs.
+      // A request-supplied http server with a header goes through the relay too (MVP-7679): the header never reaches the runtime.
       const direct = await mcpStub({});
       const api = await startFakeAnthropicApi({ toolName: STUB_TOOL_NAME, mode: end.mode });
       cleanups.push(() => api.close());
@@ -630,9 +630,11 @@ describe("a run's credentials do not remain in the Claude runtime's own log file
         end.mode === "hang-after-tool" ? { abortAfterEvent: "tool_result" } : {},
       );
 
-      // The runtime had the stdio env value and the direct header during the run.
-      expect.soft(outcome.runtimeMcpConfigs.some((c) => c.includes(envValue))).toBe(true);
-      expect.soft(outcome.runtimeMcpConfigs.some((c) => c.includes(directHeader))).toBe(true);
+      // MVP-7679: neither the stdio env value (the server runs in its own tool sandbox) nor the request header
+      // (relayed) is ever part of the runtime's configuration; the relayed header still reaches its server.
+      expect.soft(outcome.runtimeMcpConfigs.length).toBeGreaterThan(0);
+      expect.soft(outcome.runtimeMcpConfigs.some((c) => c.includes(envValue))).toBe(false);
+      expect.soft(outcome.runtimeMcpConfigs.some((c) => c.includes(directHeader))).toBe(false);
       expect.soft(direct.authorizations().length).toBeGreaterThan(0);
       if (end.mode !== "error") expect.soft(stub.authorizations().length).toBeGreaterThan(0);
       if (end.mode === "normal") {

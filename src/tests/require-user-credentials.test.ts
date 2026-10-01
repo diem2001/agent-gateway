@@ -194,7 +194,9 @@ describe("requireUserCredentials: a flagged server is left out of runs without t
     expect(Object.keys(without.servers)).not.toContain("local");
 
     const withCredential = await runQuery(app, { mcpCredentialOverrides: { local: { env: { TOKEN: "user-token" } } } });
-    expect(withCredential.servers.local).toEqual({ command: "node", args: ["server.js"], env: { TOKEN: "user-token" } });
+    // MVP-7679: a stdio server runs in its own tool sandbox behind the relay; no env value reaches the runtime.
+    expect(withCredential.servers.local).toEqual({ type: "http", url: expect.stringMatching(RELAY_URL) });
+    expect(JSON.stringify(withCredential.servers)).not.toContain("user-token");
   });
 
   it("every server without the flag (absent or false) behaves exactly as before, with and without overrides", async () => {
@@ -207,8 +209,9 @@ describe("requireUserCredentials: a flagged server is left out of runs without t
     expect(plain.servers).toEqual({
       jira: { type: "http", url: expect.stringMatching(RELAY_URL) },
       wiki: { type: "http", url: expect.stringMatching(RELAY_URL) },
-      local: { command: "node", args: ["server.js"], env: { TOKEN: "static" } },
+      local: { type: "http", url: expect.stringMatching(RELAY_URL) },
     });
+    expect(JSON.stringify(plain.servers)).not.toContain("static");
     expect(plain.allowedTools).toEqual(expect.arrayContaining(["mcp__jira__*", "mcp__wiki__*", "mcp__local__*"]));
     expect(upstream.headersAt("/jira").map((h) => h.authorization)).toEqual(["Basic STATIC"]);
     expect(upstream.headersAt("/wiki").map((h) => h.authorization)).toEqual([undefined]);

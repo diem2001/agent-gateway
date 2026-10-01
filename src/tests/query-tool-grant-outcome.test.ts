@@ -72,6 +72,8 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  const { credentialRelay } = await import("../mcp-credential-relay.js");
+  await credentialRelay.close();
   vi.doUnmock("@anthropic-ai/claude-agent-sdk");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -94,6 +96,9 @@ async function createApp(policy?: unknown) {
   for (const name of ["jira", "other"]) {
     registerMcpServer({ name, description: name, enabled: true, type: "stdio", command: "node", args: ["-e", ""], createdAt: now, updatedAt: now });
   }
+  // Registered servers are reached only through the trusted relay (MVP-7679), so it must be listening.
+  const { credentialRelay } = await import("../mcp-credential-relay.js");
+  await credentialRelay.start();
   const { queryRouter } = await import("../query.js");
   const app = express();
   app.use(express.json());
@@ -379,11 +384,11 @@ describe("request mcpServers are validated on the trusted side", () => {
 
   it("a url without a type is http; unknown fields are dropped, so nothing else reaches the runtime", async () => {
     const app = await createApp();
-    const res = await post(app, { mcpServers: { remote: { url: "http://127.0.0.1:9/mcp", headersHelper: "/bin/evil", oauth: { clientId: "x" } }, local: { command: "node", args: ["a"], cwd: "/", type: undefined, env: { K: "v" }, extra: 1 } } });
+    const res = await post(app, { mcpServers: { remote: { url: "http://127.0.0.1:9/mcp", headersHelper: "/bin/evil", oauth: { clientId: "x" } }, local: { command: "node", args: ["a"], cwd: "/", type: undefined, extra: 1 } } });
     expect(res.status).toBe(200);
     const servers = capturedOptions[0].mcpServers as Record<string, unknown>;
     expect(servers.remote).toEqual({ type: "http", url: "http://127.0.0.1:9/mcp" });
-    expect(servers.local).toEqual({ command: "node", args: ["a"], env: { K: "v" } });
+    expect(servers.local).toEqual({ command: "node", args: ["a"] });
   });
 
   it("an explicit sse type is kept (a server without headers connects directly; with headers it goes through the relay, see query-mcp-mediation-outcome)", async () => {

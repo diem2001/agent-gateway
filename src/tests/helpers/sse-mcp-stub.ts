@@ -8,6 +8,7 @@
  * - "endless-event": a `tools/call` is answered with an event that never ends (data without a blank line);
  * - "hang-on-call": a `tools/call` is accepted (202) and never answered;
  * - "inline-answer": a `tools/call` is answered in the POST response instead of on the stream.
+ * `callStatus` answers only the POST of a `tools/call` with that status (a credential refused at call time).
  * Server requests (`ping`, `roots/list`) can be sent right after the handshake, and the client's answers to them
  * are recorded in `clientAnswers`.
  */
@@ -31,6 +32,8 @@ export interface SseMcpStubOptions {
   serverRequests?: boolean;
   /** Answer a POST with this status (and no answer) instead of 202. */
   postStatus?: number;
+  /** Answer the POST of a `tools/call` with this status (everything before it works). */
+  callStatus?: number;
 }
 
 export interface SseStubRequest {
@@ -142,6 +145,12 @@ export async function startSseMcpStub(options: SseMcpStubOptions = {}): Promise<
         record.status = 202;
         if (message.method === "tools/call") {
           toolCalls.push(String(message.params?.name ?? ""));
+          if (options.callStatus) {
+            record.status = options.callStatus;
+            res.writeHead(options.callStatus);
+            res.end();
+            return;
+          }
           if (mode === "reset-on-call") {
             res.writeHead(202);
             res.end();

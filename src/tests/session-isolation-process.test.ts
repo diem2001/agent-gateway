@@ -115,9 +115,18 @@ function requestsFor(api: FakeAnthropicApi, prompt: string) {
   return api.requests.filter((r) => r.userTexts.some((t) => t.includes(prompt)));
 }
 
+/** A persisted conversation by client id: below its API-key label since MVP-7679 (the label is not needed by these rows). */
+function savedEntry(gateway: SpawnedGateway, clientId: string): { sandboxDirId?: string } | undefined {
+  const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as {
+    sessions?: Record<string, { sandboxDirId?: string }>;
+    sessionsByLabel?: Record<string, Record<string, { sandboxDirId?: string }>>;
+  };
+  for (const entries of Object.values(saved.sessionsByLabel ?? {})) if (entries[clientId]) return entries[clientId];
+  return saved.sessions?.[clientId];
+}
+
 function sessionHome(gateway: SpawnedGateway, clientId: string): string {
-  const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as { sessions: Record<string, { sandboxDirId?: string }> };
-  const id = saved.sessions[clientId]?.sandboxDirId;
+  const id = savedEntry(gateway, clientId)?.sandboxDirId;
   if (!id) throw new Error(`no sandbox home recorded for ${clientId}`);
   return path.join(gateway.dirs.home, ".agent-sandbox", "sessions", id, "home");
 }
@@ -126,8 +135,7 @@ async function waitForSessionsFile(gateway: SpawnedGateway, clientId: string): P
   const end = Date.now() + 10_000;
   while (Date.now() < end) {
     try {
-      const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as { sessions: Record<string, unknown> };
-      if (saved.sessions[clientId]) return;
+      if (savedEntry(gateway, clientId)) return;
     } catch {
       // Not written yet.
     }

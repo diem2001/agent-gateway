@@ -499,10 +499,12 @@ describe("fail closed: without a listening relay, registered http servers are le
       requestMcpServers: { jira: { url: "http://impostor.invalid/mcp", type: "http" } },
     });
 
-    const servers = captured[0].mcpServers as Record<string, unknown>;
-    expect(Object.keys(servers)).toEqual(["local"]);
+    // Every registered server (http, SSE and stdio) is left out: none is ever connected or started directly.
+    expect(captured[0].mcpServers).toBeUndefined();
     expect(captured[0].allowedTools).not.toContain("mcp__jira__*");
+    expect(captured[0].allowedTools).not.toContain("mcp__local__*");
     expect(logs.join("\n")).toContain("mcp.server.omitted serverName=jira reason=relay_unavailable");
+    expect(logs.join("\n")).toContain("mcp.server.omitted serverName=local reason=relay_unavailable");
   });
 });
 

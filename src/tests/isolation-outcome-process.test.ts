@@ -429,8 +429,8 @@ describe("the fail-closed rows end with the exact text within their deadline and
   });
 });
 
-describe("known S2 residuals (reported separately, NOT counted as passes)", () => {
-  it("an MCP server given in the request body with an env value or a header: the value sits on the runtime's own command line, inside this run's sandbox only; an audit line names the server", async () => {
+describe("former S2 residuals, closed by MVP-7679 (credential-bearing MCP servers run behind the trusted relay)", () => {
+  it("an MCP server given in the request body with an env value or a header: the value is on no process's command line or environment inside the run's sandbox, and no audit line reports it", async () => {
     const f = await fixture("api-key", () => [
       bash("OUTCOME-RESIDUAL", "echo STDIO_ENV_VISIBLE=$(cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\\0' ' ' | grep -c 'SYNTH-STDIO-ENV-7[6]78'); echo SSE_HEADER_VISIBLE=$(cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\\0' ' ' | grep -c 'SYNTH-SSE-HEADER-7[6]78'); echo RELAYED_HEADER_VISIBLE=$(cat /proc/[0-9]*/cmdline /proc/[0-9]*/environ 2>/dev/null | tr '\\0' ' ' | grep -c 'SYNTH-REGISTRY-HEADE[R]-7678')"),
     ]);
@@ -449,12 +449,11 @@ describe("known S2 residuals (reported separately, NOT counted as passes)", () =
     const result = lastResults(f.api, "OUTCOME-RESIDUAL")[0] ?? "";
     const residual = { stdioEnvVisibleInsideOwnSandbox: /STDIO_ENV_VISIBLE=([1-9])/.test(result), sseHeaderVisibleInsideOwnSandbox: /SSE_HEADER_VISIBLE=([1-9])/.test(result) };
     report(`OUTCOME-RESIDUAL-S2 ${JSON.stringify(residual)}`);
-    // Observed state today: visible to the run that owns the server. The relayed registry header is not visible at all.
-    expect(residual).toEqual({ stdioEnvVisibleInsideOwnSandbox: true, sseHeaderVisibleInsideOwnSandbox: true });
+    // Closed: the stdio server runs in its own tool sandbox and the SSE server is reached through the relay, so
+    // neither value is anywhere the agent's processes can read; the relayed registry header never was.
+    expect(residual).toEqual({ stdioEnvVisibleInsideOwnSandbox: false, sseHeaderVisibleInsideOwnSandbox: false });
     expect(result).toContain("RELAYED_HEADER_VISIBLE=0");
-    // Not a leak to the model or the events of another conversation: only this run's own request body carries them (it supplied them).
-    expect(f.gateway.output()).toContain("[audit] mcp.server.credential_in_runtime_args serverName=stdiosrv type=stdio");
-    expect(f.gateway.output()).toContain("[audit] mcp.server.credential_in_runtime_args serverName=ssesrv type=sse");
+    expect(f.gateway.output()).not.toContain("credential_in_runtime_args");
     expect(f.gateway.output()).not.toContain(STDIO_ENV);
     expect(f.gateway.output()).not.toContain(SSE_HEADER);
   });

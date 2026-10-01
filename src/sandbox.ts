@@ -366,7 +366,7 @@ function ensurePrivateDir(dir: string): void {
  * Validates the trusted storage root (no symlink in its path, a private directory owned by
  * the gateway user) and returns its `runs` directory. Throws `SandboxPrepError`.
  */
-function prepareRunsRoot(root: string): string {
+export function prepareRunsRoot(root: string): string {
   ensurePrivateDir(root);
   let real: string;
   try {
@@ -422,7 +422,7 @@ export function sweepSandboxRuns(root: string = loadIsolationConfig().sandboxRoo
 /*  Launching bwrap                                                     */
 /* ------------------------------------------------------------------ */
 
-interface Launch {
+export interface Launch {
   child: ChildProcess;
   /** Resolves when the sandbox has started and passed its check line, rejects with the start failure. */
   ready: Promise<void>;
@@ -437,7 +437,7 @@ function classifyEarlyExit(code: number | null, stderr: string): IsolationProble
   return "start_failed";
 }
 
-function launchBwrap(
+export function launchBwrap(
   config: IsolationConfig,
   argv: string[],
   env: Record<string, string>,

@@ -165,8 +165,12 @@ describe("credential values never reach the log (every Examples row)", { timeout
     expect(res.status).toBe(200);
     expect(logs.join("\n")).toContain('"env":{"API_TOKEN":"[REDACT');
     expect(leakedFragments(logs, [secret])).toEqual([]);
-    const servers = (await sdkOptions()).mcpServers as Record<string, { env?: Record<string, string> }>;
-    expect(servers.local.env?.API_TOKEN).toBe(secret);
+    // MVP-7679: a request stdio server with env runs in its own tool sandbox behind the relay: the runtime's options
+    // hold a relay URL and no env value (the bridge holds it; the real-runtime proof is in stdio-sandbox-process).
+    const servers = (await sdkOptions()).mcpServers as Record<string, { type?: string; url?: string; env?: Record<string, string> }>;
+    expect(servers.local.env).toBeUndefined();
+    expect(servers.local.url).toMatch(RELAY_URL);
+    expect(JSON.stringify(servers)).not.toContain(secret);
   });
 
   it("POST /v1/query with mcpCredentialOverrides: unchanged redaction, the MCP client gets the real value", async () => {
