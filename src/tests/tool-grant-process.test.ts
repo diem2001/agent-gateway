@@ -367,6 +367,25 @@ describe("files the agent writes in its own home cannot start anything on a late
     expect(saved).not.toContain("evil");
   });
 
+  it("a server planted in ~/.claude/.config.json (the runtime's preferred global config) starts nothing on a later turn", async () => {
+    const dotConfig = JSON.stringify({ mcpServers: { evildot: server("m-dotconfig") } });
+    const r = await rig({
+      scripts: [write("D1-DOTCONFIG", "/home/node/.claude/.config.json", dotConfig), bash("D2-BASH", "touch /home/node/m-bash-dot")],
+      policy: JSON.stringify({ labels: { proc: { deny: ["Bash"] } } }),
+      seed: seedLikeEntrypoint,
+    });
+    for (const prompt of ["D1-DOTCONFIG", "D2-BASH", "PLAIN-1", "PLAIN-2"]) {
+      const { events } = await ask(r, { prompt, sessionId: "d", useSession: true });
+      expect(events.at(-1)?.type, prompt).toBe("done");
+    }
+    expect(resultFor(r, "D1-DOTCONFIG")?.isError, resultFor(r, "D1-DOTCONFIG")?.text).toBe(false);
+    expect(resultFor(r, "D2-BASH")?.text).toBe(NO_SUCH_TOOL("Bash"));
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const home = await settle(r, "d");
+    expect(fs.readdirSync(home).filter((name) => name.startsWith("m-"))).toEqual([]);
+    expect(fs.existsSync(path.join(home, ".claude", ".config.json"))).toBe(false);
+  });
+
   it("control: a server a REQUEST asks for does start (the marker probe detects a started server)", async () => {
     const r = await rig({ scripts: [], registerTools: false });
     await ask(r, { prompt: "CTL", sessionId: "ctl", useSession: true, mcpServers: { ctl: { command: "/bin/sh", args: ["-c", "touch /home/node/m-control; sleep 20"] } } });

@@ -165,3 +165,51 @@ describe("sanitizeRuntimeConfig", () => {
     expect(fs.readdirSync(home)).toEqual([]);
   });
 });
+
+describe("the runtime's second global config file, <home>/.claude/.config.json (preferred over ~/.claude.json whenever it exists)", () => {
+  const dotClaude = () => path.join(home, ".claude");
+  const dotConfig = () => path.join(dotClaude(), ".config.json");
+
+  it("a planted file is removed, the rest of .claude stays", () => {
+    fs.mkdirSync(path.join(dotClaude(), "projects"), { recursive: true });
+    fs.writeFileSync(path.join(dotClaude(), "settings.json"), "{}");
+    fs.writeFileSync(path.join(dotClaude(), "projects", "t.jsonl"), "x");
+    fs.writeFileSync(dotConfig(), JSON.stringify({ mcpServers: { evil: MALICIOUS_SERVER } }));
+    sanitizeRuntimeConfig(home);
+    expect(fs.existsSync(dotConfig())).toBe(false);
+    expect(fs.readdirSync(dotClaude()).sort()).toEqual(["projects", "settings.json"]);
+    expect(fs.readFileSync(path.join(dotClaude(), "projects", "t.jsonl"), "utf8")).toBe("x");
+  });
+
+  it("backup and temporary copies, links and directories of that name are removed without being followed", () => {
+    fs.mkdirSync(dotClaude());
+    fs.writeFileSync(path.join(outside, "keep.txt"), "keep");
+    fs.writeFileSync(path.join(dotClaude(), ".config.json.backup"), "x");
+    fs.writeFileSync(path.join(dotClaude(), ".config.json.tmp.1.2"), "x");
+    fs.symlinkSync(outside, path.join(dotClaude(), ".config.json.link"));
+    fs.symlinkSync(path.join(outside, "keep.txt"), dotConfig());
+    sanitizeRuntimeConfig(home);
+    expect(fs.readdirSync(dotClaude())).toEqual([]);
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+  });
+
+  it("a directory in the file's place is removed", () => {
+    fs.mkdirSync(dotConfig(), { recursive: true });
+    fs.writeFileSync(path.join(dotConfig(), "x"), "y");
+    sanitizeRuntimeConfig(home);
+    expect(fs.existsSync(dotConfig())).toBe(false);
+  });
+
+  it("a .claude that is a link is removed, never followed", () => {
+    fs.writeFileSync(path.join(outside, ".config.json"), JSON.stringify({ mcpServers: { evil: MALICIOUS_SERVER } }));
+    fs.symlinkSync(outside, dotClaude());
+    sanitizeRuntimeConfig(home);
+    expect(fs.existsSync(dotClaude())).toBe(false);
+    expect(fs.existsSync(path.join(outside, ".config.json"))).toBe(true);
+  });
+
+  it("a home without .claude is left alone", () => {
+    sanitizeRuntimeConfig(home);
+    expect(fs.readdirSync(home)).toEqual([]);
+  });
+});
