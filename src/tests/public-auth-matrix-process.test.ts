@@ -90,14 +90,14 @@ const MATRIX: [Operation, string, string | undefined, number | "ok", number, num
   ["upload", "the valid key", GATEWAY_API_KEY, "ok", 0, 1],
 ];
 
-describe("public authentication on every protected route (9 rows)", () => {
+describe("public authentication on every protected route (9 rows; the query row grants no tool, so no server is attached and 0 upstream requests holds only for that variant)", () => {
   it.each(MATRIX)("%s with %s: %s, %i agent run(s), %i upstream request(s)", async (operation, _credential, key, expected, runs, upstream) => {
     const f = await fixture();
     let status = 0;
     let text = "";
     if (operation === "query") {
       // "An agent query that invokes no tool": it is granted none (an enforced empty set), so the registered server is
-      // not attached and the MCP double sees nothing. A run that does attach a server contacts it for the handshake and
+      // not attached and the MCP double sees nothing; "0 upstream requests" holds only while the server is not attached. A run that does attach a server contacts it for the handshake and
       // the tool list at start; that case is the next describe block.
       const res = await call(f.gateway.port, key, "POST", "/v1/query", { queryId: `q-${Date.now()}`, prompt: PROMPT, model: "claude-sonnet-4-5", useSession: false, enforcedTools: [] });
       status = res.status;

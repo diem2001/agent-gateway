@@ -98,7 +98,7 @@ Every agent run executes in a bubblewrap sandbox (`src/sandbox.ts`, `src/sandbox
 - **Never put a credential (header, env, args, override) into the runtime's MCP configuration.** The runtime gets only `{ "type": "http", "url": "http://127.0.0.1:<port>/mcp/<token>" }`; no registry `args`/`env`, override or request `env` value and no header may reach its command line.
 - **Every credential-bearing MCP server (http, SSE, stdio) goes through a relay binding** (token, upstream or bridge, merged credentials, grant). Stdio servers with env run in their own tool sandbox. If the relay is not listening the server is left out of the run, never connected directly.
 - **The grant check runs before any upstream request.** Effective grant = `AGENT_TOOL_POLICY` for the caller's label intersected with the caller's narrowing; a caller can only narrow. `allowedToolsPattern` is not part of the grant.
-- **The agent can write its own home**, so every file the runtime reads from it as configuration must be inert: `settingSources` is `["user"]` (enforced runs `[]`), `~/.claude.json` is rewritten and its backups deleted before every sandbox start. Each such file needs a regression row with the real runtime.
+- **The agent can write its own home**, so every file the runtime reads from it as configuration must be inert: `settingSources` is `["user"]` (enforced runs `[]`), `~/.claude.json` is rewritten and its backups deleted, and `~/.claude/.config.json` (the runtime prefers it over `~/.claude.json` whenever it exists) is removed, before every sandbox start. Each such file needs a regression row with the real runtime.
 - **A webhook, relay or bridge failure maps to a fixed `TOOL_*` text** (`tool-mediation.ts`), never an upstream body, header, URL or secret. No redirect is followed anywhere.
 
 ## Project Structure
@@ -130,7 +130,7 @@ src/
   mcp-request-servers.ts # Request mcpServers validation and normalization (name rule, command xor url, MCP_SERVER_NAME_CONFLICT)
   sdk-run-logs.ts    # Per-run directory for the Claude runtime's log files, deleted after the child exits; startup sweep; DEBUG_CLAUDE_AGENT_SDK strip
   sandbox.ts         # Per-run bubblewrap sandbox: config keys, exact bwrap argv, env allowlist, launch wrapper (nested-userns check), fail-closed IsolationFailure, /health isolation state, boot self-check
-  sandbox-content.ts # What a sandbox may see: no-follow validation of every bind source, allowlist-generated git configs, known-secret-value scan, mount plan, mount-point sanitizing, sanitizeRuntimeConfig (rewrites the agent's ~/.claude.json to allowlisted plain keys, deletes backups)
+  sandbox-content.ts # What a sandbox may see: no-follow validation of every bind source, allowlist-generated git configs, known-secret-value scan, mount plan, mount-point sanitizing, sanitizeRuntimeConfig (rewrites the agent's ~/.claude.json to allowlisted plain keys, deletes backups, removes ~/.claude/.config.json)
   model-proxy.ts     # Trusted loopback model proxy: run token in x-api-key, POST /v1/messages[/count_tokens] only, injects the gateway's provider credential (API key or OAuth with single-flight refresh); readAuthStatus for /v1/auth/status
   mcp-overrides.ts   # mcpCredentialOverrides validation, header/env checks, requireUserCredentials attachment rule (headers output keys case-insensitive, every match non-empty; env keys exact)
   gc-budget.ts       # Minor GC every 2 MiB relayed (needs node --expose-gc, set in entrypoint.sh and npm start)
@@ -165,7 +165,7 @@ src/
     tool-grant.test.ts              # AGENT_TOOL_POLICY parsing table and the effective grant
     tool-mediation.test.ts          # Fixed TOOL_* texts, webhook rejection text, secret masking, deadline parsing
     tool-owner.test.ts              # Tool ownership: 403, forwarding, legacy ownerless claim and audit
-    sandbox-runtime-config.test.ts  # ~/.claude.json rewrite and settingSources
+    sandbox-runtime-config.test.ts  # ~/.claude.json rewrite, ~/.claude/.config.json removal and settingSources
     query-tool-grant-outcome.test.ts # Grant through query/agent with the SDK mocked
     query-mcp-mediation-outcome.test.ts # Relay bindings and request-server routing through query/agent with the SDK mocked
     mcp-bridge-sse.test.ts / mcp-bridge-stdio.test.ts # SSE bridge and stdio tool sandbox bridge

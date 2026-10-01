@@ -234,6 +234,7 @@ export const RUNTIME_STATE_KEYS: readonly string[] = [
 ];
 
 const STATE_FILE = ".claude.json";
+const CONFIG_DIR_FILE = ".config.json";
 const STATE_VALUE_MAX = 256;
 
 function plainStateValue(key: string, value: unknown): unknown {
@@ -288,6 +289,29 @@ export function sanitizeRuntimeConfig(homeDir: string): void {
   // Backups and temporary copies of the state file: the runtime restores a damaged state from them.
   for (const entry of fs.readdirSync(homeDir)) {
     if (entry !== STATE_FILE && entry.startsWith(`${STATE_FILE}.`)) fs.rmSync(path.join(homeDir, entry), { recursive: true, force: true });
+  }
+  removeConfigDirState(homeDir);
+}
+
+/**
+ * The runtime reads its global config from `<config dir>/.config.json` whenever that file exists and from
+ * `~/.claude.json` otherwise (2.0.77, `cli.js` `QF()`); the config dir is `~/.claude`, which the agent can write.
+ * A planted `.config.json` therefore replaces the rewritten state file above, so the trusted side removes it
+ * (and its backups) before every start; the runtime recreates the plain state file itself. Anything else the
+ * runtime would start from the config dir needs a setting the sandbox does not have: `settings.json` is a trusted
+ * read-only copy of `permissions` only (so no `enabledPlugins`, `hooks` or `statusLine`) and the setting sources
+ * stop at the user level. A `.claude` that is not a real directory is removed itself, never followed.
+ */
+function removeConfigDirState(homeDir: string): void {
+  const dir = path.join(homeDir, ".claude");
+  const stat = lstatOrNull(dir);
+  if (!stat) return;
+  if (!stat.isDirectory()) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return;
+  }
+  for (const entry of fs.readdirSync(dir)) {
+    if (entry === CONFIG_DIR_FILE || entry.startsWith(`${CONFIG_DIR_FILE}.`)) fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
   }
 }
 
