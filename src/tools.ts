@@ -1,6 +1,12 @@
 import { log } from "./logging.js";
 import { createPersistentStore, isNamedEntryList } from "./persistence.js";
 
+/** A persisted entry's `owner`, when present, must be a non-empty string; otherwise the whole file is set aside (MVP-7616). */
+function hasValidOwners(data: unknown): boolean {
+  if (!isNamedEntryList(data)) return false;
+  return (data as { owner?: unknown }[]).every((entry) => entry.owner === undefined || (typeof entry.owner === "string" && entry.owner.length > 0));
+}
+
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */
 /* ------------------------------------------------------------------ */
@@ -11,6 +17,12 @@ export interface ToolDefinition {
   input_schema: Record<string, unknown>;
   webhook_url: string;
   timeout_ms?: number;
+  /**
+   * The API-key label that registered the tool (MVP-7679). Only the owner may change or delete it, a run is offered
+   * only its own label's tools, and only the owner's calls forward the caller's bearer. Entries registered before
+   * the update have none ("legacy") until they are registered again.
+   */
+  owner?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -26,7 +38,7 @@ const store = createPersistentStore({
   area: "tools",
   file: PERSIST_PATH,
   snapshot: () => Array.from(tools.values()),
-  isValid: isNamedEntryList,
+  isValid: hasValidOwners,
 });
 
 /* ------------------------------------------------------------------ */
@@ -52,6 +64,15 @@ export function loadTools(): void {
     tools.set(tool.name, tool);
   }
   log("tools", `Loaded ${tools.size} tool(s) from disk`);
+  const ownerless = countOwnerlessTools();
+  if (ownerless > 0) log("audit", `tools.legacy.ownerless count=${ownerless}`);
+}
+
+/** Registered tools without an owner (registered before the owner update). */
+export function countOwnerlessTools(): number {
+  let count = 0;
+  for (const tool of tools.values()) if (tool.owner === undefined) count++;
+  return count;
 }
 
 /** Debounced atomic save (src/persistence.ts). */

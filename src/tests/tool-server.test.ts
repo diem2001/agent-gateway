@@ -78,7 +78,7 @@ describe("createToolMcpServer", () => {
 
     const result = await weatherTool.handler({ city: "Berlin" }, { requestId: "req-2" });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toMatch(/Tool webhook failed/);
+    expect(result.content[0].text).toBe('TOOL_UNAVAILABLE: "weather" could not be reached or failed. Try again later; if it keeps happening, tell your gateway administrator.');
   });
 
   it("creates separate servers per call (context isolation)", async () => {

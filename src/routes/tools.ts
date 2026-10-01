@@ -11,6 +11,7 @@ import {
 const router = Router();
 
 const DEFAULT_TIMEOUT_MS = 30000;
+const OWNED_BY_OTHER_MESSAGE = "This tool was registered by another client and can only be changed or deleted by that client.";
 
 /* ------------------------------------------------------------------ */
 /*  PUT /v1/tools/:name — register or update                           */
@@ -37,12 +38,22 @@ router.put("/v1/tools/:name", (req: Request, res: Response) => {
     return;
   }
 
+  // The owner is always the authenticated label; an `owner` in the body is ignored. A legacy entry without an
+  // owner is claimed by the first label that registers it again.
+  const label = req.clientLabel ?? "";
+  const existing = getTool(name);
+  if (existing?.owner !== undefined && existing.owner !== label) {
+    res.status(403).json({ error: { code: "TOOL_OWNED_BY_OTHER_CLIENT", message: OWNED_BY_OTHER_MESSAGE } });
+    return;
+  }
+
   const def: ToolDefinition = {
     name,
     description: body.description,
     input_schema: body.input_schema,
     webhook_url: body.webhook_url,
     timeout_ms: typeof body.timeout_ms === "number" ? body.timeout_ms : DEFAULT_TIMEOUT_MS,
+    ...(label ? { owner: label } : {}),
   };
 
   const isNew = registerTool(def);
@@ -75,6 +86,11 @@ router.get("/v1/tools/:name", (req: Request, res: Response) => {
 /* ------------------------------------------------------------------ */
 
 router.delete("/v1/tools/:name", (req: Request, res: Response) => {
+  const existing = getTool(String(req.params.name));
+  if (existing?.owner !== undefined && existing.owner !== (req.clientLabel ?? "")) {
+    res.status(403).json({ error: { code: "TOOL_OWNED_BY_OTHER_CLIENT", message: OWNED_BY_OTHER_MESSAGE } });
+    return;
+  }
   const deleted = deleteTool(String(req.params.name));
   if (!deleted) {
     res.status(404).json({ error: "Tool not found" });

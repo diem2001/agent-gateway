@@ -4,6 +4,20 @@ import { buildToolInputShape } from "./tool-input-schema.js";
 import type { ToolDefinition } from "./tools.js";
 import type { WebhookContext, WebhookResponse } from "./webhook.js";
 import { executeWebhook } from "./webhook.js";
+import { mcpFailureResult } from "./tool-mediation.js";
+
+export interface ToolServerOptions {
+  /**
+   * The grant re-check of every call (MVP-7679): a name outside the grant is answered with TOOL_DENIED and never
+   * reaches the webhook, whatever the runtime's tool list or a message written to the control channel says.
+   */
+  isGranted?: (toolName: string) => boolean;
+  /** Known secret values masked out of a tool's own refusal message. */
+  secrets?: () => readonly string[];
+}
+
+/** The bearer a tool's webhook receives: one value for every tool, or a decision per tool (owner-bound forwarding). */
+export type WebhookAuth = string | undefined | ((tool: ToolDefinition) => string | undefined);
 
 /* ------------------------------------------------------------------ */
 /*  Factory                                                             */
@@ -22,7 +36,8 @@ import { executeWebhook } from "./webhook.js";
 export function createToolMcpServer(
   tools: ToolDefinition[],
   context: WebhookContext,
-  authToken?: string,
+  authToken?: WebhookAuth,
+  options: ToolServerOptions = {},
 ): McpSdkServerConfigWithInstance {
   const sdkTools = tools.map((toolDef) => {
     const inputSchema = buildToolInputShape(toolDef.name, toolDef.input_schema);
@@ -34,7 +49,11 @@ export function createToolMcpServer(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       handler: async (args: Record<string, unknown>, extra: any) => {
         const toolUseId = String(extra?.requestId ?? "mcp-call");
-        const result = await executeWebhook(toolDef, toolUseId, toolDef.name, args, context, authToken);
+        if (options.isGranted && !options.isGranted(toolDef.name)) {
+          return mcpFailureResult({ kind: "denied" });
+        }
+        const bearer = typeof authToken === "function" ? authToken(toolDef) : authToken;
+        const result = await executeWebhook(toolDef, toolUseId, toolDef.name, args, context, bearer, options.secrets?.() ?? []);
 
         if ("isError" in result && result.isError) {
           return {
