@@ -56,6 +56,8 @@ async function testHttpMcpServer(
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
       },
+      // Never follow a redirect: the credential must not leave the registered origin (MVP-7679).
+      redirect: "manual",
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: "agent-gateway-mcp-test",
@@ -72,6 +74,9 @@ async function testHttpMcpServer(
     throw new McpTestError("MCP_NETWORK_ERROR", typedError.message || "MCP transport failure");
   }
 
+  if (response.status >= 300 && response.status < 400) {
+    throw new McpTestError("MCP_NETWORK_ERROR", "upstream answered with a redirect, which the gateway does not follow");
+  }
   if (response.status === 401 || response.status === 403) {
     throw new McpTestError("MCP_AUTH_FAILED", `upstream returned ${response.status}`);
   }
