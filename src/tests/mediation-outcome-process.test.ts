@@ -479,7 +479,8 @@ describe("Outcome Probe: authorized integrations work behind the boundary and no
     const before = { feed: f.feed.requests.length, jira: f.jira.requests.length };
     f.scripts.push({ name: "Bash", prompt: "OUTCOME-RETRY", input: { command: retryScript, description: "retry" } });
     await ask(f, { prompt: "OUTCOME-RETRY", sessionId: "outcome", useSession: true, user_id: "user-1", allowedTools: ["Bash"] });
-    expect(resultsFor(f, "OUTCOME-RETRY")[0]?.text.trim()).toBe("404");
+    // The resumed conversation repeats the earlier turn's tool results: the retry's own result is the last one.
+    expect(resultsFor(f, "OUTCOME-RETRY").at(-1)?.text.trim()).toBe("404");
     expect(f.feed.requests.length).toBe(before.feed);
     expect(f.jira.requests.length).toBe(before.jira);
 

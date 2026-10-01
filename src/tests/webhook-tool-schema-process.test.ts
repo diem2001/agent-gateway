@@ -538,10 +538,10 @@ describe("webhook tool schemas at the real model boundary (spawned gateway + rea
       expect.soft(api.stepResults()[4]?.isError).toBe(false);
     });
 
-    it("a webhook error is relayed to the model as today", () => {
+    it("a webhook error is relayed to the model: the tool's own 4xx message, wrapped with the status (MVP-7679)", () => {
       const result = api.stepResults()[5];
       expect.soft(result?.isError).toBe(true);
-      expect.soft(result?.text).toBe(`Tool webhook returned error: 422 ${WEBHOOK_ERROR_BODY}`);
+      expect.soft(result?.text).toBe(`The tool rejected the request (HTTP 422): ${WEBHOOK_ERROR_BODY}`);
       expect.soft(webhook.requests.filter((r) => r.path === WEBHOOK_ERROR_PATH).map((r) => r.body)).toEqual([{ pageId: "p" }]);
     });
   });

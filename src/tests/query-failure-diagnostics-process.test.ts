@@ -151,7 +151,12 @@ async function readSessions(gw: SpawnedGateway): Promise<Record<string, { sessio
   // The session store saves 100 ms after a change.
   await new Promise((resolve) => setTimeout(resolve, 300));
   const file = path.join(gw.dirs.persist, "sessions.json");
-  return (JSON.parse(fs.readFileSync(file, "utf8")) as { sessions: Record<string, { sessionId: string; sdkSessionId?: string }> }).sessions;
+  // Since MVP-7679 conversations are stored below their API-key label; the rows here use one label.
+  const saved = JSON.parse(fs.readFileSync(file, "utf8")) as {
+    sessions?: Record<string, { sessionId: string; sdkSessionId?: string }>;
+    sessionsByLabel?: Record<string, Record<string, { sessionId: string; sdkSessionId?: string }>>;
+  };
+  return Object.assign({}, saved.sessions ?? {}, ...Object.values(saved.sessionsByLabel ?? {}));
 }
 
 interface FailureRow {
