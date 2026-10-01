@@ -337,11 +337,14 @@ async function main() {
   const committedProfile = JSON.parse(fs.readFileSync(seccompEntry.slice("seccomp=".length), "utf8"));
   const appliedSeccomp = inspect.HostConfig.SecurityOpt.find((o) => o.startsWith("seccomp="));
   const seccompSame = !!appliedSeccomp && JSON.stringify(JSON.parse(appliedSeccomp.slice("seccomp=".length))) === JSON.stringify(committedProfile);
-  const otherOpts = (list) => list.filter((o) => !o.startsWith("seccomp=")).sort();
-  const optsSame = JSON.stringify(otherOpts(inspect.HostConfig.SecurityOpt)) === JSON.stringify(otherOpts(compose.securityOpt));
+  // Docker stores `systempaths=unconfined` as empty masked and read-only path lists, not as a security option.
+  const otherOpts = (list) => list.filter((o) => !o.startsWith("seccomp=") && o !== "systempaths=unconfined").sort();
+  const systempathsUnconfined = compose.securityOpt.includes("systempaths=unconfined") ? (inspect.HostConfig.MaskedPaths ?? []).length === 0 && (inspect.HostConfig.ReadonlyPaths ?? []).length === 0 : true;
+  const optsSame = JSON.stringify(otherOpts(inspect.HostConfig.SecurityOpt)) === JSON.stringify(otherOpts(compose.securityOpt)) && systempathsUnconfined;
   row("docker inspect: the committed security options, caps dropped, not privileged, pids limit, user", seccompSame && optsSame && JSON.stringify(inspect.HostConfig.CapDrop) === JSON.stringify(compose.capDrop) && inspect.HostConfig.Privileged === false && String(inspect.HostConfig.PidsLimit) === compose.pidsLimit && inspect.Config.User === compose.user, {
     seccompProfileEqualsCommittedFile: seccompSame,
     otherSecurityOpt: otherOpts(inspect.HostConfig.SecurityOpt),
+    systempathsUnconfined,
     capDrop: inspect.HostConfig.CapDrop,
     privileged: inspect.HostConfig.Privileged,
     pidsLimit: inspect.HostConfig.PidsLimit,
