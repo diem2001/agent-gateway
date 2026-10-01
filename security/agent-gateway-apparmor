@@ -17,7 +17,7 @@ profile agent-gateway-isolation flags=(attach_disconnected,mediate_deleted) {
   userns,
 
   signal (receive) peer=unconfined,
-  signal (send,receive) peer=mvp7678-agent-gateway,
+  signal (send,receive) peer=agent-gateway-isolation,
 
   deny @{PROC}/* w,
   # docker-default denies writes below every /proc entry that is not a pid
@@ -41,5 +41,5 @@ profile agent-gateway-isolation flags=(attach_disconnected,mediate_deleted) {
   deny /sys/devices/virtual/powercap/** rwklx,
   deny /sys/kernel/security/** rwklx,
 
-  ptrace (trace,read,tracedby,readby) peer=mvp7678-agent-gateway,
+  ptrace (trace,read,tracedby,readby) peer=agent-gateway-isolation,
 }

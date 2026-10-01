@@ -14,6 +14,10 @@
  *             the conversation resumes and reads it;
  *   sandbox   from inside a run: process 1 is bwrap, a nested user namespace is refused, `CapEff` 0,
  *             no trusted file, key, clone token or Docker socket, no host path on any command line;
+ *   control   under the same profile, a cancelled run (the client closes its connection), `docker stop`
+ *             during a run and a SIGKILL of the gateway process each end every sandbox process, free the
+ *             conversation (cancel) and finish within the stop bound (a profile whose signal rules do not
+ *             name the profile itself would deny these signals);
  *   closed    a second container with Docker's default profile reports `isolation: unavailable`,
  *             fails the compose health command, and answers a query with the permanent text and
  *             0 provider requests.
@@ -22,6 +26,10 @@
  * containers, image tag and temp directories it created.
  *
  * Usage: npm run probe:docker-isolation [-- --evidence <file>]   (run as uid 1000, with `sudo -n docker`)
+ *
+ * Set PROBE_APPARMOR_PROFILE=<name> to run under an AppArmor profile that is already loaded on the host
+ * instead of the compose default (`unconfined`); the probe then also checks that the gateway process
+ * runs in that profile. It never loads or removes a host profile itself.
  */
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -48,6 +56,9 @@ const MARKERS = {
   sshKey: `SYNTH-SSH-KEY-${randomBytes(12).toString("hex")}`,
   cloneToken: `SYNTH-CLONE-TOKEN-${randomBytes(12).toString("hex")}`,
 };
+
+const APPARMOR_PROFILE = process.env.PROBE_APPARMOR_PROFILE || null;
+const withProfile = (opts) => (APPARMOR_PROFILE ? opts.map((o) => (o.startsWith("apparmor=") ? `apparmor=${APPARMOR_PROFILE}` : o)) : opts);
 
 const evidenceArg = process.argv.indexOf("--evidence");
 const EVIDENCE = evidenceArg > 0 ? path.resolve(process.argv[evidenceArg + 1]) : path.join(os.tmpdir(), `${PREFIX}evidence-${RAND}.json`);
@@ -235,6 +246,37 @@ async function scriptedApi() {
 const bash = (script) => `[[BASH:${Buffer.from(script).toString("base64")}]]`;
 const readTool = (file) => `[[READ:${Buffer.from(file).toString("base64")}]]`;
 
+
+/** Opens a streaming query and keeps the connection; `abort()` closes it the way a disconnecting client does. */
+function holdQuery(port, body) {
+  const payload = Buffer.from(JSON.stringify({ model: "claude-sonnet-4-5", useSession: true, ...body }));
+  const req = http.request({ host: "127.0.0.1", port, method: "POST", path: "/v1/query", agent: false, headers: { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json", "Content-Length": payload.length } }, (res) => res.resume());
+  req.on("error", () => {});
+  req.end(payload);
+  return { abort: () => req.destroy() };
+}
+
+/** Number of processes in the container whose command line holds the marker (the bracket keeps pgrep's own shell out). */
+async function sleeperCount(id, tag) {
+  const out = await docker("exec", id, "sh", "-c", `pgrep -fc '[s]leep ${tag}' || true`);
+  return Number(out.trim() || "0");
+}
+
+async function waitFor(check, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await check()) return true;
+    await delay(100);
+  }
+  return check();
+}
+
+async function holdRun(port, id, sessionId, tag) {
+  const held = holdQuery(port, { queryId: `q-${sessionId}`, sessionId, prompt: `PROBE-HOLD ${bash(`sleep ${tag} & sleep ${tag} & wait`)}`, user_id: "user-1" });
+  const running = await waitFor(async () => (await sleeperCount(id, tag)) >= 2, 30_000);
+  return { held, running };
+}
+
 /* ------------------------------------------------------------------ */
 /*  Fixture                                                             */
 /* ------------------------------------------------------------------ */
@@ -314,6 +356,8 @@ async function main() {
   evidence.commit = await run("git", ["-C", REPO_ROOT, "rev-parse", "HEAD"]);
   evidence.dirty = (await run("git", ["-C", REPO_ROOT, "status", "--porcelain", "--untracked-files=no"])) !== "";
   const compose = readComposeSecurity(REPO_ROOT);
+  compose.securityOpt = withProfile(compose.securityOpt);
+  evidence.apparmorProfile = APPARMOR_PROFILE ?? "compose default";
   evidence.compose = { user: compose.user, capDrop: compose.capDrop, securityOpt: compose.securityOpt.map((o) => o.replace(REPO_ROOT, "<repo>")), pidsLimit: compose.pidsLimit };
   evidence.dockerVersion = await docker("version", "--format", "{{.Server.Version}}");
 
@@ -324,7 +368,7 @@ async function main() {
   const api = await scriptedApi();
   const port = await freePort();
   const name = `${PREFIX}${RAND}`;
-  const { id } = await startContainer(name, port, api.url, composeRunArgs(REPO_ROOT));
+  const { id } = await startContainer(name, port, api.url, withProfile(composeRunArgs(REPO_ROOT)));
   const h = await waitHealth(port, "ok");
   row("gateway reports isolation ok under the committed profile", h.isolation === "ok", { isolation: h.isolation });
   evidence.bwrap = await docker("exec", id, "bwrap", "--version");
@@ -425,6 +469,37 @@ async function main() {
   const requestsBefore = api.messageRequests();
   const other = await query(port, { queryId: "q-other", sessionId: "conv-docker", prompt: `PROBE-OTHER ${bash("echo should-not-run")}`, user_id: "someone-else" });
   row("another user id is refused with the fixed text and no provider request", other.length === 1 && other[0].type === "error" && other[0].content === "This conversation cannot be continued from your account. Please start a new conversation." && api.messageRequests() === requestsBefore, { events: other.length, providerRequests: api.messageRequests() - requestsBefore });
+
+  // Process control under the same profile: cancel, container stop and a SIGKILL of the gateway.
+  if (APPARMOR_PROFILE) {
+    const attr = await docker("exec", id, "cat", `/proc/${gatewayPid}/attr/current`).catch((e) => e.message);
+    row("the gateway process runs in the selected AppArmor profile", attr.startsWith(`${APPARMOR_PROFILE} (enforce)`), { attr });
+  }
+  const cancelTag = `76781.${parseInt(RAND, 16)}`;
+  const cancelRun = await holdRun(port, id, "conv-cancel", cancelTag);
+  cancelRun.held.abort();
+  const cancelled = await waitFor(async () => (await sleeperCount(id, cancelTag)) === 0, 15_000);
+  const afterCancel = await query(port, { queryId: "q-after-cancel", sessionId: "conv-cancel", prompt: `PROBE-AFTER ${bash("echo after-cancel")}`, user_id: "user-1" });
+  row("a cancelled run ends every sandbox process and frees the conversation", cancelRun.running && cancelled && afterCancel.at(-1)?.type === "done", { sandboxStarted: cancelRun.running, processesGone: cancelled, nextQuery: afterCancel.at(-1)?.type });
+
+  const stopTag = `76782.${parseInt(RAND, 16)}`;
+  const stopRun = await holdRun(port, id, "conv-stop", stopTag);
+  const stopStarted = Date.now();
+  const stopExit = await docker("stop", "-t", "10", id).then(() => "0", (e) => String(e.message).slice(0, 120));
+  const stopMs = Date.now() - stopStarted;
+  const stopState = JSON.parse(await docker("inspect", id))[0].State;
+  row("docker stop during a run ends the container within the stop bound with exit code 0", stopRun.running && stopExit === "0" && stopState.ExitCode === 0 && stopMs < 9000, { sandboxStarted: stopRun.running, stopMs, exitCode: stopState.ExitCode });
+  stopRun.held.abort();
+
+  await docker("start", id);
+  await waitHealth(port, "ok");
+  const killTag = `76783.${parseInt(RAND, 16)}`;
+  const killRun = await holdRun(port, id, "conv-kill", killTag);
+  const killPid = (await docker("exec", id, "sh", "-c", "pgrep -f 'node --expose-gc /app/dist/server.js' | head -1")).trim();
+  await docker("exec", id, "sh", "-c", `kill -KILL ${killPid}`).catch(() => {});
+  const killed = await waitFor(async () => (await docker("inspect", "-f", "{{.State.Running}}", id)) === "false", 15_000);
+  row("a SIGKILL of the gateway process ends the container and every sandbox process", killRun.running && killed, { sandboxStarted: killRun.running, containerStopped: killed });
+  killRun.held.abort();
 
   // Fail closed: Docker's default profile (same image, same user, no seccomp/AppArmor/systempaths change).
   const closedPort = await freePort();
