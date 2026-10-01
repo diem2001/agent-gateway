@@ -131,8 +131,19 @@ function lastResults(api: FakeAnthropicApi, prompt: string): string[] {
 }
 
 function conversationHomes(gateway: SpawnedGateway, onlyFor: string[]): string[] {
-  const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as { sessions: Record<string, { sandboxDirId?: string }> };
-  return onlyFor.flatMap((id) => (saved.sessions[id]?.sandboxDirId ? [path.join(gateway.dirs.home, ".agent-sandbox", "sessions", saved.sessions[id].sandboxDirId!, "home")] : []));
+  // Since MVP-7679 a conversation is stored below its API-key label.
+  const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as {
+    sessions?: Record<string, { sandboxDirId?: string }>;
+    sessionsByLabel?: Record<string, Record<string, { sandboxDirId?: string }>>;
+  };
+  const entryFor = (id: string): { sandboxDirId?: string } | undefined => {
+    for (const entries of Object.values(saved.sessionsByLabel ?? {})) if (entries[id]) return entries[id];
+    return saved.sessions?.[id];
+  };
+  return onlyFor.flatMap((id) => {
+    const dirId = entryFor(id)?.sandboxDirId;
+    return dirId ? [path.join(gateway.dirs.home, ".agent-sandbox", "sessions", dirId, "home")] : [];
+  });
 }
 
 function homeText(home: string): string {
@@ -400,7 +411,8 @@ describe("the fail-closed rows end with the exact text within their deadline and
     f.scripts.push(bash("OUTCOME-LONG", "sleep 6; echo LONG-DONE"));
     const first = await queryAs(f.gateway.port, KEY_ALPHA, { queryId: "q-own", sessionId: "conv-own", prompt: PROMPTS.turn1, user_id: "user-1", useSession: true });
     expect(first.at(-1)?.type).toBe("done");
-    await ends(f, { queryId: "q-steal", sessionId: "conv-own", prompt: PROMPTS.turn2, user_id: "user-1" }, KEY_BETA, FIXED_TEXTS.otherOwner, 2000);
+    // Another user of the same API-key label is refused; another label does not see the conversation at all (MVP-7679).
+    await ends(f, { queryId: "q-steal", sessionId: "conv-own", prompt: PROMPTS.turn2, user_id: "user-2" }, KEY_ALPHA, FIXED_TEXTS.otherOwner, 2000);
     await ends(f, { queryId: "q-legacy", sessionId: "legacy-conv", prompt: PROMPTS.turn2, user_id: "user-1" }, KEY_ALPHA, FIXED_TEXTS.legacy, 2000);
     const long = queryAs(f.gateway.port, KEY_ALPHA, { queryId: "q-long", sessionId: "conv-long", prompt: "OUTCOME-LONG", user_id: "user-1", useSession: true });
     const end = Date.now() + 30_000;

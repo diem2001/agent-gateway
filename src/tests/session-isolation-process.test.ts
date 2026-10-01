@@ -125,6 +125,13 @@ function savedEntry(gateway: SpawnedGateway, clientId: string): { sandboxDirId?:
   return saved.sessions?.[clientId];
 }
 
+/** The home of the conversation `clientId` of API-key label `label` (the label's own entry). */
+function savedEntryFor(gateway: SpawnedGateway, label: string, clientId: string): string | undefined {
+  const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as { sessionsByLabel?: Record<string, Record<string, { sandboxDirId?: string }>> };
+  const id = saved.sessionsByLabel?.[label]?.[clientId]?.sandboxDirId;
+  return id ? path.join(gateway.dirs.home, ".agent-sandbox", "sessions", id, "home") : undefined;
+}
+
 function sessionHome(gateway: SpawnedGateway, clientId: string): string {
   const id = savedEntry(gateway, clientId)?.sandboxDirId;
   if (!id) throw new Error(`no sandbox home recorded for ${clientId}`);
@@ -263,10 +270,11 @@ describe("conversations of different owners that run at the same time", () => {
     expect(grepTree(homeA, SECRET_A).length).toBeGreaterThan(0);
     expect(grepTree(homeB, SECRET_B).length).toBeGreaterThan(0);
 
-    // Neither owner can continue the other's conversation, nor list or delete it.
+    // Neither owner can continue the other's conversation, nor list or delete it. Another API-key label does not see
+    // the conversation at all (MVP-7679): it is not refused, it gets its own new conversation under the same id.
     const before = r.api.requests.length;
-    const stolen = await queryAs(r.gateway.port, KEY_BETA, { queryId: "q-steal", sessionId: "conv-A", prompt: "PROBE-A", user_id: "user-b" });
-    expect(stolen.events).toEqual([{ seq: 0, type: "error", content: "This conversation cannot be continued from your account. Please start a new conversation." }]);
+    const sameLabelOtherUser0 = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-steal0", sessionId: "conv-A", prompt: "PROBE-A", user_id: "user-b" });
+    expect(sameLabelOtherUser0.events).toEqual([{ seq: 0, type: "error", content: "This conversation cannot be continued from your account. Please start a new conversation." }]);
     const sameLabelOtherUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-steal2", sessionId: "conv-A", prompt: "PROBE-A", user_id: "user-other" });
     expect(sameLabelOtherUser.events[0]?.content).toBe("This conversation cannot be continued from your account. Please start a new conversation.");
     const noUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-steal3", sessionId: "conv-A", prompt: "PROBE-A" });
@@ -276,6 +284,13 @@ describe("conversations of different owners that run at the same time", () => {
     expect((listBeta.json?.sessions as { id: string }[]).map((s) => s.id)).toEqual(["conv-B"]);
     expect((await getAs(r.gateway.port, KEY_BETA, "DELETE", "/v1/sessions/conv-A")).status).toBe(404);
     expect((await getAs(r.gateway.port, KEY_ALPHA, "GET", "/v1/sessions")).json?.count).toBe(1);
+    // Beta using alpha's id gets its OWN conversation: a different home with none of alpha's files.
+    const betaSameId = await queryAs(r.gateway.port, KEY_BETA, { queryId: "q-beta-same", sessionId: "conv-A", prompt: "PROBE-B", user_id: "user-b" });
+    expect(betaSameId.events.at(-1)?.type, JSON.stringify(betaSameId.events.at(-1))).toBe("done");
+    const homeOfBetaA = savedEntryFor(r.gateway, "beta", "conv-A");
+    expect(homeOfBetaA).toBeDefined();
+    expect(homeOfBetaA).not.toBe(homeA);
+    expect(fs.existsSync(path.join(homeOfBetaA!, "a.txt"))).toBe(false);
   });
 });
 
@@ -310,8 +325,8 @@ describe("a conversation created after the update", () => {
     expect(result?.text).toContain("PERSISTED=SYNTH-PERSIST-7678");
     expect(result?.text).toContain("CREDS=0");
     expect(result?.text).toContain("CREDS_ANYWHERE=0");
-    // Still the same owner, still refused for anyone else.
-    const other = await queryAs(restarted.port, KEY_BETA, { queryId: "q-3", sessionId: "keep", prompt: "PROBE-TURN2", user_id: "user-1" });
+    // Still the same owner, still refused for any other user of the label (another label has its own conversations).
+    const other = await queryAs(restarted.port, KEY_ALPHA, { queryId: "q-3", sessionId: "keep", prompt: "PROBE-TURN2", user_id: "user-2" });
     expect(other.events[0]?.content).toBe("This conversation cannot be continued from your account. Please start a new conversation.");
     // The home is the same directory before and after.
     expect(sessionHome(restarted, "keep")).toBe(home);

@@ -40,6 +40,11 @@ services:
       - ISOLATION_STARTUP_TIMEOUT_MS=${ISOLATION_STARTUP_TIMEOUT_MS:-10000}
       - AGENT_RUN_TIMEOUT_MS=${AGENT_RUN_TIMEOUT_MS:-7200000}
       - MODEL_PROXY_IDLE_TIMEOUT_MS=${MODEL_PROXY_IDLE_TIMEOUT_MS:-600000}
+      # Tool grant per API-key label (JSON, see README "Tool mediation"); empty = no restriction. A label named here
+      # must exist in API_KEYS, otherwise the gateway stops at startup (and restarts in a loop): change both together.
+      - AGENT_TOOL_POLICY=${AGENT_TOOL_POLICY:-}
+      # Overall deadline of one mediated MCP tools/call in an agent run, in ms; empty = 600000.
+      - AGENT_MCP_TOOL_TIMEOUT_MS=${AGENT_MCP_TOOL_TIMEOUT_MS:-}
     # Healthy only while agent runs can be isolated: /health must report "isolation":"ok".
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3001/health | grep -q '\"isolation\":\"ok\"'"]

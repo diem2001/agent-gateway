@@ -12,6 +12,7 @@
  *
  * Needs `npm run build`, `bwrap` and user namespaces. Linux only. Every secret is synthetic.
  */
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -29,6 +30,7 @@ afterEach(async () => {
 const REGISTRY_ENV = "SYNTH-STDIO-REGISTRY-ENV-7679";
 const USER_ENV = "SYNTH-STDIO-USER-ENV-7679";
 const ARGS_MARKER = "SYNTH-STDIO-ARGS-7679";
+const sha = (value: string): string => createHash("sha256").update(value).digest("hex");
 /** Assembled at run time so this file's own command line and scans never contain the needle. */
 const SERVER_NEEDLE = ["STDIO-SERVER", "7679"].join("-");
 
@@ -47,9 +49,11 @@ rl.on('line', (line) => {
     { name: 'echo', description: 'echo', inputSchema: { type: 'object', properties: {} } },
     { name: 'hang', description: 'hang', inputSchema: { type: 'object', properties: {} } } ] } });
   else if (m.method === 'tools/call' && m.params.name === 'echo') {
+    // Values are reported as hashes: the answer travels to the model, and no marker may.
+    const sha = (v) => require('node:crypto').createHash('sha256').update(String(v)).digest('hex');
     const view = {
-      token: process.env.SERVER_TOKEN,
-      args: process.argv.slice(1),
+      tokenSha: sha(process.env.SERVER_TOKEN),
+      argShas: process.argv.slice(1).map(sha),
       envKeys: Object.keys(process.env).filter((k) => !['PWD', 'SHLVL', '_', 'OLDPWD'].includes(k)).sort(),
       homeEntries: fs.readdirSync(home).sort(),
       tmpEntries: fs.readdirSync('/tmp').sort(),
@@ -169,9 +173,9 @@ describe("a registered stdio server in its own tool sandbox (real runtime, real 
 
     // The server's own view: the user's override replaced the registry value; the base environment plus its env only;
     // a private home and /tmp; it cannot see the agent's canaries; the args it was given are its own.
-    const view = JSON.parse(results[1].text) as { token: string; args: string[]; envKeys: string[]; homeEntries: string[]; tmpEntries: string[]; sawAgentCanary: boolean; uid: number };
-    expect(view.token).toBe(USER_ENV);
-    expect(view.args).toEqual([ARGS_MARKER]);
+    const view = JSON.parse(results[1].text) as { tokenSha: string; argShas: string[]; envKeys: string[]; homeEntries: string[]; tmpEntries: string[]; sawAgentCanary: boolean; uid: number };
+    expect(view.tokenSha).toBe(sha(USER_ENV));
+    expect(view.argShas).toEqual([sha(ARGS_MARKER)]);
     expect(view.envKeys).toEqual(["HOME", "LANG", "PATH", "SERVER_TOKEN", "TERM", "TMPDIR", "USER"]);
     expect(view.homeEntries).toEqual(["server-home-file-7679"]);
     expect(view.tmpEntries).toEqual([]);
@@ -202,8 +206,8 @@ describe("a registered stdio server in its own tool sandbox (real runtime, real 
     expect(res.status).toBe(200);
     const offered = r.api.requests.find((q) => q.userTexts.at(-1)?.includes("S2-RUN") && !q.warmup)?.tools ?? [];
     expect(offered).toEqual(expect.arrayContaining(["mcp__local__echo", "mcp__local__hang"]));
-    const view = JSON.parse(resultFor(r, "S2-RUN")!.text) as { token: string };
-    expect(view.token).toBe(REGISTRY_ENV);
+    const view = JSON.parse(resultFor(r, "S2-RUN")!.text) as { tokenSha: string };
+    expect(view.tokenSha).toBe(sha(REGISTRY_ENV));
   });
 
   it("a tool outside the caller's grant is TOOL_DENIED and never reaches the server", async () => {

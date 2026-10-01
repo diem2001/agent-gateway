@@ -324,10 +324,11 @@ describe("a process in the sandbox that finds the relay URL (real runtime)", () 
     for (const q of feed.requests.filter((x) => x.method === "POST")) expect(() => JSON.parse(q.body)).not.toThrow();
 
     // A later run (a new sandbox, a new relay token): the URL saved by the earlier run no longer works.
-    const requestsBefore = feed.requests.length;
+    // (The new run attaches the server itself, so it contacts it for the handshake; the saved URL adds no tool call.)
+    const callsBefore = feed.toolCalls.length;
     await ask(r, { prompt: "A2-RETRY", ...grantBody });
     expect(resultFor(r, "A2-RETRY")?.text.trim()).toBe("404");
-    expect(feed.requests.length).toBe(requestsBefore);
+    expect(feed.toolCalls.length).toBe(callsBefore);
     expect(r.gateway.child.exitCode).toBeNull();
   });
 });

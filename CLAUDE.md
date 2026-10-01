@@ -40,6 +40,8 @@ npm run probe:docker-stop       # Docker Outcome Probe for the clean stop (same 
 | `MCP_UPLOAD_IDLE_TIMEOUT_MS` | No | `60000` | No-progress timeout for one relayed upload (`POST /v1/mcp-servers/:name/uploads/*`), in ms; 504 `UPLOAD_TIMEOUT` on expiry, no overall deadline |
 | `ISOLATION_STARTUP_TIMEOUT_MS` | No | `10000` | A sandbox must pass its start check within this many ms, otherwise it is killed and the run fails with the transient isolation text; an invalid value (non-numeric, 0, negative) stops startup |
 | `AGENT_RUN_TIMEOUT_MS` | No | `7200000` | Deadline of one query request, retries and backoff included; expiry ends the run with the deadline text and saves nothing; an invalid value stops startup |
+| `AGENT_MCP_TOOL_TIMEOUT_MS` | No | `600000` | Overall deadline of one mediated MCP `tools/call` in an agent run (http, SSE, stdio), in ms; empty = default; an invalid value stops startup (`FATAL config key=AGENT_MCP_TOOL_TIMEOUT_MS reason=must be a positive whole number of milliseconds`). The relay's 120 s no-progress timeout stays |
+| `AGENT_TOOL_POLICY` | No | unset | Tool grant per API-key label, JSON `{"default":{allow?,deny?},"labels":{"<label>":{allow?,deny?}}}` of built-in names, `mcp__<server>__*` and `mcp__<server>__<tool>`; empty/unset = no restriction; an invalid value or a label not in `API_KEYS` stops startup (`FATAL config key=AGENT_TOOL_POLICY reason=<reason>`) |
 | `AGENT_SANDBOX_ROOT` | No | `$HOME/.agent-sandbox` | Trusted storage of the sandbox homes (never mounted as a whole); must be an absolute path to a private directory without symlinks, else every run fails closed |
 | `AGENT_SANDBOX_BWRAP` | No | `/usr/bin/bwrap` | Path of the isolation runtime; must be an absolute path |
 | `MODEL_PROXY_IDLE_TIMEOUT_MS` | No | `600000` | No-progress timeout per proxied provider request (trusted model proxy); an invalid value (non-numeric, 0, negative) stops startup |
@@ -52,7 +54,7 @@ npm run probe:docker-stop       # Docker Outcome Probe for the clean stop (same 
 API_KEYS=label1:secret1,label2:secret2
 ```
 
-Keys are sent as `Authorization: Bearer <secret>`. The label is used for audit logging.
+Keys are sent as `Authorization: Bearer <secret>`. The label is used for audit logging and scopes sessions, the event cache and registered tools. A label named in `AGENT_TOOL_POLICY` must stay in `API_KEYS`: removing or renaming it alone stops the gateway at startup (and the restart policy keeps restarting it), so change both settings together.
 
 ## Docker
 
@@ -91,6 +93,14 @@ Every agent run executes in a bubblewrap sandbox (`src/sandbox.ts`, `src/sandbox
 - **Trusted files never enter a sandbox**: `.credentials.json`, state files, `~/.ssh`, other homes. New trusted state needs a test row that proves it is absent from a real sandbox (with a control that proves the probe works) and a synthetic marker, never a real secret.
 - Real-process tests that start sandboxes and runtimes run through the workflow kit's `scripts/run-verification.mjs`; clean up only your own temp directories and containers.
 
+## Tool Mediation Rules (MVP-7679)
+
+- **Never put a credential (header, env, args, override) into the runtime's MCP configuration.** The runtime gets only `{ "type": "http", "url": "http://127.0.0.1:<port>/mcp/<token>" }`; no registry `args`/`env`, override or request `env` value and no header may reach its command line.
+- **Every credential-bearing MCP server (http, SSE, stdio) goes through a relay binding** (token, upstream or bridge, merged credentials, grant). Stdio servers with env run in their own tool sandbox. If the relay is not listening the server is left out of the run, never connected directly.
+- **The grant check runs before any upstream request.** Effective grant = `AGENT_TOOL_POLICY` for the caller's label intersected with the caller's narrowing; a caller can only narrow. `allowedToolsPattern` is not part of the grant.
+- **The agent can write its own home**, so every file the runtime reads from it as configuration must be inert: `settingSources` is `["user"]` (enforced runs `[]`), `~/.claude.json` is rewritten and its backups deleted before every sandbox start. Each such file needs a regression row with the real runtime.
+- **A webhook, relay or bridge failure maps to a fixed `TOOL_*` text** (`tool-mediation.ts`), never an upstream body, header, URL or secret. No redirect is followed anywhere.
+
 ## Project Structure
 
 ```
@@ -99,23 +109,28 @@ src/
   auth.ts            # API key middleware (Bearer token)
   query.ts           # POST /v1/query, GET /v1/query/:queryId/events
   agent.ts           # Claude Agent SDK wrapper, event emission, MCP server injection
-  sessions.ts        # Session CRUD, persistence, idle cleanup, SDK session ID sync; owner (API-key label + user_id or null) and random sandboxDirId per conversation, admitSession (exact owner, legacy refused), caller-scoped list/delete
+  sessions.ts        # Session CRUD, persistence, idle cleanup, SDK session ID sync; conversations keyed by (API-key label, sessionId) in the additive sessionsByLabel map; owner (label + user_id or null) and random sandboxDirId per conversation, admitSession (exact owner, ownerless legacy refused), caller-scoped list/delete
   retry.ts           # Exponential backoff retry (transient failures, empty responses); resumes only established sessions
   run-failure.ts     # Classifies a failed run (runtime stdout diagnostic, thrown error) into a safe public error message + safe log fields
-  event-cache.ts     # In-memory NDJSON event cache with TTL
+  event-cache.ts     # In-memory NDJSON event cache with TTL, keyed by (API-key label, queryId)
   workspace.ts       # File CRUD for memory/agents/skills directories
   logging.ts         # Runtime-adjustable log levels
-  tools.ts           # Tool registry CRUD + persistence (TOOLS_PERSIST_PATH)
-  webhook.ts         # Webhook executor (POST to tool webhook_url with context)
+  tools.ts           # Tool registry CRUD + persistence (TOOLS_PERSIST_PATH); owner per tool, legacy ownerless count at startup
+  webhook.ts         # Webhook executor (POST to tool webhook_url with context; no redirects, 8 MiB cap, fixed TOOL_* failure texts)
   tool-server.ts     # MCP server factory (wraps registered tools for Agent SDK)
+  tool-grant.ts      # AGENT_TOOL_POLICY parsing (FATAL lines), effective grant = policy(label) intersected with enforcedTools/allowedTools, built-in lists for the runtime
+  tool-mediation.ts  # Internal ToolRequest/ToolReply contract, the five TOOL_* codes with fixed texts, webhook rejection text, secret masking, AGENT_MCP_TOOL_TIMEOUT_MS
   tool-policy.ts     # enforcedTools: request validation, built-in/server selection, deny-only PreToolUse hook (per-run enforced tool set)
   tool-input-schema.ts # Webhook tool input_schema -> typed, described SDK shape; per-property "any value" fallback, per-tool untyped fallback
   mcp-registry.ts    # External MCP server registry CRUD + persistence (MCP_SERVERS_PERSIST_PATH)
   mcp-upload-relay.ts # Streaming upload relay: raw-path rule, parser skip, pre-auth guard, X-MCP-Credential-Headers, relay core
-  mcp-credential-relay.ts # Loopback relay for registered http MCP servers: per-run token, header allowlists, refusal answers (no OAuth login in the runtime)
+  mcp-credential-relay.ts # Loopback relay for every registered MCP server (http, SSE, stdio) and request servers with headers/env: per-run token and binding, grant check, message rules, buffered and validated answers, fixed TOOL_* failures (no OAuth login in the runtime)
+  mcp-bridge.ts      # SSE bridge of the relay (endpoint event only on the registered origin, local answers to server requests)
+  mcp-stdio-sandbox.ts # Stdio MCP servers in their own tool sandbox (bwrap, own namespaces, private home, env allowlist + server env) with a line-based bridge
+  mcp-request-servers.ts # Request mcpServers validation and normalization (name rule, command xor url, MCP_SERVER_NAME_CONFLICT)
   sdk-run-logs.ts    # Per-run directory for the Claude runtime's log files, deleted after the child exits; startup sweep; DEBUG_CLAUDE_AGENT_SDK strip
   sandbox.ts         # Per-run bubblewrap sandbox: config keys, exact bwrap argv, env allowlist, launch wrapper (nested-userns check), fail-closed IsolationFailure, /health isolation state, boot self-check
-  sandbox-content.ts # What a sandbox may see: no-follow validation of every bind source, allowlist-generated git configs, known-secret-value scan, mount plan, mount-point sanitizing
+  sandbox-content.ts # What a sandbox may see: no-follow validation of every bind source, allowlist-generated git configs, known-secret-value scan, mount plan, mount-point sanitizing, sanitizeRuntimeConfig (rewrites the agent's ~/.claude.json to allowlisted plain keys, deletes backups)
   model-proxy.ts     # Trusted loopback model proxy: run token in x-api-key, POST /v1/messages[/count_tokens] only, injects the gateway's provider credential (API key or OAuth with single-flight refresh); readAuthStatus for /v1/auth/status
   mcp-overrides.ts   # mcpCredentialOverrides validation, header/env checks, requireUserCredentials attachment rule (headers output keys case-insensitive, every match non-empty; env keys exact)
   gc-budget.ts       # Minor GC every 2 MiB relayed (needs node --expose-gc, set in entrypoint.sh and npm start)
@@ -147,6 +162,17 @@ src/
     query-failure-outcome.test.ts   # Failed runs through query/agent/retry with the SDK mocked: one error event, no done, retry and resume rules
     query-failure-diagnostics-process.test.ts # Real-runtime probe: provider rejections reach the client as safe messages, sessions after a failed first request (needs `npm run build`)
     mcp-credential-relay.test.ts    # Credential relay unit tests
+    tool-grant.test.ts              # AGENT_TOOL_POLICY parsing table and the effective grant
+    tool-mediation.test.ts          # Fixed TOOL_* texts, webhook rejection text, secret masking, deadline parsing
+    tool-owner.test.ts              # Tool ownership: 403, forwarding, legacy ownerless claim and audit
+    sandbox-runtime-config.test.ts  # ~/.claude.json rewrite and settingSources
+    query-tool-grant-outcome.test.ts # Grant through query/agent with the SDK mocked
+    query-mcp-mediation-outcome.test.ts # Relay bindings and request-server routing through query/agent with the SDK mocked
+    mcp-bridge-sse.test.ts / mcp-bridge-stdio.test.ts # SSE bridge and stdio tool sandbox bridge
+    mcp-direct-mediation.test.ts    # Direct call, test and health: header merge, no redirect, user-credential refusal
+    tool-grant-process.test.ts / mcp-mediation-process.test.ts / mcp-stdio-sandbox-process.test.ts # Real-runtime probes: built-in refusal for every actor, relay mediation, stdio tool sandbox (need `npm run build`)
+    public-auth-matrix-process.test.ts / mediation-outcome-process.test.ts # Public auth matrix per label; end-to-end Outcome Probe of the mediation (need `npm run build`)
+    helpers/sse-mcp-stub.ts         # SSE MCP server stub for the bridge tests
     mcp-overrides.test.ts           # Override merge + requireUserCredentials header-key casing
     routes.mcp.test.ts              # Registry PUT schema validation + new-entry name rule
     require-user-credentials.test.ts # requireUserCredentials + header/env validation
