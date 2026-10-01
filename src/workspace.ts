@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { log } from "./logging.js";
+import { listRegularFilesNoFollow } from "./sandbox-content.js";
 
 const HOME = process.env.HOME || "/home/node";
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || path.join(HOME, ".claude");
@@ -34,19 +35,13 @@ export function safePath(baseDir: string, userPath: string): string | null {
 
 export interface FileEntry { path: string; size: number; modified: string; }
 
+/**
+ * The regular files below `baseDir`. A symlink is neither listed nor followed (MVP-7678):
+ * a link planted in a workspace directory can never make a listing, or the skill bundle
+ * built from it, reach a file outside that directory.
+ */
 export function listFiles(baseDir: string): FileEntry[] {
-  const files: FileEntry[] = [];
-  const walk = (dir: string, prefix = ""): void => {
-    if (!fs.existsSync(dir)) return;
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) { walk(fullPath, rel); }
-      else { const stat = fs.statSync(fullPath); files.push({ path: rel, size: stat.size, modified: stat.mtime.toISOString() }); }
-    }
-  };
-  walk(baseDir);
-  return files;
+  return listRegularFilesNoFollow(baseDir);
 }
 
 /**

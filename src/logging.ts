@@ -25,6 +25,11 @@ export function log(category: string, ...args: unknown[]): void {
   console.log(`[${category}]`, ...args);
 }
 
+/** An operator-facing error line that prints at every `LOG_LEVEL`, including "off" (stderr, like the persistence ERROR line). */
+export function logAlways(category: string, ...args: unknown[]): void {
+  console.error(`[${category}]`, ...args);
+}
+
 export function logDebug(category: string, ...args: unknown[]): void {
   if (logLevel !== "debug") return;
   console.log(`[${category}]`, ...args);

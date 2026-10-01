@@ -11,11 +11,13 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-The gateway is now running at `http://localhost:3001`. Verify with:
+The container runs as the `node` user (uid 1000): `./agent_home` must be owned by uid 1000 (`chown 1000:1000 agent_home`). The gateway is now running at `http://localhost:3001`. Verify with:
 
 ```bash
 curl http://localhost:3001/health
 ```
+
+`/health` must report `"isolation":"ok"`; otherwise agent runs are refused, see [Agent isolation](#agent-isolation).
 
 ### Anthropic Authentication
 
@@ -111,6 +113,78 @@ Every problem is also logged, whatever the log level, as one line: `ERROR persis
 
 Copies of `mcp-servers.json` contain MCP credentials (headers and env values). Handle them as secrets, never attach state files or their copies to tickets or evidence, and delete them once resolved.
 
+## Agent isolation
+
+Every agent run executes inside its own sandbox. Bash commands, interpreters, the Read, Write, Edit, Glob and Grep tools, MCP servers the runtime starts itself and sub-agents all run in the sandbox, so an agent can neither read the gateway's secrets nor see other conversations. The gateway itself (API keys, the provider credential, OAuth tokens, state files, SSH keys) stays outside.
+
+**What a run sees.** The sandbox is built with `bubblewrap` (new user, PID, IPC, UTS and cgroup namespaces; the network is shared; all capabilities dropped; nested user namespaces disabled and checked at every start). Only an allowlist is visible:
+
+- read-only: the system directories, the Claude runtime, the global `CLAUDE.md`, `skills/`, `agents/`, `memory/` and `commands/`, a generated `settings.json` that keeps only `permissions`, and every repository under `~/.claude/projects/` (each repository's git configuration is replaced by a copy that holds only remote URLs without user info, fetch refspecs, branch settings and core settings);
+- writable: the conversation's own home at `/home/node`, a private `/tmp`, and this run's log directory;
+- not visible: `.credentials.json`, `sessions.json`, `tools.json`, `mcp-servers.json` and their `.corrupt-*` copies, `~/.ssh`, legacy transcripts and logs, other conversations' homes, the Docker socket, and every process of the gateway or of other runs.
+
+The sandbox environment is an allowlist built from nothing (`HOME`, `USER`, `PATH`, `LANG`/`LC_*`, `TERM`, `TMPDIR`, the per-run log variables, `DISABLE_AUTOUPDATER`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, the SDK's non-secret `CLAUDE_CODE_*` and `CLAUDE_AGENT_SDK_*` keys). Its only provider credential is a random per-run token for the gateway's **model proxy**: the proxy accepts the token only in the `x-api-key` header, forwards `POST /v1/messages` and `POST /v1/messages/count_tokens` to the provider with the gateway's own credential (`ANTHROPIC_API_KEY`, otherwise the OAuth token, refreshed on the gateway side) and revokes the token when the run ends. Registered http MCP servers are reached through the credential relay as before. Operator tuning variables of the runtime that are not in the allowlist (for example `MCP_TIMEOUT`, `BASH_DEFAULT_TIMEOUT_MS`) are no longer passed on.
+
+**Every file the gateway binds into a sandbox is checked without following symlinks** (a regular file or directory owned by the gateway user, inside its expected tree); anything else is left out with an `audit` log line. Mounted content is also scanned for the gateway's own secret values (API keys, provider key, OAuth tokens, registered MCP header and env values): a file that holds one is hidden behind an empty file. Files over 1 MiB are not scanned.
+
+**Conversations.** A conversation records its owner (the API-key label and the request's `user_id`, or none) and a random sandbox home name when it is created, and only that exact owner can continue it. A conversation with a `user_id` and the same conversation without one are different owners. Another caller gets the "cannot be continued from your account" text with no run and no change to the conversation. A conversation is processed by one request at a time (a second request gets the "still answering" text). `GET /v1/sessions` and `DELETE /v1/sessions/:id` are scoped to the caller's API-key label. Deleting a conversation does not remove its home on disk (retention is MVP-7402).
+
+### Configuration
+
+| Variable | Default | When to change it |
+|----------|---------|-------------------|
+| `ISOLATION_STARTUP_TIMEOUT_MS` | `10000` | Raise it on a very loaded host where `/health` or users report "could not start a protected workspace in time"; the sandbox itself starts in about 10 ms. |
+| `AGENT_RUN_TIMEOUT_MS` | `7200000` (120 min) | Lower it to stop runaway agents sooner, raise it for tasks that legitimately run longer. It covers the whole request including retries and backoff. |
+| `MODEL_PROXY_IDLE_TIMEOUT_MS` | `600000` | The time a provider request may stay silent before it is cut. Raise it only for extremely slow answers. |
+| `AGENT_SANDBOX_ROOT` | `$HOME/.agent-sandbox` | Only to move the storage of the conversation homes. It must be an absolute path to a private directory owned by the gateway user; it is never mounted as a whole. `docker-compose.yml` does not forward it from the shell: add it under `environment:`. |
+| `AGENT_SANDBOX_BWRAP` | `/usr/bin/bwrap` | Only if the isolation runtime lives elsewhere. Like `AGENT_SANDBOX_ROOT`, it is not forwarded by `docker-compose.yml`. |
+
+An invalid value (not a positive whole number, or a relative path) stops the gateway at startup with one fixed line, `FATAL config key=<KEY> reason=<fixed text>`; nothing falls back silently.
+
+### `/health` and the compose health check
+
+`GET /health` carries one more field, `isolation`. `docker-compose.yml` marks the container unhealthy unless it reads `"ok"`.
+
+| `isolation` | Meaning | What users see | What the operator does | What clears it |
+|-------------|---------|----------------|------------------------|----------------|
+| `starting` | The boot self-check is still running (a few hundred ms). | Nothing yet. | Wait. | The self-check finishing. |
+| `ok` | A sandbox started and passed its check. | Normal answers. | Nothing. | Stays until a permanent problem occurs. |
+| `unavailable` | The boot self-check or a start failed for a permanent reason. The log has one line `ERROR isolation problem=<word> reason=<fixed text> (see /health)`. | Every query ends with "The gateway cannot start a protected workspace ...". Nothing runs unsandboxed. | Read the `problem` word (`binary_missing`, `invalid_root`, `namespace_denied`, `proc_denied`, `userns_not_blocked`, `canary_visible`, `pid_namespace_shared`, `mount_failed`, `content_invalid`, `proxy_unavailable`, `start_failed`) and fix the container profile, the storage directory or the host setting it names. | The next sandbox start that succeeds: a query starts one, and a gateway restart repeats the boot self-check. `proxy_unavailable` is cleared only by a gateway restart. |
+
+A slow start of a user's run ("could not start a protected workspace in time") does not change `isolation`. A slow start during the boot self-check does: it reads `unavailable` with `problem=start_failed` until a later start succeeds.
+
+### Container security profile and host prerequisites
+
+`docker-compose.yml` runs the container as `node` (uid 1000; `./agent_home` must be owned by it) with `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 512`, the committed seccomp profile `security/agent-gateway-seccomp.json` (Docker's default profile plus `clone`, `unshare`, `setns`, `mount`, `umount2`, `pivot_root` for a process without capabilities) and `systempaths=unconfined`. The sandbox needs namespaces and a fresh `/proc` inside the container; Docker's default profile and masked `/proc` paths block both. This loosens the boundary between the container and the host, which is why every other control above is on. **Host prerequisites:** unprivileged user namespaces must be allowed (`kernel.apparmor_restrict_unprivileged_userns=0` on Ubuntu 24.04 and later, and `user.max_user_namespaces` above 0).
+
+AppArmor: Docker's default AppArmor profile also blocks the sandbox's mounts. By default the compose file runs without an AppArmor profile (`apparmor=unconfined`). To keep a profile, load the committed one on the host and select it: `sudo apparmor_parser -r security/agent-gateway-apparmor`, then `AGENT_GATEWAY_APPARMOR_PROFILE=agent-gateway-isolation docker compose up -d`. Tested once (2026-10-01, Ubuntu 24.04, kernel 6.8, Docker 29.2): a task-owned container under a copy of this profile loaded with a different name (the rules are identical, only the profile name and the two self-references differ) ran in enforce mode with `isolation: ok`, and a cancelled run, `docker stop` during a run and a SIGKILL of the gateway process behaved as without a profile. The committed file under its own name, other kernels and a long-running production use are not tested. `PROBE_APPARMOR_PROFILE=<loaded profile> npm run probe:docker-isolation` repeats the check.
+
+### Updating a running gateway
+
+1. **Risk acceptance (operator):** accepting the container profile above is a prerequisite for redeploying the shared gateway; it is recorded on the Epic MVP-7676. It must name the loosened defaults: no AppArmor profile (`apparmor=unconfined`) unless the committed one is selected, and `systempaths=unconfined`.
+2. **Every conversation started before this update is refused after it.** On the production gateway that counted 8,339 stored conversations on 2026-09-30, of which 3,834 had a saved transcript and 1,216 were used in the last 14 days. Callers get the "started before a gateway security update" text and must start a new conversation (reqlift does not recover by itself; replaying from its own database is a caller follow-up). Alternative that was not implemented: admit them after a secret scan and bind each to its first caller; that keeps old conversations, but whoever knows an id first can claim it.
+3. Check that `./agent_home` and everything below it is owned by uid 1000 (`sudo chown -R 1000:1000 agent_home`). The old entrypoint ran `chown -R` as root; the new one does not, and a root-owned file is left out of runs with an `audit` log line only. Also review what agents planted there before the update (see the first item of the residuals below).
+4. Recreate the container so the new image, user and security options apply: `docker compose up -d --build`.
+5. Check: `curl -s http://localhost:3001/health | jq .isolation` must print `"ok"` (the container is then also `healthy`).
+6. The first message of a conversation can be slower when it starts an `npx` MCP server: that run's home is empty, so the package is downloaded again (about 7 s for a small server); later messages of the same conversation reuse it.
+
+### Behavior changes
+
+- The global directories and repositories are **read-only for agents**: an agent can no longer write to `~/.claude/memory`, `skills`, `agents` or a repository. The workspace API (`PUT /v1/memory/*`, git routes) stays the write path. A prompt that tells an agent to update memory files there fails until it uses the API.
+- An agent has no `~/.ssh`: SSH access from a run needs a mediated path (MVP-7679).
+- `claude auth status` no longer exists in the bundled CLI: `GET /v1/auth/status` is read from the credential files and returns the same fields; login runs the CLI bundled with the SDK, never `~/.local/bin/claude`. The entrypoint no longer installs a Claude CLI and no longer runs as root.
+- `GET /v1/sessions` lists only the caller's label (plus ownerless pre-update entries) and `count` is that number; `/health` `sessions` stays the total.
+- Workspace listings (`GET /v1/memory`, `/v1/agents`, `/v1/skills`, `/v1/knowledge-base`) and user-skill bundles list and copy regular files only (a symlink is neither listed nor followed).
+
+### Known residuals (owned by MVP-7679, never reported as solved here)
+
+- **Content planted before the update.** The secret scan skips files over 1 MiB, and its value list does not include the contents of `~/.ssh` private keys or the `tools.json` webhook authentication values, so a copy or hard link of those made by an agent before the update, inside a mounted tree, would not be hidden. The trusted `git` calls and `/v1/auth/login` (tmux) run with `HOME=/home/node` and read configuration an agent planted there before the update (`~/.gitconfig`, repository hooks, `core.fsmonitor`, `~/.tmux.conf`). New runs cannot plant any of this; the operator reviews or removes it before the first deploy.
+- A refusal ("cannot be continued from your account") versus a fresh conversation reveals that an id exists, and the first caller to use an unknown id claims it.
+- Conversation homes are never removed (MVP-7402), there is no size cap on a home or a private `/tmp`, and `pids_limit` is shared by all runs: an availability risk, not a credential exposure.
+- The SDK puts the whole MCP configuration on the runtime's own command line, and stdio MCP servers inherit its environment. Header and env values of a **non-relayed** server (a stdio server's `env`, an SSE server's headers, `mcpCredentialOverrides` aimed at them, and values given in the request body's `mcpServers`) are therefore readable inside that run's own sandbox. The gateway writes one `audit` line per such server (`mcp.server.credential_in_runtime_args serverName=<name> type=<type>`). Registered http servers go through the relay and are not affected.
+- The network is shared: a sandbox can reach loopback listeners (the proxy and relay need a run token) and other network peers. Egress control belongs to MVP-7679.
+- `GET /v1/query/:id/events` replays any query to any API key, and `/v1/auth/login` plus `submit-code` run the CLI in the gateway's own context.
+
 ## API Overview
 
 All endpoints except `/health` require `Authorization: Bearer <api-key>`.
@@ -120,8 +194,8 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `GET` | `/health` | Health check (no auth); `persistence` / `persistenceIssues` report state-file problems ([Stopping and recovery](#stopping-and-recovery)) |
 | `POST` | `/v1/query` | Run an agent query (NDJSON stream) |
 | `GET` | `/v1/query/:queryId/events` | Replay/resume event stream |
-| `GET` | `/v1/sessions` | List active sessions |
-| `DELETE` | `/v1/sessions/:id` | Delete a session |
+| `GET` | `/v1/sessions` | List the calling API-key label's active sessions |
+| `DELETE` | `/v1/sessions/:id` | Delete one of the calling label's sessions (another label's: 404) |
 | `GET` | `/v1/settings` | Get session settings |
 | `PUT` | `/v1/settings` | Update session settings |
 | `GET` | `/v1/logging` | Get current log level |
@@ -249,9 +323,15 @@ A failed query ends with exactly one `error` event and no `done`, and it confirm
 | The provider rejects the gateway's Claude runtime as too old for the model | no | `The AI runtime on the gateway server is too old for the selected model (installed 2.0.77, required 2.1.280 or newer). Ask your gateway administrator to update the gateway runtime. Retrying will not help until the administrator has done this.` |
 | Authentication with the provider failed (401/403) | no | `The gateway could not authenticate with the AI provider. Ask your gateway administrator to check the gateway's authentication. Retrying will not help until the administrator has done this.` |
 | Rate limit or overload (429/529) after the retry budget (3 retries, 60 s) | yes | `The AI provider is busy right now. Please try again in a few minutes.` |
+| The gateway cannot start a protected workspace (the isolation runtime is missing or unusable) | no | `The gateway cannot start a protected workspace, so this request did not run. Ask your gateway administrator to check the gateway's isolation status. Retrying will not help until the administrator has done this. (reference: <queryId>)` |
+| The protected workspace did not start in time (`ISOLATION_STARTUP_TIMEOUT_MS`) | no (the client may try again) | `The gateway could not start a protected workspace in time, so this request did not run. Please try again in a few minutes. If it keeps happening, tell your gateway administrator. (reference: <queryId>)` |
+| The request ran longer than `AGENT_RUN_TIMEOUT_MS`, retries included | no | `The request was stopped because it ran longer than the gateway's limit of <N> minutes. Its results were not saved. Try again with a smaller task, or ask your gateway administrator to raise the limit. (reference: <queryId>)` |
+| The conversation belongs to another caller (another API-key label, or another `user_id`, or one with and one without a `user_id`) | no | `This conversation cannot be continued from your account. Please start a new conversation.` |
+| The conversation was started before the isolation update | no | `This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help.` |
+| The conversation is still answering an earlier request | no (wait, then repeat) | `This conversation is still answering an earlier request. Please wait until it has finished, then try again.` |
 | Anything else, including a missing or unreadable diagnostic | no | `The AI request failed on the gateway for an unknown reason. Please try again. If it keeps failing, ask your gateway administrator to check the gateway logs (reference: <queryId>).` |
 
-In the version message each version is named only when it is known and valid (`x.y.z`): with only the installed one the parenthesis reads `(installed 2.0.77; a newer version is required)`, with only the required one `(required 2.1.280 or newer)`, and without either it is left out. The reference is left out when the `queryId` is not 1–128 characters of `A-Z a-z 0-9 . _ : -`. A client abort keeps the SDK's abort text. The next query with the same `sessionId` after a failed first query starts a fresh conversation. The gateway logs one line per failure with safe fields only: `Error queryId=<id> kind=<runtime_version_unsupported|authentication|transient|unknown> apiStatus=<n|none> providerType=<known type|other|none> installed=<version|none> required=<version|none>`.
+In the version message each version is named only when it is known and valid (`x.y.z`): with only the installed one the parenthesis reads `(installed 2.0.77; a newer version is required)`, with only the required one `(required 2.1.280 or newer)`, and without either it is left out. The reference is left out when the `queryId` is not 1–128 characters of `A-Z a-z 0-9 . _ : -`. A client abort keeps the SDK's abort text. The next query with the same `sessionId` after a failed first query starts a fresh conversation. The gateway logs one line per failure with safe fields only: `Error queryId=<id> kind=<runtime_version_unsupported|authentication|transient|unknown|isolation_unavailable|isolation_timeout|run_deadline> apiStatus=<n|none> providerType=<known type|other|none> installed=<version|none> required=<version|none>`.
 
 ## Authentication
 
@@ -287,6 +367,11 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `MCP_TEST_TIMEOUT_MS` | `10000` | Per-test deadline for `POST /v1/mcp-servers/:name/test` |
 | `MCP_CALL_TIMEOUT_MS` | `10000` | Per-call deadline for `POST /v1/mcp-servers/:name/call` |
 | `MCP_UPLOAD_IDLE_TIMEOUT_MS` | `60000` | No-progress timeout for one relayed upload (`POST /v1/mcp-servers/:name/uploads/*`); no overall deadline |
+| `ISOLATION_STARTUP_TIMEOUT_MS` | `10000` | A sandbox must pass its start check within this time; see [Agent isolation](#agent-isolation) |
+| `AGENT_RUN_TIMEOUT_MS` | `7200000` | Deadline of one query request, retries included |
+| `MODEL_PROXY_IDLE_TIMEOUT_MS` | `600000` | No-progress timeout of one proxied provider request |
+| `AGENT_SANDBOX_ROOT` | `$HOME/.agent-sandbox` | Trusted storage of the sandbox homes |
+| `AGENT_SANDBOX_BWRAP` | `/usr/bin/bwrap` | Path of the isolation runtime |
 
 ## Development Setup
 
@@ -312,6 +397,8 @@ npm start      # node --expose-gc dist/server.js (the upload relay's memory boun
 npm test            # Unit tests (vitest, excludes E2E)
 npm run test:e2e    # E2E tests (requires running Gateway + GATEWAY_API_KEY env var)
 ```
+
+The isolation tests (`sandbox-process`, `session-isolation-process`, `isolation-outcome-process`, `model-proxy-process`) start the compiled gateway, the real Claude runtime and real `bwrap`: run `npm run build` first, and run them on a host that allows unprivileged user namespaces. `npm run probe:docker-isolation` builds the image and checks the same isolation inside task-owned containers started with the security options of `docker-compose.yml` (it needs `sudo -n docker`, uid 1000, and removes only what it created); `npm run probe:docker-stop` does the same for the clean stop.
 
 The E2E suite (`src/tests/e2e-*.test.ts`) runs against a **live, Anthropic-authenticated** gateway and is excluded from the fast unit gate. Each E2E file gates itself on `GATEWAY_API_KEY` (the gateway Bearer token) and **skips cleanly** when it is absent, so `npm run test:e2e` is safe to run in any environment:
 

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Agent Gateway Entrypoint
-# Runs as root, sets up workspace, then drops to node user via gosu.
-# All persistent state lives in /home/node (bind-mounted from ./agent_home).
+# Runs as the `node` user (the image sets USER node, docker-compose.yml user: node); there is no
+# root step. Sets up the workspace and starts the gateway. All persistent state lives in
+# /home/node (bind-mounted from ./agent_home, which must be owned by uid 1000).
 
 set -e
 
@@ -11,13 +12,12 @@ set -e
 mkdir -p /home/node/.claude/memory \
          /home/node/.claude/agents \
          /home/node/.claude/skills \
-         /home/node/.ssh \
-         /home/node/.local/bin
-chown -R node:node /home/node
+         /home/node/.ssh
 
 # ------------------------------------------------------------------
 # 2. Write Claude settings with broad tool permissions (only if not exists)
-#    (bypassPermissions alone is insufficient for SDK tools)
+#    (bypassPermissions alone is insufficient for SDK tools). The agent sandbox
+#    sees only the `permissions` of this file.
 # ------------------------------------------------------------------
 if [ ! -f /home/node/.claude/settings.json ]; then
     cat > /home/node/.claude/settings.json <<'SETTINGS'
@@ -40,25 +40,7 @@ SETTINGS
 fi
 
 # ------------------------------------------------------------------
-# 3. Install Claude Code CLI if not already present
-# ------------------------------------------------------------------
-if [ ! -x /home/node/.local/bin/claude ]; then
-    echo "[entrypoint] Installing Claude Code CLI..."
-    gosu node bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
-    echo "[entrypoint] Claude Code CLI installed"
-else
-    echo "[entrypoint] Claude Code CLI already installed ($(gosu node /home/node/.local/bin/claude --version))"
-fi
-
-# ------------------------------------------------------------------
-# 4. Ensure PATH in .bashrc for interactive shells
-# ------------------------------------------------------------------
-if ! grep -q '.local/bin' /home/node/.bashrc 2>/dev/null; then
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/node/.bashrc
-fi
-
-# ------------------------------------------------------------------
-# 4. Set up SSH config if keys exist
+# 3. Set up SSH config if keys exist
 # ------------------------------------------------------------------
 if [ "$(ls -A /home/node/.ssh/id_* 2>/dev/null)" ]; then
     find /home/node/.ssh -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \;
@@ -80,4 +62,4 @@ else
 fi
 
 echo "[entrypoint] Agent Gateway starting..."
-exec gosu node node --expose-gc /app/dist/server.js
+exec node --expose-gc /app/dist/server.js

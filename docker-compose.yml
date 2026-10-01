@@ -2,10 +2,30 @@ services:
   agent-gateway:
     build: .
     container_name: agent-gateway
+    # The whole container runs as the node user (uid 1000): ./agent_home must be owned by it.
+    user: node
     ports:
       - "127.0.0.1:3001:3001"
     volumes:
       - ./agent_home:/home/node
+    # Container security profile of the per-run agent sandbox (MVP-7678). Every agent run starts
+    # in a bubblewrap sandbox (user, PID, IPC, UTS and cgroup namespaces), which needs namespaces
+    # and a fresh /proc inside the container. Nothing else is loosened: no capability, no privileged
+    # mode, no new privileges, and a committed seccomp profile instead of "unconfined".
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      # The Docker default profile plus clone/unshare/setns/mount/pivot_root without CAP_SYS_ADMIN.
+      - seccomp=./security/agent-gateway-seccomp.json
+      # Docker's AppArmor default blocks the sandbox's mounts. Load security/agent-gateway-apparmor on the
+      # host (sudo apparmor_parser -r ...) and set AGENT_GATEWAY_APPARMOR_PROFILE=agent-gateway-isolation;
+      # without it the container runs without an AppArmor profile. The profile was tested once under a renamed
+      # copy only (see README, Container security profile); the unconfined default is the verified configuration.
+      - apparmor=${AGENT_GATEWAY_APPARMOR_PROFILE:-unconfined}
+      # Docker masks paths of /proc, which makes the sandbox's own /proc mount fail.
+      - systempaths=unconfined
+    pids_limit: 512
     environment:
       # ANTHROPIC_API_KEY is intentionally NOT passed by default.
       # The Gateway uses OAuth (claude.ai subscription) for authentication.
@@ -17,8 +37,12 @@ services:
       - TOOLS_PERSIST_PATH=/home/node/.claude/tools.json
       - MCP_SERVERS_PERSIST_PATH=/home/node/.claude/mcp-servers.json
       - SESSION_IDLE_TIMEOUT_MS=${SESSION_IDLE_TIMEOUT_MS:-0}
+      - ISOLATION_STARTUP_TIMEOUT_MS=${ISOLATION_STARTUP_TIMEOUT_MS:-10000}
+      - AGENT_RUN_TIMEOUT_MS=${AGENT_RUN_TIMEOUT_MS:-7200000}
+      - MODEL_PROXY_IDLE_TIMEOUT_MS=${MODEL_PROXY_IDLE_TIMEOUT_MS:-600000}
+    # Healthy only while agent runs can be isolated: /health must report "isolation":"ok".
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:3001/health"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:3001/health | grep -q '\"isolation\":\"ok\"'"]
       interval: 30s
       timeout: 5s
       retries: 3

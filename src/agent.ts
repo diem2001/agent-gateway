@@ -1,4 +1,3 @@
-import type { ChildProcess } from "node:child_process";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlock } from "./query.js";
@@ -17,8 +16,9 @@ import {
 import { materializeUserSkills, cleanupUserSkillBundle } from "./user-skills.js";
 import { requestMcpAllowedToolPatterns, type RequestMcpServers } from "./mcp-request-servers.js";
 import { credentialRelay } from "./mcp-credential-relay.js";
-import { createRunLogDir, removeRunLogDirAfterExit, spawnRuntimeWithHandle } from "./sdk-run-logs.js";
-import { classifyRunFailure, isAbortError } from "./run-failure.js";
+import { createRunLogDir, removeRunLogDirAfterExit } from "./sdk-run-logs.js";
+import { SandboxRun, runtimeEnvFrom } from "./sandbox.js";
+import { RunFailure, classifyRunFailure, isAbortError } from "./run-failure.js";
 import { builtInTools, createToolPolicyHook, namesServer } from "./tool-policy.js";
 
 export interface QueryParams {
@@ -51,6 +51,8 @@ export interface QueryParams {
   userId?: string;
   /** Only for the log reference in the unknown-failure message (run-failure.ts). */
   queryId?: string;
+  /** The conversation's recorded sandbox home name (sessions.ts); without one the run has a private home. */
+  sandboxDirId?: string;
   /**
    * The exact tool set this run may call (MVP-7637, see tool-policy.ts),
    * validated by the query route. `undefined` ⇒ the options are unchanged.
@@ -145,7 +147,7 @@ async function* buildContentMessageStream(
  * it is kept here and classified, never forwarded. Client aborts (AbortError)
  * are rethrown unchanged.
  */
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools }: QueryParams): Promise<QueryResult> {
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools, sandboxDirId }: QueryParams): Promise<QueryResult> {
   const enforced = enforcedTools !== undefined;
   // An enforced run gets only the registered tools its set names.
   const registeredTools = enforced
@@ -237,11 +239,19 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // private per-run directory, deleted once the runtime child has exited.
   // Created before any relay token, so a failure here cannot leave a token unrevoked.
   const runLogs = createRunLogDir();
-  let runtimeChild: ChildProcess | null = null;
-  options.env = { ...process.env, ...runLogs.env };
-  options.spawnClaudeCodeProcess = spawnRuntimeWithHandle((child) => {
-    runtimeChild = child;
+  // The runtime runs only inside this run's sandbox (MVP-7678): the SDK's spawn hook is the
+  // sandbox launcher, and nothing of the gateway's environment is handed to the SDK. The
+  // environment given here holds no secret; the sandbox builds its own allowlist from it.
+  const sandbox = new SandboxRun({
+    queryId,
+    runLogDir: runLogs.dir,
+    runLogEnv: runLogs.env,
+    userSkillsDir: userSkills.pluginRoot,
+    sessionDirId: sandboxDirId,
+    signal: abortController.signal,
   });
+  options.env = { ...runtimeEnvFrom(process.env), ...runLogs.env };
+  options.spawnClaudeCodeProcess = sandbox.spawnHook;
 
   const relayTokens: string[] = [];
   const registeredMcpServers = buildMcpServersForSdk(runRegistryServers);
@@ -265,6 +275,17 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     for (const [serverName, override] of Object.entries(mcpCredentialOverrides)) {
       const keys = summarizeOverrideKeys(override);
       log("audit", `mcp.override.applied serverName=${serverName} keys=${keys.join(",") || "none"}`);
+    }
+  }
+
+  // Known residual (MVP-7678, owned by MVP-7679): the SDK hands the whole MCP configuration to the runtime as a
+  // command-line argument and stdio children inherit its environment, so a header or env value of a server that is
+  // not relayed is readable inside this run's own sandbox. One audit line per such server: name and type only.
+  for (const [name, config] of Object.entries(mcpServers)) {
+    const entry = config as { type?: unknown; headers?: unknown; env?: unknown };
+    const carries = (value: unknown): boolean => typeof value === "object" && value !== null && Object.keys(value).length > 0;
+    if (carries(entry.headers) || carries(entry.env)) {
+      log("audit", `mcp.server.credential_in_runtime_args serverName=${name} type=${typeof entry.type === "string" ? entry.type : "stdio"}`);
     }
   }
 
@@ -380,15 +401,26 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   }
   } catch (err) {
     if (isAbortError(err)) throw err;
+    // A sandbox that did not start is reported with its own fixed text, never as the SDK's
+    // generic "process exited" error; nothing ran.
+    const startFailure = sandbox.startFailure;
+    if (startFailure) throw startFailure;
+    if (err instanceof RunFailure) throw err;
     throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors, thrown: err }, queryId);
   } finally {
-    // Every end (answer, error, abort): the relay URLs stop working and their
-    // in-flight upstream requests are destroyed.
+    // Every end (answer, error, abort): the relay URLs and the model proxy token stop
+    // working and their in-flight upstream requests are destroyed.
     for (const token of relayTokens) credentialRelay.revoke(token);
     // Request-scoped bundle: remove it once this query() call has drained.
     cleanupUserSkillBundle(userSkills.pluginRoot);
-    void removeRunLogDirAfterExit(runLogs.dir, runtimeChild);
+    // The sandbox process is gone before this run returns, so the conversation's lock (query.ts) is
+    // released only after its home has no process left.
+    void removeRunLogDirAfterExit(runLogs.dir, sandbox.child);
+    await sandbox.dispose();
   }
+
+  // A sandbox that failed to start while the SDK ended without an error: nothing ran.
+  if (sandbox.startFailure) throw sandbox.startFailure;
 
   // A result flagged is_error is a failure even when its subtype says "success"
   // and the runtime exited 0.

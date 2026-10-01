@@ -2,8 +2,18 @@ import { Router, type Request, type Response } from "express";
 import { log, logDebug } from "./logging.js";
 import { createCacheEntry, getCacheEntry, markDone, type StreamEvent } from "./event-cache.js";
 import { runQueryWithRetry } from "./retry.js";
-import { getSession, updateSessionSdkId } from "./sessions.js";
-import { RunFailure, classifyRunFailure, formatLogFields, isAbortError } from "./run-failure.js";
+import { admitSession, getSession, updateSessionSdkId } from "./sessions.js";
+import { tryLockConversation, type ConversationLock } from "./sandbox.js";
+import {
+  RunFailure,
+  SESSION_BUSY_MESSAGE,
+  SESSION_LEGACY_MESSAGE,
+  SESSION_OTHER_OWNER_MESSAGE,
+  classifyRunFailure,
+  fixedFailure,
+  formatLogFields,
+  isAbortError,
+} from "./run-failure.js";
 import {
   validateMcpCredentialOverrides,
   type McpCredentialOverrides,
@@ -174,16 +184,50 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
 
   const startTime = Date.now();
 
+  // Who is asking (MVP-7678): the API-key label and the request's user id (null when it has none).
+  // A conversation belongs to exactly one such owner; null and a present user id are different owners.
+  const caller = { label: req.clientLabel ?? "", userId: typeof user_id === "string" && user_id.length > 0 ? user_id : null };
+  const conversationId = useSession !== false && typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
+
+  // Admission comes before anything else happens for this request: a refused caller gets one fixed
+  // `error` event and nothing ran (no runtime, no session change, no acknowledgment).
+  const refuse = (kind: "session_other_owner" | "session_legacy" | "session_busy", message: string): void => {
+    log("query", `Refused queryId=${queryId} kind=${kind}`);
+    emit({ type: "error", content: fixedFailure(kind, message).message });
+    markDone(queryId);
+    if (!res.writableEnded) res.end();
+  };
+  let conversationLock: ConversationLock | null = null;
+  if (conversationId) {
+    const admission = admitSession(conversationId, caller);
+    if (admission.kind === "refused") {
+      refuse(admission.reason === "legacy" ? "session_legacy" : "session_other_owner", admission.reason === "legacy" ? SESSION_LEGACY_MESSAGE : SESSION_OTHER_OWNER_MESSAGE);
+      return;
+    }
+    // One active request per conversation: the lock is taken before the conversation entry is touched.
+    if (admission.kind === "resume") {
+      conversationLock = tryLockConversation(admission.sandboxDirId);
+      if (!conversationLock) {
+        refuse("session_busy", SESSION_BUSY_MESSAGE);
+        return;
+      }
+    }
+  }
+
   // The acknowledgment comes first and only once: the retry path below never
   // re-emits it, and every attempt gets the same set.
   if (enforcedTools) emit({ type: "tool_policy", enforced: true, tools: enforcedTools });
 
   try {
     // Resolve session: map client sessionId → SDK sessionId for resume
-    let effectiveSessionId = useSession !== false ? sessionId : undefined;
+    let effectiveSessionId = conversationId;
     let isResume = false;
+    let sandboxDirId: string | undefined;
     if (effectiveSessionId) {
-      const resolved = getSession(effectiveSessionId, systemPrompt || "", model || "claude-sonnet-4-20250514");
+      const resolved = getSession(effectiveSessionId, systemPrompt || "", model || "claude-sonnet-4-20250514", true, caller);
+      sandboxDirId = resolved.sandboxDirId;
+      // A conversation created just now gets its lock here (no other request can have seen its home name yet).
+      if (!conversationLock && sandboxDirId) conversationLock = tryLockConversation(sandboxDirId);
       if (!resolved.isNew) {
         // Existing session: resume with the SDK sessionId (stored on disk)
         effectiveSessionId = resolved.sessionId;
@@ -194,15 +238,24 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
       }
     }
 
-    const { response: _response, resultData } = await runQueryWithRetry({
-      prompt, content: contentBlocks, systemPrompt, model, allowedTools,
-      sessionId: effectiveSessionId,
-      isResume, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
-      mcpCredentialOverrides: overrideValidation.overrides,
-      requestMcpServers: mcpServersValidation.servers,
-      userId: user_id || undefined,
-      enforcedTools,
-    });
+    let runResult: Awaited<ReturnType<typeof runQueryWithRetry>>;
+    try {
+      runResult = await runQueryWithRetry({
+        prompt, content: contentBlocks, systemPrompt, model, allowedTools,
+        sessionId: effectiveSessionId,
+        sandboxDirId,
+        isResume, abortController, onEvent: emit, queryId, webhookContext, clientAuthToken,
+        mcpCredentialOverrides: overrideValidation.overrides,
+        requestMcpServers: mcpServersValidation.servers,
+        userId: user_id || undefined,
+        enforcedTools,
+      });
+    } finally {
+      // Every sandbox process of this request has exited (agent.ts waits for it): the conversation is free
+      // again before its `done` or `error` reaches the client, so a prompt follow-up is never refused as busy.
+      conversationLock?.release();
+    }
+    const { response: _response, resultData } = runResult;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = resultData as any;
@@ -241,6 +294,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
 
     log("query", `Completed queryId=${queryId} tokens=${inputTokens}+${outputTokens} cost=$${costUsd} duration=${Date.now() - startTime}ms`);
   } catch (err) {
+    conversationLock?.release();
     emitError(err);
   }
 

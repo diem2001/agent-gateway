@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { log } from "./logging.js";
 import { runQuery, type QueryParams, type QueryResult } from "./agent.js";
-import { RunFailure, classifyRunFailure, isAbortError } from "./run-failure.js";
+import { RunFailure, classifyRunFailure, fixedFailure, isAbortError, runDeadlineMessage } from "./run-failure.js";
+import { loadIsolationConfig } from "./sandbox.js";
 
 const RETRY_MAX_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 1000;
@@ -25,7 +26,30 @@ export interface RetryParams extends QueryParams { queryId: string; }
  * session ID, so it never appends to, or resumes, a failed attempt's transcript.
  * A request without a session ID never resumes.
  */
-export async function runQueryWithRetry({ queryId, ...params }: RetryParams): Promise<QueryResult> {
+export async function runQueryWithRetry(retryParams: RetryParams): Promise<QueryResult> {
+  // One deadline for the whole request, retries and backoff included (AGENT_RUN_TIMEOUT_MS, MVP-7678).
+  // It stops the run through the same abort a client disconnect uses, and its expiry is reported as
+  // its own failure: the run's answer is discarded and nothing is saved to the conversation.
+  const limitMs = loadIsolationConfig().runTimeoutMs;
+  let deadlineHit = false;
+  const timer = setTimeout(() => {
+    deadlineHit = true;
+    retryParams.abortController.abort();
+  }, limitMs);
+  const deadlineFailure = (): RunFailure => fixedFailure("run_deadline", runDeadlineMessage(limitMs, retryParams.queryId));
+  try {
+    const result = await runWithRetry(retryParams, () => deadlineHit);
+    if (deadlineHit) throw deadlineFailure();
+    return result;
+  } catch (err) {
+    if (deadlineHit) throw deadlineFailure();
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function runWithRetry({ queryId, ...params }: RetryParams, deadlineHit: () => boolean): Promise<QueryResult> {
   const startTime = Date.now();
   let established = params.isResume === true;
   let sessionId = params.sessionId;
@@ -67,5 +91,7 @@ export async function runQueryWithRetry({ queryId, ...params }: RetryParams): Pr
       throw failure;
     }
   }
+  // The deadline ended the loop: no further run is started.
+  if (deadlineHit()) throw fixedFailure("run_deadline", "");
   return runQuery(attemptParams(RETRY_MAX_ATTEMPTS + 1));
 }

@@ -102,7 +102,7 @@
 
 <article class="wiki-article">
   <h1>Agent Gateway <span>API Reference</span></h1>
-  <p class="wiki-meta">Last updated: 2026-09-25 · Epic: <a href="https://diemit.atlassian.net/browse/MVP-2453">MVP-2453</a> · <a href="https://github.com/diem2001/agent-gateway">GitHub</a></p>
+  <p class="wiki-meta">Last updated: 2026-10-01 · Epic: <a href="https://diemit.atlassian.net/browse/MVP-2453">MVP-2453</a> · <a href="https://github.com/diem2001/agent-gateway">GitHub</a></p>
 
   <p>The Agent Gateway is a standalone REST API service wrapping the <strong>Claude Agent SDK</strong>. It exposes Claude Code's agentic capabilities (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch) over HTTP with <strong>NDJSON streaming</strong>, session management, workspace file CRUD, and automatic retry with exponential backoff.</p>
 
@@ -129,6 +129,7 @@
       <li><a href="#ep-mcp-servers">MCP Server Registry</a></li>
       <li><a href="#ndjson">NDJSON Event Reference</a></li>
       <li><a href="#session-mgmt">Session Management</a></li>
+      <li><a href="#isolation">Agent Isolation</a></li>
       <li><a href="#deployment">Deployment Guide</a></li>
       <li><a href="#architecture">Architecture</a></li>
     </ol>
@@ -162,8 +163,8 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>GET</strong></td><td><code>/health</code></td><td>No</td><td>Health check, including state-file problems (<code>persistence</code>, <code>persistenceIssues</code>)</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/query</code></td><td>Yes</td><td>Run agent query (NDJSON stream)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/query/:queryId/events</code></td><td>Yes</td><td>Replay/resume event stream</td></tr>
-      <tr><td><strong>GET</strong></td><td><code>/v1/sessions</code></td><td>Yes</td><td>List active sessions</td></tr>
-      <tr><td><strong>DELETE</strong></td><td><code>/v1/sessions/:id</code></td><td>Yes</td><td>Delete a session</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/sessions</code></td><td>Yes</td><td>List the calling label's active sessions</td></tr>
+      <tr><td><strong>DELETE</strong></td><td><code>/v1/sessions/:id</code></td><td>Yes</td><td>Delete one of the calling label's sessions</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/settings</code></td><td>Yes</td><td>Get session settings</td></tr>
       <tr><td><strong>PUT</strong></td><td><code>/v1/settings</code></td><td>Yes</td><td>Update session settings</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/logging</code></td><td>Yes</td><td>Get log level</td></tr>
@@ -226,9 +227,12 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
   "version": "0.1.0",
   "uptime": 3600,
   "sessions": 2,
+  "isolation": "ok",
   "persistence": "ok",
   "persistenceIssues": []
 }</code></pre>
+
+    <p><code>isolation</code> is <code>"ok"</code> once a sandbox has started and passed its check, <code>"unavailable"</code> after a permanent start problem (agent runs are refused until a later start succeeds) and <code>"starting"</code> while the boot self-check runs. The compose health check requires <code>"ok"</code>. See <a href="#isolation">Agent Isolation</a>.</p>
 
     <h3>Response (degraded)</h3>
 <pre><code>{
@@ -236,6 +240,7 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
   "version": "0.1.0",
   "uptime": 1,
   "sessions": 0,
+  "isolation": "ok",
   "persistence": "degraded",
   "persistenceIssues": [
     {
@@ -430,7 +435,7 @@ curl -N "http://localhost:3001/v1/query/q-001/events?after=5" \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Lists all active sessions with their model and last-used timestamp.</p>
+    <p>Lists the active sessions of the calling API-key label with their model and last-used timestamp. Sessions of another label are not listed; sessions from before the isolation update (no recorded owner) are listed for every label. <code>count</code> is the number listed.</p>
 
     <h3>Response</h3>
 <pre><code>{
@@ -456,7 +461,7 @@ curl -N "http://localhost:3001/v1/query/q-001/events?after=5" \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Deletes a session by ID. Returns <code>404</code> if the session does not exist.</p>
+    <p>Deletes a session by ID. Returns <code>404</code> if the session does not exist or belongs to another API-key label (it is left in place). Sessions from before the isolation update can be deleted by every label. A conversation's sandbox home on disk is not removed by this call.</p>
 
     <h3>Response</h3>
 <pre><code>{"deleted": true}</code></pre>
@@ -757,7 +762,7 @@ curl -X PUT http://localhost:3001/v1/settings \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Checks whether the Claude CLI inside the container has a valid Anthropic login. This is separate from the gateway's API key auth -- it determines whether the SDK can make API calls to Anthropic. The response is augmented with <code>expiresAt</code> (epoch ms read from <code>~/.claude.json</code> <code>claudeAiOauth.expiresAt</code>) and <code>tokenExpired</code> (boolean, <code>true</code> if <code>Date.now() &gt; expiresAt</code>) so clients can warn users before queries start failing with auth errors.</p>
+    <p>Reports whether the gateway has a valid Anthropic login, read from the credential files in the container (or <code>ANTHROPIC_API_KEY</code>). This is separate from the gateway's API key auth -- it determines whether the SDK can make API calls to Anthropic. The response is augmented with <code>expiresAt</code> (epoch ms read from <code>~/.claude.json</code> <code>claudeAiOauth.expiresAt</code>) and <code>tokenExpired</code> (boolean, <code>true</code> if <code>Date.now() &gt; expiresAt</code>) so clients can warn users before queries start failing with auth errors.</p>
 
     <h3>Response (logged in, fresh token)</h3>
 <pre><code>{
@@ -1558,6 +1563,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
     <h4>error</h4>
     <p>Query failed. Always the last event on failure, emitted exactly once, and never together with <code>done</code>. <code>content</code> is a safe, actionable message: the runtime is too old for the model, provider authentication failed, the provider is busy (after the retry budget), or an unknown failure with a log reference. It never contains raw diagnostics. See <a href="#ep-query">Failed Queries</a> for the exact texts.</p>
 <pre><code>{"seq": 3, "type": "error", "content": "The AI provider is busy right now. Please try again in a few minutes."}</code></pre>
+    <p>Isolation and conversation refusals use the same event with fixed texts: <em>"The gateway cannot start a protected workspace, so this request did not run. Ask your gateway administrator to check the gateway's isolation status. Retrying will not help until the administrator has done this. (reference: &lt;queryId&gt;)"</em>; <em>"The gateway could not start a protected workspace in time, so this request did not run. Please try again in a few minutes. If it keeps happening, tell your gateway administrator. (reference: &lt;queryId&gt;)"</em>; <em>"This conversation cannot be continued from your account. Please start a new conversation."</em>; <em>"This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help."</em>; <em>"This conversation is still answering an earlier request. Please wait until it has finished, then try again."</em>; and <em>"The request was stopped because it ran longer than the gateway's limit of &lt;N&gt; minutes. Its results were not saved. Try again with a smaller task, or ask your gateway administrator to raise the limit. (reference: &lt;queryId&gt;)"</em>. A refused request produces exactly this one event, no <code>done</code> and no run.</p>
   </div>
 
   <!-- ============================================================ -->
@@ -1603,9 +1609,80 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <h3>Managing Sessions via API</h3>
   <ul>
-    <li><code>GET /v1/sessions</code> -- list all active sessions with model and lastUsed timestamp</li>
-    <li><code>DELETE /v1/sessions/:id</code> -- remove a specific session</li>
+    <li><code>GET /v1/sessions</code> -- list the calling label's active sessions with model and lastUsed timestamp</li>
+    <li><code>DELETE /v1/sessions/:id</code> -- remove one of the calling label's sessions (another label's answers 404)</li>
     <li><code>PUT /v1/settings</code> -- configure <code>sessionIdleTimeoutMs</code></li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2 id="isolation">Agent Isolation</h2>
+
+  <p>Every agent run executes inside its own <strong>sandbox</strong> (<code>bubblewrap</code>: new user, PID, IPC, UTS and cgroup namespaces, shared network, all capabilities dropped, nested user namespaces disabled and checked at every start). Bash, interpreters, the Read, Write, Edit, Glob and Grep tools, MCP servers started by the runtime and sub-agents all run inside it. The gateway keeps its secrets (API keys, provider credential, OAuth tokens, state files, SSH keys) outside.</p>
+
+  <h3>What a run sees</h3>
+  <ul>
+    <li><strong>Read-only:</strong> the system directories, the Claude runtime, the global <code>CLAUDE.md</code>, <code>skills/</code>, <code>agents/</code>, <code>memory/</code>, <code>commands/</code>, a generated <code>settings.json</code> that keeps only <code>permissions</code>, and every repository under <code>~/.claude/projects/</code>. Each repository's git configuration is a generated copy with only remote URLs without user info, fetch refspecs, branch settings and core settings.</li>
+    <li><strong>Writable:</strong> the conversation's own home <code>/home/node</code>, a private <code>/tmp</code> and this run's log directory.</li>
+    <li><strong>Not visible:</strong> <code>.credentials.json</code>, the state files and their <code>.corrupt-*</code> copies, <code>~/.ssh</code>, legacy transcripts and logs, other conversations' homes, the Docker socket, and every process of the gateway or of other runs.</li>
+    <li>Every bind source is checked <strong>without following symlinks</strong> (a regular file or directory owned by the gateway user, inside its tree); anything else is left out with an <code>audit</code> log line. Mounted content is scanned for the gateway's own secret values; a file that holds one is hidden behind an empty file (files over 1 MiB are not scanned).</li>
+    <li>The environment is an allowlist built from nothing. The only provider credential a run holds is a random per-run token for the gateway's <strong>model proxy</strong> (<code>x-api-key</code> only, <code>POST /v1/messages</code> and <code>/v1/messages/count_tokens</code> only, revoked when the run ends); the proxy adds the gateway's own credential on the way out. Runtime tuning variables outside the allowlist (for example <code>MCP_TIMEOUT</code>) are no longer passed on.</li>
+  </ul>
+
+  <h3>Conversations</h3>
+  <p>A conversation records its owner (API-key label and the request's <code>user_id</code>, or none) and a random sandbox home name when it is created. Only that exact owner can continue it; a conversation with a <code>user_id</code> and the same one without are different owners. Another caller gets the "cannot be continued from your account" text with no run and no change. One request at a time is processed per conversation. <code>GET /v1/sessions</code> and <code>DELETE /v1/sessions/:id</code> are scoped to the caller's label. Deleting a conversation leaves its home on disk (retention: MVP-7402).</p>
+
+  <h3>Configuration</h3>
+  <table>
+    <thead><tr><th>Variable</th><th>Default</th><th>When to change it</th></tr></thead>
+    <tbody>
+      <tr><td><code>ISOLATION_STARTUP_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Raise on a very loaded host if users see "could not start a protected workspace in time"; a sandbox normally starts in about 10 ms.</td></tr>
+      <tr><td><code>AGENT_RUN_TIMEOUT_MS</code></td><td><code>7200000</code> (120 min)</td><td>Lower to stop runaway agents sooner, raise for tasks that legitimately run longer. Covers the request including retries and backoff.</td></tr>
+      <tr><td><code>MODEL_PROXY_IDLE_TIMEOUT_MS</code></td><td><code>600000</code></td><td>Time a provider request may stay silent before it is cut.</td></tr>
+      <tr><td><code>AGENT_SANDBOX_ROOT</code></td><td><code>$HOME/.agent-sandbox</code></td><td>Only to move the storage of the conversation homes: an absolute path to a private directory owned by the gateway user; never mounted as a whole.</td></tr>
+      <tr><td><code>AGENT_SANDBOX_BWRAP</code></td><td><code>/usr/bin/bwrap</code></td><td>Only if the isolation runtime lives elsewhere.</td></tr>
+    </tbody>
+  </table>
+  <p>An invalid value (not a positive whole number, or a relative path) stops startup with one fixed line, <code>FATAL config key=&lt;KEY&gt; reason=&lt;fixed text&gt;</code>. Nothing falls back silently.</p>
+
+  <h3><code>/health</code> and the compose health check</h3>
+  <table>
+    <thead><tr><th><code>isolation</code></th><th>Meaning</th><th>What users see</th><th>What the operator does</th><th>What clears it</th></tr></thead>
+    <tbody>
+      <tr><td><code>starting</code></td><td>The boot self-check is running (a few hundred ms).</td><td>Nothing yet.</td><td>Wait.</td><td>The self-check finishing.</td></tr>
+      <tr><td><code>ok</code></td><td>A sandbox started and passed its check.</td><td>Normal answers.</td><td>Nothing.</td><td>Stays until a permanent problem occurs.</td></tr>
+      <tr><td><code>unavailable</code></td><td>The boot self-check or a start failed permanently. One log line: <code>ERROR isolation problem=&lt;word&gt; reason=&lt;fixed text&gt; (see /health)</code>.</td><td>Every query ends with "The gateway cannot start a protected workspace ...". Nothing runs unsandboxed.</td><td>Read the <code>problem</code> word (<code>binary_missing</code>, <code>invalid_root</code>, <code>namespace_denied</code>, <code>proc_denied</code>, <code>userns_not_blocked</code>, <code>canary_visible</code>, <code>pid_namespace_shared</code>, <code>mount_failed</code>, <code>content_invalid</code>, <code>proxy_unavailable</code>, <code>start_failed</code>) and fix the container profile, the storage directory or the host setting it names.</td><td>The next sandbox start that succeeds.</td></tr>
+    </tbody>
+  </table>
+  <p>A slow start of a user's run ("could not start a protected workspace in time") does not change <code>isolation</code>. A slow start during the boot self-check does: it reads <code>unavailable</code> with <code>problem=start_failed</code> until a later start succeeds (a query starts one; a gateway restart repeats the boot self-check; <code>proxy_unavailable</code> is cleared only by a restart).</p>
+
+  <h3>Container security profile and host prerequisites</h3>
+  <p><code>docker-compose.yml</code> runs the container as <code>node</code> (uid 1000; <code>./agent_home</code> must be owned by it) with <code>cap_drop: ALL</code>, <code>no-new-privileges</code>, <code>pids_limit: 512</code>, the committed seccomp profile <code>security/agent-gateway-seccomp.json</code> (Docker's default plus <code>clone</code>, <code>unshare</code>, <code>setns</code>, <code>mount</code>, <code>umount2</code>, <code>pivot_root</code> for a process without capabilities) and <code>systempaths=unconfined</code> (Docker's masked <code>/proc</code> paths make the sandbox's own <code>/proc</code> mount fail). This loosens the boundary between container and host, so every other control above is on. <strong>Host prerequisites:</strong> unprivileged user namespaces allowed (<code>kernel.apparmor_restrict_unprivileged_userns=0</code> on Ubuntu 24.04 and later, <code>user.max_user_namespaces</code> above 0). Docker's default AppArmor profile also blocks the sandbox's mounts: by default the compose file runs without an AppArmor profile; to keep one, load <code>security/agent-gateway-apparmor</code> (<code>sudo apparmor_parser -r security/agent-gateway-apparmor</code>) and start with <code>AGENT_GATEWAY_APPARMOR_PROFILE=agent-gateway-isolation</code>. Tested once (2026-10-01, Ubuntu 24.04, kernel 6.8, Docker 29.2): a task-owned container under a copy of this profile loaded with a different name (identical rules; only the profile name and its two self-references differ) ran in enforce mode with <code>isolation: ok</code>, and a cancelled run, <code>docker stop</code> during a run and a SIGKILL of the gateway process behaved as without a profile. The committed file under its own name and other kernels are not tested; <code>PROBE_APPARMOR_PROFILE=&lt;loaded profile&gt; npm run probe:docker-isolation</code> repeats the check.</p>
+
+  <h3>Updating a running gateway</h3>
+  <ol>
+    <li><strong>Risk acceptance (operator):</strong> accepting the container profile above is a prerequisite for redeploying the shared gateway; it is recorded on the Epic MVP-7676.</li>
+    <li><strong>Every conversation started before this update is refused after it.</strong> On the production gateway that counted 8,339 stored conversations on 2026-09-30: 3,834 with a saved transcript, 1,216 used in the last 14 days. Callers get the "started before a gateway security update" text and must start a new conversation (reqlift does not recover by itself; replaying from its database is a caller follow-up). Not implemented alternative: admit them after a secret scan and bind each to its first caller, which keeps old conversations but lets whoever knows an id first claim it.</li>
+    <li>Recreate the container so image, user and security options apply: <code>docker compose up -d --build</code>.</li>
+    <li>Check <code>curl -s http://localhost:3001/health | jq .isolation</code>: it must print <code>"ok"</code> (the container is then also <code>healthy</code>).</li>
+    <li>The first message of a conversation that starts an <code>npx</code> MCP server can be slower: that run's home is empty, so the package is downloaded again (about 7 s for a small server); later messages reuse it.</li>
+  </ol>
+
+  <h3>Behavior changes</h3>
+  <ul>
+    <li>Global directories and repositories are <strong>read-only for agents</strong>: an agent can no longer write to <code>~/.claude/memory</code>, <code>skills</code>, <code>agents</code> or a repository. The workspace API (<code>PUT /v1/memory/*</code>, the git routes) stays the write path; a prompt that tells an agent to update memory files there fails until it uses the API.</li>
+    <li>An agent has no <code>~/.ssh</code>; SSH access from a run needs a mediated path (MVP-7679).</li>
+    <li><code>claude auth status</code> does not exist in the bundled CLI: <code>GET /v1/auth/status</code> is read from the credential files with the same fields, and login runs the CLI bundled with the SDK. The entrypoint no longer installs a CLI and no longer runs as root.</li>
+    <li>Workspace listings and user-skill bundles list and copy regular files only (a symlink is neither listed nor followed).</li>
+  </ul>
+
+  <h3>Known residuals (MVP-7679)</h3>
+  <ul>
+    <li><strong>Content planted before the update.</strong> The secret scan skips files over 1 MiB and does not know the contents of <code>~/.ssh</code> private keys or the <code>tools.json</code> webhook authentication values, so a copy or hard link of those made by an agent before the update would not be hidden. The trusted <code>git</code> calls and <code>/v1/auth/login</code> run with <code>HOME=/home/node</code> and read configuration planted there before the update (<code>~/.gitconfig</code>, repository hooks, <code>core.fsmonitor</code>, <code>~/.tmux.conf</code>). The operator reviews or removes it before the first deploy.</li>
+    <li>A refusal versus a fresh conversation reveals that an id exists, and the first caller to use an unknown id claims it.</li>
+    <li>Conversation homes are never removed (MVP-7402), there is no size cap on a home or a private <code>/tmp</code>, and <code>pids_limit</code> is shared by all runs: an availability risk, not a credential exposure.</li>
+    <li>The SDK puts the whole MCP configuration on the runtime's own command line and stdio servers inherit its environment: header and env values of a <strong>non-relayed</strong> server (a stdio server's <code>env</code>, an SSE server's headers, <code>mcpCredentialOverrides</code> aimed at them, values in the request body's <code>mcpServers</code>) are readable inside that run's own sandbox. One <code>audit</code> line per such server: <code>mcp.server.credential_in_runtime_args serverName=&lt;name&gt; type=&lt;type&gt;</code>. Registered http servers go through the relay and are not affected.</li>
+    <li>The network is shared: a sandbox can reach loopback listeners (the proxy and relay need a run token) and other network peers. Egress control belongs to MVP-7679.</li>
+    <li><code>GET /v1/query/:id/events</code> replays any query to any API key; <code>/v1/auth/login</code> and <code>submit-code</code> run the CLI in the gateway's own context.</li>
   </ul>
 
   <!-- ============================================================ -->
@@ -1653,6 +1730,11 @@ curl http://localhost:3001/health</code></pre>
       <tr><td><code>MCP_TEST_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-test deadline for <code>POST /v1/mcp-servers/:name/test</code></td></tr>
       <tr><td><code>MCP_CALL_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-call deadline for <code>POST /v1/mcp-servers/:name/call</code></td></tr>
       <tr><td><code>MCP_UPLOAD_IDLE_TIMEOUT_MS</code></td><td><code>60000</code></td><td>No-progress timeout for one relayed upload (<code>POST /v1/mcp-servers/:name/uploads/*</code>); 504 <code>UPLOAD_TIMEOUT</code> on expiry, no overall deadline</td></tr>
+      <tr><td><code>ISOLATION_STARTUP_TIMEOUT_MS</code></td><td><code>10000</code></td><td>A sandbox must pass its start check within this time (see <a href="#isolation">Agent Isolation</a>)</td></tr>
+      <tr><td><code>AGENT_RUN_TIMEOUT_MS</code></td><td><code>7200000</code></td><td>Deadline of one query request, retries included</td></tr>
+      <tr><td><code>MODEL_PROXY_IDLE_TIMEOUT_MS</code></td><td><code>600000</code></td><td>No-progress timeout of one proxied provider request</td></tr>
+      <tr><td><code>AGENT_SANDBOX_ROOT</code></td><td><code>$HOME/.agent-sandbox</code></td><td>Trusted storage of the sandbox homes</td></tr>
+      <tr><td><code>AGENT_SANDBOX_BWRAP</code></td><td><code>/usr/bin/bwrap</code></td><td>Path of the isolation runtime</td></tr>
       <tr><td><code>GIT_MAX_CONCURRENCY</code></td><td><code>3</code></td><td>Git operations of <code>/v1/workspace/git/*</code> running at once across all repositories; further requests wait in arrival order, none is rejected</td></tr>
       <tr><td><code>GIT_TIMEOUT_MS</code></td><td><code>120000</code></td><td>Deadline for one git command of <code>/v1/workspace/git/*</code>; on expiry 500 <code>git &lt;subcommand&gt; timed out after &lt;n&gt; s</code></td></tr>
     </tbody>
@@ -1692,22 +1774,20 @@ curl http://localhost:3001/health</code></pre>
     <li><strong>openssh-client</strong> -- for SSH connectivity to remote servers</li>
     <li><strong>tmux</strong> -- for the Anthropic OAuth login flow</li>
     <li><strong>rsync, wget, curl, jq, mc, python3</strong> -- general utilities</li>
-    <li><strong>gosu</strong> -- privilege de-escalation (root to node user)</li>
+    <li><strong>bubblewrap, util-linux</strong> -- the per-run agent sandbox and its start check (<code>unshare</code>)</li>
     <li><strong>tini</strong> -- init process (process 1): forwards stop signals to the gateway, reaps finished child processes, returns the gateway's exit code</li>
-    <li><strong>Claude Code CLI</strong> -- installed on first startup via <code>curl -fsSL https://claude.ai/install.sh | bash</code></li>
+    <li><strong>Claude Code CLI</strong> -- the copy bundled with the Agent SDK (runs the agents and the OAuth login); nothing is downloaded at startup</li>
   </ul>
 
   <h3>Entrypoint Behavior</h3>
 
-  <p>The container starts as root and performs setup before dropping to the <code>node</code> user:</p>
+  <p>The whole container runs as the <code>node</code> user (<code>user: node</code> in <code>docker-compose.yml</code>; <code>./agent_home</code> must be owned by uid 1000). There is no root step:</p>
 
   <ol>
-    <li>Creates workspace directories (<code>~/.claude/memory</code>, <code>~/.claude/agents</code>, <code>~/.claude/skills</code>, <code>~/.ssh</code>, <code>~/.local/bin</code>)</li>
+    <li>Creates workspace directories (<code>~/.claude/memory</code>, <code>~/.claude/agents</code>, <code>~/.claude/skills</code>, <code>~/.ssh</code>)</li>
     <li>Writes default Claude settings with broad tool permissions (if not already present)</li>
-    <li>Installs Claude Code CLI via <code>curl</code> install script (if not already installed)</li>
-    <li>Ensures <code>PATH</code> includes <code>~/.local/bin</code> in <code>.bashrc</code></li>
     <li>Restores SSH key config from bind-mount if keys exist in <code>~/.ssh/</code></li>
-    <li>Drops to <code>node</code> user via <code>gosu</code> and starts the Express server</li>
+    <li>Starts the Express server</li>
   </ol>
 
   <h3>Stopping the Container</h3>

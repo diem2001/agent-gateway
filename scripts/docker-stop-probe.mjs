@@ -33,6 +33,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { composeRunArgs } from "./lib/compose-security.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PREFIX = "agw-mvp7616-probe-";
@@ -226,14 +227,10 @@ function refused(host, port) {
 }
 
 function seedHome(home) {
-  // A stub CLI, so the entrypoint does not download the Claude CLI; the
-  // gateway runs the runtime bundled with the Agent SDK.
-  fs.mkdirSync(path.join(home, ".local", "bin"), { recursive: true });
-  fs.writeFileSync(path.join(home, ".local", "bin", "claude"), "#!/bin/sh\necho 0.0.0-probe-stub\n", { mode: 0o755 });
+  // The container runs as the node user (uid 1000) like the compose file's `user: node`: the mounted
+  // directory must belong to that uid, and the gateway runs the runtime bundled with the Agent SDK.
   fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
-  // Files the entrypoint would otherwise create as root inside the temp directory.
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({ permissions: { allow: [] } }, null, 2));
-  fs.writeFileSync(path.join(home, ".bashrc"), 'export PATH="$HOME/.local/bin:$PATH"\n');
   const now = Date.now();
   const sessions = {
     sessions: {
@@ -256,6 +253,7 @@ function removeOwnTempDir(dir) {
 }
 
 async function main() {
+  if (typeof process.getuid === "function" && process.getuid() !== 1000) fail("run this probe as uid 1000: the container's node user must own the mounted home");
   evidence.commit = await run("git", ["-C", REPO_ROOT, "rev-parse", "HEAD"]);
   evidence.dirty = (await run("git", ["-C", REPO_ROOT, "status", "--porcelain", "--untracked-files=no"])) !== "";
   await docker("version", "--format", "{{.Server.Version}}");
@@ -290,7 +288,8 @@ async function main() {
   );
 
   try {
-    containerId = await docker("run", "-d", "--name", CONTAINER_NAME, "--network", "host", "--env-file", envFile, "-v", `${home}:/home/node`, IMAGE);
+    // The security profile of the committed compose file (user, capabilities, seccomp, AppArmor, systempaths, pids): agent runs need it.
+    containerId = await docker("run", "-d", "--name", CONTAINER_NAME, "--network", "host", ...composeRunArgs(REPO_ROOT), "--env-file", envFile, "-v", `${home}:/home/node`, IMAGE);
     log(`container ${containerId.slice(0, 12)} on 127.0.0.1:${port}`);
     await waitHealthy(port);
 

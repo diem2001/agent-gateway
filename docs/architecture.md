@@ -61,9 +61,17 @@ Calls `query()` from `@anthropic-ai/claude-agent-sdk` with configured tools, per
 
 Default tools: `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebSearch`, `WebFetch`.
 
+**Isolation (MVP-7678):** the runtime is started only through the SDK's `spawnClaudeCodeProcess` hook, which is `SandboxRun.spawnHook` (`sandbox.ts`): the runtime and everything it starts run inside a bubblewrap sandbox, and `options.env` holds no secret (`runtimeEnvFrom(process.env)` plus the per-run log variables; the sandbox builds its own allowlist). A start problem is thrown as an `IsolationFailure` (fixed text, never retried) instead of the SDK's generic exit error. `runQuery` waits for the sandbox process to exit before it returns, so the conversation lock of `query.ts` frees only when no process is left in the conversation's home.
+
 If registered webhook tools exist, they are wrapped as in-process MCP servers via `createToolMcpServer()` and injected into the SDK query alongside the built-in tools. The webhook context (user_id, session_id, api_key_label) and the client's Bearer token are passed to each webhook call. External MCP servers from the MCP Server Registry are merged into the same `mcpServers` map (per-server credentials applied), so the agent can call their tools over the MCP protocol. A registered **http** server reaches the SDK as a credential-relay URL with a per-run token and no headers (see [Credential Relay Flow](#credential-relay-flow)); the tokens are revoked when the run ends. The SDK child environment points the runtime's own log files into a private per-run directory (`sdk-run-logs.ts`), deleted after the runtime child has exited.
 
 **Run failures:** on a provider rejection the Claude runtime writes its diagnostic to stdout (a `system/init` message with `claude_code_version`, an assistant message with a non-null SDK `error` and the text `API Error: <status> <raw provider body>`, and a `result` with `is_error: true`, often with `subtype: "success"`) and then exits 1; the SDK yields those messages and only then throws `Claude Code process exited with code 1`. `agent.ts` keeps the classifier inputs of the attempt (the init version, error-flagged assistant messages, the result) and, on that throw or on a completed result with `is_error: true`, throws a `RunFailure` from `run-failure.ts` instead. Every other error thrown during iteration (for example an SDK JSON `SyntaxError`, whose message quotes runtime stdout) is wrapped too; only a client abort (`AbortError`) passes through unchanged. Error-flagged assistant text is never added to the answer, and ordinary assistant text is never classified.
+
+### sandbox.ts -- Per-Run Sandbox
+Configuration (`ISOLATION_STARTUP_TIMEOUT_MS`, `AGENT_RUN_TIMEOUT_MS`, `AGENT_SANDBOX_ROOT`, `AGENT_SANDBOX_BWRAP`; an invalid value throws `IsolationConfigError`, which stops startup), the exact `bwrap` argument list (`buildBwrapArgv`), the sandbox environment allowlist (`buildSandboxEnv`), the launch wrapper and `SandboxRun`. The wrapper is the first process inside a sandbox: it exits 97 when a nested user namespace can still be created (the run is then refused as `userns_not_blocked`), closes the launcher's argument descriptor, reports `SANDBOX-CHECK-OK` on stderr (the readiness signal) and execs the runtime. The options reach `bwrap` through `--args 3` so `/proc/1/cmdline` inside a sandbox shows no host path. `SandboxRun` prepares a private run directory below `AGENT_SANDBOX_ROOT/runs/` (trusted files: generated `settings.json`, git config masks, an empty file for hidden paths), the conversation's persistent home (`sessions/<sandboxDirId>/home`) or a private per-run home, validates the content plan (`sandbox-content.ts`), registers a model proxy token and starts `bwrap`; `dispose()` revokes the token, waits for the process to exit and removes the run directory. `isolationStatus()` feeds `/health`; `runIsolationSelfCheck()` starts a real sandbox at boot (canary file invisible, own PID namespace, nested user namespace refused). `tryLockConversation()` is the one-active-request-per-conversation lock. Problems are reported as one fixed log line `ERROR isolation problem=<word> reason=<fixed text> (see /health)`.
+
+### sandbox-content.ts -- What a Sandbox May See
+`checkTrusted()` (lstat, owner, tree, real path), `readFileNoFollow()`, `listRegularFilesNoFollow()`, `copyFileNoFollow()`, `allowlistGitConfig()` (remote url without user info and fetch, `branch.*`, `core.*` without `sshCommand`/`askpass`/`fsmonitor`/`hooksPath`, `extensions.*`), `KnownValueScanner` (the gateway's known secret values, cached by mtime and size, skips git object stores and files over 1 MiB) and `planTrustedContent()` (global entries, generated settings, repositories under `projects/` with their git configs, hidden files). `prepareMountPoints()` removes links and wrong-typed entries the agent planted at mount points in its own home. Nothing here logs a value or a path below the workspace root.
 
 ### run-failure.ts -- Run Failure Classification
 `classifyRunFailure()` turns one failed attempt into a `RunFailure` (an `Error` without `cause`) with `kind`, a fixed safe public `message`, `retryable`, operator-safe `logFields` and `resultSummary` (the result's usage, cost, duration, turn count, subtype, `is_error` and `session_id`, never its text or `errors`). Inputs are only the init `claude_code_version`, the result text when `is_error` is true, `result.errors[]`, the text and enum of error-flagged assistant messages, and the thrown error. A text is parsed only after an `API Error: <status>` prefix and only up to 16 KiB, reading fixed paths (`error.type`, `error.code`, `error.error.type`, `error.error.code`, `error.message`); version patterns run only on the first 1 KiB of `error.message`, and a version is used only when it matches `^\d{1,5}\.\d{1,5}\.\d{1,5}$`. The classifier is total (an internal exception gives `unknown`).
@@ -74,6 +82,9 @@ If registered webhook tools exist, they are wrapped as in-process MCP servers vi
 | `authentication` | assistant `error: "authentication_failed"`, provider type `authentication_error` or `permission_error` | no |
 | `transient` | status 429/529, provider type `rate_limit_error`/`overloaded_error`, assistant `error: "rate_limit"`, or (without any diagnostic) a thrown message matching the historic pattern (`rate.limit`, `429`, `throttl` or `overloaded`, case-insensitive; not for a JSON `SyntaxError`) | yes |
 | `unknown` | everything else, including absent, malformed or oversized diagnostics and `billing_error`/`invalid_request`/`server_error` without a recognized code | no |
+| `isolation_unavailable`, `isolation_timeout` | `IsolationFailure` from `sandbox.ts` (a permanent start problem, or no readiness within `ISOLATION_STARTUP_TIMEOUT_MS`) | no |
+| `run_deadline` | `AGENT_RUN_TIMEOUT_MS` expired (retries and backoff included) | no |
+| `session_other_owner`, `session_legacy`, `session_busy` | conversation admission in `query.ts` | no |
 
 Permanent kinds beat `transient`, and `transient` beats `unknown`. The exact public messages are listed in the README ("Failed queries"). The installed version comes only from the init message and the required one only from an explicit "`<version>` or newer" or ">= `<version>`" in `error.message`.
 
@@ -92,6 +103,8 @@ Maps client-provided session IDs to internal Claude SDK session IDs. Sessions ar
 - **Persisted** to disk (debounced, atomic; see `persistence.ts`) at `SESSION_PERSIST_PATH`
 - **Restored** from disk on startup (expired sessions filtered out)
 - **Cleaned** every 5 minutes if `SESSION_IDLE_TIMEOUT_MS > 0`
+- **Owned** (MVP-7678): a new entry records its `owner` (`{label, userId|null}`) and a random `sandboxDirId` (the conversation's sandbox home). `admitSession()` runs before anything else and changes nothing: no entry means new, the exact owner resumes, another owner is refused, and an entry without a recorded owner and home (created before the update) is refused for everyone and counted in one audit line. `listSessions(label)` and `deleteSession(id, label)` are scoped to the caller's label (ownerless entries stay visible to all).
+- **Validated at load**: a present `owner` or `sandboxDirId` of the wrong shape sets the whole file aside like other unexpected content (`persistence.ts`).
 
 Session continuity uses two SDK options:
 - **New sessions**: pass `sessionId` to start a fresh conversation
@@ -118,9 +131,12 @@ Three levels: `off`, `info`, `debug`. Level is adjustable at runtime via `PUT /v
 
 ### routes/auth.ts -- Anthropic OAuth
 Three-step flow using tmux to interact with Claude CLI:
-1. **POST /v1/auth/login**: Starts Claude CLI in a tmux session, captures the OAuth authorization URL.
+1. **POST /v1/auth/login**: Starts the Claude CLI bundled with the SDK in the image (never `~/.local/bin/claude`, which agents could write) in a tmux session, captures the OAuth authorization URL.
 2. **POST /v1/auth/submit-code**: Sends the authorization code to the tmux session, polls for login success.
-3. **GET /v1/auth/status**: Checks if Claude CLI reports a valid login. The response is augmented with `expiresAt` (epoch ms from `~/.claude.json` `claudeAiOauth.expiresAt`) and `tokenExpired` (boolean, `Date.now() > expiresAt`) so clients can warn users before queries start failing with auth errors.
+3. **GET /v1/auth/status**: Reads the login state from the trusted files (`~/.claude/.credentials.json`, `~/.claude.json`) or `ANTHROPIC_API_KEY`; the bundled CLI has no `auth status` command. The response carries `loggedIn`, `email`, `expiresAt` (epoch ms from `claudeAiOauth.expiresAt`) and `tokenExpired` (boolean, `Date.now() > expiresAt`) so clients can warn users before queries start failing with auth errors.
+
+### model-proxy.ts -- Trusted model proxy (MVP-7678)
+A loopback listener (127.0.0.1, ephemeral port, not an Express route). An agent run gets `ANTHROPIC_BASE_URL` pointing at it and a random run token as its only `ANTHROPIC_API_KEY`. The proxy accepts the token only in `x-api-key` (constant-time, revoked when the run ends), allows only `POST /v1/messages` and `POST /v1/messages/count_tokens` (query `beta=true` or none, body up to 32 MiB, canonical paths only), drops the caller's credential headers, adds the gateway's credential (`ANTHROPIC_API_KEY`, otherwise the OAuth access token of `.credentials.json`, refreshed once at a time on the trusted side) and forwards to `ANTHROPIC_BASE_URL` (default `https://api.anthropic.com`). Status, `x-should-retry` and rate-limit headers pass through; `set-cookie` does not. It never logs headers, bodies, paths or tokens. `MODEL_PROXY_IDLE_TIMEOUT_MS` (default 600000) bounds a silent provider request.
 
 ### routes/git.ts -- Workspace Git Endpoints
 Lets clients clone and refresh git repositories inside `WORKSPACE_ROOT/projects/<path>` so agents can `Read`/`Grep` real source trees as part of their context:
@@ -214,9 +230,9 @@ REST endpoints for the external MCP server registry:
 2. Auth middleware validates Bearer token
 3. `validateMcpCredentialOverrides()` confirms every overridden server is registered + enabled and that the override targets match transport (`headers` for http/sse, `env` for stdio)
 4. Event cache entry created for `queryId`
-5. Session resolved: existing session reused (with `resume`) or new one created (with `sessionId`)
+5. Conversation admission (`query.ts`): another owner, a legacy entry or a busy conversation ends the request here with one fixed `error` event and no run. Then the session is resolved: existing session reused (with `resume`) or new one created (with `sessionId`, an owner and a sandbox home name), and the conversation lock is held until the request ends
 6. Registered webhook tools are wrapped as in-process MCP servers via `createToolMcpServer()`. External MCP servers are pulled from `mcp-registry.ts`, merged with per-request overrides, and added to the same `mcpServers` map handed to the SDK
-7. `runQueryWithRetry` calls `runQuery` (agent.ts)
+7. `runQueryWithRetry` starts the run deadline (`AGENT_RUN_TIMEOUT_MS`) and calls `runQuery` (agent.ts), which starts the runtime in the sandbox (see Agent Isolation)
 8. Agent SDK streams messages; `agent.ts` translates to events:
    - `text` -- assistant text chunks
    - `tool_use` -- tool invocation (name, input summary)
@@ -262,6 +278,35 @@ Resume conversation   Start fresh
 ```
 
 Sessions persist across server restarts via `SESSION_PERSIST_PATH`. The cleanup timer evicts sessions idle longer than `SESSION_IDLE_TIMEOUT_MS`.
+
+## Agent Isolation
+
+```
+                  trusted (the gateway process, uid node)                      untrusted (per run)
++---------------------------------------------------------------+   +------------------------------------------+
+| API keys, provider key, OAuth tokens, state files, SSH keys   |   | bubblewrap sandbox: user, PID, IPC, UTS, |
+| model proxy  127.0.0.1:<p>  (run token -> provider call)  <---+---+-- cgroup namespaces; shared network        |
+| credential relay 127.0.0.1:<q> (registered http MCP servers)<-+---+-- Claude runtime, Bash, interpreters,        |
+| session lock, owner check, content validation and scan        |   |   Read/Write/Edit/Glob/Grep, stdio MCP   |
++---------------------------------------------------------------+   |   servers, sub-agents                    |
+        |  starts bwrap --args 3 (options on a pipe), env allowlist  |                                          |
+        +----------------------------------------------------------->|  sees: read-only system + runtime +      |
+                                                                     |  global dirs + repositories (masked git  |
+                                                                     |  config) ; writable: its home, /tmp      |
+                                                                     +------------------------------------------+
+```
+
+**Trust boundary.** The gateway never gives the runtime a secret: the environment is an allowlist built from nothing, the provider credential stays behind the model proxy (the runtime holds a random run token, valid for this run only), registered MCP servers stay behind the relay, and trusted files are never mounted. Everything an agent can run is the runtime process or its child, so it is inside the sandbox; there is no command filtering to bypass.
+
+**Data flow of a run.** caller query -> owner check -> conversation lock -> sandbox home and content validation (no-follow checks, git config masks, known-value scan) -> `bwrap` start and check (`unshare -U` must fail inside) -> runtime inside the sandbox -> provider calls to the model proxy with the run token -> tool calls (shell and files inside the sandbox; http MCP through the relay; webhook tools in-process through the SDK control channel) -> events and the transcript in the conversation's home -> `done` -> token revoked, process exited, lock released, run directory removed.
+
+**Failure flows.** Cancel (client close) or gateway stop or kill ends every sandbox process (`--die-with-parent`, and the PID namespace ends every child). A restart resumes an admitted conversation from its home. A start fault is refused with the permanent or the transient isolation text, never retried, and nothing runs unsandboxed. The run deadline aborts the run, discards its answer and saves nothing to the conversation.
+
+**Conversation lifecycle.** `POST /v1/query` with a `sessionId`: new conversation -> owner and `sandboxDirId` recorded, home `<AGENT_SANDBOX_ROOT>/sessions/<sandboxDirId>/home` created on first use; later requests by the same owner reuse that home and the runtime's own transcript in it; a request by another owner or for a pre-update conversation is refused before anything is touched. Deleting a conversation removes its entry only (the home stays until MVP-7402 defines retention).
+
+**Container profile.** One container, running as `node`: `cap_drop: ALL`, `no-new-privileges`, `pids_limit`, a committed seccomp profile, `systempaths=unconfined` (needed for the sandbox's fresh `/proc`) and an AppArmor profile (committed, loaded by the operator) or none. Host prerequisite: unprivileged user namespaces allowed. The Docker socket is never mounted and no port is added.
+
+**Known residuals (MVP-7679).** Content an agent planted in a mounted tree before the update is not fully neutralized (files over 1 MiB, `~/.ssh` key contents and `tools.json` webhook values are not in the scan; trusted `git` and `/v1/auth/login` read configuration planted in `/home/node`); an id refusal reveals that the id exists and the first caller to use an unknown id claims it; conversation homes are never removed (MVP-7402), have no size cap, and `pids_limit` is shared. MCP configuration values of non-relayed servers are readable inside the owning run's sandbox (the SDK passes the whole configuration on the runtime's command line); the network is shared (loopback listeners need a run token, egress is not restricted); `GET /v1/query/:id/events` and the OAuth login routes are caller-level, not agent-level, surfaces.
 
 ## Tool Surfaces: Webhook Registry vs MCP Server Registry
 
@@ -466,12 +511,13 @@ In the image `tini` is process 1 and forwards the signal, so the container exit 
 - **Path Traversal Protection**: `safePath()` (workspace) and `resolveProjectPath()` (git) prevent directory escape via `../`, absolute paths, null bytes, and symlink resolution.
 - **SSH Key Validation**: Filename restricted to `[a-zA-Z0-9_-]` to prevent injection. Inline keys for the git routes are written, only once the request holds a git slot, to a private per-request temp directory (`0700`, key file created exclusively with `0600`) and removed in `finally`; the key path is quoted inside `GIT_SSH_COMMAND`.
 - **Git Arguments and Credentials**: git runs without a shell, with `--` before clone and fetch positionals, an explicit fetch refspec, leading-dash branches rejected and the `ext::` transport disabled. Error text and git log lines carry no user-info credentials of `http(s)://` URLs, whatever characters the token contains (on each line everything from the first `scheme://` to the last `@` is hidden; query-string tokens are not redacted). `ssh://`, `git://` and `file://` transports do not use URL passwords, and ssh/git may echo such a URL's user-info without `scheme://` or `@` (e.g. `Could not resolve hostname user:<password>`), which the redaction cannot recognize, and the debug log redacts `sshKey` values and, in every string under a `url` key, everything from `scheme://` to the last `@`.
+- **Agent Isolation (MVP-7678)**: every agent run executes in a bubblewrap sandbox with an allowlisted view, an allowlisted environment and a per-run model proxy token as its only provider credential; conversations belong to one exact owner, run one request at a time, and pre-update conversations are refused. See "Agent Isolation".
 - **Tool Permissions**: without `enforcedTools` the Claude SDK runs with `bypassPermissions` -- the gateway trusts the SDK's tool execution, and every built-in tool, registered webhook tool and registered MCP server is available.
 - **MCP Tool Allowlist**: `allowedToolsPattern` per registered MCP server only adds that server's tools to the pre-approved `allowedTools` list. It does not stop the agent from calling other tools; it is no security boundary.
 - **Enforced tool set (MVP-7637)**: a caller that sends `enforcedTools` gets a run in which every tool outside the set is refused before its handler runs (`src/tool-policy.ts`). The layers: `settingSources: []` (nothing from the writable HOME — settings, hooks, permission rules, `.mcp.json`, user-scope MCP servers — applies), `permissionMode: "dontAsk"` with `allowedTools` exactly the set (the primary deny: an unlisted tool is denied, not asked for), `tools` limited to the listed built-ins, `agent-gateway-tools` and registry/request MCP servers attached only for listed tools, a `PreToolUse` hook that denies every other name (it never answers "allow", because under `dontAsk` an allow would override the mode, and any internal error denies; it is the `tool.denied` audit point), and no per-user skill bundle. The query route validates the field (400) and emits a `tool_policy` event echoing the set before any other event and before the retry loop. Measured on SDK 0.1.77 with the real runtime (`src/tests/tool-policy-process.test.ts`): the refusal holds with a HOME seeded like `entrypoint.sh`, with a hostile HOME (hooks disabled, allow rules, an allow hook, a parent `.mcp.json`, user-scope servers), with the hook throwing and with the hook never deciding. Residual risk outside this feature: an unrestricted run can still rewrite gateway state files (`tools.json`, `mcp-servers.json`), including a webhook URL an enforced run would then call (tracked separately).
 - **Credential Boundaries**: `userCredentialSchema` enforces transport-appropriate output targets (`SCHEMA_TARGET_MISMATCH`); per-request overrides are never written back to `MCP_SERVERS_PERSIST_PATH`; test-client errors are sanitized so header/env values do not leak in error messages.
 - **Token Expiry Surfacing**: `/v1/auth/status` exposes `tokenExpired` + `expiresAt` so clients can warn users before queries fail with auth errors.
-- **Docker Isolation**: Container runs as `node` user (dropped from root via `gosu`), SSH keys, sessions, tools, and MCP server definitions persist on a named volume.
+- **Docker Isolation**: Container runs as the `node` user from the start (`user: node`, no root step), SSH keys, sessions, tools, and MCP server definitions persist on a named volume.
 - **State File Protection**: temp files are created with `O_EXCL` and mode 0600 (no symlink follow, never more readable than the owner while credentials are written); `.corrupt-*` copies keep the original bytes and permissions; ERROR lines and `/health` carry only area, problem, paths, a fixed reason and the errno.
 - **Localhost Binding**: Docker compose binds port 3001 to `127.0.0.1` only -- requires a reverse proxy for external access.
 - **Upload Relay**: target path and query come from the raw URL with dot segments, encoded slashes and backslashes refused; upstream host and port come only from the registry. Only `Authorization` is taken from `X-MCP-Credential-Headers`, which is never forwarded or logged; hop-by-hop headers never come from an override or a registration. Refusals on the upload path close the connection after at most 1 MiB / 5 s, so a caller without a key cannot make the gateway read a large body. The gateway enforces no size or concurrency cap of its own (reqlift's 100 MiB cap applies to reqlift callers; other key holders are bounded by the MCP server).

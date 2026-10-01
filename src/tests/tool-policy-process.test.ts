@@ -137,8 +137,9 @@ async function rig(setup: Setup): Promise<Rig> {
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     },
   });
-  // The marker lives inside the gateway's own temp root.
-  markerHolder.path = path.join(gateway.dirs.tmp, "marker-7637");
+  // The marker is a path in the agent's own home inside its sandbox (MVP-7678): the host cannot see it,
+  // so a Bash call that ran shows as a successful tool result and one that was refused as an error.
+  markerHolder.path = "/home/node/marker-7637";
   const bashInput = JSON.parse(JSON.stringify(input).replaceAll("__MARKER__", markerHolder.path));
   Object.assign(input, bashInput);
   for (const name of ["probe_read", "probe_write"]) {
@@ -186,7 +187,6 @@ function scriptedResult(r: Rig): { isError: boolean; text: string } | undefined 
 function expectRefusedAndHarmless(r: Rig, events: NdjsonEvent[]): void {
   expect(r.webhook.hits, "webhook requests").toEqual([]);
   expect(r.mcp.toolCalls, "MCP tools/call at the relay upstream").toEqual([]);
-  expect(fs.existsSync(r.marker), "Bash marker created").toBe(false);
   expect(r.webTarget.hits, "WebFetch target requests").toEqual([]);
   const result = scriptedResult(r);
   expect(result?.isError, JSON.stringify(result)).toBe(true);
@@ -241,7 +241,6 @@ describe("an enforced run refuses every other tool before it runs (real runtime)
     const r = await rig({ tool: "Bash", input: { command: "touch MARKER", description: "probe" } });
     const { events } = await run(r, { enforcedTools: [] });
     expect(events[0]).toEqual({ seq: 0, type: "tool_policy", enforced: true, tools: [] });
-    expect(fs.existsSync(r.marker)).toBe(false);
     expect(scriptedResult(r)?.isError).toBe(true);
     // No tool is offered at all.
     expect(r.api.mainRequests().every((q) => q.tools.length === 0)).toBe(true);
@@ -308,12 +307,15 @@ describe("HOME cannot widen an enforced run (real runtime)", () => {
         );
   };
 
-  it("control: without enforcedTools the hostile HOME's user-scope server does start", async () => {
+  it("control: even without enforcedTools the hostile HOME is invisible to the run (isolation), and Bash works in its own home", async () => {
     const logs = { parent: "", user: "" };
     const r = await rig({ tool: "Bash", input: { command: "touch MARKER", description: "probe" }, home: hostileHome(logs) });
     await run(r, {});
-    expect(fs.existsSync(logs.user), "user-scope server log").toBe(true);
-    expect(fs.existsSync(r.marker)).toBe(true);
+    // The gateway's HOME holds the hostile user-scope configuration and its parent a project one;
+    // the run's sandbox has a fresh home, so neither server starts any more.
+    expect(fs.existsSync(logs.user), "user-scope server log").toBe(false);
+    expect(fs.existsSync(logs.parent), "project-scope server log").toBe(false);
+    expect(scriptedResult(r)?.isError, JSON.stringify(scriptedResult(r))).toBe(false);
   }, RUN_TIMEOUT_MS);
 
   it.each([
@@ -378,7 +380,6 @@ describe("without enforcedTools nothing changes (real runtime)", () => {
     const r = await rig({ tool: "Bash", input: { command: "touch MARKER", description: "probe" } });
     const { events } = await run(r, {});
     expect(events.some((e) => e.type === "tool_policy")).toBe(false);
-    expect(fs.existsSync(r.marker)).toBe(true);
     expect(scriptedResult(r)?.isError).toBe(false);
   }, RUN_TIMEOUT_MS);
 });

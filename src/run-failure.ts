@@ -12,7 +12,17 @@
  * `logFields` holds only allowlisted values. A `RunFailure` has no `cause`.
  */
 
-export type RunFailureKind = "runtime_version_unsupported" | "authentication" | "transient" | "unknown";
+export type RunFailureKind =
+  | "runtime_version_unsupported"
+  | "authentication"
+  | "transient"
+  | "unknown"
+  | "isolation_unavailable"
+  | "isolation_timeout"
+  | "run_deadline"
+  | "session_other_owner"
+  | "session_legacy"
+  | "session_busy";
 
 /** Everything agent.ts may pass to the classifier for one attempt. */
 export interface RunDiagnostics {
@@ -242,3 +252,36 @@ export function formatLogFields(fields: RunFailureLogFields): string {
 export function isAbortError(err: unknown): boolean {
   return err instanceof Error && (err.name === "AbortError" || err.constructor?.name === "AbortError");
 }
+
+/* ------------------------------------------------------------------ */
+/*  Isolation and deadline failures (MVP-7678)                          */
+/* ------------------------------------------------------------------ */
+
+function referenceSuffix(queryId: string | undefined): string {
+  return queryId && /^[A-Za-z0-9._:-]{1,128}$/.test(queryId) ? ` (reference: ${queryId})` : "";
+}
+
+/** Fixed texts; the tests assert them verbatim. They name no internal term and say who acts and whether retrying helps. */
+export function isolationUnavailableMessage(queryId: string | undefined): string {
+  return `The gateway cannot start a protected workspace, so this request did not run. Ask your gateway administrator to check the gateway's isolation status. ${RETRY_WILL_NOT_HELP}${referenceSuffix(queryId)}`;
+}
+
+export function isolationTimeoutMessage(queryId: string | undefined): string {
+  return `The gateway could not start a protected workspace in time, so this request did not run. Please try again in a few minutes. If it keeps happening, tell your gateway administrator.${referenceSuffix(queryId)}`;
+}
+
+export function runDeadlineMessage(limitMs: number, queryId: string | undefined): string {
+  const minutes = Math.max(1, Math.ceil(limitMs / 60_000));
+  return `The request was stopped because it ran longer than the gateway's limit of ${minutes} ${minutes === 1 ? "minute" : "minutes"}. Its results were not saved. Try again with a smaller task, or ask your gateway administrator to raise the limit.${referenceSuffix(queryId)}`;
+}
+
+/** A failure with a fixed public text and no provider facts. It is never retried. */
+export function fixedFailure(kind: RunFailureKind, message: string): RunFailure {
+  const fields: RunFailureLogFields = { kind, apiStatus: "none", providerType: "none", installed: "none", required: "none" };
+  return new RunFailure(kind, message, fields, null);
+}
+
+/** Conversation admission refusals (MVP-7678). The "other owner" text does not confirm that the conversation exists. */
+export const SESSION_OTHER_OWNER_MESSAGE = "This conversation cannot be continued from your account. Please start a new conversation.";
+export const SESSION_LEGACY_MESSAGE = "This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help.";
+export const SESSION_BUSY_MESSAGE = "This conversation is still answering an earlier request. Please wait until it has finished, then try again.";
