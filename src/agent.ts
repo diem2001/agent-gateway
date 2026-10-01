@@ -350,81 +350,93 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   options.spawnClaudeCodeProcess = sandbox.spawnHook;
 
   const relayTokens: string[] = [];
-  // Request stdio servers with env run in their own tool sandbox behind the relay.
-  for (const [name, config] of Object.entries(mcpServers)) {
-    if (!carriesEnv(config)) continue;
-    const entry = config as { command: string; args?: string[]; env: Record<string, string> };
-    const bridge = new StdioBridge({ serverName: name, command: entry.command, args: entry.args ?? [], env: { ...entry.env }, queryId });
-    const { token, url } = credentialRelay.register({
-      serverName: name,
-      url: STDIO_PLACEHOLDER_URL,
-      headers: {},
-      kind: "stdio",
-      bridge,
-      grant: relayGrantFor(grant, name),
-      credentialSource: "user",
-    });
-    relayTokens.push(token);
-    mcpServers[name] = { type: "http", url };
-  }
-  // Request servers with headers: the runtime gets a relay URL, the header values stay with the relay.
-  for (const [name, config] of Object.entries(mcpServers)) {
-    if (!carriesHeaders(config)) continue;
-    const kind = (config as { type?: unknown }).type === "sse" ? "sse" : "http";
-    const { token, url } = credentialRelay.register({
-      serverName: name,
-      url: (config as { url: string }).url,
-      headers: { ...((config as { headers?: Record<string, string> }).headers ?? {}) },
-      kind,
-      grant: relayGrantFor(grant, name),
-      credentialSource: "user",
-    });
-    relayTokens.push(token);
-    mcpServers[name] = { type: "http", url };
-  }
-  const registeredMcpServers = buildMcpServersForSdk(runRegistryServers);
-  if (registeredMcpServers) {
-    // One case-insensitive merge: a user header replaces the shared header of the same name.
-    const effectiveMcpServers = applyMcpCredentialOverrides(
-      registeredMcpServers,
-      mcpCredentialOverrides,
-    );
-    // The runtime gets a loopback relay URL with a per-run token and no header; the relay holds this
-    // run's URL, header snapshot and grant until the run ends.
-    for (const [name, config] of Object.entries(effectiveMcpServers)) {
-      const def = runRegistryServers.find((d) => d.name === name)!;
-      const override = mcpCredentialOverrides?.[name];
-      if (!("type" in config)) {
-        // A registered stdio server (with or without env) runs in its own tool sandbox; args and env stay with the bridge.
-        const bridge = new StdioBridge({ serverName: name, command: config.command, args: config.args ?? [], env: { ...(config.env ?? {}) }, queryId });
+  try {
+    // Request stdio servers with env run in their own tool sandbox behind the relay.
+    for (const [name, config] of Object.entries(mcpServers)) {
+      if (!carriesEnv(config)) continue;
+      const entry = config as { command: string; args?: string[]; env: Record<string, string> };
+      const bridge = new StdioBridge({ serverName: name, command: entry.command, args: entry.args ?? [], env: { ...entry.env }, queryId });
+      const { token, url } = credentialRelay.register({
+        serverName: name,
+        url: STDIO_PLACEHOLDER_URL,
+        headers: {},
+        kind: "stdio",
+        bridge,
+        grant: relayGrantFor(grant, name),
+        credentialSource: "user",
+      });
+      relayTokens.push(token);
+      mcpServers[name] = { type: "http", url };
+    }
+    // Request servers with headers: the runtime gets a relay URL, the header values stay with the relay.
+    for (const [name, config] of Object.entries(mcpServers)) {
+      if (!carriesHeaders(config)) continue;
+      const kind = (config as { type?: unknown }).type === "sse" ? "sse" : "http";
+      const { token, url } = credentialRelay.register({
+        serverName: name,
+        url: (config as { url: string }).url,
+        headers: { ...((config as { headers?: Record<string, string> }).headers ?? {}) },
+        kind,
+        grant: relayGrantFor(grant, name),
+        credentialSource: "user",
+      });
+      relayTokens.push(token);
+      mcpServers[name] = { type: "http", url };
+    }
+    const registeredMcpServers = buildMcpServersForSdk(runRegistryServers);
+    if (registeredMcpServers) {
+      // One case-insensitive merge: a user header replaces the shared header of the same name.
+      const effectiveMcpServers = applyMcpCredentialOverrides(
+        registeredMcpServers,
+        mcpCredentialOverrides,
+      );
+      // The runtime gets a loopback relay URL with a per-run token and no header; the relay holds this
+      // run's URL, header snapshot and grant until the run ends.
+      for (const [name, config] of Object.entries(effectiveMcpServers)) {
+        const def = runRegistryServers.find((d) => d.name === name)!;
+        const override = mcpCredentialOverrides?.[name];
+        if (!("type" in config)) {
+          // A registered stdio server (with or without env) runs in its own tool sandbox; args and env stay with the bridge.
+          const bridge = new StdioBridge({ serverName: name, command: config.command, args: config.args ?? [], env: { ...(config.env ?? {}) }, queryId });
+          const { token, url } = credentialRelay.register({
+            serverName: name,
+            url: STDIO_PLACEHOLDER_URL,
+            headers: {},
+            kind: "stdio",
+            bridge,
+            grant: relayGrantFor(grant, name),
+            credentialSource: hasOverrideValues(override, "env") ? "user" : "gateway",
+            noUserCredential: schemaWantsTarget(def, "env") && !hasUserCredential(def, override),
+          });
+          relayTokens.push(token);
+          effectiveMcpServers[name] = { type: "http", url };
+          continue;
+        }
+        if (config.type !== "http" && config.type !== "sse") continue;
         const { token, url } = credentialRelay.register({
           serverName: name,
-          url: STDIO_PLACEHOLDER_URL,
-          headers: {},
-          kind: "stdio",
-          bridge,
+          url: config.url,
+          headers: config.headers ?? {},
+          kind: config.type,
           grant: relayGrantFor(grant, name),
-          credentialSource: hasOverrideValues(override, "env") ? "user" : "gateway",
-          noUserCredential: schemaWantsTarget(def, "env") && !hasUserCredential(def, override),
+          credentialSource: hasOverrideValues(override, "headers") ? "user" : "gateway",
+          noUserCredential: schemaWantsTarget(def, "headers") && !hasUserCredential(def, override),
         });
         relayTokens.push(token);
         effectiveMcpServers[name] = { type: "http", url };
-        continue;
       }
-      if (config.type !== "http" && config.type !== "sse") continue;
-      const { token, url } = credentialRelay.register({
-        serverName: name,
-        url: config.url,
-        headers: config.headers ?? {},
-        kind: config.type,
-        grant: relayGrantFor(grant, name),
-        credentialSource: hasOverrideValues(override, "headers") ? "user" : "gateway",
-        noUserCredential: schemaWantsTarget(def, "headers") && !hasUserCredential(def, override),
-      });
-      relayTokens.push(token);
-      effectiveMcpServers[name] = { type: "http", url };
+      Object.assign(mcpServers, effectiveMcpServers);
     }
-    Object.assign(mcpServers, effectiveMcpServers);
+
+
+  } catch (error) {
+    // A binding that could not be built (for example an invalid isolation setting) must not leave the tokens, the run
+    // directory or the skill bundle of this run behind.
+    for (const token of relayTokens) credentialRelay.revoke(token);
+    cleanupUserSkillBundle(userSkills.pluginRoot);
+    void removeRunLogDirAfterExit(runLogs.dir, sandbox.child);
+    await sandbox.dispose();
+    throw error;
   }
 
   if (mcpCredentialOverrides) {

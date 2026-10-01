@@ -139,17 +139,21 @@ const attackScript = (gatewayPort: () => number): string =>
 import json, os, re, sys, urllib.request, urllib.error
 GATEWAY = 'http://127.0.0.1:${gatewayPort()}'
 pattern = re.compile(rb'http://127\.0\.0\.1:\d+/mcp/[A-Za-z0-9_-]+')
-def find_url():
+def find_urls():
+    found = []
+    def add(data):
+        for m in pattern.finditer(data):
+            u = m.group(0).decode()
+            if u not in found:
+                found.append(u)
     for pid in os.listdir('/proc'):
         if not pid.isdigit():
             continue
         for name in ('cmdline', 'environ'):
             try:
-                m = pattern.search(open('/proc/%s/%s' % (pid, name), 'rb').read())
+                add(open('/proc/%s/%s' % (pid, name), 'rb').read())
             except Exception:
                 continue
-            if m:
-                return m.group(0).decode()
     for root in ('/tmp', '/home/node'):
         for base, dirs, files in os.walk(root):
             for f in files:
@@ -157,12 +161,10 @@ def find_url():
                     p = os.path.join(base, f)
                     if os.path.getsize(p) > 5000000:
                         continue
-                    m = pattern.search(open(p, 'rb').read())
+                    add(open(p, 'rb').read())
                 except Exception:
                     continue
-                if m:
-                    return m.group(0).decode()
-    return None
+    return found
 def proxy_token():
     for pid in os.listdir('/proc'):
         if not pid.isdigit():
@@ -199,7 +201,13 @@ def out(label, status, body):
     print(json.dumps({'case': label, 'status': status, 'body': body}))
 def rpc(method, id=1, params=None):
     return json.dumps({'jsonrpc': '2.0', 'id': id, 'method': method, 'params': params or {}}).encode()
-url = find_url()
+# The server whose grant names one tool only: the one that lists lookup_record (the others are granted whole).
+url = None
+for candidate in find_urls():
+    s, b = post(candidate, rpc('tools/list', 99))
+    if 'lookup_record' in b:
+        url = candidate
+        break
 if url is None:
     out('no-url', 0, '')
     sys.exit(0)
