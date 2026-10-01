@@ -301,3 +301,22 @@ describe("nothing agent-writable under ~/.claude is left in place as configurati
     });
   });
 });
+
+describe("the home is never a repository the runtime runs git in at start (core.fsmonitor, filter drivers)", () => {
+  it("a .git directory, file or link in the home is removed without being followed, repositories below it stay", () => {
+    fs.writeFileSync(path.join(outside, "keep.txt"), "keep");
+    fs.mkdirSync(path.join(home, ".git"));
+    fs.writeFileSync(path.join(home, ".git", "config"), "[core]\n\tfsmonitor = touch /home/node/m-evil\n");
+    fs.mkdirSync(path.join(home, "work", ".git"), { recursive: true });
+    sanitizeRuntimeConfig(home);
+    expect(fs.existsSync(path.join(home, ".git"))).toBe(false);
+    expect(fs.existsSync(path.join(home, "work", ".git"))).toBe(true);
+    fs.writeFileSync(path.join(home, ".git"), "gitdir: /elsewhere\n");
+    sanitizeRuntimeConfig(home);
+    expect(fs.existsSync(path.join(home, ".git"))).toBe(false);
+    fs.symlinkSync(outside, path.join(home, ".git"));
+    sanitizeRuntimeConfig(home);
+    expect(fs.existsSync(path.join(home, ".git"))).toBe(false);
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+  });
+});

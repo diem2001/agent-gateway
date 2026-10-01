@@ -22,13 +22,21 @@ import { log } from "./logging.js";
 export const SANDBOX_HOME = "/home/node";
 export const SANDBOX_CLAUDE_DIR = `${SANDBOX_HOME}/.claude`;
 
-/** Global workspace entries an agent may read: (name, kind). */
-export const GLOBAL_ENTRIES: readonly { name: string; kind: "file" | "dir" }[] = [
-  { name: "CLAUDE.md", kind: "file" },
-  { name: "skills", kind: "dir" },
-  { name: "agents", kind: "dir" },
-  { name: "memory", kind: "dir" },
-  { name: "commands", kind: "dir" },
+/**
+ * Global workspace entries an agent may read: (name, kind). `trusted` entries are configuration or extensions the
+ * runtime loads from `~/.claude` (instructions, skills, agents, commands, output styles, plugins, hooks): a file the
+ * agent writes there can carry hooks or MCP servers, so the sandbox always sees the workspace entry read-only, or a
+ * trusted EMPTY one when the workspace has none (never the agent-writable directory underneath). `memory` is data.
+ */
+export const GLOBAL_ENTRIES: readonly { name: string; kind: "file" | "dir"; trusted: boolean }[] = [
+  { name: "CLAUDE.md", kind: "file", trusted: true },
+  { name: "skills", kind: "dir", trusted: true },
+  { name: "agents", kind: "dir", trusted: true },
+  { name: "memory", kind: "dir", trusted: false },
+  { name: "commands", kind: "dir", trusted: true },
+  { name: "output-styles", kind: "dir", trusted: true },
+  { name: "plugins", kind: "dir", trusted: true },
+  { name: "hooks", kind: "dir", trusted: true },
 ];
 
 /** A repository or entry name that is used in a mount destination. */
@@ -234,7 +242,6 @@ export const RUNTIME_STATE_KEYS: readonly string[] = [
 ];
 
 const STATE_FILE = ".claude.json";
-const CONFIG_DIR_FILE = ".config.json";
 const STATE_VALUE_MAX = 256;
 
 function plainStateValue(key: string, value: unknown): unknown {
@@ -290,19 +297,30 @@ export function sanitizeRuntimeConfig(homeDir: string): void {
   for (const entry of fs.readdirSync(homeDir)) {
     if (entry !== STATE_FILE && entry.startsWith(`${STATE_FILE}.`)) fs.rmSync(path.join(homeDir, entry), { recursive: true, force: true });
   }
-  removeConfigDirState(homeDir);
+  purgeConfigDir(homeDir);
+  // The runtime runs `git status` in its working directory (the home) at start: a `core.fsmonitor` command or a
+  // filter driver in a repository the agent planted there would run, so the home itself is never a repository
+  // (a `.git` directory, file or link is removed, never followed; repositories below the home are not touched).
+  fs.rmSync(path.join(homeDir, ".git"), { recursive: true, force: true });
 }
 
 /**
- * The runtime reads its global config from `<config dir>/.config.json` whenever that file exists and from
- * `~/.claude.json` otherwise (2.0.77, `cli.js` `QF()`); the config dir is `~/.claude`, which the agent can write.
- * A planted `.config.json` therefore replaces the rewritten state file above, so the trusted side removes it
- * (and its backups) before every start; the runtime recreates the plain state file itself. Anything else the
- * runtime would start from the config dir needs a setting the sandbox does not have: `settings.json` is a trusted
- * read-only copy of `permissions` only (so no `enabledPlugins`, `hooks` or `statusLine`) and the setting sources
- * stop at the user level. A `.claude` that is not a real directory is removed itself, never followed.
+ * What the agent may leave under `~/.claude` between two starts: data only, nothing the runtime reads as
+ * configuration or extension. Measured on the real runtime (2.0.77): it writes `projects/` (session transcripts,
+ * needed for resume), `todos/` and `plans/` there, and `memory` is the mount point of the workspace memory. Every
+ * other entry is removed at every start, so a name the runtime reads today (`commands`, `agents`, `skills`,
+ * `output-styles`, `plugins`, `hooks`, `settings.local.json`, `CLAUDE.md`, `.config.json`, `shell-snapshots` that are
+ * sourced as scripts) or learns to read later is untrusted by default; the runtime recreates what it needs.
  */
-function removeConfigDirState(homeDir: string): void {
+export const RUNTIME_WRITABLE_DIRS: readonly string[] = ["memory", "plans", "projects", "todos"];
+
+/**
+ * Allow-list of the runtime's config directory (`~/.claude`, which the agent can write): everything not in
+ * `RUNTIME_WRITABLE_DIRS` is removed without following links, and an allowed name that is not a real directory
+ * is removed too. The runtime also prefers `<config dir>/.config.json` over `~/.claude.json` whenever it exists
+ * (2.0.77, `cli.js` `QF()`), which this covers. A `.claude` that is not a real directory is removed itself.
+ */
+function purgeConfigDir(homeDir: string): void {
   const dir = path.join(homeDir, ".claude");
   const stat = lstatOrNull(dir);
   if (!stat) return;
@@ -311,7 +329,9 @@ function removeConfigDirState(homeDir: string): void {
     return;
   }
   for (const entry of fs.readdirSync(dir)) {
-    if (entry === CONFIG_DIR_FILE || entry.startsWith(`${CONFIG_DIR_FILE}.`)) fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
+    const full = path.join(dir, entry);
+    if (RUNTIME_WRITABLE_DIRS.includes(entry) && lstatOrNull(full)?.isDirectory()) continue;
+    fs.rmSync(full, { recursive: true, force: true });
   }
 }
 
@@ -574,6 +594,16 @@ export interface PlanOptions {
   scanner?: KnownValueScanner;
 }
 
+/** An empty read-only stand-in below the trusted directory (created once per start, shared by every entry of that kind). */
+function trustedEmpty(trustedDir: string, kind: "file" | "dir"): string {
+  const target = path.join(trustedDir, kind === "dir" ? "empty-dir" : "empty-file");
+  if (!lstatOrNull(target)) {
+    if (kind === "dir") fs.mkdirSync(target, { mode: 0o555 });
+    else fs.writeFileSync(target, "", { flag: "wx", mode: 0o444 });
+  }
+  return target;
+}
+
 function audit(kind: string, name: string, reason: SkipReason | "known_value"): void {
   log("audit", `sandbox.content.skipped kind=${kind} name=${SAFE_NAME.test(name) ? name : "invalid"} reason=${reason}`);
 }
@@ -642,7 +672,7 @@ export function planTrustedContent(options: PlanOptions): MountPlan {
   const scanner = options.scanner ?? contentScanner;
   const plan: MountPlan = { mounts: [], hidden: [], skipped: 0, hiddenCount: 0 };
   const root = realpathOrNull(options.workspaceRoot);
-  if (!root) return plan;
+  fs.mkdirSync(options.trustedDir, { recursive: true, mode: 0o700 });
   const skip = (kind: string, name: string, reason: SkipReason): void => {
     plan.skipped++;
     audit(kind, name, reason);
@@ -655,10 +685,12 @@ export function planTrustedContent(options: PlanOptions): MountPlan {
   };
 
   for (const entry of GLOBAL_ENTRIES) {
-    const source = path.join(root, entry.name);
-    const check = checkTrusted(source, entry.kind, root);
+    const source = root ? path.join(root, entry.name) : "";
+    const check: TrustCheck = root ? checkTrusted(source, entry.kind, root) : { ok: false, reason: "missing" };
     if (!check.ok) {
       if (check.reason !== "missing") skip("global", entry.name, check.reason);
+      // No trusted workspace entry: the sandbox sees an empty read-only one, never the agent-writable directory.
+      if (entry.trusted) plan.mounts.push({ src: trustedEmpty(options.trustedDir, entry.kind), dest: `${SANDBOX_CLAUDE_DIR}/${entry.name}` });
       continue;
     }
     if (entry.kind === "file") {
@@ -673,6 +705,7 @@ export function planTrustedContent(options: PlanOptions): MountPlan {
     if (entry.kind === "dir") hide("global", entry.name, source, `${SANDBOX_CLAUDE_DIR}/${entry.name}`);
   }
 
+  if (!root) return plan;
   const settings = generatedSettings(root, options.trustedDir);
   if (settings) plan.mounts.push({ src: settings, dest: `${SANDBOX_CLAUDE_DIR}/settings.json` });
 

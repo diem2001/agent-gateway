@@ -13,7 +13,7 @@
  *
  * Needs `npm run build`, `bwrap` and user namespaces. Linux only. Every secret is synthetic.
  */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net, { type AddressInfo } from "node:net";
@@ -358,9 +358,9 @@ describe("files the agent writes in its own home cannot start anything on a late
     expect(resultFor(r, "W4-BASH")?.text).toBe(NO_SUCH_TOOL("Bash"));
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const home = await settle(r, "w");
-    // The files the agent wrote are really there (the probe is not vacuous): only the runtime-start rewrite changed ~/.claude.json.
+    // The writes succeeded (the probe is not vacuous, asserted above); ~/.claude.json is rewritten and settings.local.json removed at the next start.
     expect(fs.existsSync(path.join(home, ".mcp.json"))).toBe(true);
-    expect(fs.existsSync(path.join(home, ".claude", "settings.local.json"))).toBe(true);
+    expect(fs.existsSync(path.join(home, ".claude", "settings.local.json"))).toBe(false);
     expect(fs.readdirSync(home).filter((name) => name.startsWith("m-"))).toEqual([]);
     const saved = fs.readFileSync(path.join(home, ".claude.json"), "utf8");
     expect(saved).not.toContain("mcpServers");
@@ -403,17 +403,34 @@ describe("files the agent writes in its own home cannot start anything on a late
       bash("X7-BASH", "touch /home/node/m-bash-x"),
     ];
 
-    it("a later turn runs no hook or server from them and Bash stays refused (Bash denied, Write granted)", async () => {
+    it("the agent cannot write them, and files already in the home (a conversation from before the update) run nothing on a later turn (Bash denied, Write granted)", async () => {
       const r = await rig({ scripts, policy: JSON.stringify({ labels: { proc: { deny: ["Bash"] } } }), seed: seedLikeEntrypoint });
-      for (const prompt of turns) {
+      const ask1 = async (prompt: string) => {
         const { events } = await ask(r, { prompt, sessionId: "x", useSession: true });
         expect(events.at(-1)?.type, prompt).toBe("done");
-        if (prompt.startsWith("X") && prompt.includes("WRITE")) expect(resultFor(r, prompt)?.isError, `${prompt}: ${resultFor(r, prompt)?.text}`).toBe(false);
+      };
+      // The extension directories are read-only (empty) for the agent: planting is refused by the filesystem itself.
+      for (const prompt of ["X1-WRITE-CMD", "X2-WRITE-AGENT", "X3-WRITE-SKILL"]) {
+        await ask1(prompt);
+        expect(resultFor(r, prompt)?.isError, prompt).toBe(true);
+        expect(resultFor(r, prompt)?.text, prompt).toMatch(/EROFS|read-only file system|ENOENT/);
       }
+      // Files a pre-update conversation may hold are put there by the host, as the agent's earlier turns would have.
+      const home = await settle(r, "x");
+      const plant = (rel: string, text: string) => {
+        fs.rmSync(path.join(home, ".claude", rel.split("/")[0]), { recursive: true, force: true });
+        fs.mkdirSync(path.dirname(path.join(home, ".claude", rel)), { recursive: true });
+        fs.writeFileSync(path.join(home, ".claude", rel), text);
+      };
+      plant("commands/qacmd.md", commandFile);
+      plant("agents/qaagent.md", agentFile);
+      plant("skills/qaskill/SKILL.md", skillFile);
+      for (const prompt of turns.slice(3)) await ask1(prompt);
       expect(resultFor(r, "X7-BASH")?.text).toBe(NO_SUCH_TOOL("Bash"));
       await new Promise((resolve) => setTimeout(resolve, 1500));
-      const home = await settle(r, "x");
       expect(fs.readdirSync(home).filter((name) => name.startsWith("m-"))).toEqual([]);
+      // The planted files were really there before the turns and the trusted start removed them.
+      expect(fs.existsSync(path.join(home, ".claude", "commands", "qacmd.md"))).toBe(false);
     });
 
     it("control: the same command file in the TRUSTED workspace does run its hooks (the markers are producible)", async () => {
@@ -431,6 +448,20 @@ describe("files the agent writes in its own home cannot start anything on a late
       const home = await settle(r, "xc");
       expect(fs.readdirSync(home).filter((name) => name.startsWith("m-cmd")).sort()).toEqual(["m-cmd-post", "m-cmd-stop"]);
     });
+  });
+
+  it("a repository planted in the home (core.fsmonitor in .git/config, written by an earlier turn) runs nothing at the next start", async () => {
+    const r = await rig({ scripts: [], policy: JSON.stringify({ labels: { proc: { deny: ["Bash"] } } }), seed: seedLikeEntrypoint });
+    expect((await ask(r, { prompt: "PLAIN-0", sessionId: "g", useSession: true })).events.at(-1)?.type).toBe("done");
+    const home = await settle(r, "g");
+    execFileSync("git", ["-C", home, "init", "-q"]);
+    execFileSync("git", ["-C", home, "config", "core.fsmonitor", "touch /home/node/m-fsmonitor"]);
+    // Not vacuous: the planted directory is a valid repository whose configuration names the command (git runs it on `git status`).
+    expect(execFileSync("git", ["-C", home, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" }).trim()).toBe("true");
+    for (const prompt of ["PLAIN-1", "PLAIN-2"]) expect((await ask(r, { prompt, sessionId: "g", useSession: true })).events.at(-1)?.type, prompt).toBe("done");
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(fs.existsSync(path.join(home, ".git"))).toBe(false);
+    expect(fs.readdirSync(home).filter((name) => name.startsWith("m-"))).toEqual([]);
   });
 
   it("control: a server a REQUEST asks for does start (the marker probe detects a started server)", async () => {
