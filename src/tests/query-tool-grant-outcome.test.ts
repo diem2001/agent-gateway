@@ -386,10 +386,10 @@ describe("request mcpServers are validated on the trusted side", () => {
     expect(servers.local).toEqual({ command: "node", args: ["a"], env: { K: "v" } });
   });
 
-  it("an explicit sse type is kept", async () => {
+  it("an explicit sse type is kept (a server without headers connects directly; with headers it goes through the relay, see query-mcp-mediation-outcome)", async () => {
     const app = await createApp();
-    await post(app, { mcpServers: { feed: { type: "sse", url: "http://127.0.0.1:9/sse", headers: { Authorization: "Bearer SYNTH" } } } });
-    expect((capturedOptions[0].mcpServers as Record<string, unknown>).feed).toMatchObject({ type: "sse", url: "http://127.0.0.1:9/sse" });
+    await post(app, { mcpServers: { feed: { type: "sse", url: "http://127.0.0.1:9/sse" } } });
+    expect((capturedOptions[0].mcpServers as Record<string, unknown>).feed).toEqual({ type: "sse", url: "http://127.0.0.1:9/sse" });
   });
 });
 

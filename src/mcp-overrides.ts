@@ -77,7 +77,7 @@ export function applyMcpCredentialOverride(
   if ("type" in base && (base.type === "http" || base.type === "sse")) {
     return {
       ...base,
-      headers: { ...(base.headers ?? {}), ...(override.headers ?? {}) },
+      headers: mergeHeaders(base.headers ?? {}, override.headers ?? {}),
     };
   }
 
@@ -85,6 +85,26 @@ export function applyMcpCredentialOverride(
     ...base,
     env: { ...(base.env ?? {}), ...(override.env ?? {}) },
   };
+}
+
+/**
+ * The one header merge of every credential-bearing path (relay, SSE bridge, direct call): header names are
+ * case-insensitive in HTTP, so an override value REPLACES every base header of the same name in any casing
+ * (the user's credential never travels next to the shared one). The override's own casing is kept.
+ */
+export function mergeHeaders(base: Record<string, string>, override: Record<string, string>): Record<string, string> {
+  const merged: Record<string, string> = {};
+  const keyOf = new Map<string, string>();
+  const put = (name: string, value: string): void => {
+    const lower = name.toLowerCase();
+    const earlier = keyOf.get(lower);
+    if (earlier !== undefined) delete merged[earlier];
+    merged[name] = value;
+    keyOf.set(lower, name);
+  };
+  for (const [name, value] of Object.entries(base)) put(name, value);
+  for (const [name, value] of Object.entries(override)) put(name, value);
+  return merged;
 }
 
 export function summarizeOverrideKeys(override: McpCredentialOverride): string[] {

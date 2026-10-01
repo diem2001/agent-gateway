@@ -9,13 +9,15 @@ import { createToolMcpServer } from "./tool-server.js";
 import { buildMcpServersForSdk, getEnabledMcpServers, getMcpAllowedToolPatterns } from "./mcp-registry.js";
 import {
   applyMcpCredentialOverrides,
+  hasUserCredential,
   selectRegistryServersForRun,
   summarizeOverrideKeys,
+  type McpCredentialOverride,
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
 import { materializeUserSkills, cleanupUserSkillBundle } from "./user-skills.js";
 import { requestMcpAllowedToolPatterns, type RequestMcpServers } from "./mcp-request-servers.js";
-import { credentialRelay } from "./mcp-credential-relay.js";
+import { credentialRelay, type RelayGrant } from "./mcp-credential-relay.js";
 import { createRunLogDir, removeRunLogDirAfterExit } from "./sdk-run-logs.js";
 import { SandboxRun, runtimeEnvFrom } from "./sandbox.js";
 import { RunFailure, classifyRunFailure, isAbortError } from "./run-failure.js";
@@ -121,6 +123,29 @@ export function toolUseEventInput(
   return formatToolInput(toolName, input);
 }
 
+/** Whether a request-supplied server config is an http/SSE server that carries at least one header. */
+function carriesHeaders(config: unknown): boolean {
+  if (typeof config !== "object" || config === null) return false;
+  const entry = config as { type?: unknown; url?: unknown; headers?: unknown };
+  if (entry.type !== "http" && entry.type !== "sse") return false;
+  return typeof entry.url === "string" && typeof entry.headers === "object" && entry.headers !== null && Object.keys(entry.headers).length > 0;
+}
+
+/** The relay's view of the run's grant for one server. */
+function relayGrantFor(grant: ToolGrant, serverName: string): RelayGrant {
+  return { allowsTool: (tool) => grant.allows(mcpToolName(serverName, tool)), coversServer: grant.coversServer(serverName) };
+}
+
+/** Whether the override carries a non-empty value for the target. */
+function hasOverrideValues(override: McpCredentialOverride | undefined, target: "headers" | "env"): boolean {
+  return Object.values(override?.[target] ?? {}).some((value) => value.length > 0);
+}
+
+/** A server whose credential schema composes headers needs the user's values for them. */
+function schemaWantsHeaders(def: { userCredentialSchema?: { outputs: { target: string }[] } }): boolean {
+  return (def.userCredentialSchema?.outputs ?? []).some((output) => output.target === "headers");
+}
+
 /** A tool name as it may appear in an audit line. */
 function loggableName(name: string): string {
   return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name) ? name : "(unrecognized)";
@@ -191,11 +216,12 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   const selection = selectRegistryServersForRun(getEnabledMcpServers(), mcpCredentialOverrides);
   const omitted = selection.omitted.map((name) => ({ name, reason: "missing_user_credential" }));
   let runRegistryServers = selection.attached;
-  // Registered http servers are reached only through the credential relay; if it
+  // Registered http and SSE servers are reached only through the trusted relay; if it
   // is not listening they are left out, never connected directly (fail closed).
-  if (!credentialRelay.isListening()) {
-    for (const def of runRegistryServers) if (def.type === "http") omitted.push({ name: def.name, reason: "relay_unavailable" });
-    runRegistryServers = runRegistryServers.filter((def) => def.type !== "http");
+  const relayUp = credentialRelay.isListening();
+  if (!relayUp) {
+    for (const def of runRegistryServers) if (def.type === "http" || def.type === "sse") omitted.push({ name: def.name, reason: "relay_unavailable" });
+    runRegistryServers = runRegistryServers.filter((def) => def.type !== "http" && def.type !== "sse");
   }
   for (const { name, reason } of omitted) {
     log("audit", `mcp.server.omitted serverName=${name} reason=${reason}`);
@@ -204,6 +230,15 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   let runRequestMcpServers = requestMcpServers
     ? Object.fromEntries(Object.entries(requestMcpServers).filter(([name]) => !omittedServers.includes(name)))
     : undefined;
+  // A request server that carries headers needs the relay too; without it the server is left out (fail closed).
+  if (runRequestMcpServers && !relayUp) {
+    for (const [name, config] of Object.entries(runRequestMcpServers)) {
+      if (carriesHeaders(config)) {
+        log("audit", `mcp.server.omitted serverName=${name} reason=relay_unavailable`);
+        delete runRequestMcpServers[name];
+      }
+    }
+  }
   // A server with no granted tool is not attached at all (no wasted calls, nothing to refuse later).
   runRegistryServers = runRegistryServers.filter((def) => grant.allowsServer(def.name));
   if (runRequestMcpServers) {
@@ -304,17 +339,43 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   options.spawnClaudeCodeProcess = sandbox.spawnHook;
 
   const relayTokens: string[] = [];
+  // Request servers with headers: the runtime gets a relay URL, the header values stay with the relay.
+  for (const [name, config] of Object.entries(mcpServers)) {
+    if (!carriesHeaders(config)) continue;
+    const kind = (config as { type?: unknown }).type === "sse" ? "sse" : "http";
+    const { token, url } = credentialRelay.register({
+      serverName: name,
+      url: (config as { url: string }).url,
+      headers: { ...((config as { headers?: Record<string, string> }).headers ?? {}) },
+      kind,
+      grant: relayGrantFor(grant, name),
+      credentialSource: "user",
+    });
+    relayTokens.push(token);
+    mcpServers[name] = { type: "http", url };
+  }
   const registeredMcpServers = buildMcpServersForSdk(runRegistryServers);
   if (registeredMcpServers) {
+    // One case-insensitive merge: a user header replaces the shared header of the same name.
     const effectiveMcpServers = applyMcpCredentialOverrides(
       registeredMcpServers,
       mcpCredentialOverrides,
     );
-    // The runtime gets a loopback relay URL with a per-run token and no header;
-    // the relay holds this run's URL and header snapshot until the run ends.
+    // The runtime gets a loopback relay URL with a per-run token and no header; the relay holds this
+    // run's URL, header snapshot and grant until the run ends.
     for (const [name, config] of Object.entries(effectiveMcpServers)) {
-      if (!("type" in config) || config.type !== "http") continue;
-      const { token, url } = credentialRelay.register({ serverName: name, url: config.url, headers: config.headers ?? {} });
+      if (!("type" in config) || (config.type !== "http" && config.type !== "sse")) continue;
+      const def = runRegistryServers.find((d) => d.name === name)!;
+      const override = mcpCredentialOverrides?.[name];
+      const { token, url } = credentialRelay.register({
+        serverName: name,
+        url: config.url,
+        headers: config.headers ?? {},
+        kind: config.type,
+        grant: relayGrantFor(grant, name),
+        credentialSource: hasOverrideValues(override, "headers") ? "user" : "gateway",
+        noUserCredential: schemaWantsHeaders(def) && !hasUserCredential(def, override),
+      });
       relayTokens.push(token);
       effectiveMcpServers[name] = { type: "http", url };
     }
