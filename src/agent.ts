@@ -278,6 +278,17 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     }
   }
 
+  // Known residual (MVP-7678, owned by MVP-7679): the SDK hands the whole MCP configuration to the runtime as a
+  // command-line argument and stdio children inherit its environment, so a header or env value of a server that is
+  // not relayed is readable inside this run's own sandbox. One audit line per such server: name and type only.
+  for (const [name, config] of Object.entries(mcpServers)) {
+    const entry = config as { type?: unknown; headers?: unknown; env?: unknown };
+    const carries = (value: unknown): boolean => typeof value === "object" && value !== null && Object.keys(value).length > 0;
+    if (carries(entry.headers) || carries(entry.env)) {
+      log("audit", `mcp.server.credential_in_runtime_args serverName=${name} type=${typeof entry.type === "string" ? entry.type : "stdio"}`);
+    }
+  }
+
   if (Object.keys(mcpServers).length > 0) {
     options.mcpServers = mcpServers;
     log("query", `MCP servers: ${Object.keys(mcpServers).join(", ")}`);

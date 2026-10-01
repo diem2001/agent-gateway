@@ -14,6 +14,8 @@ npm run dev         # Dev server with hot-reload (tsx watch)
 npm start           # Production start (node --expose-gc dist/server.js)
 npm test            # Unit tests (vitest, excludes E2E)
 npm run test:e2e    # E2E session tests (requires running Gateway + GATEWAY_API_KEY env var)
+npm run probe:docker-isolation  # Docker Outcome Probe: builds the image, runs task-owned containers under the compose security profile (needs sudo -n docker, uid 1000)
+npm run probe:docker-stop       # Docker Outcome Probe for the clean stop (same profile)
 ```
 
 ## Environment Variables
@@ -60,7 +62,7 @@ docker compose logs -f           # Follow logs
 docker compose down              # Stop
 ```
 
-Port `3001` binds to `127.0.0.1` only (reverse proxy expected).
+Port `3001` binds to `127.0.0.1` only (reverse proxy expected). The container runs as `node` with the security profile of `docker-compose.yml` (`cap_drop: ALL`, `no-new-privileges`, committed seccomp profile in `security/`, `systempaths=unconfined`, `pids_limit`); the health check requires `/health` `isolation` to be `ok`. `./agent_home` must be owned by uid 1000.
 
 ## Git Conventions
 
@@ -77,6 +79,17 @@ Port `3001` binds to `127.0.0.1` only (reverse proxy expected).
 - New event types: update `docs/index.html` NDJSON Event Reference
 - Architecture changes: update `docs/architecture.md` + `docs/index.html` architecture diagram
 - Docker changes: update `README.md` deployment section + `docs/index.html` deployment guide
+
+## Isolation Rules (MVP-7678)
+
+Every agent run executes in a bubblewrap sandbox (`src/sandbox.ts`, `src/sandbox-content.ts`). When you change anything near it:
+
+- **Never pass `process.env` (or a copy of it) to the runtime.** The SDK `env` option and the spawn hook get only `runtimeEnvFrom(...)` plus the per-run log variables; the sandbox builds its own allowlist in `buildSandboxEnv`. A new variable the runtime needs is added to that allowlist with a test that asserts the exact key set (`sandbox.test.ts`, `sandbox-process.test.ts`), never inherited.
+- **The only provider credential a run holds is its model proxy token** (`ANTHROPIC_API_KEY=<run token>`, `ANTHROPIC_BASE_URL=<loopback proxy>`). The real key and the OAuth tokens stay in `model-proxy.ts` on the trusted side.
+- **No-follow rules.** Every path the trusted side binds into a sandbox, copies, lists or reads from agent-writable storage is checked with `lstat`/`O_NOFOLLOW` (`checkTrusted`, `readFileNoFollow`, `listRegularFilesNoFollow`, `copyFileNoFollow`): a regular file or directory owned by the gateway user, inside its expected tree, whose real path is the path itself. Never use `existsSync`, `statSync`, `copyFileSync` or `realpathSync`-then-use on such a path. Mount points inside a conversation home are sanitized with `prepareMountPoints`.
+- **Fail closed.** A start problem must end in an `IsolationFailure` (fixed text, not retried); nothing may fall back to an unsandboxed run. New fixed texts go through `run-failure.ts` and are asserted verbatim.
+- **Trusted files never enter a sandbox**: `.credentials.json`, state files, `~/.ssh`, other homes. New trusted state needs a test row that proves it is absent from a real sandbox (with a control that proves the probe works) and a synthetic marker, never a real secret.
+- Real-process tests that start sandboxes and runtimes run through the workflow kit's `scripts/run-verification.mjs`; clean up only your own temp directories and containers.
 
 ## Project Structure
 

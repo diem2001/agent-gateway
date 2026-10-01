@@ -78,6 +78,8 @@ export interface RecordedMessagesRequest {
   apiKey: string | null;
   authorization: string | null;
   anthropicBeta: string | null;
+  /** The raw request body, for surface scans (MVP-7678: nothing of the gateway may be in it). */
+  body: string;
 }
 
 export interface FakeAnthropicApi {
@@ -211,8 +213,9 @@ export async function startFakeAnthropicApi(options: {
         return;
       }
       let body: { model?: string; stream?: boolean; tools?: { name?: string }[]; messages?: MessageParam[]; metadata?: { user_id?: unknown } } = {};
+      const bodyText = Buffer.concat(chunks).toString("utf8");
       try {
-        body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        body = JSON.parse(bodyText);
       } catch {
         // An unparseable body is answered like an empty one.
       }
@@ -266,6 +269,7 @@ export async function startFakeAnthropicApi(options: {
         apiKey: header("x-api-key"),
         authorization: header("authorization"),
         anthropicBeta: header("anthropic-beta"),
+        body: bodyText,
       };
       requests.push(record);
       const latestText = userTexts.at(-1) ?? "";
