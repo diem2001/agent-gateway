@@ -5,6 +5,7 @@ import express from "express";
 import { loadApiKeys, authMiddleware } from "./auth.js";
 import {
   log,
+  logAlways,
   getLogLevel,
   setLogLevel,
   requestLoggingMiddleware,
@@ -80,8 +81,8 @@ try {
   loadIsolationConfig();
   void gatewayModelProxy();
 } catch (e) {
-  if (e instanceof IsolationConfigError) log("server", e.logLine);
-  else if (e instanceof ModelProxyConfigError) log("server", `FATAL config key=${e.key} reason=must be a positive whole number of milliseconds`);
+  if (e instanceof IsolationConfigError) logAlways("server", e.logLine);
+  else if (e instanceof ModelProxyConfigError) logAlways("server", `FATAL config key=${e.key} reason=must be a positive whole number of milliseconds`);
   else throw e;
   process.exit(1);
 }

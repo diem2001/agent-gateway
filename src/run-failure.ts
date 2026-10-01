@@ -272,7 +272,7 @@ export function isolationTimeoutMessage(queryId: string | undefined): string {
 
 export function runDeadlineMessage(limitMs: number, queryId: string | undefined): string {
   const minutes = Math.max(1, Math.ceil(limitMs / 60_000));
-  return `The request was stopped because it ran longer than the gateway's limit of ${minutes} minutes. Its results were not saved. Try again with a smaller task, or ask your gateway administrator to raise the limit.${referenceSuffix(queryId)}`;
+  return `The request was stopped because it ran longer than the gateway's limit of ${minutes} ${minutes === 1 ? "minute" : "minutes"}. Its results were not saved. Try again with a smaller task, or ask your gateway administrator to raise the limit.${referenceSuffix(queryId)}`;
 }
 
 /** A failure with a fixed public text and no provider facts. It is never retried. */

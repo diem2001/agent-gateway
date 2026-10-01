@@ -276,7 +276,7 @@ describe("fixed failure texts", () => {
       "The request was stopped because it ran longer than the gateway's limit of 120 minutes. Its results were not saved. Try again with a smaller task, or ask your gateway administrator to raise the limit. (reference: q-1)",
     );
     expect(runDeadlineMessage(90_000, "q-1")).toContain("limit of 2 minutes");
-    expect(runDeadlineMessage(1_000, "q-1")).toContain("limit of 1 minutes");
+    expect(runDeadlineMessage(1_000, "q-1")).toContain("limit of 1 minute.");
     for (const text of [isolationUnavailableMessage("q"), isolationTimeoutMessage("q"), runDeadlineMessage(60_000, "q")]) {
       expect(text).not.toMatch(/bwrap|bubblewrap|namespace|sandbox|seccomp|apparmor|proxy|userns/i);
     }

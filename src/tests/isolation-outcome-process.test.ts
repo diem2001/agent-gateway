@@ -422,7 +422,7 @@ describe("the fail-closed rows end with the exact text within their deadline and
     const started = Date.now();
     const events = await queryAs(gateway.port, KEY_ALPHA, { queryId: "q-deadline", sessionId: "conv-deadline", prompt: "OUTCOME-DEADLINE", useSession: true });
     expect(Date.now() - started).toBeLessThan(15_000);
-    expect(events.at(-1)).toEqual({ seq: events.at(-1)!.seq, type: "error", content: "The request was stopped because it ran longer than the gateway's limit of 1 minutes. Its results were not saved. Try again with a smaller task, or ask your gateway administrator to raise the limit. (reference: q-deadline)" });
+    expect(events.at(-1)).toEqual({ seq: events.at(-1)!.seq, type: "error", content: "The request was stopped because it ran longer than the gateway's limit of 1 minute. Its results were not saved. Try again with a smaller task, or ask your gateway administrator to raise the limit. (reference: q-deadline)" });
     expect(events.map((e) => e.type)).not.toContain("done");
     await new Promise((r) => setTimeout(r, 1500));
     expect(descendants(gateway.child.pid!)).toEqual([]);

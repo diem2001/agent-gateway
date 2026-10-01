@@ -144,6 +144,9 @@ beforeEach(async () => {
   vi.spyOn(console, "log").mockImplementation((...args) => {
     logs.push(args.map(String).join(" "));
   });
+  vi.spyOn(console, "error").mockImplementation((...args) => {
+    logs.push(args.map(String).join(" "));
+  });
   resetIsolationStatusForTests();
   proxy = new ModelProxy({ upstreamBaseUrl: "http://127.0.0.1:1", credentials: new ProviderCredentials({ home, env: { ANTHROPIC_API_KEY: PROVIDER_KEY } }) });
   await proxy.start();
@@ -873,6 +876,16 @@ describe("failing closed through the gateway", () => {
     await expect(spawnGateway(gatewayCleanups, { rootPrefix: "mvp7678-cfg-", env: { [key]: value } })).rejects.toThrow(`FATAL config key=${key} reason=${reason}`);
   }, 30_000);
 
+  it("with LOG_LEVEL=off the fixed FATAL config line and the isolation ERROR line are still printed", async () => {
+    await expect(spawnGateway(gatewayCleanups, { rootPrefix: "mvp7678-cfg-off-", env: { LOG_LEVEL: "off", AGENT_SANDBOX_ROOT: "relative/root" } })).rejects.toThrow("FATAL config key=AGENT_SANDBOX_ROOT reason=must be an absolute path");
+    const c = await chain({ tool: { name: "Bash", input: { command: "echo started", description: "probe" } }, env: { LOG_LEVEL: "off", AGENT_SANDBOX_BWRAP: "/nonexistent/bwrap" } });
+    const started = Date.now();
+    while (!c.gateway.output().includes("[isolation] ERROR isolation problem=binary_missing")) {
+      if (Date.now() - started > 10_000) throw new Error(`no isolation ERROR line at LOG_LEVEL=off: ${c.gateway.output()}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }, 60_000);
+
   it("a run that exceeds AGENT_RUN_TIMEOUT_MS is stopped with the deadline text, nothing is saved and no process survives", async () => {
     const c = await chain({ mode: "hang", env: { AGENT_RUN_TIMEOUT_MS: "3000" } });
     const started = Date.now();
@@ -881,7 +894,7 @@ describe("failing closed through the gateway", () => {
     expect(events.map((e) => e.type)).not.toContain("done");
     expect(events.at(-1)).toMatchObject({ type: "error" });
     expect(events.at(-1)?.content).toBe(
-      "The request was stopped because it ran longer than the gateway's limit of 1 minutes. Its results were not saved. Try again with a smaller task, or ask your gateway administrator to raise the limit. (reference: q-7678-deadline)",
+      "The request was stopped because it ran longer than the gateway's limit of 1 minute. Its results were not saved. Try again with a smaller task, or ask your gateway administrator to raise the limit. (reference: q-7678-deadline)",
     );
     // The conversation was not confirmed: the gateway's session list holds no sdk session id for it.
     const sessions = await gatewayRequest(c.gateway.port, "GET", "/v1/sessions");

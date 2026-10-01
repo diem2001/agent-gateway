@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import type { SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
-import { log, logDebug } from "./logging.js";
+import { log, logAlways, logDebug } from "./logging.js";
 import { getEnabledMcpServers } from "./mcp-registry.js";
 import { gatewayModelProxy, type ModelProxy } from "./model-proxy.js";
 import { fixedFailure, isolationTimeoutMessage, isolationUnavailableMessage, RunFailure } from "./run-failure.js";
@@ -132,7 +132,7 @@ function markIsolationOk(): void {
 function markIsolationUnavailable(problem: IsolationProblem): void {
   isolationState = "unavailable";
   // One fixed line; the same operator action applies to every problem.
-  log("isolation", `ERROR isolation problem=${problem} reason=${PROBLEMS[problem]} (see /health)`);
+  logAlways("isolation", `ERROR isolation problem=${problem} reason=${PROBLEMS[problem]} (see /health)`);
 }
 
 /** Tests only: the state a fresh gateway starts in. */
