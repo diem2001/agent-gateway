@@ -607,17 +607,19 @@ describe("failing closed", () => {
     expect(() => loadIsolationConfig({ AGENT_SANDBOX_ROOT: "relative/path" })).toThrow();
   });
 
-  it("a mount source that is missing or unsafe is left out; the run starts without it", async () => {
+  it("a mount source that is missing or unsafe is replaced by an empty trusted one; the run starts without its content", async () => {
     // A workspace with a missing CLAUDE.md and a skills entry that is a symlink to a directory.
     const odd = path.join(tmp, "odd-ws");
     fs.mkdirSync(path.join(odd, "agents"), { recursive: true });
     fs.writeFileSync(path.join(odd, "agents", "x.md"), "AGENT-X");
     fs.symlinkSync(ws, path.join(odd, "skills"));
-    const r = await probe(`echo AGENT=$(cat /home/node/.claude/agents/x.md); echo SKILLS=$(ls /home/node/.claude/skills 2>&1 | grep -c 'ok'); echo MEMORY=$(test -e /home/node/.claude/CLAUDE.md && echo yes || echo no)`, { workspaceRoot: odd });
+    const r = await probe(`echo AGENT=$(cat /home/node/.claude/agents/x.md); echo SKILLS=$(ls /home/node/.claude/skills 2>&1 | grep -c 'ok'); echo MEMORY=$(test -e /home/node/.claude/CLAUDE.md && wc -c < /home/node/.claude/CLAUDE.md || echo missing); echo WRITABLE=$(touch /home/node/.claude/commands/x.md 2>&1 | grep -c 'Read-only')`, { workspaceRoot: odd });
     expect(r.exitCode, r.stdout).toBe(0);
     expect(r.lines.get("AGENT")).toBe("AGENT-X");
     expect(r.lines.get("SKILLS")).toBe("0");
-    expect(r.lines.get("MEMORY")).toBe("no");
+    // The missing CLAUDE.md is an empty read-only file and the missing directories are empty read-only ones: nothing the agent writes there is ever loaded.
+    expect(r.lines.get("MEMORY")).toBe("0");
+    expect(r.lines.get("WRITABLE")).toBe("1");
   });
 });
 
