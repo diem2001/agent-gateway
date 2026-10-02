@@ -613,15 +613,24 @@ describe("mount plan", () => {
     expect(dests(p).filter((d) => d.includes("/projects/"))).toEqual(["/home/node/.claude/projects/docs", "/home/node/.claude/projects/sub"]);
   });
 
-  it("hides a global CLAUDE.md over 1 MiB that holds a known value, and keeps a clean one over 1 MiB", () => {
+  it("hides a global CLAUDE.md over 1 MiB that holds a known value", () => {
     const MiB = 1024 * 1024;
     fs.mkdirSync(path.join(root, "ws"), { recursive: true });
     fs.writeFileSync(path.join(root, "ws", "CLAUDE.md"), Buffer.concat([Buffer.alloc(2 * MiB, "x"), Buffer.from(SECRET)]));
     const planted = plan([Buffer.from(SECRET)]);
     expect(planted.hidden).toEqual(["/home/node/.claude/CLAUDE.md"]);
     expect(logs.join("\n")).toMatch(/kind=global name=CLAUDE.md reason=known_value/);
+  });
+
+  it("keeps a clean global CLAUDE.md and a clean file over 1 MiB mounted", () => {
+    const MiB = 1024 * 1024;
+    fs.mkdirSync(path.join(root, "ws", "projects", "repo"), { recursive: true });
     fs.writeFileSync(path.join(root, "ws", "CLAUDE.md"), Buffer.alloc(2 * MiB, "x"));
-    expect(plan([Buffer.from(SECRET)]).hidden).toEqual([]);
+    fs.writeFileSync(path.join(root, "ws", "projects", "repo", "big-clean.bin"), Buffer.alloc(2 * MiB, "x"));
+    const p = plan([Buffer.from(SECRET)]);
+    expect(p.hidden).toEqual([]);
+    expect(p.hiddenCount).toBe(0);
+    expect(p.mounts.some((m) => m.dest === "/home/node/.claude/CLAUDE.md" && m.src === path.join(root, "ws", "CLAUDE.md"))).toBe(true);
   });
 
   it("hides a file or global CLAUDE.md above the ceiling with the audit reason too_large, never reading it", () => {

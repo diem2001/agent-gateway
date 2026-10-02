@@ -5,7 +5,6 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import type { SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import { log, logAlways, logDebug } from "./logging.js";
-import { getEnabledMcpServers } from "./mcp-registry.js";
 import { gatewayModelProxy, type ModelProxy } from "./model-proxy.js";
 import { fixedFailure, isolationTimeoutMessage, isolationUnavailableMessage, RunFailure } from "./run-failure.js";
 import {
@@ -13,7 +12,6 @@ import {
   SANDBOX_WORK,
   checkTrusted,
   contentScanner,
-  knownSecretValues,
   lstatOrNull,
   planTrustedContent,
   prepareMountPoints,
@@ -23,6 +21,7 @@ import {
   type MountPlan,
   type SandboxMount,
 } from "./sandbox-content.js";
+import { gatewayKnownValues } from "./tool-mediation.js";
 import { getWorkspaceRoot } from "./workspace.js";
 
 /**
@@ -614,15 +613,6 @@ function runtimeSdkDir(cliPath: string): string {
   return path.dirname(cliPath);
 }
 
-function registryExtraSecrets(): string[] {
-  const values: string[] = [];
-  for (const def of getEnabledMcpServers()) {
-    for (const value of Object.values(def.headers ?? {})) values.push(value);
-    for (const value of Object.values(def.env ?? {})) values.push(value);
-  }
-  return values;
-}
-
 /**
  * The sandbox of one agent run. `spawnHook` is the SDK's `spawnClaudeCodeProcess`: it
  * prepares the run's private directories, plans the allowed content, registers a model
@@ -714,7 +704,7 @@ export class SandboxRun {
     }
 
     const workspaceRoot = this.options.workspaceRoot ?? getWorkspaceRoot();
-    const needles = knownSecretValues(process.env, path.join(workspaceRoot, ".credentials.json"), registryExtraSecrets());
+    const needles = gatewayKnownValues(workspaceRoot);
     const plan: MountPlan = planTrustedContent({ workspaceRoot, trustedDir, needles, scanner: contentScanner });
     if (plan.skipped > 0 || plan.hiddenCount > 0) log("audit", `sandbox.content skipped=${plan.skipped} hidden=${plan.hiddenCount}`);
 
