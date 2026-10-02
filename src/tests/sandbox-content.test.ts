@@ -633,7 +633,7 @@ describe("mount plan", () => {
     expect(p.mounts.some((m) => m.dest === "/home/node/.claude/CLAUDE.md" && m.src === path.join(root, "ws", "CLAUDE.md"))).toBe(true);
   });
 
-  it("hides a file or global CLAUDE.md above the ceiling with the audit reason too_large, never reading it", () => {
+  it("hides an oversized global CLAUDE.md but leaves repository files outside the scan", () => {
     const ceiling = 2048;
     fs.mkdirSync(path.join(root, "ws", "projects", "repo"), { recursive: true });
     fs.writeFileSync(path.join(root, "ws", "projects", "repo", "huge.bin"), Buffer.alloc(ceiling + 1, "x"));
@@ -641,15 +641,16 @@ describe("mount plan", () => {
     fs.writeFileSync(path.join(root, "ws", "CLAUDE.md"), Buffer.alloc(ceiling + 1, "x"));
     const trustedDir = path.join(root, "trusted");
     const p = planTrustedContent({ workspaceRoot: path.join(root, "ws"), trustedDir, needles: [Buffer.from(SECRET)], scanner: new KnownValueScanner({ maxFileBytes: ceiling }) });
-    expect(p.hidden.sort()).toEqual(["/home/node/.claude/CLAUDE.md", "/home/node/.claude/projects/repo/huge.bin"]);
-    expect(p.hiddenCount).toBe(2);
+    expect(p.hidden).toEqual(["/home/node/.claude/CLAUDE.md"]);
+    expect(p.hiddenCount).toBe(1);
+    expect(p.mounts).toContainEqual({ src: path.join(root, "ws", "projects", "repo"), dest: "/home/node/.claude/projects/repo" });
     const audit = logs.filter((l) => l.includes("sandbox.content.skipped")).join("\n");
-    expect(audit).toMatch(/kind=repo name=repo reason=too_large/);
+    expect(audit).not.toMatch(/kind=repo name=repo reason=too_large/);
     expect(audit).toMatch(/kind=global name=CLAUDE.md reason=too_large/);
     expect(audit).not.toMatch(/known_value/);
   });
 
-  it("hides a file that holds a known value behind an empty file, in a global directory and a repository, with an audit line without the value", () => {
+  it("hides known values in global entries without scanning repository contents", () => {
     write("ws/skills/ok.md", "fine");
     write("ws/skills/planted-copy.md", `token ${SECRET}`);
     write("ws/CLAUDE.md", `my key is ${SECRET}`);
@@ -657,12 +658,13 @@ describe("mount plan", () => {
     write("ws/projects/repo/src/fine.txt", "fine");
     const p = plan([Buffer.from(SECRET)]);
     expect(p.hidden.sort()).toEqual(
-      ["/home/node/.claude/CLAUDE.md", "/home/node/.claude/projects/repo/src/leak.txt", "/home/node/.claude/skills/planted-copy.md"].sort(),
+      ["/home/node/.claude/CLAUDE.md", "/home/node/.claude/skills/planted-copy.md"].sort(),
     );
-    expect(p.hiddenCount).toBe(3);
+    expect(p.hiddenCount).toBe(2);
+    expect(p.mounts).toContainEqual({ src: path.join(root, "ws", "projects", "repo"), dest: "/home/node/.claude/projects/repo" });
     const audit = logs.filter((l) => l.includes("known_value")).join("\n");
     expect(audit).toMatch(/kind=global name=skills reason=known_value/);
-    expect(audit).toMatch(/kind=repo name=repo reason=known_value/);
+    expect(audit).not.toMatch(/kind=repo name=repo reason=known_value/);
     expect(logs.join("\n")).not.toContain(SECRET);
   });
 });
