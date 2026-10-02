@@ -4,7 +4,7 @@
  *
  * The compiled gateway runs as a child process with the production Claude runtime and real bwrap (no mock of the
  * scanner or the sandbox). Before it starts, a fixture plants synthetic markers for every row of the acceptance
- * table in a mounted global directory (`memory/`) and in a repository under `projects/`: a known service credential
+ * table in a mounted global directory (`memory/`): a known service credential
  * (an `API_KEYS` key) in a 2 MiB file, an SSH private key (the gateway's own `$HOME/.ssh` key) and registered
  * webhook URL credentials (query token, path token, user-info password), each under and over 1 MiB with the marker
  * placed after the first MiB in the large files, plus a 2 MiB global `CLAUDE.md` holding the known credential, a clean
@@ -102,9 +102,7 @@ function fileFor(row: Row): string {
 }
 
 const GLOBAL_DIR = "memory/planted";
-const REPO_DIR = "projects/repo/planted";
 const SANDBOX_GLOBAL = "/home/node/.claude/memory/planted";
-const SANDBOX_REPO = "/home/node/.claude/projects/repo/planted";
 
 const cleanups: Cleanup[] = [];
 afterEach(async () => {
@@ -221,7 +219,7 @@ interface Fixture {
   scripts: ExactToolScript[];
 }
 
-/** The fixture gateway: every planted row in a global directory and a repository, the SSH key and the webhook tools. */
+/** The fixture gateway: every planted row in a global directory, the SSH key and the webhook tools. */
 async function fixture(routeScripts: ExactToolScript[], options: { claudeMd?: "planted" | "none"; env?: Record<string, string> } = {}): Promise<Fixture> {
   const scripts: ExactToolScript[] = [...routeScripts];
   const api = await startFakeAnthropicApi({ toolName: "unused-7919", exactTool: scripts });
@@ -249,9 +247,7 @@ async function fixture(routeScripts: ExactToolScript[], options: { claudeMd?: "p
       for (const row of ROWS) {
         const text = fileFor(row);
         write(path.join(dirs.workspace, GLOBAL_DIR, `${row.id}.txt`), text);
-        write(path.join(dirs.workspace, REPO_DIR, `${row.id}.txt`), text);
       }
-      write(path.join(dirs.workspace, "projects", "repo", "README.md"), "REPO-OK");
       if (options.claudeMd !== "none") {
         write(path.join(dirs.workspace, "CLAUDE.md"), `${"global instruction line\n".repeat(90_000)}export SERVICE_KEY=${KEY_ALPHA}\nCLAUDE-TAIL-7919\n`);
       }
@@ -263,7 +259,6 @@ async function fixture(routeScripts: ExactToolScript[], options: { claudeMd?: "p
 const PROMPTS = {
   list: "SCAN-LIST",
   tailGlobal: "SCAN-TAIL-GLOBAL",
-  tailRepo: "SCAN-TAIL-REPO",
   grep: "SCAN-GREP",
   readSmall: "SCAN-READ-SMALL",
   readClaudeMd: "SCAN-READ-CLAUDEMD",
@@ -277,12 +272,11 @@ function tailCommand(dir: string): string {
 /** The scripted ordinary chat: it reaches every planted path in every ordinary way. */
 function chatScripts(): ExactToolScript[] {
   return [
-    bash(PROMPTS.list, `ls -l ${SANDBOX_GLOBAL} ${SANDBOX_REPO}; wc -c /home/node/.claude/CLAUDE.md`),
+    bash(PROMPTS.list, `ls -l ${SANDBOX_GLOBAL}; wc -c /home/node/.claude/CLAUDE.md`),
     bash(PROMPTS.tailGlobal, tailCommand(SANDBOX_GLOBAL)),
-    bash(PROMPTS.tailRepo, tailCommand(SANDBOX_REPO)),
     bash(
       PROMPTS.grep,
-      "grep -rah --binary-files=text -e 'SYNTH-API-KEY-ALPH[A]-7919' -e 'SYNTHSSHPRIVATEKEY7919BOD[Y]' -e 'SYNTH-WEBHOOK-[A-Z]*-7919' /home/node/.claude /work 2>&1; cat /home/node/.claude/memory/planted/* /home/node/.claude/projects/repo/planted/* 2>&1 | grep -a -c 'SYNTH'",
+      "grep -rah --binary-files=text -e 'SYNTH-API-KEY-ALPH[A]-7919' -e 'SYNTHSSHPRIVATEKEY7919BOD[Y]' -e 'SYNTH-WEBHOOK-[A-Z]*-7919' /home/node/.claude /work 2>&1; cat /home/node/.claude/memory/planted/* 2>&1 | grep -a -c 'SYNTH'",
     ),
     read(PROMPTS.readSmall, `${SANDBOX_GLOBAL}/ssh-under.txt`),
     read(PROMPTS.readClaudeMd, "/home/node/.claude/CLAUDE.md"),
@@ -315,16 +309,13 @@ describe("the Outcome Probe: planted credentials of every size stay unreadable, 
     // Accessible control: every clean file is there with its sentinel, and the planted rows are empty stand-ins.
     // Every row is judged before anything is asserted, so a red run names all failing rows, not only the first.
     const rowVerdicts: Record<string, boolean> = {};
-    for (const prompt of [PROMPTS.tailGlobal, PROMPTS.tailRepo]) {
-      const text = lastResults(f.api, prompt)[0] ?? "";
-      const location = prompt === PROMPTS.tailGlobal ? "global" : "repository";
-      for (const row of ROWS) {
-        const section = new RegExp(`^== ${row.id}\\n(\\d+)\\n([\\s\\S]*?)(?=^== |(?![\\s\\S]))`, "m").exec(text);
-        const size = section ? Number(section[1]) : -1;
-        const tail = section ? section[2] : "";
-        rowVerdicts[`${location}:${row.id}`] =
-          row.content === "clean" ? size === Buffer.byteLength(fileFor(row)) && tail.includes(tailSentinel(row)) : size === 0 && tail.trim() === "";
-      }
+    const text = lastResults(f.api, PROMPTS.tailGlobal)[0] ?? "";
+    for (const row of ROWS) {
+      const section = new RegExp(`^== ${row.id}\\n(\\d+)\\n([\\s\\S]*?)(?=^== |(?![\\s\\S]))`, "m").exec(text);
+      const size = section ? Number(section[1]) : -1;
+      const tail = section ? section[2] : "";
+      rowVerdicts[`global:${row.id}`] =
+        row.content === "clean" ? size === Buffer.byteLength(fileFor(row)) && tail.includes(tailSentinel(row)) : size === 0 && tail.trim() === "";
     }
     // The 2 MiB global CLAUDE.md is hidden too.
     rowVerdicts["global:CLAUDE.md-2MiB"] = /^0 \/home\/node\/\.claude\/CLAUDE\.md$/m.test(lastResults(f.api, PROMPTS.list)[0] ?? "");
@@ -332,7 +323,7 @@ describe("the Outcome Probe: planted credentials of every size stay unreadable, 
     const surfaces = surfacesOf(f, events, CHAT_PROMPTS, CHAT_PROMPTS.map((p) => `conv-${p}`));
     const hits = detect(surfaces);
     const failingRows = Object.entries(rowVerdicts).filter(([, ok]) => !ok).map(([name]) => name);
-    report(`SCAN-RESIDUALS-MATRIX ${JSON.stringify({ surfaces: surfaces.map((s) => ({ surface: s.name, bytes: s.text.length })), markers: Object.keys(MARKERS).length, rows: ROWS.length, locations: 2, rowChecks: Object.keys(rowVerdicts).length, rowsFailing: failingRows, cleanRows: ROWS.filter((r) => r.content === "clean").length * 2, hits: hits.length, hitPairs: hits })}`);
+    report(`SCAN-RESIDUALS-MATRIX ${JSON.stringify({ surfaces: surfaces.map((s) => ({ surface: s.name, bytes: s.text.length })), markers: Object.keys(MARKERS).length, rows: ROWS.length, locations: 1, rowChecks: Object.keys(rowVerdicts).length, rowsFailing: failingRows, cleanRows: ROWS.filter((r) => r.content === "clean").length, hits: hits.length, hitPairs: hits })}`);
     expect(failingRows).toEqual([]);
     expect(hits).toEqual([]);
     // Every surface is non-trivial (the detector looked at something).
@@ -340,7 +331,6 @@ describe("the Outcome Probe: planted credentials of every size stay unreadable, 
     // The audit lines name the hidden entries and reasons, never a value.
     expect(f.gateway.output()).toMatch(/sandbox\.content\.skipped kind=global name=CLAUDE\.md reason=known_value/);
     expect(f.gateway.output()).toMatch(/sandbox\.content\.skipped kind=global name=memory reason=known_value/);
-    expect(f.gateway.output()).toMatch(/sandbox\.content\.skipped kind=repo name=repo reason=known_value/);
   });
 });
 

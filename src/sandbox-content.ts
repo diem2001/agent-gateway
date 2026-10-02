@@ -11,9 +11,10 @@ import { log } from "./logging.js";
  * following symlinks: it must be a regular file or directory owned by the gateway
  * user whose real path is exactly the path it was found at, inside the tree it is
  * expected in. Anything else is left out with an audit line (never the content).
- * Mounted content is also scanned for the gateway's known secret values (files of any
- * size up to a ceiling); a file that holds one, cannot be read safely or is above the
- * ceiling is hidden behind an empty file.
+ * Mounted global workspace entries are also scanned for the gateway's known secret
+ * values (files of any size up to a ceiling); a file that holds one, cannot be read
+ * safely or is above the ceiling is hidden behind an empty file. Repository contents
+ * are mounted read-only without a known-value scan.
  *
  * Nothing here logs a secret value, a path below the workspace root or file
  * content: audit lines carry fixed words, entry names that pass `SAFE_NAME` and counts.
@@ -716,18 +717,8 @@ export class KnownValueScanner {
   }
 }
 
-/** The gateway's scanner (agent runs and trusted git syncs share it). */
+/** The gateway's scanner for mounted global workspace entries. */
 export const contentScanner = new KnownValueScanner();
-
-/**
- * A trusted write changed `dir` (a git clone or pull): its cached scan results are dropped,
- * so the next sandbox start scans it again before any of it is mounted.
- */
-export function noteTrustedContentChange(dir: string): void {
-  contentScanner.invalidate(dir);
-  const real = realpathOrNull(dir);
-  if (real && real !== dir) contentScanner.invalidate(real);
-}
 
 /* ------------------------------------------------------------------ */
 /*  Mount plan                                                          */
@@ -814,7 +805,7 @@ function gitConfigFiles(repo: string): string[] | null {
  * `settings.json` that keeps only `permissions`, every repository under
  * `projects/` (names starting with `-` are runtime transcript directories and never
  * mounted) with its git configuration replaced by allowlist-generated copies, and
- * the files hidden because they hold a known secret value. Entries that fail the
+ * global files hidden because they hold a known secret value. Entries that fail the
  * no-follow checks are left out with an audit line.
  */
 export function planTrustedContent(options: PlanOptions): MountPlan {
@@ -909,7 +900,6 @@ export function planTrustedContent(options: PlanOptions): MountPlan {
       continue;
     }
     plan.mounts.push({ src: repo, dest: `${SANDBOX_CLAUDE_DIR}/projects/${name}` }, ...masks);
-    hide("repo", name, repo, `${SANDBOX_CLAUDE_DIR}/projects/${name}`);
   }
   return plan;
 }

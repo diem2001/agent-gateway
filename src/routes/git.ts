@@ -5,7 +5,6 @@ import os from "node:os";
 import type { Request, Response } from "express";
 import { log, redactUrlValue } from "../logging.js";
 import { gitErrorText, runGit, withGitSlot, withRepoTurn } from "../git-exec.js";
-import { noteTrustedContentChange } from "../sandbox-content.js";
 
 const router = Router();
 const HOME = process.env.HOME || "/home/node";
@@ -233,7 +232,6 @@ router.post("/v1/workspace/git/clone", async (req: Request, res: Response) => {
               await ensureBranchAndUpstream(targetPath, branch, env);
             }
             await git(["pull"], targetPath, env);
-            noteTrustedContentChange(targetPath);
             const info = await repoInfo(targetPath);
             log("git", `Pulled ${userPath}: ${info.branch}@${info.commit}`);
             return { status: "pulled", path: userPath, branch: info.branch, commit: info.commit };
@@ -245,7 +243,6 @@ router.post("/v1/workspace/git/clone", async (req: Request, res: Response) => {
           // Clone. "--" keeps a URL such as "--upload-pack=…" from being read as an option.
           const branchArgs = branch ? ["-b", branch] : [];
           await git(["clone", ...branchArgs, "--", url, targetPath], WORKSPACE_ROOT, env);
-          noteTrustedContentChange(targetPath);
 
           const info = await repoInfo(targetPath);
           log("git", `Cloned ${redactUrlValue(url)} -> ${userPath}: ${info.branch}@${info.commit}`);
@@ -304,7 +301,6 @@ router.post("/v1/workspace/git/pull", async (req: Request, res: Response) => {
 
           const beforeCommit = await git(["rev-parse", "HEAD"], targetPath);
           await git(["pull"], targetPath, env);
-          noteTrustedContentChange(targetPath);
           const afterCommit = await git(["rev-parse", "HEAD"], targetPath);
 
           const info = await repoInfo(targetPath);
