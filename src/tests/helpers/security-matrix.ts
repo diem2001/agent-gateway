@@ -300,6 +300,21 @@ export const AC_ROWS: Record<string, string> = {
   "X.leftovers": "Leftovers of an earlier version planted in a conversation home start nothing and are gone at the next start",
   "X.extension-writes": "Writes into the read-only extension directories fail",
   "X.run-leftovers": "Per-run runtime and sandbox directories hold no marker during a held run and after SIGKILL; the next start sweeps them",
+  "EI.profile": "Epic integration: the container runs under the committed security profile and reports isolation ok",
+  "EI.registration": "Epic integration: both callers register their tools; the deploy read-back shows zero ownerless tools and servers",
+  "EI.auth": "Epic integration: query, direct MCP call and upload relay with no key, an unknown key and the valid key",
+  "EI.oauth": "Epic integration: one refresh against the local token endpoint, copies planted after it stay invisible",
+  "EI.reqlift": "Epic integration: reqlift chat with webhook tool and per-user override, enforcedTools run, request stdio server, resume",
+  "EI.diemcrm": "Epic integration: diemcrm website-builder chat with its webhook tool and resume",
+  "EI.skills": "Epic integration: global skill and CLAUDE.md available to a run",
+  "EI.route": "Epic integration: the eight secret routes in the container before and after a restart (`EI.route.<route>.<fresh|restarted>`)",
+  "EI.direct": "Epic integration: authenticated direct MCP call",
+  "EI.upload.progressing": "Epic integration: an upload that keeps progressing outlasts the idle timeout",
+  "EI.upload.stalled": "Epic integration: a stalled upload is 504 UPLOAD_TIMEOUT and the upstream is aborted",
+  "EI.legacy": "Epic integration: a legacy conversation is refused, then delete-and-replay succeeds",
+  "EI.restart": "Epic integration: docker restart, both callers resume",
+  "EI.surfaces": "Epic integration: zero markers on every agent-side surface, every double received only its bound credential",
+  "EI.cleanup": "Epic integration: the probe removed its own containers, network, image and temp directories",
   "RT.config.subject": "The config route as the file detector's subject row (child run of the negative control)",
 };
 
@@ -616,7 +631,7 @@ export interface QueryOutcome {
 }
 
 /** One `POST /v1/query` as `key`, streamed to the end. `deadlineMs` ends a hanging request (the result then has `aborted`). */
-export function queryAs(port: number, key: string, body: Record<string, unknown>, deadlineMs = 180_000, control?: { abort?: () => void }): Promise<QueryOutcome> {
+export function queryAs(port: number, key: string, body: Record<string, unknown>, deadlineMs = 180_000, control?: { abort?: () => void }, host = "127.0.0.1"): Promise<QueryOutcome> {
   return new Promise((resolve) => {
     const started = Date.now();
     const payload = Buffer.from(JSON.stringify({ model: "claude-sonnet-4-5", ...body }), "utf8");
@@ -640,7 +655,7 @@ export function queryAs(port: number, key: string, body: Record<string, unknown>
       resolve({ status, events, raw, ms: Date.now() - started, aborted });
     };
     const req = http.request(
-      { host: "127.0.0.1", port, method: "POST", path: "/v1/query", agent: false, headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", "Content-Length": payload.length } },
+      { host, port, method: "POST", path: "/v1/query", agent: false, headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", "Content-Length": payload.length } },
       (res) => {
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
         res.on("end", () => finish(res.statusCode ?? 0));
@@ -714,7 +729,7 @@ export interface Counting {
 }
 
 /** A recording http double: every request answered 200 with a fixed JSON result; `redirectTo` answers 302 instead. */
-export async function startCountingDouble(options: { redirectTo?: string } = {}): Promise<Counting> {
+export async function startCountingDouble(options: { redirectTo?: string; host?: string } = {}): Promise<Counting> {
   const hits: Counting["hits"] = [];
   const sockets = new Set<net.Socket>();
   const server = http.createServer((req, res) => {
@@ -734,9 +749,9 @@ export async function startCountingDouble(options: { redirectTo?: string } = {})
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  await new Promise<void>((resolve) => server.listen(0, options.host ?? "127.0.0.1", () => resolve()));
   return {
-    base: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    base: `http://${options.host ?? "127.0.0.1"}:${(server.address() as AddressInfo).port}`,
     hits,
     close: async () => {
       for (const socket of sockets) socket.destroy();
@@ -753,7 +768,7 @@ export interface TokenDouble {
 }
 
 /** A local OAuth token endpoint: every refresh is answered with a fresh access token that lasts an hour. */
-export async function startTokenDouble(): Promise<TokenDouble> {
+export async function startTokenDouble(host = "127.0.0.1", tokens: { access: string; refresh: string } = { access: "refreshed-access", refresh: "refreshed-refresh-token" }): Promise<TokenDouble> {
   const refreshTokens: string[] = [];
   const sockets = new Set<net.Socket>();
   const server = http.createServer((req, res) => {
@@ -766,16 +781,16 @@ export async function startTokenDouble(): Promise<TokenDouble> {
         refreshTokens.push("");
       }
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ access_token: `refreshed-access-${refreshTokens.length}`, refresh_token: "refreshed-refresh-token", expires_in: 3600 }));
+      res.end(JSON.stringify({ access_token: tokens.access, refresh_token: tokens.refresh, expires_in: 3600 }));
     });
   });
   server.on("connection", (socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  await new Promise<void>((resolve) => server.listen(0, host, () => resolve()));
   return {
-    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/oauth/token`,
+    url: `http://${host}:${(server.address() as AddressInfo).port}/oauth/token`,
     refreshTokens,
     close: async () => {
       for (const socket of sockets) socket.destroy();
@@ -792,7 +807,7 @@ export interface RedirectMcp {
 }
 
 /** An http MCP server whose handshake and tool list work and whose `tools/call` answers 302 to `target`. */
-export async function startRedirectMcp(target: string): Promise<RedirectMcp> {
+export async function startRedirectMcp(target: string, host = "127.0.0.1"): Promise<RedirectMcp> {
   const methods: string[] = [];
   const sockets = new Set<net.Socket>();
   const server = http.createServer((req, res) => {
@@ -828,9 +843,9 @@ export async function startRedirectMcp(target: string): Promise<RedirectMcp> {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  await new Promise<void>((resolve) => server.listen(0, host, () => resolve()));
   return {
-    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`,
+    url: `http://${host}:${(server.address() as AddressInfo).port}/mcp`,
     methods,
     close: async () => {
       for (const socket of sockets) socket.destroy();

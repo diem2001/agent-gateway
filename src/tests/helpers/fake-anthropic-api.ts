@@ -196,6 +196,8 @@ export async function startFakeAnthropicApi(options: {
    * a request is answered by the entry whose `prompt` its user text carries (MVP-7678, concurrent conversations).
    */
   exactTool?: ExactToolScript | ExactToolScript[];
+  /** The address to listen on and to put in `baseUrl` (default 127.0.0.1; the Docker integration probe uses a bridge address). */
+  host?: string;
 }): Promise<FakeAnthropicApi> {
   const mode = options.mode ?? "normal";
   const exactTools: ExactToolScript[] = options.exactTool === undefined ? [] : Array.isArray(options.exactTool) ? options.exactTool : [options.exactTool];
@@ -369,11 +371,11 @@ export async function startFakeAnthropicApi(options: {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  await new Promise<void>((resolve) => server.listen(0, options.host ?? "127.0.0.1", () => resolve()));
   const { port } = server.address() as AddressInfo;
 
   return {
-    baseUrl: `http://127.0.0.1:${port}`,
+    baseUrl: `http://${options.host ?? "127.0.0.1"}:${port}`,
     requests,
     agentRequests: () => requests.filter((r) => r.tools.length > 0),
     mainRequests: () =>

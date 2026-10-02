@@ -32,6 +32,8 @@ export interface OAuthStubOptions {
   loseSessionOn?: string;
   /** The tools this stub lists (default: [`STUB_TOOL_NAME`]). MVP-7637 */
   toolNames?: string[];
+  /** The address to listen on (default 127.0.0.1; the Docker integration probe uses a bridge address). */
+  host?: string;
 }
 
 export interface OAuthStubRequest {
@@ -257,9 +259,9 @@ export async function startOAuthMcpStub(options: OAuthStubOptions = {}): Promise
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  await new Promise<void>((resolve) => server.listen(0, options.host ?? "127.0.0.1", () => resolve()));
   const { port } = server.address() as AddressInfo;
-  origin = `http://127.0.0.1:${port}`;
+  origin = `http://${options.host ?? "127.0.0.1"}:${port}`;
 
   return {
     port,
