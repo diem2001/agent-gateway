@@ -393,6 +393,139 @@ describe("route matrix", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/*  Normal chat                                                         */
+/* ------------------------------------------------------------------ */
+
+interface NormalChat {
+  env: TurnObservation[];
+  command: TurnObservation;
+  interpreter: TurnObservation;
+  credentialRead: TurnObservation;
+}
+
+/** A normal chat turn the way reqlift sends it: no agent, no skill, no tool list, no request-scoped MCP configuration. */
+function normalTurn(rig: SecurityRig, prompt: string, sessionId: string, step: ToolStep): Promise<TurnObservation> {
+  return chatTurn(rig, { prompt, sessionId, steps: [step], withCredentials: false, body: { allowedTools: undefined, conversation_id: `${sessionId}-ui`, systemPrompt: "You are a helpful assistant." } });
+}
+
+/** The exact normal-chat route: three `env | sort` turns in one conversation, an allowed workspace command, an alternate interpreter read and a built-in Read of a credential file. */
+async function normalChat(rig: SecurityRig, session: string, tag: string, full = true): Promise<NormalChat> {
+  const bash = (command: string): ToolStep => ({ name: "Bash", input: { command, description: "probe" } });
+  const env: TurnObservation[] = [];
+  for (const n of [1, 2, 3]) env.push(await normalTurn(rig, `NC-ENV-${tag}-${n}`, session, bash("env | sort")));
+  const command = await normalTurn(rig, `NC-CMD-${tag}`, session, bash("echo NC-WORKSPACE-OK > /work/nc.txt && cat /work/nc.txt && ls /work"));
+  if (!full) return { env, command, interpreter: command, credentialRead: command };
+  const interpreter = await normalTurn(rig, `NC-INTERP-${tag}`, session, bash(`python3 -c "import os, json; print(json.dumps(dict(os.environ)))"; node -e "console.log(JSON.stringify(process.env))"; perl -e 'print join(",", %ENV)'; sh -c env`));
+  const credentialRead = await normalTurn(rig, `NC-READ-${tag}`, session, { name: "Read", input: { file_path: path.join(rig.gateway.dirs.workspace, ".credentials.json") } });
+  return { env, command, interpreter, credentialRead };
+}
+
+function normalChatRows(rig: SecurityRig, mode: Mode, started: number, chats: NormalChat[], extraProblems: string[] = []): void {
+  const chatTurns = chats.flatMap((chat) => [...chat.env, chat.command]);
+  const problems = [...extraProblems];
+  const controls: string[] = [];
+  for (const turn of chatTurns) problems.push(...turnProblems(turn));
+  for (const turn of chats.flatMap((chat) => chat.env)) {
+    const text = turn.results[0]?.text ?? "";
+    if (!(text.includes("HOME=/home/node") && /ANTHROPIC_API_KEY=mpt_/.test(text) && text.length > 200)) problems.push("a Bash output was not the sandbox's actual environment");
+    const main = requestsFor(rig.api, turn.prompt).find((request) => !request.warmup);
+    if (!main?.tools.includes("Bash")) problems.push("Bash was not offered to the model (the trusted grant must enable it)");
+  }
+  for (const chat of chats) if (!(chat.command.results[0]?.text ?? "").includes("NC-WORKSPACE-OK")) problems.push("the allowed workspace command did not run in the same conversation");
+  if (problems.length === extraProblems.length) controls.push("three_env_turns_showed_the_sandbox_environment", "bash_offered_by_the_trusted_grant", "allowed_workspace_command_ran");
+  finishRow(recorder, rig, { id: `NC.chat.${mode}`, mode, durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS * chatTurns.length, surfaces: surfacesOf(rig, chatTurns), controls, problems });
+
+  const interpreterTurns = chats.filter((chat) => chat.interpreter !== chat.command).map((chat) => chat.interpreter);
+  const interpreterProblems = interpreterTurns.flatMap((turn) => [...turnProblems(turn), ...((turn.results[0]?.text ?? "").includes("HOME") ? [] : ["the interpreter dump was empty"])]);
+  finishRow(recorder, rig, { id: `NC.interpreter.${mode}`, mode, durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS, surfaces: surfacesOf(rig, interpreterTurns), controls: ["python_node_perl_sh_environment_dumps_ran"], problems: interpreterProblems });
+
+  const readTurns = chats.filter((chat) => chat.credentialRead !== chat.command).map((chat) => chat.credentialRead);
+  const readProblems = readTurns.flatMap((turn) => [...turnProblems(turn), ...(turn.results[0]?.isError ? [] : ["the built-in Read of the credential file did not fail"])]);
+  finishRow(recorder, rig, { id: `NC.read.${mode}`, mode, durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS, surfaces: surfacesOf(rig, readTurns), controls: ["read_of_the_credential_file_failed"], problems: readProblems });
+}
+
+describe("normal chat", () => {
+  it("normal chat, fresh: three env | sort turns, an allowed workspace command, an alternate interpreter read and a Read of a credential file", async () => {
+    const rig = await newRig();
+    const started = Date.now();
+    normalChatRows(rig, "fresh", started, [await normalChat(rig, "conv-nc-fresh", "fresh")]);
+  });
+
+  it("normal chat, resumed: the same in a conversation that already had a turn", async () => {
+    const rig = await newRig();
+    const started = Date.now();
+    const warm = await warmTurn(rig, "NC-WARM-resumed", "conv-nc-resumed");
+    normalChatRows(rig, "resumed", started, [await normalChat(rig, "conv-nc-resumed", "resumed")], warm.problems);
+  });
+
+  it("normal chat, restarted: the same in a conversation created before a gateway restart, and the three turns in a new one", async () => {
+    const rig = await newRig({ logLevel: "debug" });
+    const started = Date.now();
+    const warm = await warmTurn(rig, "NC-WARM-restarted", "conv-nc-pre");
+    await rig.restart();
+    expect(await waitForIsolation(rig), "/health isolation after the restart").toBe("ok");
+    const pre = await normalChat(rig, "conv-nc-pre", "restarted-pre");
+    const post = await normalChat(rig, "conv-nc-post", "restarted-post", false);
+    normalChatRows(rig, "restarted", started, [pre, post], warm.problems);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Trusted git configuration (the open question of the S2 QA)          */
+/* ------------------------------------------------------------------ */
+
+describe("trusted git configuration", () => {
+  it("X.gitconfig: the trusted configuration reaches the runtime's own git and the agent's git as command-scope environment, and the start-time git runs nothing an earlier turn planted", async () => {
+    const rig = await newRig();
+    const started = Date.now();
+    const lines = (turn: TurnObservation): Map<string, string> => new Map((turn.results[0]?.text ?? "").split("\n").flatMap((line) => (/^[A-Z0-9_]+=/.test(line) ? [[line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)] as [string, string]] : [])));
+    const plant = String.raw`echo SHELL_GIT_ENV_VARS=$(env | grep -c '^GIT_CONFIG')
+echo SHELL_GIT_ENV_NAMES=$(env | grep '^GIT_CONFIG' | cut -d= -f1 | sort | tr '\n' ',')
+echo AGENT_GIT_SCOPES=$(git config --show-scope --get-regexp '^(safe\.barerepository|core\.fsmonitor|core\.hookspath)$' | tr '\t\n' '  ')
+python3 - <<'PY'
+import os
+found = 'none'
+for pid in os.listdir('/proc'):
+    if not pid.isdigit():
+        continue
+    try:
+        cmd = open('/proc/%s/cmdline' % pid, 'rb').read().replace(b'\0', b' ')
+        env = open('/proc/%s/environ' % pid, 'rb').read().split(b'\0')
+    except Exception:
+        continue
+    if cmd.startswith(b'claude'):
+        found = str(len([e for e in env if e.startswith(b'GIT_CONFIG_COUNT=3')]))
+print('RUNTIME_GIT_CONFIG_COUNT_3=' + found)
+PY
+export GIT_CONFIG_COUNT=0
+git init -q --bare /work && git -C /work config core.bare false && git -C /work config core.worktree /work && git -C /work config core.fsmonitor 'touch /work/m-ran'
+rm -f /work/m-ran
+echo PLANTED=1`;
+    const turn1 = await chatTurn(rig, { prompt: "GITCFG-PLANT", sessionId: "conv-gitconfig", steps: [{ name: "Bash", input: { command: plant, description: "probe" } }], withCredentials: false });
+    const check = String.raw`echo START_TIME_GIT_RAN=$(ls /work/m-ran 2>/dev/null | wc -l)
+env -u GIT_CONFIG_COUNT git -C /work status >/dev/null 2>&1
+echo CONTROL_GIT_WITHOUT_TRUSTED_CONFIG_RAN=$(ls /work/m-ran 2>/dev/null | wc -l)
+echo DONE=1`;
+    const turn2 = await chatTurn(rig, { prompt: "GITCFG-CHECK", sessionId: "conv-gitconfig", steps: [{ name: "Bash", input: { command: check, description: "probe" } }], withCredentials: false });
+    const one = lines(turn1);
+    const two = lines(turn2);
+    const problems = [...turnProblems(turn1), ...turnProblems(turn2)];
+    const controls: string[] = [];
+    const expectLine = (name: string, ok: boolean): void => {
+      if (ok) controls.push(name);
+      else problems.push(`control did not hold: ${name}`);
+    };
+    expectLine("shell_environment_holds_the_seven_trusted_git_variables", one.get("SHELL_GIT_ENV_VARS") === "7");
+    expectLine("agent_git_reports_the_three_values_at_command_scope", ["command safe.barerepository explicit", "command core.fsmonitor false", "command core.hookspath /dev/null"].every((entry) => (one.get("AGENT_GIT_SCOPES") ?? "").toLowerCase().includes(entry)));
+    expectLine("runtime_process_environment_holds_the_trusted_git_count", one.get("RUNTIME_GIT_CONFIG_COUNT_3") === "1");
+    expectLine("agent_planted_the_implicit_bare_layout", one.get("PLANTED") === "1");
+    expectLine("start_time_git_ran_nothing_the_agent_planted", two.get("START_TIME_GIT_RAN") === "0");
+    expectLine("planted_vector_is_live_without_the_trusted_configuration", two.get("CONTROL_GIT_WITHOUT_TRUSTED_CONFIG_RAN") === "1");
+    finishRow(recorder, rig, { id: "X.gitconfig", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS * 2, surfaces: surfacesOf(rig, [turn1, turn2]), controls, problems });
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /*  The regression row                                                  */
 /* ------------------------------------------------------------------ */
 

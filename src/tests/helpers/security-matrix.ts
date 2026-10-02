@@ -1122,6 +1122,8 @@ export interface TurnObservation {
   /** The tool results of this turn, in order (as many as the turn had steps). */
   results: { isError: boolean; text: string }[];
   prompt: string;
+  /** Prompts of delegated conversations started by this turn. */
+  extraPrompts: string[];
   sessionId: string;
   queryId: string;
   logFrom: number;
@@ -1161,6 +1163,8 @@ export interface ChatTurnOptions {
   /** Extra request body fields (`allowedTools`, `enforcedTools`, ...); they win over the defaults. */
   body?: Record<string, unknown>;
   deadlineMs?: number;
+  /** Prompts of conversations the turn starts itself (a delegated sub-agent), so their model requests join the surfaces. */
+  extraPrompts?: string[];
 }
 
 /** One chat turn of an ordinary conversation, observed from the host: a process sampler, an egress sampler and the model double's records. */
@@ -1191,6 +1195,7 @@ export async function chatTurn(rig: SecurityRig, options: ChatTurnOptions): Prom
     outcome,
     results: options.steps.length > 0 ? resultsFor(rig.api, options.prompt).slice(-options.steps.length) : [],
     prompt: options.prompt,
+    extraPrompts: options.extraPrompts ?? [],
     sessionId: options.sessionId,
     queryId,
     logFrom,
@@ -1204,7 +1209,7 @@ export async function chatTurn(rig: SecurityRig, options: ChatTurnOptions): Prom
 
 /** The five observation surfaces of the given turns; `transcripts` also holds the runtime's per-run leftovers. */
 export function surfacesOf(rig: SecurityRig, turns: TurnObservation[]): Surface[] {
-  const prompts = [...new Set(turns.map((turn) => turn.prompt))];
+  const prompts = [...new Set(turns.flatMap((turn) => [turn.prompt, ...turn.extraPrompts]))];
   const unique = [...new Set(prompts.flatMap((prompt) => requestsFor(rig.api, prompt)))];
   const sessions = [...new Set(turns.map((turn) => turn.sessionId))];
   const home = conversationText(rig.gateway, sessions);
