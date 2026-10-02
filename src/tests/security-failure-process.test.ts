@@ -261,7 +261,7 @@ describe("sandbox startup and policy-check failures", () => {
     problems.push(...turnProblems(recovered));
     if ((await waitForIsolation(rig)) === "ok") controls.push("next_start_recovered_and_health_returned_to_ok");
     else problems.push("/health isolation did not return to ok");
-    finishRow(recorder, rig, { id: "IF.startup-exit", durationMs: Date.now() - started, deadlineMs: STARTUP_TIMEOUT_MS + 2000, surfaces: noRunSurfaces(rig, window, outcome), controls, problems });
+    finishRow(recorder, rig, { id: "IF.startup-exit", durationMs: outcome.ms, deadlineMs: STARTUP_TIMEOUT_MS + 2000, surfaces: noRunSurfaces(rig, window, outcome), controls, problems });
   });
 
   it("IF.startup-hang: a sandbox that never reports ready is killed and refused with the transient text within the startup bound; nothing ran", async () => {
@@ -279,7 +279,7 @@ describe("sandbox startup and policy-check failures", () => {
     await waitFor(() => hungLauncher() === 0, 5000, "the hung launcher to be killed").catch(() => problems.push("the hung launcher was not killed"));
     const dir = conversationDirs(rig.gateway, ["conv-startup-hang"])[0];
     if (dir && fs.existsSync(path.join(dir, "work", "m-hang"))) problems.push("the scripted tool ran");
-    finishRow(recorder, rig, { id: "IF.startup-hang", durationMs: Date.now() - started, deadlineMs: STARTUP_TIMEOUT_MS + 2000, surfaces: noRunSurfaces(rig, window, outcome), controls, problems });
+    finishRow(recorder, rig, { id: "IF.startup-hang", durationMs: outcome.ms, deadlineMs: STARTUP_TIMEOUT_MS + 2000, surfaces: noRunSurfaces(rig, window, outcome), controls, problems });
   });
 
   it("IF.policy: a sandbox that can still create nested user namespaces fails the in-sandbox restriction check before the first tool; nothing ran", async () => {
@@ -297,7 +297,7 @@ describe("sandbox startup and policy-check failures", () => {
     if (outcome.ms > STARTUP_TIMEOUT_MS + 2000) problems.push("the failure took longer than the startup bound plus 2 s");
     const dir = conversationDirs(rig.gateway, ["conv-policy"])[0];
     if (dir && fs.existsSync(path.join(dir, "work", "m-policy"))) problems.push("the scripted tool's marker exists");
-    finishRow(recorder, rig, { id: "IF.policy", durationMs: Date.now() - started, deadlineMs: STARTUP_TIMEOUT_MS + 2000, surfaces: noRunSurfaces(rig, window, outcome), controls, problems });
+    finishRow(recorder, rig, { id: "IF.policy", durationMs: outcome.ms, deadlineMs: STARTUP_TIMEOUT_MS + 2000, surfaces: noRunSurfaces(rig, window, outcome), controls, problems });
   });
 });
 
@@ -350,6 +350,7 @@ describe("cancellation and restart during a tool call with a child process", () 
     const held = await startHeldRun(rig, "cancel");
     const problems: string[] = [];
     const controls = ["tagged_child_below_the_gateway_and_tool_call_recorded_before_the_cancel"];
+    const cancelledAt = Date.now();
     held.control.abort!();
     const outcome = await held.outcome;
     await waitFor(() => taggedProcesses(rig, held.tag) === 0, NOTHING_LEFT_WITHIN_MS, "the tagged child to end").catch(() => problems.push("a tagged process survived the cancellation"));
@@ -365,7 +366,7 @@ describe("cancellation and restart during a tool call with a child process", () 
     problems.push(...fallbackProblems(rig, held.window, { runtimes: "some", modelRequests: "some" }));
     finishRow(recorder, rig, {
       id: "IF.cancel",
-      durationMs: Date.now() - started,
+      durationMs: Date.now() - cancelledAt,
       deadlineMs: NOTHING_LEFT_WITHIN_MS,
       surfaces: [...surfacesOf(rig, [{ ...next, prompt: held.prompt, extraPrompts: [next.prompt] }]), { name: "caller-body", text: outcome.raw }, { name: "replayed-events", text: replayed.text }],
       controls,
@@ -417,7 +418,8 @@ describe("cancellation and restart during a tool call with a child process", () 
     else problems.push("the resumed conversation did not run inside a sandbox");
     finishRow(recorder, rig, {
       id,
-      durationMs: Date.now() - started,
+      // The failure's own time (the stop to the end of the caller's stream); the resume afterwards is not part of the deadline.
+      durationMs: streamEndMs,
       deadlineMs: bound,
       surfaces: [...surfacesOf(rig, [{ ...resumed, prompt: held.prompt, extraPrompts: [resumed.prompt] }]), { name: "caller-body", text: outcome.raw }, { name: "replayed-events", text: replayed.text }],
       controls,
