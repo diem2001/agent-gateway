@@ -180,6 +180,8 @@ export interface ExactToolScript {
   name: string;
   input: Record<string, unknown>;
   prompt: string;
+  /** Further calls of the same turn: each is made after the previous call's result came back (MVP-7679). */
+  then?: { name: string; input: Record<string, unknown> }[];
 }
 
 export async function startFakeAnthropicApi(options: {
@@ -301,8 +303,8 @@ export async function startFakeAnthropicApi(options: {
       const target = tools.find((name) => name.endsWith(`__${options.toolName}`));
       type Block = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } | { type: "text"; text: string };
       const content: Block[] =
-        exact && main && resultsAfterLatestPrompt === 0
-          ? [{ type: "tool_use", id: `toolu_7637_${++toolUseSeq}`, name: exact.name, input: exact.input }]
+        exact && main && resultsAfterLatestPrompt <= (exact.then?.length ?? 0)
+          ? [{ type: "tool_use", id: `toolu_7637_${++toolUseSeq}`, ...(resultsAfterLatestPrompt === 0 ? { name: exact.name, input: exact.input } : exact.then![resultsAfterLatestPrompt - 1]) }]
           : !exact && target && toolResults.length === 0
             ? [{ type: "tool_use", id: `toolu_7667_${++toolUseSeq}`, name: target, input: { id: "R-1" } }]
             : [{ type: "text", text: FINAL_ANSWER }];

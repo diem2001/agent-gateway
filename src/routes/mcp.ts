@@ -12,7 +12,7 @@ import {
 import { getCredentialTemplateFieldKeys } from "../credential-composer.js";
 import { testMcpServer, McpTestError } from "../mcp-test-client.js";
 import { callMcpTool, McpCallError } from "../mcp-call-client.js";
-import { credentialMapsError, type McpCredentialOverride } from "../mcp-overrides.js";
+import { credentialMapsError, hasUserCredential, type McpCredentialOverride } from "../mcp-overrides.js";
 import {
   UPLOAD_MESSAGES,
   UPLOAD_ROUTE,
@@ -349,6 +349,14 @@ router.post("/v1/mcp-servers/:name/call", async (req: Request, res: Response) =>
       res.status(400).json({ error: { code: "MCP_OVERRIDE_INVALID", message: credentialError } });
       return;
     }
+  }
+
+  // 4b. A server that requires a user credential is never called with the shared one (MVP-7679): refused
+  //     before any upstream request, like the run that leaves such a server out.
+  if (srv.requireUserCredentials === true && !hasUserCredential(srv, credentials)) {
+    log("audit", `mcp.call.called serverName=${name} tool=${body.tool} result=auth_failed`);
+    res.status(401).json({ error: { code: "MCP_AUTH_FAILED", message: "this server requires the user's credential and none was provided" } });
+    return;
   }
 
   // 5. Execute the tool. Success → the MCP tools/call result verbatim at HTTP 200

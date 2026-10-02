@@ -322,7 +322,8 @@ describe("tools/call validates before the webhook (AC-2)", () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response("pageId: invalid", { status: 422 }));
     const client = await connect([PAGE_TOOL]);
     const result = await client.call("page", JSON.stringify(VALID_PAGE_ARGS));
-    expect(result).toEqual({ isError: true, content: [{ type: "text", text: "Tool webhook returned error: 422 pageId: invalid" }] });
+    // A tool's own 4xx refusal reaches the model with its message (MVP-7679: bounded, wrapped with the status).
+    expect(result).toEqual({ isError: true, content: [{ type: "text", text: "The tool rejected the request (HTTP 422): pageId: invalid" }] });
   });
 });
 

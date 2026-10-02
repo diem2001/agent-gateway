@@ -109,6 +109,12 @@ function buildFixture(): void {
   git("init", "-q", "-b", "main");
   git("add", ".");
   git("commit", "-q", "-m", "init");
+  // A second branch whose file is not in the checked-out tree: read-only git commands must reach it (MVP-7679 item 5).
+  git("checkout", "-q", "-b", "other");
+  write(path.join(ws, "projects", "repo", "feature.txt"), "OTHER-BRANCH-7679");
+  git("add", ".");
+  git("commit", "-q", "-m", "other branch");
+  git("checkout", "-q", "main");
   write(
     path.join(ws, "projects", "repo", ".git", "config"),
     `[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n\turl = https://x-access-token:${CLONE_TOKEN}@github.com/acme/repo.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n`,
@@ -262,6 +268,13 @@ describe("environment and processes", () => {
       "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
       "CLAUDE_CODE_ENTRYPOINT",
       "DISABLE_AUTOUPDATER",
+      "GIT_CONFIG_COUNT",
+      "GIT_CONFIG_KEY_0",
+      "GIT_CONFIG_KEY_1",
+      "GIT_CONFIG_KEY_2",
+      "GIT_CONFIG_VALUE_0",
+      "GIT_CONFIG_VALUE_1",
+      "GIT_CONFIG_VALUE_2",
       "HOME",
       "LANG",
       "PATH",
@@ -464,17 +477,20 @@ describe("what the sandbox sees of the trusted workspace", () => {
 });
 
 describe("homes of conversations", () => {
-  it("a conversation's home persists between runs; a run without a conversation leaves nothing behind", async () => {
-    const first = await probe(`echo first > /home/node/state.txt; echo DONE=1`, { sessionDirId: dirId("conv-A") });
+  it("a conversation's work area and runtime data persist between runs, its home root does not; a run without a conversation leaves nothing behind", async () => {
+    const first = await probe(`echo first > /work/state.txt; echo home > /home/node/state.txt; mkdir -p /home/node/.claude/todos; echo todo > /home/node/.claude/todos/t.json; echo DONE=1`, { sessionDirId: dirId("conv-A") });
     expect(first.lines.get("DONE")).toBe("1");
-    const second = await probe(`echo SEEN=$(cat /home/node/state.txt 2>&1)`, { sessionDirId: dirId("conv-A") });
+    const second = await probe(`echo SEEN=$(cat /work/state.txt 2>&1); echo HOME_SEEN=$(cat /home/node/state.txt 2>&1 | grep -c '^home$'); echo TODO=$(cat /home/node/.claude/todos/t.json)`, { sessionDirId: dirId("conv-A") });
     expect(second.lines.get("SEEN")).toBe("first");
+    expect(second.lines.get("HOME_SEEN")).toBe("0");
+    expect(second.lines.get("TODO")).toBe("todo");
     // Another conversation does not see it.
-    const other = await probe(`echo SEEN=$(cat /home/node/state.txt 2>&1 | grep -c first)`, { sessionDirId: dirId("conv-B") });
+    const other = await probe(`echo SEEN=$(cat /work/state.txt 2>&1 | grep -c first); echo TODO=$(cat /home/node/.claude/todos/t.json 2>&1 | grep -c '^todo$')`, { sessionDirId: dirId("conv-B") });
     expect(other.lines.get("SEEN")).toBe("0");
-    // A run without a conversation: its home is removed with its run directory.
+    expect(other.lines.get("TODO")).toBe("0");
+    // A run without a conversation: its home and work area are removed with its run directory.
     const before = fs.readdirSync(path.join(sandboxRoot, "runs"));
-    const stateless = await probe(`echo x > /home/node/leftover.txt; echo DONE=1`);
+    const stateless = await probe(`echo x > /home/node/leftover.txt; echo x > /work/leftover.txt; echo DONE=1`);
     expect(stateless.lines.get("DONE")).toBe("1");
     expect(fs.readdirSync(path.join(sandboxRoot, "runs"))).toEqual(before);
   });
@@ -492,6 +508,205 @@ describe("homes of conversations", () => {
     expect(r.lines.get("MEMORY")).toBe("GLOBAL-MEMORY-OK");
     expect(fs.readFileSync(victim, "utf8")).toBe("keep");
     expect(fs.existsSync(path.join(tmp, "victim", "ok"))).toBe(false);
+  });
+});
+
+describe("the clean home and the work area (MVP-7679, A2)", () => {
+  it("the working directory is /work: writable, persistent for the same conversation, invisible to another, and not the home", async () => {
+    const first = await probe(`echo PWD=$(pwd); echo WRITE=$(echo w1 > /work/note.txt; echo $?); mkdir -p /work/sub && echo w2 > /work/sub/deep.txt; echo DONE=1`, { sessionDirId: dirId("work-A") });
+    expect(first.exitCode, first.stdout).toBe(0);
+    expect(first.lines.get("PWD")).toBe("/work");
+    expect(first.lines.get("WRITE")).toBe("0");
+    const second = await probe(`echo NOTE=$(cat /work/note.txt); echo DEEP=$(cat /work/sub/deep.txt); echo HOME_NOTE=$(ls /home/node/note.txt 2>&1 | grep -c -v 'No such')`, { sessionDirId: dirId("work-A") });
+    expect(second.lines.get("NOTE")).toBe("w1");
+    expect(second.lines.get("DEEP")).toBe("w2");
+    expect(second.lines.get("HOME_NOTE")).toBe("0");
+    const other = await probe(`echo SEEN=$(ls /work | wc -l)`, { sessionDirId: dirId("work-B") });
+    expect(other.lines.get("SEEN")).toBe("0");
+    const workDir = path.join(sandboxRoot, "sessions", dirId("work-A"), "work");
+    expect(fs.readFileSync(path.join(workDir, "note.txt"), "utf8")).toBe("w1\n");
+    expect(fs.statSync(workDir).mode & 0o777).toBe(0o700);
+  });
+
+  it("a run without a conversation gets a work area that is removed with its run", async () => {
+    const before = fs.readdirSync(path.join(sandboxRoot, "runs"));
+    const r = await probe(`echo x > /work/leftover.txt; echo PWD=$(pwd); echo DONE=1`);
+    expect(r.lines.get("PWD")).toBe("/work");
+    expect(r.lines.get("DONE")).toBe("1");
+    expect(fs.readdirSync(path.join(sandboxRoot, "runs"))).toEqual(before);
+  });
+
+  it("every home-root file the agent wrote in an earlier run is gone at the next start; the data directories and the work area stay", async () => {
+    const id = dirId("clean-home");
+    const files = [".bashrc", ".bash_profile", ".bash_login", ".profile", ".bash_logout", ".zshenv", ".zshrc", ".zprofile", ".gitconfig", ".claude.json", ".mcp.json"];
+    const first = await probe(
+      `for f in ${files.join(" ")}; do echo "touch /home/node/m-$f" > /home/node/$f; done
+       mkdir -p /home/node/.config/git /home/node/.claude/todos /home/node/.claude/projects/-work /home/node/.claude/commands 2>/dev/null
+       echo x > /home/node/.config/git/config; echo t > /home/node/.claude/todos/t.json; echo s > /home/node/.claude/projects/-work/s.jsonl; echo w > /work/keep.txt
+       echo DONE=1`,
+      { sessionDirId: id },
+    );
+    expect(first.exitCode, first.stdout).toBe(0);
+    const second = await probe(`echo HOME_ROOT=$(ls -A /home/node | tr '\n' ' '); echo TODO=$(cat /home/node/.claude/todos/t.json); echo TRANSCRIPT=$(cat /home/node/.claude/projects/-work/s.jsonl); echo WORK=$(cat /work/keep.txt)`, { sessionDirId: id });
+    expect(second.exitCode, second.stdout).toBe(0);
+    expect(second.lines.get("HOME_ROOT")?.trim()).toBe(".claude");
+    expect(second.lines.get("TODO")).toBe("t");
+    expect(second.lines.get("TRANSCRIPT")).toBe("s");
+    expect(second.lines.get("WORK")).toBe("w");
+  });
+
+  it("a shell that starts as the runtime starts it (bash -l, then the snapshot) runs nothing from the home of an earlier run", async () => {
+    const id = dirId("shell-start");
+    await probe(`for f in .bashrc .bash_profile .bash_login .profile; do echo "touch /work/m$f" > /home/node/$f; done; echo DONE=1`, { sessionDirId: id });
+    const second = await probe(`bash -l -c 'echo LOGIN=ok'; bash -i -c true 2>/dev/null; echo MARKERS=$(ls -A /work | grep -c '^m\.')`, { sessionDirId: id });
+    expect(second.lines.get("LOGIN")).toBe("ok");
+    expect(second.lines.get("MARKERS")).toBe("0");
+    // Control: the same files DO run when a shell is started inside the run that wrote them (the markers are producible).
+    const control = await probe(`for f in .bash_profile; do echo "touch /work/mc$f" > /home/node/$f; done; bash -l -c true; echo MARKERS=$(ls -A /work | grep -c '^mc\.bash_profile$')`, { sessionDirId: dirId("shell-control") });
+    expect(control.lines.get("MARKERS")).toBe("1");
+  });
+
+  it("a repository planted at /work/.git with core.fsmonitor runs nothing at the next start", async () => {
+    const id = dirId("work-git");
+    await probe(`git init -q /work && git -C /work config core.fsmonitor 'touch /work/m-fsmonitor' && echo DONE=1`, { sessionDirId: id });
+    const second = await probe(`git -C /work status --porcelain >/dev/null 2>&1; echo STATUS=$?; echo MARKER=$(ls /work/m-fsmonitor 2>&1 | grep -c -v 'No such'); echo GIT=$(ls -A /work/.git 2>&1 | grep -c -v 'No such')`, { sessionDirId: id });
+    expect(second.lines.get("MARKER")).toBe("0");
+    expect(second.lines.get("GIT")).toBe("0");
+    // Control: the planted configuration is a working fsmonitor (git runs it inside the run that wrote it).
+    const control = await probe(`git init -q /work && git -C /work config core.fsmonitor 'touch /work/m-control' && env -u GIT_CONFIG_COUNT git -C /work status >/dev/null 2>&1; echo MARKER=$(ls /work/m-control 2>&1 | grep -c -v 'No such')`, { sessionDirId: dirId("work-git-control") });
+    expect(control.lines.get("MARKER")).toBe("1");
+  });
+
+  it("a repository at /work/.git is removed at every start, whatever it is: a commondir pointer, a worktree config and a plain directory run nothing", async () => {
+    const plant = (name: string, extra: string) =>
+      `mkdir -p /work/.git/objects /work/.git/refs /work/evil/objects /work/evil/refs && echo 'ref: refs/heads/main' > /work/.git/HEAD && echo 'ref: refs/heads/main' > /work/evil/HEAD && ${extra.replaceAll("MARK", name)} && echo DONE=1`;
+    const check = (name: string) =>
+      `git -C /work status --porcelain >/dev/null 2>&1; echo MARKER=$(ls /work/${name} 2>&1 | grep -c -v 'No such'); echo GIT=$(ls -A /work/.git 2>&1 | grep -c -v 'No such')`;
+    const rows: Array<{ name: string; extra: string }> = [
+      { name: "m-commondir", extra: `echo '../evil' > /work/.git/commondir && printf '[core]\\n\\trepositoryformatversion = 0\\n\\tfsmonitor = touch /work/MARK\\n' > /work/evil/config` },
+      { name: "m-worktreecfg", extra: `printf '[core]\\n\\trepositoryformatversion = 1\\n[extensions]\\n\\tworktreeConfig = true\\n' > /work/.git/config && printf '[core]\\n\\tfsmonitor = touch /work/MARK\\n' > /work/.git/config.worktree` },
+      { name: "m-plain", extra: `printf '[core]\\n\\trepositoryformatversion = 0\\n\\tfsmonitor = touch /work/MARK\\n' > /work/.git/config` },
+    ];
+    for (const row of rows) {
+      const id = dirId(`work-git-${row.name}`);
+      const planted = await probe(plant(row.name, row.extra), { sessionDirId: id });
+      expect(planted.lines.get("DONE"), row.name).toBe("1");
+      const second = await probe(check(row.name), { sessionDirId: id });
+      expect(second.lines.get("MARKER"), row.name).toBe("0");
+      expect(second.lines.get("GIT"), row.name).toBe("0");
+      // Control: the same planted repository DOES run its fsmonitor when git is started inside the run that wrote it.
+      const control = await probe(`${plant(row.name + "c", row.extra)}; env -u GIT_CONFIG_COUNT git -C /work status >/dev/null 2>&1; echo MARKER=$(ls /work/${row.name}c 2>&1 | grep -c -v 'No such')`, { sessionDirId: dirId(`work-git-control-${row.name}`) });
+      expect(control.lines.get("MARKER"), row.name).toBe("1");
+    }
+  });
+
+  it("every way a repository can be discovered at the root of /work runs nothing at the next start: a gitfile, an implicit bare layout (with includes, includeIf, a worktree configuration, a filter driver) and a plain directory", async () => {
+    // Each plant makes git, run from /work WITHOUT the sandbox's trusted configuration, run `touch /work/MARK`.
+    const BARE = `git init -q --bare /work && git -C /work config core.bare false && git -C /work config core.worktree /work`;
+    const MON = `printf '[core]\\n\\tfsmonitor = touch /work/MARK\\n' > /work/inc.cfg`;
+    const rows: Array<{ name: string; plant: string }> = [
+      { name: "m-gitfile", plant: `git init -q --separate-git-dir /work/evil /work && git --git-dir=/work/evil config core.fsmonitor 'touch /work/MARK'` },
+      { name: "m-bare", plant: `${BARE} && git -C /work config core.fsmonitor 'touch /work/MARK'` },
+      { name: "m-include", plant: `${BARE} && ${MON} && git -C /work config include.path /work/inc.cfg` },
+      { name: "m-includeif", plant: `${BARE} && ${MON} && git -C /work config 'includeIf.gitdir:/work.path' /work/inc.cfg` },
+      { name: "m-worktreecfg", plant: `${BARE} && git -C /work config extensions.worktreeConfig true && git -C /work config core.repositoryformatversion 1 && printf '[core]\\n\\tfsmonitor = touch /work/MARK\\n' > /work/config.worktree` },
+      { name: "m-filter", plant: `${BARE} && git -C /work config filter.x.clean 'touch /work/MARK; cat' && echo '* filter=x' > /work/.gitattributes && echo one > /work/tracked.txt && GIT_DIR=/work git add tracked.txt .gitattributes 2>/dev/null; echo two > /work/tracked.txt; rm -f /work/MARK` },
+      { name: "m-plaindir", plant: `git init -q /work && git -C /work config core.fsmonitor 'touch /work/MARK'` },
+    ];
+    for (const row of rows) {
+      // The agent's own shell may unset the trusted configuration to build the layout (it holds Bash there); the next start's git still has it.
+      const plant = `export GIT_CONFIG_COUNT=0; ${row.plant.replaceAll("MARK", row.name)}`;
+      const check = `git -C /work status --porcelain >/dev/null 2>&1; echo MARKER=$(ls /work/${row.name} 2>&1 | grep -c -v 'No such')`;
+      const id = dirId(`work-vec-${row.name}`);
+      const planted = await probe(`${plant}; echo DONE=1`, { sessionDirId: id });
+      expect(planted.lines.get("DONE"), row.name).toBe("1");
+      // The planted layout is still there (only a .git entry is removed at the start), and the next start's git runs nothing.
+      const second = await probe(check, { sessionDirId: id });
+      expect(second.lines.get("MARKER"), row.name).toBe("0");
+      // Control: without the sandbox's trusted git configuration the same planted files DO run the command (the vector is producible).
+      const control = await probe(`${plant}; env -u GIT_CONFIG_COUNT git -C /work status >/dev/null 2>&1; echo MARKER=$(ls /work/${row.name} 2>&1 | grep -c -v 'No such')`, { sessionDirId: dirId(`work-vec-c-${row.name}`) });
+      expect(control.lines.get("MARKER"), `${row.name} control`).toBe("1");
+    }
+  });
+
+  it("the trusted git configuration of the sandbox has the highest precedence and leaves legitimate git alone: a copied repository below /work still works, an agent's own repository cannot re-enable fsmonitor, a bare repository must be named explicitly", async () => {
+    const r = await probe(
+      `git init -q /work/sub && git -C /work/sub config core.fsmonitor 'touch /work/m-sub' && echo x > /work/sub/f && git -C /work/sub add f && git -C /work/sub -c user.name=a -c user.email=a@b.c commit -q -m c && echo SUBLOG=$(git -C /work/sub log --oneline | wc -l);
+       git -C /work/sub status --porcelain >/dev/null 2>&1; echo SUBMARKER=$(ls /work/m-sub 2>&1 | grep -c -v 'No such');
+       git init -q --bare /work/b.git; echo IMPLICIT=$(cd /work/b.git && git rev-parse --git-dir 2>&1 | head -1 | grep -c '^fatal: cannot use bare repository'); echo EXPLICIT=$(git --git-dir=/work/b.git rev-parse --is-bare-repository 2>&1);
+       echo CFGCOUNT=$(git config --show-scope --list | grep -c '^command'); echo DONE=1`,
+      { sessionDirId: dirId("work-git-config") },
+    );
+    expect(r.lines.get("SUBLOG")).toBe("1");
+    expect(r.lines.get("SUBMARKER")).toBe("0");
+    expect(r.lines.get("IMPLICIT")).toBe("1");
+    expect(r.lines.get("EXPLICIT")).toBe("true");
+    expect(r.lines.get("CFGCOUNT")).toBe("3");
+  });
+
+  it("a repository below /work (a copied project) is not consulted by the start-time git: its fsmonitor does not run, and git from /work does not see it", async () => {
+    const id = dirId("work-git-nested");
+    await probe(`mkdir -p /work/sub && git init -q /work/sub && git -C /work/sub config core.fsmonitor 'touch /work/m-nested' && echo DONE=1`, { sessionDirId: id });
+    const second = await probe(`git -C /work status --porcelain >/dev/null 2>&1; echo STATUS=$?; echo MARKER=$(ls /work/m-nested 2>&1 | grep -c -v 'No such'); echo NESTED=$(grep -c fsmonitor /work/sub/.git/config); echo TOP=$(git -C /work rev-parse --show-toplevel 2>&1 | head -1 | grep -c '^/work$')`, { sessionDirId: id });
+    expect(second.lines.get("MARKER")).toBe("0");
+    expect(second.lines.get("NESTED")).toBe("1");
+    expect(second.lines.get("TOP")).toBe("0");
+    // Control: the nested repository is a working fsmonitor when git is run inside it.
+    const control = await probe(`git init -q /work/sub && git -C /work/sub config core.fsmonitor 'touch /work/m-nested-c' && env -u GIT_CONFIG_COUNT git -C /work/sub status >/dev/null 2>&1; echo MARKER=$(ls /work/m-nested-c 2>&1 | grep -c -v 'No such')`, { sessionDirId: dirId("work-git-nested-control") });
+    expect(control.lines.get("MARKER")).toBe("1");
+  });
+
+  it("the start-time git cannot be steered elsewhere: no GIT_* variable but the trusted configuration, nothing an earlier run wrote above /work survives, and every configuration file it reads is outside the agent's reach", async () => {
+    const id = dirId("work-git-origins");
+    // Whatever the agent writes outside /work, the home and /tmp (the sandbox root is a fresh tmpfs per start) is gone at the next start.
+    const planted = await probe(`mkdir -p /.git/objects /.git/refs && echo 'ref: refs/heads/main' > /.git/HEAD && printf '[core]\\n\\tfsmonitor = touch /work/m-root\\n' > /.git/config && echo DONE=1; git -C /work status >/dev/null 2>&1; echo CONTROL=$(cd / && env -u GIT_CONFIG_COUNT git status >/dev/null 2>&1; ls /work/m-root 2>&1 | grep -c -v 'No such'); echo STOP=$(git -C /work rev-parse --git-dir 2>&1 | head -1 | tr ' ' '_'); rm -f /work/m-root`, { sessionDirId: id });
+    expect(planted.lines.get("DONE")).toBe("1");
+    // Control: that repository is a working fsmonitor for git run at /, but git's discovery from /work stops at the /work mount point and never crosses into it (the work area is its own mount).
+    expect(planted.lines.get("CONTROL")).toBe("1");
+    expect(planted.lines.get("STOP")).toBe("fatal:_not_a_git_repository_(or_any_parent_up_to_mount_point_/)");
+    const result = await probe(
+      `echo GITENV=$(env | grep '^GIT_' | grep -v -c '^GIT_CONFIG_\\(COUNT\\|KEY_[0-9]\\|VALUE_[0-9]\\)='); echo ROOTGIT=$(ls -A /.git 2>&1 | grep -c -v 'No such');
+       git -C /work status >/dev/null 2>&1; echo MARKER=$(ls /work/m-root 2>&1 | grep -c -v 'No such');
+       echo SEARCH=$(git -C /work rev-parse --git-dir 2>&1 | head -1 | grep -c -v '^fatal');
+       for origin in $(git -C /work config --list --show-origin 2>/dev/null | cut -f1 | sort -u); do echo ORIGIN=$origin; done; echo DONE=1`,
+      { sessionDirId: id },
+    );
+    expect(result.lines.get("GITENV")).toBe("0");
+    expect(result.lines.get("ROOTGIT")).toBe("0");
+    expect(result.lines.get("MARKER")).toBe("0");
+    expect(result.lines.get("SEARCH")).toBe("0");
+    // Whatever configuration files git lists (the system file at most) are not below /work, the home or /tmp.
+    for (const line of result.stdout.split("\n").filter((l) => l.startsWith("ORIGIN="))) expect(line).not.toMatch(/\/work|\/home\/node|\/tmp/);
+  });
+
+  it("read-only git commands reach another branch of a mounted repository; git's ownership check does not block them; the repository stays read-only", async () => {
+    const repo = path.join(ws, "projects", "repo");
+    const branchesBefore = fs.readdirSync(path.join(repo, ".git", "refs", "heads")).sort();
+    const r = await probe(`
+      R=/home/node/.claude/projects/repo
+      echo SHOW=$(git -C $R show other:feature.txt 2>&1)
+      echo CATFILE=$(git -C $R cat-file -p other:feature.txt 2>&1)
+      echo LSTREE=$(git -C $R ls-tree -r --name-only other 2>&1 | tr '\n' ,)
+      echo LOG=$(git -C $R log --oneline other 2>&1 | wc -l)
+      echo DIFF=$(git -C $R diff --stat main other 2>&1 | tail -1 | tr -s ' ')
+      echo BRANCHES=$(git -C $R branch --list 2>&1 | tr -d ' *' | sort | tr '\n' ,)
+      echo FROM_WORK=$(cd /work && git -C $R show other:feature.txt 2>&1)
+      echo COMMIT=$(git -C $R -c user.name=x -c user.email=x@example.test commit --allow-empty -m x 2>&1 | head -1)
+      echo NEWBRANCH=$(git -C $R branch evil 2>&1 | head -1)
+      echo OWNERSHIP=$(git -C $R show other:feature.txt 2>&1 | grep -c -i 'dubious ownership')
+    `);
+    expect(r.exitCode, r.stdout).toBe(0);
+    expect(r.lines.get("SHOW")).toBe("OTHER-BRANCH-7679");
+    expect(r.lines.get("CATFILE")).toBe("OTHER-BRANCH-7679");
+    expect(r.lines.get("LSTREE")).toBe("feature.txt,src/main.txt,");
+    expect(r.lines.get("LOG")).toBe("2");
+    expect(r.lines.get("DIFF")).toMatch(/1 file changed/);
+    expect(r.lines.get("BRANCHES")).toBe("main,other,");
+    expect(r.lines.get("FROM_WORK")).toBe("OTHER-BRANCH-7679");
+    expect(r.lines.get("OWNERSHIP")).toBe("0");
+    expect(r.lines.get("COMMIT")).toMatch(/read-only|Read-only|Permission denied|unable|error|fatal/i);
+    expect(r.lines.get("NEWBRANCH")).toMatch(/read-only|Read-only|Permission denied|unable|error|fatal/i);
+    expect(fs.readdirSync(path.join(repo, ".git", "refs", "heads")).sort()).toEqual(branchesBefore);
   });
 });
 
@@ -607,17 +822,19 @@ describe("failing closed", () => {
     expect(() => loadIsolationConfig({ AGENT_SANDBOX_ROOT: "relative/path" })).toThrow();
   });
 
-  it("a mount source that is missing or unsafe is left out; the run starts without it", async () => {
+  it("a mount source that is missing or unsafe is replaced by an empty trusted one; the run starts without its content", async () => {
     // A workspace with a missing CLAUDE.md and a skills entry that is a symlink to a directory.
     const odd = path.join(tmp, "odd-ws");
     fs.mkdirSync(path.join(odd, "agents"), { recursive: true });
     fs.writeFileSync(path.join(odd, "agents", "x.md"), "AGENT-X");
     fs.symlinkSync(ws, path.join(odd, "skills"));
-    const r = await probe(`echo AGENT=$(cat /home/node/.claude/agents/x.md); echo SKILLS=$(ls /home/node/.claude/skills 2>&1 | grep -c 'ok'); echo MEMORY=$(test -e /home/node/.claude/CLAUDE.md && echo yes || echo no)`, { workspaceRoot: odd });
+    const r = await probe(`echo AGENT=$(cat /home/node/.claude/agents/x.md); echo SKILLS=$(ls /home/node/.claude/skills 2>&1 | grep -c 'ok'); echo MEMORY=$(test -e /home/node/.claude/CLAUDE.md && wc -c < /home/node/.claude/CLAUDE.md || echo missing); echo WRITABLE=$(touch /home/node/.claude/commands/x.md 2>&1 | grep -c 'Read-only')`, { workspaceRoot: odd });
     expect(r.exitCode, r.stdout).toBe(0);
     expect(r.lines.get("AGENT")).toBe("AGENT-X");
     expect(r.lines.get("SKILLS")).toBe("0");
-    expect(r.lines.get("MEMORY")).toBe("no");
+    // The missing CLAUDE.md is an empty read-only file and the missing directories are empty read-only ones: nothing the agent writes there is ever loaded.
+    expect(r.lines.get("MEMORY")).toBe("0");
+    expect(r.lines.get("WRITABLE")).toBe("1");
   });
 });
 

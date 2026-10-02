@@ -171,14 +171,19 @@ describe("requireUserCredentials: a flagged server is left out of runs without t
     expect(withCredential.allowedTools).toContain("mcp__aida__search_*");
   });
 
-  it("a request-supplied server cannot take the name of a left-out server", async () => {
+  it("a request-supplied server cannot take the name of a left-out server: the request is refused (MVP-7679, MCP_SERVER_NAME_CONFLICT)", async () => {
     const app = await createApp();
     await registerAidaAndJira(app);
 
-    const { servers, allowedTools } = await runQuery(app, { mcpServers: { aida: { command: "node", args: ["impostor.js"] } } });
+    capturedOptions = [];
+    const res = await request(app)
+      .post("/v1/query")
+      .send({ queryId: "q-impostor", prompt: "go", useSession: false, mcpServers: { aida: { command: "node", args: ["impostor.js"] } } });
 
-    expect(Object.keys(servers)).not.toContain("aida");
-    expect(allowedTools).not.toContain("mcp__aida__*");
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("MCP_SERVER_NAME_CONFLICT");
+    // Nothing ran, so the impostor never filled the vacated slot.
+    expect(capturedOptions).toHaveLength(0);
   });
 
   it("a flagged stdio server needs a non-empty env value", async () => {
@@ -189,7 +194,9 @@ describe("requireUserCredentials: a flagged server is left out of runs without t
     expect(Object.keys(without.servers)).not.toContain("local");
 
     const withCredential = await runQuery(app, { mcpCredentialOverrides: { local: { env: { TOKEN: "user-token" } } } });
-    expect(withCredential.servers.local).toEqual({ command: "node", args: ["server.js"], env: { TOKEN: "user-token" } });
+    // MVP-7679: a stdio server runs in its own tool sandbox behind the relay; no env value reaches the runtime.
+    expect(withCredential.servers.local).toEqual({ type: "http", url: expect.stringMatching(RELAY_URL) });
+    expect(JSON.stringify(withCredential.servers)).not.toContain("user-token");
   });
 
   it("every server without the flag (absent or false) behaves exactly as before, with and without overrides", async () => {
@@ -202,8 +209,9 @@ describe("requireUserCredentials: a flagged server is left out of runs without t
     expect(plain.servers).toEqual({
       jira: { type: "http", url: expect.stringMatching(RELAY_URL) },
       wiki: { type: "http", url: expect.stringMatching(RELAY_URL) },
-      local: { command: "node", args: ["server.js"], env: { TOKEN: "static" } },
+      local: { type: "http", url: expect.stringMatching(RELAY_URL) },
     });
+    expect(JSON.stringify(plain.servers)).not.toContain("static");
     expect(plain.allowedTools).toEqual(expect.arrayContaining(["mcp__jira__*", "mcp__wiki__*", "mcp__local__*"]));
     expect(upstream.headersAt("/jira").map((h) => h.authorization)).toEqual(["Basic STATIC"]);
     expect(upstream.headersAt("/wiki").map((h) => h.authorization)).toEqual([undefined]);

@@ -345,6 +345,9 @@ describe("mount plan", () => {
       "/home/node/.claude/agents",
       "/home/node/.claude/memory",
       "/home/node/.claude/commands",
+      "/home/node/.claude/output-styles",
+      "/home/node/.claude/plugins",
+      "/home/node/.claude/hooks",
       "/home/node/.claude/settings.json",
       "/home/node/.claude/projects/knowledge-base",
     ]);
@@ -366,7 +369,7 @@ describe("mount plan", () => {
     expect(JSON.parse(fs.readFileSync(p.mounts.find((m) => m.dest.endsWith("settings.json"))!.src, "utf8"))).toEqual({});
   });
 
-  it("leaves out a planted symlink in every position, each with an audit line and no mount", () => {
+  it("leaves out a planted symlink in every position, each with an audit line and no mount of the linked content", () => {
     write("outside/secret.txt", SECRET);
     fs.mkdirSync(path.join(root, "outside", "dir"));
     fs.mkdirSync(path.join(root, "ws", "projects"), { recursive: true });
@@ -386,7 +389,14 @@ describe("mount plan", () => {
     // The settings file and the projects directory.
     fs.symlinkSync(path.join(root, "outside", "secret.txt"), path.join(root, "ws", "settings.json"));
     const p = plan();
-    expect(dests(p).filter((d) => !d.endsWith("settings.json"))).toEqual([]);
+    // Nothing from the workspace is mounted; the trusted entries a link replaced are empty stand-ins below the trusted directory.
+    const rest = p.mounts.filter((m) => !m.dest.endsWith("settings.json"));
+    expect(rest.map((m) => m.dest).sort()).toEqual(["agents", "commands", "hooks", "output-styles", "plugins", "skills", "CLAUDE.md"].map((n) => `/home/node/.claude/${n}`).sort());
+    for (const m of rest) expect(m.src.startsWith(path.join(root, "trusted")), m.dest).toBe(true);
+    for (const m of rest) {
+      const stat = fs.lstatSync(m.src);
+      expect(stat.isDirectory() ? fs.readdirSync(m.src).length : stat.size, m.dest).toBe(0);
+    }
     expect(p.skipped).toBe(6);
     expect(logs.join("\n")).toMatch(/kind=settings name=settings.json reason=symlink/);
     expect(logs.filter((l) => l.includes("sandbox.content.skipped")).join("\n")).toMatch(/kind=global name=skills reason=symlink/);

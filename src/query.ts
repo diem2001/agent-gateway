@@ -23,8 +23,9 @@ import {
   validateRequestMcpServers,
   type RequestMcpServers,
 } from "./mcp-request-servers.js";
-import { getEnabledMcpServers } from "./mcp-registry.js";
+import { getAllMcpServers, getEnabledMcpServers } from "./mcp-registry.js";
 import { validateEnforcedTools } from "./tool-policy.js";
+import { computeToolGrant } from "./tool-grant.js";
 
 /**
  * A single block of multimodal request content. Maps directly to the Anthropic
@@ -122,9 +123,14 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     res.status(400).json({ error: overrideValidation.error });
     return;
   }
-  const mcpServersValidation = validateRequestMcpServers(mcpServers);
+  const mcpServersValidation = validateRequestMcpServers(mcpServers, getAllMcpServers().map((def) => def.name));
   if (mcpServersValidation.error) {
-    res.status(400).json({ error: mcpServersValidation.error });
+    res.status(400).json({ error: mcpServersValidation.code ? { code: mcpServersValidation.code, message: mcpServersValidation.error } : mcpServersValidation.error });
+    return;
+  }
+  // `allowedTools` narrows the trusted grant (MVP-7679): a list of tool names and `mcp__<server>__*` patterns.
+  if (allowedTools !== undefined && !(Array.isArray(allowedTools) && allowedTools.length <= 256 && allowedTools.every((name) => typeof name === "string" && name.length > 0 && name.length <= 256))) {
+    res.status(400).json({ error: "allowedTools must be an array of tool names" });
     return;
   }
   const enforcedValidation = validateEnforcedTools(enforcedToolsValue, allowedTools, [
@@ -153,7 +159,8 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   res.setHeader("X-Accel-Buffering", "no");
 
   let seq = 0;
-  const cacheEntry = createCacheEntry(queryId);
+  const label = req.clientLabel ?? "";
+  const cacheEntry = createCacheEntry(label, queryId);
 
   function emit(event: Omit<StreamEvent, "seq">): void {
     const line = { seq: seq++, ...event } as StreamEvent;
@@ -194,7 +201,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   const refuse = (kind: "session_other_owner" | "session_legacy" | "session_busy", message: string): void => {
     log("query", `Refused queryId=${queryId} kind=${kind}`);
     emit({ type: "error", content: fixedFailure(kind, message).message });
-    markDone(queryId);
+    markDone(label, queryId);
     if (!res.writableEnded) res.end();
   };
   let conversationLock: ConversationLock | null = null;
@@ -214,9 +221,17 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     }
   }
 
+  // The trusted grant of this request: the policy for the caller's label intersected with the caller's narrowing.
+  const grant = computeToolGrant({ label: caller.label, narrowing: enforcedTools ?? allowedTools });
+
   // The acknowledgment comes first and only once: the retry path below never
-  // re-emits it, and every attempt gets the same set.
-  if (enforcedTools) emit({ type: "tool_policy", enforced: true, tools: enforcedTools });
+  // re-emits it, and every attempt gets the same set. It echoes the REQUESTED set; a member the trusted policy
+  // does not grant is refused at call time (the run enforces a subset, so the acknowledgment stays true).
+  if (enforcedTools) {
+    const narrowed = enforcedTools.filter((name) => !grant.allows(name));
+    if (narrowed.length > 0) log("audit", `tool.policy.narrowed queryId=${queryId} denied=${narrowed.join(",")}`);
+    emit({ type: "tool_policy", enforced: true, tools: enforcedTools });
+  }
 
   try {
     // Resolve session: map client sessionId → SDK sessionId for resume
@@ -249,6 +264,8 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
         requestMcpServers: mcpServersValidation.servers,
         userId: user_id || undefined,
         enforcedTools,
+        label: caller.label,
+        grant,
       });
     } finally {
       // Every sandbox process of this request has exited (agent.ts waits for it): the conversation is free
@@ -262,8 +279,9 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     const sdkResultSessionId = (result?.session_id || result?.sessionId) as string | undefined;
     log("query", `SDK session_id=${sdkResultSessionId || "none"} (client: ${sessionId || "none"}, isResume: ${isResume})`);
     // Update session mapping if SDK returned a different sessionId than what we generated
-    if (sessionId && sdkResultSessionId) {
-      updateSessionSdkId(sessionId, sdkResultSessionId);
+    // Only a request that used its conversation updates it, and only the caller label's own entry.
+    if (conversationId && sdkResultSessionId) {
+      updateSessionSdkId(conversationId, sdkResultSessionId, caller.label);
     }
     const usage = result?.usage || {};
     const inputTokens: number = usage.input_tokens || 0;
@@ -298,7 +316,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     emitError(err);
   }
 
-  markDone(queryId);
+  markDone(label, queryId);
   if (!res.writableEnded) res.end();
 });
 
@@ -306,7 +324,7 @@ queryRouter.get("/v1/query/:queryId/events", (req: Request, res: Response) => {
   const queryId = String(req.params.queryId || "");
   const afterParam = req.query.after;
   const after = parseInt(typeof afterParam === "string" ? afterParam : "-1", 10);
-  const entry = getCacheEntry(queryId);
+  const entry = getCacheEntry(req.clientLabel ?? "", queryId);
 
   if (!entry) { res.status(404).json({ error: "Query not found or expired" }); return; }
 

@@ -69,6 +69,7 @@ const SPEC: BwrapSpec = {
   layout: { symlinks: [{ link: "/bin", target: "usr/bin" }, { link: "/lib", target: "usr/lib" }], binds: [] },
   procMasks: { files: ["kcore", "timer_list"], dirs: ["acpi"] },
   homeDir: "/srv/sb/sessions/abc/home",
+  workDir: "/srv/sb/sessions/abc/work",
   mounts: [
     { src: "/ws/CLAUDE.md", dest: "/home/node/.claude/CLAUDE.md" },
     { src: "/ws/projects/repo", dest: "/home/node/.claude/projects/repo" },
@@ -127,6 +128,9 @@ describe("bwrap argument list", () => {
       "--bind",
       "/srv/sb/sessions/abc/home",
       "/home/node",
+      "--bind",
+      "/srv/sb/sessions/abc/work",
+      "/work",
       "--ro-bind",
       "/ws/CLAUDE.md",
       "/home/node/.claude/CLAUDE.md",
@@ -149,7 +153,7 @@ describe("bwrap argument list", () => {
       "/tmp/agent-gateway-run-x",
       "/tmp/agent-gateway-run-x",
       "--chdir",
-      "/home/node",
+      "/work",
       "--",
       "/bin/sh",
       "-c",
@@ -218,6 +222,13 @@ describe("sandbox environment", () => {
         "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
         "CLAUDE_CODE_ENTRYPOINT",
         "DISABLE_AUTOUPDATER",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_KEY_1",
+        "GIT_CONFIG_KEY_2",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_VALUE_1",
+        "GIT_CONFIG_VALUE_2",
         "HOME",
         "LANG",
         "LC_ALL",
@@ -240,6 +251,10 @@ describe("sandbox environment", () => {
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     });
     expect(env.PATH).toBe("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    // Trusted, highest-precedence git configuration: no fsmonitor, no hooks, no implicit bare repository.
+    const gitConfig = Object.fromEntries([0, 1, 2].map((i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+    expect(env.GIT_CONFIG_COUNT).toBe("3");
+    expect(gitConfig).toEqual({ "core.fsmonitor": "false", "core.hooksPath": "/dev/null", "safe.bareRepository": "explicit" });
     const text = JSON.stringify(env);
     for (const secret of Object.values(secrets).filter((v) => v.length >= 8)) expect(text).not.toContain(secret);
     for (const name of ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "NODE_OPTIONS", "LD_PRELOAD", "SSH_AUTH_SOCK", "MCP_TIMEOUT", "DEBUG_CLAUDE_AGENT_SDK", "GITHUB_TOKEN", "API_KEYS", "CLAUDE_CODE_OAUTH_TOKEN"]) expect(env[name], name).toBeUndefined();

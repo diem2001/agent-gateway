@@ -115,19 +115,29 @@ Copies of `mcp-servers.json` contain MCP credentials (headers and env values). H
 
 ## Agent isolation
 
-Every agent run executes inside its own sandbox. Bash commands, interpreters, the Read, Write, Edit, Glob and Grep tools, MCP servers the runtime starts itself and sub-agents all run in the sandbox, so an agent can neither read the gateway's secrets nor see other conversations. The gateway itself (API keys, the provider credential, OAuth tokens, state files, SSH keys) stays outside.
+Every agent run executes inside its own sandbox. Bash commands, interpreters, the Read, Write, Edit, Glob and Grep tools, MCP servers that need no credential and sub-agents all run in the sandbox, so an agent can neither read the gateway's secrets nor see other conversations. The gateway itself (API keys, the provider credential, OAuth tokens, state files, SSH keys) stays outside.
 
 **What a run sees.** The sandbox is built with `bubblewrap` (new user, PID, IPC, UTS and cgroup namespaces; the network is shared; all capabilities dropped; nested user namespaces disabled and checked at every start). Only an allowlist is visible:
 
 - read-only: the system directories, the Claude runtime, the global `CLAUDE.md`, `skills/`, `agents/`, `memory/` and `commands/`, a generated `settings.json` that keeps only `permissions`, and every repository under `~/.claude/projects/` (each repository's git configuration is replaced by a copy that holds only remote URLs without user info, fetch refspecs, branch settings and core settings);
-- writable: the conversation's own home at `/home/node`, a private `/tmp`, and this run's log directory;
+- writable: the conversation's work area at `/work` (the working directory, kept between its turns), the conversation's home at `/home/node` (rebuilt at every start, see below), a private `/tmp`, and this run's log directory;
 - not visible: `.credentials.json`, `sessions.json`, `tools.json`, `mcp-servers.json` and their `.corrupt-*` copies, `~/.ssh`, legacy transcripts and logs, other conversations' homes, the Docker socket, and every process of the gateway or of other runs.
 
-The sandbox environment is an allowlist built from nothing (`HOME`, `USER`, `PATH`, `LANG`/`LC_*`, `TERM`, `TMPDIR`, the per-run log variables, `DISABLE_AUTOUPDATER`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, the SDK's non-secret `CLAUDE_CODE_*` and `CLAUDE_AGENT_SDK_*` keys). Its only provider credential is a random per-run token for the gateway's **model proxy**: the proxy accepts the token only in the `x-api-key` header, forwards `POST /v1/messages` and `POST /v1/messages/count_tokens` to the provider with the gateway's own credential (`ANTHROPIC_API_KEY`, otherwise the OAuth token, refreshed on the gateway side) and revokes the token when the run ends. Registered http MCP servers are reached through the credential relay as before. Operator tuning variables of the runtime that are not in the allowlist (for example `MCP_TIMEOUT`, `BASH_DEFAULT_TIMEOUT_MS`) are no longer passed on.
+The sandbox environment is an allowlist built from nothing (`HOME`, `USER`, `PATH`, `LANG`/`LC_*`, `TERM`, `TMPDIR`, the per-run log variables, the trusted `GIT_CONFIG_*` entries, `DISABLE_AUTOUPDATER`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, the SDK's non-secret `CLAUDE_CODE_*` and `CLAUDE_AGENT_SDK_*` keys). Its only provider credential is a random per-run token for the gateway's **model proxy**: the proxy accepts the token only in the `x-api-key` header, forwards `POST /v1/messages` and `POST /v1/messages/count_tokens` to the provider with the gateway's own credential (`ANTHROPIC_API_KEY`, otherwise the OAuth token, refreshed on the gateway side) and revokes the token when the run ends. Every registered MCP server (http, SSE and stdio) is reached through the credential relay, which holds its credentials on the trusted side (see [Tool mediation](#tool-mediation)). Operator tuning variables of the runtime that are not in the allowlist (for example `MCP_TIMEOUT`, `BASH_DEFAULT_TIMEOUT_MS`) are no longer passed on.
+
+**The agent's home and work area.** The agent can write its own home, and the runtime and the processes it starts read the home by name at every start: the shell snapshot runs `bash -l` (`.bash_profile`, `.bash_login`, `.profile`, then `.bashrc`; the `zsh` files when a zsh is installed, the production image has none), `git` reads `.gitconfig`, `.config/git/config` and the repository at the working directory, the runtime reads `.claude.json` and `.claude/.config.json`. Shielding such names one by one failed three QA rounds, so the home is **rebuilt from nothing before every sandbox start**: the trusted side deletes every home-root entry except `.claude` (no link is followed) and keeps below `.claude` only the runtime's data, the transcript directories `projects/-*`, `todos/`, `plans/` and the `memory` mount point; the runtime recreates its state file, shell snapshot and caches itself. A file an agent writes in the home lasts until its run ends and is gone at the next start; a name a later runtime version learns to read is untrusted by default. Run-time starts read nothing the agent wrote: the measured start-time reads of the runtime, `bash -l` and `git` are listed in the Jira design comment of MVP-7679 (comment 38301) and asserted by the inventory rows of `sandbox-home.test.ts`.
+
+What an agent wants to keep goes to **`/work`**: `<AGENT_SANDBOX_ROOT>/sessions/<sandboxDirId>/work`, bound read-write at `/work`, the working directory of the runtime, private to the conversation (same lock and owner check as the home) and persistent between the turns of that conversation only. Because the working directory is `/work`, the runtime keeps the transcripts under `projects/-work/` (carried over with `todos/` and `plans/`, so resume works). Nothing in `/work` is read as configuration: runs read only the user setting source (`settingSources: ["user"]`; enforced runs none), so a `.mcp.json`, `.claude/settings.json`, `.claude/settings.local.json`, `CLAUDE.md` or `.claude/agents|commands|skills` written there is never loaded (a row plants all of them with Bash denied and asserts that no server, hook, agent, command or skill starts and no instruction reaches the model). The one thing the runtime looks at in `/work` is git: it runs `git status` there at start, so before every start ANY `.git` entry at the root of `/work` (a directory, a file, a link; never followed) is removed. Rewriting only its configuration was not enough: a `commondir` file names an agent-written directory, and `extensions.worktreeConfig` with a `config.worktree` file adds a configuration the allowlist never sees. A repository at the root of `/work` is not a supported scenario (repositories are the central read-only mounts). Removing `.git` is one layer: git also treats a directory that holds `HEAD`, `objects/`, `refs/` and `config` as an implicit bare repository, so the sandbox environment carries trusted command-scope git configuration (`GIT_CONFIG_COUNT/KEY_n/VALUE_n`: `safe.bareRepository=explicit`, `core.fsmonitor=false`, `core.hooksPath=/dev/null`; highest precedence, above any file the agent writes). With no repository discovered in `/work`, the start-time git reads no agent-written file. Repositories below `/work` are untouched: git run from `/work` does not discover them and does not cross the `/work` mount upward (git run inside them works, with fsmonitor and hooks off; a bare repository there needs `--git-dir`), the sandbox environment holds no other `GIT_*` variable, and what the agent writes outside `/work`, the home and `/tmp` is gone at the next start (rows in `sandbox-process.test.ts` and `tool-grant-process.test.ts`). The extension directories (`commands`, `agents`, `skills`, `output-styles`, `plugins`, `hooks`) and `CLAUDE.md` are mounted read-only from the gateway workspace, or from an empty trusted stand-in when the workspace has none: commands, agents and skills carry frontmatter hooks and agent `mcpServers` that execute commands, so they are trusted content only.
+
+**Repositories** under `~/.claude/projects/` stay central, read-only and live. Read-only git commands work in them, for example `git -C ~/.claude/projects/<repo> show <other-branch>:<path>`, `log`, `diff` and `ls-tree` (a row reads a file that exists only on another branch). Git's "dubious ownership" check does not block them: it compares the repository owner with the process user, only repositories owned by the gateway user are mounted, and the sandbox keeps that user. A commit or a new branch fails (read-only file system).
+
+**Global `memory`.** `~/.claude/memory` is the gateway workspace's `memory/` directory. It is written only through `PUT /v1/memory/*` (any API-key holder; entries are not owner-scoped) and mounted read-only into every sandbox, so no conversation can write it and nothing one conversation writes reaches another through it; the conversation's own `.claude/memory` is only the mount point. A workspace without a `memory/` directory (the entrypoint always creates it) leaves the conversation's own directory writable, visible to that conversation only.
+
+**Run directories.** The per-run directory `<root>/runs/run-XXXXXX` (generated settings, git configuration copies, empty stand-ins, and the home and work area of a run without a conversation) is removed when the request ends, whatever its outcome; a crashed gateway's leftovers are swept at start. A row asserts that no `run-*` entry is left after a request. The conversation directories `sessions/<sandboxDirId>/home` and `.../work` are not removed when a conversation is deleted (MVP-7402).
 
 **Every file the gateway binds into a sandbox is checked without following symlinks** (a regular file or directory owned by the gateway user, inside its expected tree); anything else is left out with an `audit` log line. Mounted content is also scanned for the gateway's own secret values (API keys, provider key, OAuth tokens, registered MCP header and env values): a file that holds one is hidden behind an empty file. Files over 1 MiB are not scanned.
 
-**Conversations.** A conversation records its owner (the API-key label and the request's `user_id`, or none) and a random sandbox home name when it is created, and only that exact owner can continue it. A conversation with a `user_id` and the same conversation without one are different owners. Another caller gets the "cannot be continued from your account" text with no run and no change to the conversation. A conversation is processed by one request at a time (a second request gets the "still answering" text). `GET /v1/sessions` and `DELETE /v1/sessions/:id` are scoped to the caller's API-key label. Deleting a conversation does not remove its home on disk (retention is MVP-7402).
+**Conversations.** A conversation is keyed by the API-key label and the `sessionId` the caller sent, and records its owner (the label and the request's `user_id`, or none) and a random sandbox home name when it is created. Another label that uses the same `sessionId` gets its own new conversation (no refusal, nothing learned about the first). Within a label only the exact owner can continue a conversation: a conversation with a `user_id` and the same conversation without one are different owners, and another `user_id` gets the "cannot be continued from your account" text with no run and no change to the conversation. Conversations are stored in the additive `sessionsByLabel` map of `sessions.json`; public routes keep the raw ids. Ownerless entries from before the isolation update keep their raw id and are still refused for every label. A conversation is processed by one request at a time (a second request gets the "still answering" text). `GET /v1/sessions` and `DELETE /v1/sessions/:id` are scoped to the caller's API-key label. Deleting a conversation does not remove its home or its work area on disk (retention is MVP-7402).
 
 ### Configuration
 
@@ -136,10 +146,12 @@ The sandbox environment is an allowlist built from nothing (`HOME`, `USER`, `PAT
 | `ISOLATION_STARTUP_TIMEOUT_MS` | `10000` | Raise it on a very loaded host where `/health` or users report "could not start a protected workspace in time"; the sandbox itself starts in about 10 ms. |
 | `AGENT_RUN_TIMEOUT_MS` | `7200000` (120 min) | Lower it to stop runaway agents sooner, raise it for tasks that legitimately run longer. It covers the whole request including retries and backoff. |
 | `MODEL_PROXY_IDLE_TIMEOUT_MS` | `600000` | The time a provider request may stay silent before it is cut. Raise it only for extremely slow answers. |
+| `AGENT_MCP_TOOL_TIMEOUT_MS` | `600000` | Overall deadline of one mediated MCP `tools/call` in an agent run (http, SSE, stdio); an empty value is the default. Raise it only for tools that legitimately run longer. |
+| `AGENT_TOOL_POLICY` | unset | Tool grant per API-key label, see [Tool mediation](#tool-mediation). Empty or unset means no restriction. |
 | `AGENT_SANDBOX_ROOT` | `$HOME/.agent-sandbox` | Only to move the storage of the conversation homes. It must be an absolute path to a private directory owned by the gateway user; it is never mounted as a whole. `docker-compose.yml` does not forward it from the shell: add it under `environment:`. |
 | `AGENT_SANDBOX_BWRAP` | `/usr/bin/bwrap` | Only if the isolation runtime lives elsewhere. Like `AGENT_SANDBOX_ROOT`, it is not forwarded by `docker-compose.yml`. |
 
-An invalid value (not a positive whole number, or a relative path) stops the gateway at startup with one fixed line, `FATAL config key=<KEY> reason=<fixed text>`; nothing falls back silently.
+An invalid value (not a positive whole number, or a relative path; for `AGENT_TOOL_POLICY` see its reasons below) stops the gateway at startup with one fixed line, `FATAL config key=<KEY> reason=<fixed text>` (for `AGENT_MCP_TOOL_TIMEOUT_MS`: `reason=must be a positive whole number of milliseconds`); nothing falls back silently. `AGENT_TOOL_POLICY` and `AGENT_MCP_TOOL_TIMEOUT_MS` are forwarded by `docker-compose.yml` (`${AGENT_TOOL_POLICY:-}`, `${AGENT_MCP_TOOL_TIMEOUT_MS:-}`).
 
 ### `/health` and the compose health check
 
@@ -163,27 +175,99 @@ AppArmor: Docker's default AppArmor profile also blocks the sandbox's mounts. By
 
 1. **Risk acceptance (operator):** accepting the container profile above is a prerequisite for redeploying the shared gateway; it is recorded on the Epic MVP-7676. It must name the loosened defaults: no AppArmor profile (`apparmor=unconfined`) unless the committed one is selected, and `systempaths=unconfined`.
 2. **Every conversation started before this update is refused after it.** On the production gateway that counted 8,339 stored conversations on 2026-09-30, of which 3,834 had a saved transcript and 1,216 were used in the last 14 days. Callers get the "started before a gateway security update" text and must start a new conversation (reqlift does not recover by itself; replaying from its own database is a caller follow-up). Alternative that was not implemented: admit them after a secret scan and bind each to its first caller; that keeps old conversations, but whoever knows an id first can claim it.
-3. Check that `./agent_home` and everything below it is owned by uid 1000 (`sudo chown -R 1000:1000 agent_home`). The old entrypoint ran `chown -R` as root; the new one does not, and a root-owned file is left out of runs with an `audit` log line only. Also review what agents planted there before the update (see the first item of the residuals below).
+3. Check that `./agent_home` and everything below it is owned by uid 1000 (`sudo chown -R 1000:1000 agent_home`). The old entrypoint ran `chown -R` as root; the new one does not, and a root-owned file is left out of runs with an `audit` log line only. Also review what agents planted there before the update (see the residuals below).
 4. Recreate the container so the new image, user and security options apply: `docker compose up -d --build`.
 5. Check: `curl -s http://localhost:3001/health | jq .isolation` must print `"ok"` (the container is then also `healthy`).
 6. The first message of a conversation can be slower when it starts an `npx` MCP server: that run's home is empty, so the package is downloaded again (about 7 s for a small server); later messages of the same conversation reuse it.
+7. **Tool mediation update (MVP-7679).** After the new image runs, re-register the webhook tools so each records its owner (reqlift does it at boot; diemcrm with its registration command). Then read back two things: `GET /v1/tools` shows no entry without an `owner`, and the audit line `tool.webhook.legacy_forward` has count 0 since the update (`tools.legacy.ownerless count=<n>` at startup should read 0 after the re-registration and a restart).
+8. **Operator warning for `AGENT_TOOL_POLICY` and key rotation.** Removing or renaming a label in `API_KEYS` while the policy still names it stops the gateway at startup (`FATAL config key=AGENT_TOOL_POLICY reason=label not in API_KEYS`). The container restarts automatically, so it keeps restarting until both settings agree: update `API_KEYS` and `AGENT_TOOL_POLICY` together.
+9. **Rollback to the previous gateway version** ignores and then drops the `sessionsByLabel` map of `sessions.json`: conversations started or moved under the new version start fresh after the rollback. Registered tools keep their `owner` field unused.
 
 ### Behavior changes
 
 - The global directories and repositories are **read-only for agents**: an agent can no longer write to `~/.claude/memory`, `skills`, `agents` or a repository. The workspace API (`PUT /v1/memory/*`, git routes) stays the write path. A prompt that tells an agent to update memory files there fails until it uses the API.
-- An agent has no `~/.ssh`: SSH access from a run needs a mediated path (MVP-7679).
+- An agent has no `~/.ssh`, and there is no agent-side ssh mediation (no caller uses it).
 - `claude auth status` no longer exists in the bundled CLI: `GET /v1/auth/status` is read from the credential files and returns the same fields; login runs the CLI bundled with the SDK, never `~/.local/bin/claude`. The entrypoint no longer installs a Claude CLI and no longer runs as root.
 - `GET /v1/sessions` lists only the caller's label (plus ownerless pre-update entries) and `count` is that number; `/health` `sessions` stays the total.
+- **Tool mediation (MVP-7679):**
+  - `allowedTools` now narrows the trusted grant instead of only pre-approving tools; `[]` means no tool at all.
+  - A `tool_result` event of a failed call carries `"success": false`. reqlift's admin tool success rate will drop after the deploy because failed calls stop counting as successes.
+  - Failed tool calls end in the fixed `TOOL_*` texts (see [Tool errors](#tool-errors)); the refusal text of `enforcedTools` is the `TOOL_DENIED` text (it was `Refused: this tool is not allowed for this run.`).
+  - `AGENT_MCP_TOOL_TIMEOUT_MS` adds an overall deadline (default 600 s) to a mediated MCP `tools/call`; the relay used to have only its 120 s no-progress timeout, which stays.
+  - The relay buffers and validates upstream answers and returns each as one JSON message; it forwards only methods the grant allows.
+  - Conversations and the event cache are keyed by API-key label: another label cannot see or replay them.
+  - A request `mcpServers` entry named like any registered server (enabled, disabled or left out of the run) answers 400 `MCP_SERVER_NAME_CONFLICT`. Registering a server named like a caller's request server makes those requests fail.
+  - `allowedToolsPattern` of a registry server has no authorization effect (it only pre-approves).
+  - Stdio MCP servers run in their own tool sandbox and see only `/usr` and the system directories, so their command must live there.
+  - Registered webhook tools record an `owner`; a run is offered only its own label's tools plus legacy ownerless ones.
 - Workspace listings (`GET /v1/memory`, `/v1/agents`, `/v1/skills`, `/v1/knowledge-base`) and user-skill bundles list and copy regular files only (a symlink is neither listed nor followed).
 
-### Known residuals (owned by MVP-7679, never reported as solved here)
+### Known residuals
 
-- **Content planted before the update.** The secret scan skips files over 1 MiB, and its value list does not include the contents of `~/.ssh` private keys or the `tools.json` webhook authentication values, so a copy or hard link of those made by an agent before the update, inside a mounted tree, would not be hidden. The trusted `git` calls and `/v1/auth/login` (tmux) run with `HOME=/home/node` and read configuration an agent planted there before the update (`~/.gitconfig`, repository hooks, `core.fsmonitor`, `~/.tmux.conf`). New runs cannot plant any of this; the operator reviews or removes it before the first deploy.
-- A refusal ("cannot be continued from your account") versus a fresh conversation reveals that an id exists, and the first caller to use an unknown id claims it.
+- The sandbox shares the network namespace: agent code can reach network peers, credential-free MCP servers and the gateway's public port (where it gets 401 without a key). Loopback listeners of the proxy and relay need a run token.
+- There is no agent-side ssh mediation (no caller uses it).
+- The MCP server registry has no owner: any API-key label can change a registered server's URL, after which per-user override credentials go to that URL. This is reachable by callers, not by agent code.
+- `/v1/auth/login` hardening and content planted before the deploy are tracked separately (MVP-7919). The secret scan skips files over 1 MiB and does not know the contents of `~/.ssh` private keys or the `tools.json` webhook authentication values, and the trusted `git` calls and `/v1/auth/login` (tmux) run with `HOME=/home/node` and read configuration an agent planted there before the update (`~/.gitconfig`, repository hooks, `core.fsmonitor`, `~/.tmux.conf`); the operator reviews or removes it before the first deploy.
+- Legacy webhook tools without an `owner` keep today's forwarding until they are registered again.
+- A credential-free request MCP server runs inside the agent sandbox and is granted per server only: a grant that names only some of its tools is not enforced on the trusted side.
+- The work area has no size cap and is never removed (MVP-7402): it grows with what agents keep there. The home of a run is rebuilt only at the START of the next run, so a file an agent writes there can still be read by a process of the same run (for example a shell the agent itself starts when Bash is granted); no trusted step reads it.
+- Global agents, skills and commands are trusted content (their frontmatter hooks and agent `mcpServers` execute commands): an agent cannot write them (read-only mounts, an empty trusted stand-in when the workspace has none), but any API-key holder can write global agents and skills through `PUT /v1/agents` and `PUT /v1/skills`, and those load in ordinary runs, so a caller can place hooks or servers that bypass its own label's Bash denial. This is reachable by callers, not by agent code, and is not fixed here.
 - Conversation homes are never removed (MVP-7402), there is no size cap on a home or a private `/tmp`, and `pids_limit` is shared by all runs: an availability risk, not a credential exposure.
-- The SDK puts the whole MCP configuration on the runtime's own command line, and stdio MCP servers inherit its environment. Header and env values of a **non-relayed** server (a stdio server's `env`, an SSE server's headers, `mcpCredentialOverrides` aimed at them, and values given in the request body's `mcpServers`) are therefore readable inside that run's own sandbox. The gateway writes one `audit` line per such server (`mcp.server.credential_in_runtime_args serverName=<name> type=<type>`). Registered http servers go through the relay and are not affected.
-- The network is shared: a sandbox can reach loopback listeners (the proxy and relay need a run token) and other network peers. Egress control belongs to MVP-7679.
-- `GET /v1/query/:id/events` replays any query to any API key, and `/v1/auth/login` plus `submit-code` run the CLI in the gateway's own context.
+- An ownerless pre-update conversation id stays visible: a refusal versus a fresh conversation reveals that such an id exists.
+
+## Tool mediation
+
+Every tool call that needs a credential leaves the agent sandbox through a trusted channel (the in-process webhook server, a relay binding, an SSE bridge or a stdio tool sandbox). The channel is bound to the run, so the identity and the credential come from the trusted side, never from a field the agent sends. The agent gets only the tools its grant allows.
+
+### Tool policy (`AGENT_TOOL_POLICY`)
+
+One JSON object in the environment, per API-key label (single-quote it in `.env`):
+
+```json
+{
+  "default": { "allow": ["Read", "Grep", "mcp__agent-gateway-tools__*"] },
+  "labels": { "cicd": { "allow": ["Read", "mcp__jira__*"], "deny": ["mcp__jira__delete_issue"] } }
+}
+```
+
+- An entry is a built-in tool name (case-sensitive: `AskUserQuestion`, `Bash`, `Edit`, `EnterPlanMode`, `ExitPlanMode`, `Glob`, `Grep`, `KillShell`, `LSP`, `NotebookEdit`, `Read`, `Skill`, `Task`, `TaskOutput`, `TodoWrite`, `WebFetch`, `WebSearch`, `Write`; the names of the pinned runtime Claude Code 2.0.77), `mcp__<server>__*` or `mcp__<server>__<tool>`. Webhook tools are tools of the server `agent-gateway-tools`.
+- Deny beats allow. An absent `allow` means everything a run gets without a policy; `allow: []` means nothing. A label entry replaces `default` for that label. An empty or unset value means no restriction.
+- Startup stops with one fixed line `FATAL config key=AGENT_TOOL_POLICY reason=<reason>` for `must be a JSON object`, `unknown field`, `label not in API_KEYS`, `unknown built-in tool name` or `invalid tool pattern`. One startup audit line per label lists its effective built-in tools and server patterns (names only).
+- **Operator warning:** removing or renaming a label in `API_KEYS` while the policy still names it stops the gateway at startup; because the container restarts automatically it keeps restarting. Update both settings together.
+
+**Effective grant** = the policy for the caller's label intersected with the caller's own narrowing (`enforcedTools`: the exact set; or `allowedTools`: names and `mcp__<server>__*` patterns). An omitted list uses the policy grant, an explicit `[]` grants no tool, and a caller can only narrow, never widen. A configured agent, skill, prompt or sub-agent never adds authority. `allowedToolsPattern` of a registry server is not part of the grant.
+
+**How it is enforced.**
+
+- Built-in tools run inside the runtime, so they are enforced by what the runtime is offered (`tools` and `disallowedTools`). A built-in outside the grant is refused by the runtime itself for the main agent, a configured agent, a skill, a sub-agent and a resumed conversation, even under the permission-bypass mode the gateway always uses. The runtime's own text for such a refusal is `<tool_use_error>Error: No such tool available: <name></tool_use_error>` (not changeable).
+- A tool that is offered but not granted (a tool of an attached MCP server) is refused at call time on the trusted side with the `TOOL_DENIED` text, before any upstream request. A server with no granted tool is not attached.
+- Credential-free request servers that run inside the agent sandbox are granted per server only; a grant naming only some of their tools is not enforced on the trusted side.
+
+### Where credentials go
+
+Every registered MCP server (http, SSE and stdio) reaches the runtime only as `{ "type": "http", "url": "http://127.0.0.1:<port>/mcp/<token>" }`; the server name and every `mcp__<server>__<tool>` name stay unchanged. The relay holds the run's binding (upstream, merged credential headers, grant) until the run ends; the token is revoked at run end or cancel.
+
+| Server | Reaches the runtime as |
+|--------|------------------------|
+| Registered http / SSE / stdio | Relay URL (own binding per run and server) |
+| Request http/SSE server **with** `headers`, or a URL with a user name, password or query | Relay URL |
+| Request stdio server **with** `env` | Relay URL; the server runs in its own tool sandbox |
+| Request server without `headers` / `env` | Direct connection, or runs inside the agent sandbox |
+| Webhook tools | In-process server `agent-gateway-tools`; the gateway calls the webhook |
+
+A request-supplied `command` server is code the caller picked: it is attached only when the trusted policy lets the caller's label run `Bash` (no policy, or `Bash` not denied) or names that server in its `allow` list; otherwise it is left out with `mcp.server.omitted serverName=<name> reason=command_not_granted`. Callers must pass credentials for request servers only through `env` or `headers`, never in `args` or a URL path: those are readable by the agent (a user name, password or query in the URL is relayed, but keep credentials in `headers`). After this no registry `args`/`env`, override or request `env` value and no header reaches the runtime's command line (the old `mcp.server.credential_in_runtime_args` audit line no longer exists). If the relay is not listening, registered servers (and request servers with headers/env) are left out of the run with `mcp.server.omitted ... reason=relay_unavailable`.
+
+**Relay message rules.** A body that does not parse as strict UTF-8 JSON (BOM, other encodings), every batch and every message without a `method` are refused locally. Only the re-serialized parsed message is forwarded, with `content-type: application/json`. Default-deny methods: `initialize`, `ping`, `tools/list` and the client notifications `notifications/initialized|cancelled|progress|roots/list_changed` are allowed; `tools/call` only with `params.name` exactly in the grant; `resources/*`, `prompts/*`, `completion/*` and anything else only when the grant covers the whole server (`mcp__<server>__*`). Every refusal is answered locally with zero upstream requests. The relay buffers and validates the upstream answer and returns it as one JSON message. For a server whose credential schema composes headers/env and a run that carries no value, `tools/call` is answered `TOOL_AUTH_UNAVAILABLE` ("no credential") before any upstream request (the handshake still goes upstream); `requireUserCredentials` omission is unchanged.
+
+**One header merge** for relay, SSE bridge, direct call and test: the per-user value replaces the shared header of the same name in any casing. No broader-credential fallback, no OAuth login and no redirect is followed anywhere (webhook, relay, SSE bridge, direct call, test, health).
+
+**SSE bridge.** The gateway opens the SSE stream with the run's headers and accepts the `endpoint` event only on the registered origin (otherwise the redirect text; the credential is never sent elsewhere). It answers server requests locally (`ping` with `{}`, `roots/list` with no roots, others method-not-found) and drops server notifications.
+
+**Stdio tool sandbox.** Every registered stdio server (with or without env), stdio overrides and request stdio servers with env run in their own tool sandbox: own user, PID, IPC, UTS and cgroup namespaces, a private empty home and `/tmp`, read-only system directories only and no gateway content. The environment is the base allowlist (`HOME`, `USER`, `PATH`, `LANG`, `LC_*`, `TERM`, `TMPDIR`) plus the server's own env after overrides, never the model proxy token or URL or the run-log path. It starts with the run's first message within `ISOLATION_STARTUP_TIMEOUT_MS`, is restarted once if it dies before answering `initialize`, is killed on revoke, cancel or gateway stop (`--die-with-parent`), and its stderr is discarded. A stdio server sees only `/usr` and the system directories, so its command must live there.
+
+**Deadlines.** `AGENT_MCP_TOOL_TIMEOUT_MS` (default 600 s) is the overall deadline of one mediated MCP `tools/call` (http, SSE, stdio). The relay's 120 s no-progress timeout stays. Webhook tools keep their per-tool `timeout_ms` (default 30 s), direct MCP calls keep `MCP_CALL_TIMEOUT_MS`, and the upload relay keeps its no-progress timeout with no overall deadline.
+
+**Tool ownership.** Every `PUT /v1/tools/:name` records the authenticated API-key label as `owner` (an `owner` in the body is ignored). Another label's `PUT` or `DELETE` of an owned tool is HTTP 403 `{"error":{"code":"TOOL_OWNED_BY_OTHER_CLIENT","message":"This tool was registered by another client and can only be changed or deleted by that client."}}` (no owner name). A run is offered only its own label's tools plus legacy ownerless entries, and the calling client's gateway key is forwarded as Bearer only to tools its label owns. Legacy entries registered before the update keep today's forwarding until they are registered again (the first label that registers one claims it), with one audit line `tool.webhook.legacy_forward toolName=<name>` per such call and a startup line `tools.legacy.ownerless count=<n>`. `X-Webhook-Context` comes only from the authenticated request; tool input keys such as `context` or `user_id` stay in the body.
 
 ## API Overview
 
@@ -193,9 +277,9 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 |--------|------|-------------|
 | `GET` | `/health` | Health check (no auth); `persistence` / `persistenceIssues` report state-file problems ([Stopping and recovery](#stopping-and-recovery)) |
 | `POST` | `/v1/query` | Run an agent query (NDJSON stream) |
-| `GET` | `/v1/query/:queryId/events` | Replay/resume event stream |
-| `GET` | `/v1/sessions` | List the calling API-key label's active sessions |
-| `DELETE` | `/v1/sessions/:id` | Delete one of the calling label's sessions (another label's: 404) |
+| `GET` | `/v1/query/:queryId/events` | Replay/resume event stream; replays only the calling API-key label's own query (another label's: 404 `Query not found or expired`) |
+| `GET` | `/v1/sessions` | List the calling API-key label's active sessions (raw ids, plus ownerless pre-update entries) |
+| `DELETE` | `/v1/sessions/:id` | Delete the calling label's own session with that id, else an ownerless legacy entry (another label's: 404) |
 | `GET` | `/v1/settings` | Get session settings |
 | `PUT` | `/v1/settings` | Update session settings |
 | `GET` | `/v1/logging` | Get current log level |
@@ -221,17 +305,17 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `DELETE` | `/v1/users/{user_id}/skills/*` | Delete a user-namespaced skill file |
 | `GET` | `/v1/knowledge-base` | List knowledge-base files (read-only) |
 | `GET` | `/v1/knowledge-base/*` | Read a knowledge-base file as `text/markdown` (read-only) |
-| `PUT` | `/v1/tools/:name` | Register/update a webhook tool |
-| `GET` | `/v1/tools` | List all registered tools |
-| `GET` | `/v1/tools/:name` | Get a single tool |
-| `DELETE` | `/v1/tools/:name` | Delete a tool |
+| `PUT` | `/v1/tools/:name` | Register/update a webhook tool; records the calling label as `owner` (another label's tool: 403 `TOOL_OWNED_BY_OTHER_CLIENT`) |
+| `GET` | `/v1/tools` | List all registered tools (with `owner`) |
+| `GET` | `/v1/tools/:name` | Get a single tool (with `owner`) |
+| `DELETE` | `/v1/tools/:name` | Delete a tool (another label's tool: 403 `TOOL_OWNED_BY_OTHER_CLIENT`) |
 | `PUT` | `/v1/mcp-servers/:name` | Register/update an external MCP server |
 | `GET` | `/v1/mcp-servers` | List all registered MCP servers |
 | `GET` | `/v1/mcp-servers/:name` | Get a single MCP server |
 | `DELETE` | `/v1/mcp-servers/:name` | Unregister an MCP server |
 | `POST` | `/v1/mcp-servers/:name/restart` | Force the SDK to reconnect to the MCP server on next query |
 | `POST` | `/v1/mcp-servers/:name/test` | Test merged MCP credentials with `tools/list` |
-| `POST` | `/v1/mcp-servers/:name/call` | Directly execute a registered MCP server's tool (`tools/call`, no LLM) |
+| `POST` | `/v1/mcp-servers/:name/call` | Directly execute a registered MCP server's tool (`tools/call`, no LLM); 401 `MCP_AUTH_FAILED` before any upstream request for a `requireUserCredentials` server without a user credential |
 | `POST` | `/v1/mcp-servers/:name/uploads/*` | Stream a raw file upload to a registered http/sse MCP server's `/uploads/*` route (no buffering) |
 | `GET` | `/v1/mcp-servers/:name/health` | Health check for a registered MCP server |
 | `POST` | `/v1/workspace/git/clone` | Clone a repository into the workspace (pulls instead when it exists); `400 Invalid branch` for a branch starting with `-`, `400 Invalid url` for a URL with a line break, `400 <field> must be a string` for a non-string `url`/`path`/`branch`/`sshKey` |
@@ -252,8 +336,9 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `sessionId` | string | no | Resume an existing session |
 | `systemPrompt` | string | no | Appended to the Claude Code preset system prompt |
 | `model` | string | no | Model id |
-| `allowedTools` | string[] | no | Override the default tool set. This pre-approves tools; it does **not** remove others, so it is no security boundary (use `enforcedTools`) |
-| `enforcedTools` | string[] | no | The exact tools the run may call; every other tool is refused before it runs (see below) |
+| `allowedTools` | string[] | no | Narrows the run's trusted tool grant to these names and `mcp__<server>__*` patterns; omitted = the policy grant, `[]` = no tool at all. A non-array or an entry that is not a non-empty string is HTTP 400 `allowedTools must be an array of tool names`. Cannot be combined with `enforcedTools` (see [Tool mediation](#tool-mediation)) |
+| `enforcedTools` | string[] | no | The exact tools the run may call; every other tool is refused (see below) |
+| `mcpServers` | object | no | Request-scoped MCP servers, validated and normalized on the trusted side (see [External MCP Server Registry](#external-mcp-server-registry)) |
 
 \* Provide **either** `prompt` **or** `content`. If both are present, `content` takes precedence. If neither is present, the request is rejected with HTTP 400.
 
@@ -269,11 +354,12 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 }
 ```
 
-- **Refused before it runs.** Any tool call outside the set reaches no handler: no webhook request, no MCP `tools/call`, no shell command, no fetch. The model gets an error tool result (`Refused: this tool is not allowed for this run.` when the gateway's hook refuses it, or the runtime's own "not available" answer for a tool it was not offered), and the gateway logs `audit tool.denied toolName=<name> queryId=<id>` (the name only). The run itself goes on and can end normally; deciding that a refusal fails the job is the caller's business.
+- **Refused before it runs.** Any tool call outside the set reaches no handler: no webhook request, no MCP `tools/call`, no shell command, no fetch. The model gets an error tool result (the `TOOL_DENIED` text when the gateway refuses it, or the runtime's own `<tool_use_error>Error: No such tool available: <name></tool_use_error>` for a built-in it was not offered; that text is the runtime's and cannot be changed), the `tool_result` event carries `"success": false`, and the gateway logs `audit tool.denied toolName=<name> queryId=<id>` (the name only). The run itself goes on and can end normally; deciding that a refusal fails the job is the caller's business.
 - **How it is enforced** (layers, because one alone has a gap on the pinned SDK 0.1.77): no user or project settings are loaded (`settingSources: []`, so nothing in the writable HOME — settings, hooks, permission rules, `.mcp.json`, user-scope MCP servers — can widen the run); `permissionMode: "dontAsk"` with `allowedTools` set to exactly the set (an unlisted tool is denied); only the listed built-ins are offered (`tools`); `agent-gateway-tools` carries only the listed registered tools, and a registry or request MCP server is attached only when the set names one of its tools; a `PreToolUse` hook denies every other name and never answers "allow"; no per-user skill bundle is loaded.
 - **Acknowledgment.** The first NDJSON event of such a run is `{"seq":0,"type":"tool_policy","enforced":true,"tools":[…]}`, echoing the set. It is sent once, before any retry, and every retry attempt keeps the same set. A caller can require it and drop the run when it is missing (reqlift does): an older gateway ignores the field and would send no acknowledgment.
 - **Validation (400 before streaming):** the value must be an array (also `null` is refused) of at most 64 distinct names, each 1–128 characters of `A-Z a-z 0-9 _ -`; not together with `allowedTools`; `Task` and `Agent` are refused (whether a sub-agent inherits the set is not proven); an `mcp__…` name that fits more than one attachable server (registry names may contain `__`) is refused as ambiguous. `[]` means "no tool at all", never the default set.
-- **Without `enforcedTools` nothing changes:** the run keeps `bypassPermissions`, the user and project settings, every registered server and the default tool list, and `allowedTools` keeps its current meaning.
+- **Policy interplay.** The effective grant is the policy for the caller's label intersected with the set, so a caller can only narrow. When `enforcedTools` names a tool the policy denies, the request is accepted, the `tool_policy` acknowledgment still echoes the requested set, the gateway logs `audit tool.policy.narrowed queryId=<id> denied=<names>`, and the tool is refused at call time.
+- **Without `enforcedTools`** the run keeps `bypassPermissions` and its other defaults, reads only the user setting source and loads the per-user bundle; its tools are the trusted grant (see [Tool mediation](#tool-mediation)).
 
 ### Multimodal Content (`content[]`)
 
@@ -333,6 +419,25 @@ A failed query ends with exactly one `error` event and no `done`, and it confirm
 
 In the version message each version is named only when it is known and valid (`x.y.z`): with only the installed one the parenthesis reads `(installed 2.0.77; a newer version is required)`, with only the required one `(required 2.1.280 or newer)`, and without either it is left out. The reference is left out when the `queryId` is not 1–128 characters of `A-Z a-z 0-9 . _ : -`. A client abort keeps the SDK's abort text. The next query with the same `sessionId` after a failed first query starts a fresh conversation. The gateway logs one line per failure with safe fields only: `Error queryId=<id> kind=<runtime_version_unsupported|authentication|transient|unknown|isolation_unavailable|isolation_timeout|run_deadline> apiStatus=<n|none> providerType=<known type|other|none> installed=<version|none> required=<version|none>`.
 
+### Tool errors
+
+A failed tool call reaches the model as an error tool result with one of five fixed texts, and the `tool_result` event carries `"success": false`. The texts carry no upstream body, header, URL or secret (`<name>` is the server or tool name).
+
+| Code | When | Text |
+|------|------|------|
+| `TOOL_DENIED` | The tool or MCP method is outside the grant | `TOOL_DENIED: This tool is not allowed for this request. Do not retry; continue without it or tell the user.` |
+| `TOOL_AUTH_UNAVAILABLE` | No credential was provided for a server that needs a per-user credential | `TOOL_AUTH_UNAVAILABLE: No credential for "<name>" was provided with this request. Ask the user to connect their account; retrying will not help.` |
+| `TOOL_AUTH_UNAVAILABLE` | The upstream refused the user's credential | `TOOL_AUTH_UNAVAILABLE: "<name>" did not accept the user's credential. Ask the user to reconnect their account; retrying will not help.` |
+| `TOOL_AUTH_UNAVAILABLE` | The upstream refused the gateway's/shared credential, or a webhook refused the gateway key | `TOOL_AUTH_UNAVAILABLE: "<name>" did not accept the gateway's credential. Ask your gateway administrator to check this tool's credential; retrying will not help.` |
+| `TOOL_UNAVAILABLE` | Connect error, DNS, reset, 5xx, 429, 408 | `TOOL_UNAVAILABLE: "<name>" could not be reached or failed. Try again later; if it keeps happening, tell your gateway administrator.` |
+| `TOOL_UNAVAILABLE` | Redirect refused | `TOOL_UNAVAILABLE: "<name>" tried to send the request to another address, which the gateway does not allow. Tell your gateway administrator; retrying will not help.` |
+| `TOOL_TIMEOUT` | No answer within the deadline | `TOOL_TIMEOUT: "<name>" did not answer within <N> seconds. Try again later or with a smaller request; if it keeps happening, tell your gateway administrator.` |
+| `TOOL_RESPONSE_INVALID` | A 2xx answer that is not valid JSON-RPC, JSON or event stream, or is over the 25 MiB cap (webhooks: 8 MiB) | `TOOL_RESPONSE_INVALID: "<name>" sent an answer the gateway could not read. If it keeps happening, tell your gateway administrator.` |
+
+Webhook tools and http/SSE bindings can produce every row. For stdio the gateway can observe only `TOOL_DENIED`, `TOOL_UNAVAILABLE` (the server failed to start or exited), `TOOL_TIMEOUT` and `TOOL_RESPONSE_INVALID`; a stdio server's own authentication failure is its tool-level `isError` result.
+
+A tool's own answer is not a mediation failure: an MCP `isError` result passes through unchanged, and a webhook 4xx other than 401/403/408/429 reaches the model as `The tool rejected the request (HTTP <status>): <message>`, where `<message>` is, in order, `error.message`, a string `error`, `message` of a JSON body, else a text/plain body, at most 500 characters, control characters removed and known secret values masked. Successful upstream answers pass through unmasked: an upstream that echoes its own credential in a success answer is outside the gateway's control.
+
 ## Authentication
 
 API keys are configured via the `API_KEYS` environment variable:
@@ -341,7 +446,7 @@ API keys are configured via the `API_KEYS` environment variable:
 API_KEYS=myapp:sk-abc123,cicd:sk-def456
 ```
 
-Each entry is `label:secret`. The label appears in server logs for audit purposes. Send the secret as a Bearer token:
+Each entry is `label:secret`. The label appears in server logs for audit purposes, scopes sessions, the event cache and registered tools, and is the key of `AGENT_TOOL_POLICY`. Removing or renaming a label while the policy still names it stops the gateway at startup; update `API_KEYS` and `AGENT_TOOL_POLICY` together. Send the secret as a Bearer token:
 
 ```bash
 curl -H "Authorization: Bearer sk-abc123" http://localhost:3001/v1/sessions
@@ -367,6 +472,8 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `MCP_TEST_TIMEOUT_MS` | `10000` | Per-test deadline for `POST /v1/mcp-servers/:name/test` |
 | `MCP_CALL_TIMEOUT_MS` | `10000` | Per-call deadline for `POST /v1/mcp-servers/:name/call` |
 | `MCP_UPLOAD_IDLE_TIMEOUT_MS` | `60000` | No-progress timeout for one relayed upload (`POST /v1/mcp-servers/:name/uploads/*`); no overall deadline |
+| `AGENT_MCP_TOOL_TIMEOUT_MS` | `600000` | Overall deadline of one mediated MCP `tools/call` in an agent run (http, SSE, stdio); empty = default; invalid value stops startup |
+| `AGENT_TOOL_POLICY` | -- | Tool grant per API-key label (JSON); empty = no restriction; see [Tool mediation](#tool-mediation) |
 | `ISOLATION_STARTUP_TIMEOUT_MS` | `10000` | A sandbox must pass its start check within this time; see [Agent isolation](#agent-isolation) |
 | `AGENT_RUN_TIMEOUT_MS` | `7200000` | Deadline of one query request, retries included |
 | `MODEL_PROXY_IDLE_TIMEOUT_MS` | `600000` | No-progress timeout of one proxied provider request |
@@ -433,7 +540,7 @@ Express Server (auth middleware)
     |                              |                |
     |                              |                +-> External MCP Servers (http/sse/stdio)
     |                         NDJSON stream                   |
-    |                              |                          +-> connect/spawn per query
+    |                              |                          +-> credential relay (grant check, bridge / tool sandbox)
     +-- GET /v1/query/:id/events   (replay from event cache)
     |
     +-- /v1/sessions, /v1/settings, /v1/logging
@@ -471,7 +578,7 @@ When the agent calls a registered tool, the gateway POSTs to the webhook URL wit
 }
 ```
 
-The client's Bearer token is forwarded to webhook calls for authentication. Tools persist to disk at `TOOLS_PERSIST_PATH` and survive server restarts.
+The calling client's Bearer token is forwarded to webhook calls for authentication, only to tools its own API-key label registered (see [Tool mediation](#tool-mediation)); a webhook call never follows a redirect, and its failures end in the fixed `TOOL_*` texts. Every tool records the registering label as `owner`, and a run is offered only its own label's tools plus legacy ownerless entries. Tools persist to disk at `TOOLS_PERSIST_PATH` and survive server restarts.
 
 ### External MCP Server Registry
 
@@ -482,7 +589,7 @@ In addition to webhook-based tools, the gateway can register full external MCP s
 | **Purpose**        | Expose custom integrations as tools      | Embed existing MCP servers                     |
 | **Transport**      | HTTP POST to `webhook_url`               | MCP protocol: `http` / `sse` / `stdio`         |
 | **Tool schema**    | Defined by the registrar                 | Discovered from the MCP server itself          |
-| **Auth**           | Client's Bearer token forwarded          | Per-server `headers` / `env`                   |
+| **Auth**           | Owner's client Bearer token forwarded    | Per-server `headers` / `env`                   |
 
 Register the production Jira HTTP MCP server with per-user Basic auth outputs:
 
@@ -556,7 +663,7 @@ Payload fields:
 | `env` | no | Environment variables for stdio command |
 | `description` | no | Human-readable description |
 | `enabled` | no | Defaults to `true` |
-| `allowedToolsPattern` | no | Glob restricting which MCP tools the agent may call (e.g. `mcp__jira__*`) |
+| `allowedToolsPattern` | no | Glob of tools to pre-approve for the runtime (e.g. `mcp__jira__*`). It is **not** part of the tool grant and has no authorization effect |
 | `userCredentialSchema` | no | Per-user credential fields and output templates for `headers` or `env` overrides |
 | `requireUserCredentials` | no | Boolean, default `false`. When `true`, the server is attached to a run only if the run's `mcpCredentialOverrides` carries its user credential (see below). Not allowed together with `type: "sse"` |
 
@@ -568,9 +675,9 @@ Output templates support plain substitution (`"{fieldKey}"`, `"prefix-{a}-{b}"`)
 
 `headers` and `env` must be string maps. Every header must be one Node can send (a token name; no CR, LF, NUL or other invalid character in the value), and env names and values must not contain NUL. The same check applies to `mcpCredentialOverrides`, the `/test` body and the `/call` `credentials`. A violation answers `400` in each route's error style (`MCP_OVERRIDE_INVALID` outside the registry `PUT`), and the message never echoes the value.
 
-`requireUserCredentials: true` marks a server that must run with the requesting user's own credential. A run gets such a server only when its `mcpCredentialOverrides` entry carries at least one non-empty value for the transport's target (`headers` for http, `env` for stdio) and, when the server has a `userCredentialSchema`, a value for every output key. A `headers` output key matches override headers in any casing (`authorization` is satisfied by an `Authorization` header); it counts only when at least one header matches and every matching header is non-empty, so an empty duplicate that differs only by case leaves the server out. `env` output keys must match exactly. An empty entry such as `{"aida": {}}` counts as missing. Otherwise the server is left out of that run: it is not in `options.mcpServers`, its tool pattern (custom `allowedToolsPattern` or `mcp__<name>__*`) is not in the default allowed tools, a request-supplied `mcpServers` entry with the same name is dropped, and the gateway logs `mcp.server.omitted serverName=<name> reason=missing_user_credential` (names only). The field is stored and returned only when sent; a `PUT` without it clears it, and `/restart` keeps it. `/test`, `/call` and `/uploads/*` are not affected.
+`requireUserCredentials: true` marks a server that must run with the requesting user's own credential. A run gets such a server only when its `mcpCredentialOverrides` entry carries at least one non-empty value for the transport's target (`headers` for http, `env` for stdio) and, when the server has a `userCredentialSchema`, a value for every output key. A `headers` output key matches override headers in any casing (`authorization` is satisfied by an `Authorization` header); it counts only when at least one header matches and every matching header is non-empty, so an empty duplicate that differs only by case leaves the server out. `env` output keys must match exactly. An empty entry such as `{"aida": {}}` counts as missing. Otherwise the server is left out of that run: it is not in `options.mcpServers`, its tool pattern (custom `allowedToolsPattern` or `mcp__<name>__*`) is not in the pre-approved tools, a request `mcpServers` entry with that name is refused with 400 `MCP_SERVER_NAME_CONFLICT` (any registered name is), and the gateway logs `mcp.server.omitted serverName=<name> reason=missing_user_credential` (names only). The field is stored and returned only when sent; a `PUT` without it clears it, and `/restart` keeps it. `/test` and `/uploads/*` are not affected; `/call` answers 401 `MCP_AUTH_FAILED` without a user credential (see below).
 
-Registered MCP servers persist to `MCP_SERVERS_PERSIST_PATH` and are merged into `options.mcpServers` on every `/v1/query` call (except a `requireUserCredentials` server when the run lacks its user credential). The SDK connects (http/sse) or spawns (stdio) per query; use `POST /v1/mcp-servers/:name/restart` to force a fresh connection.
+Registered MCP servers persist to `MCP_SERVERS_PERSIST_PATH` and are attached to every `/v1/query` run through the credential relay (except a `requireUserCredentials` server when the run lacks its user credential, and a server with no granted tool). Use `POST /v1/mcp-servers/:name/restart` to force a fresh connection.
 
 Per-request MCP credential overrides can be attached to `POST /v1/query` without changing the existing request contract:
 
@@ -591,7 +698,7 @@ Per-request MCP credential overrides can be attached to `POST /v1/query` without
 
 Override server names must already exist and be enabled in the registry. Unknown names return `MCP_SERVER_NOT_FOUND`; disabled names return `MCP_SERVER_DISABLED`. For http/sse transports, `headers` are shallow-merged over the static registry config. For stdio transports, `env` is shallow-merged. Overrides are request-scoped only and never write back to `MCP_SERVERS_PERSIST_PATH`.
 
-Per-request MCP **servers** can also be attached to a single `POST /v1/query` via the optional `mcpServers` field — an unregistered server that lives only for that one query. The value is the SDK `mcpServers` map (server name → `{ command, args?, env? }` for stdio, or `{ url, type? }` for http/sse). The gateway injects these into `options.mcpServers` and adds the matching `mcp__<name>__*` patterns to the default allowed-tool set, so their tools are usable without an explicit `allowedTools`:
+Per-request MCP **servers** can also be attached to a single `POST /v1/query` via the optional `mcpServers` field: an unregistered server that lives only for that one query. The gateway validates and normalizes the map on the trusted side and adds the matching `mcp__<name>__*` patterns to the pre-approved tools (subject to the grant):
 
 ```json
 {
@@ -606,7 +713,13 @@ Per-request MCP **servers** can also be attached to a single `POST /v1/query` vi
 }
 ```
 
-Request servers are merged at the **lowest precedence**: the gateway's own `agent-gateway-tools` webhook server and the registered registry servers always overlay on top, so a request can never override or shadow them — the reserved name `agent-gateway-tools` is rejected with `400`. Each value must define a string `command` (stdio) or `url` (http/sse); malformed entries return `400`. Request servers are query-scoped only and are never persisted to `MCP_SERVERS_PERSIST_PATH`. (Used by reqlift recon to attach a per-run chrome-devtools MCP server.)
+Rules for each entry:
+
+- The name matches `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`; `agent-gateway-tools` is reserved (400).
+- A server has either `command` (stdio; it must not set `type`) or `url` (`type` only `http` or `sse`; a `url` without `type` is `http`). `headers` and `env` must be string maps with sendable values. Unknown fields are dropped. Malformed entries return 400.
+- A name equal to **any** registered server (enabled, disabled or left out of the run) answers 400 `{"error":{"code":"MCP_SERVER_NAME_CONFLICT","message":...}}`, so the request can never take over a registry name or a grant written for it. Registering a server named like a caller's request server makes those requests fail.
+- Request servers are merged at the lowest precedence: the gateway's `agent-gateway-tools` server and the registered servers always overlay on top. They are query-scoped only and never persisted. (Used by reqlift recon to attach a per-run chrome-devtools MCP server.)
+- **Routing:** http/SSE servers **with** `headers` (or a URL with a user name, password or query) go through the relay (the runtime gets only a relay URL), stdio servers **with** `env` run in their own tool sandbox, and servers without `headers`/`env` connect directly or run inside the agent sandbox. Pass credentials for request servers only through `env` or `headers`, never in `args` or `url` (the agent can read those).
 
 Use `POST /v1/mcp-servers/:name/test` to validate a credential set before saving or enabling it:
 
@@ -617,9 +730,9 @@ curl -X POST http://localhost:3001/v1/mcp-servers/jira/test \
   -d '{ "headers": { "Authorization": "Basic <base64(email:apiToken)>" } }'
 ```
 
-Success returns `{ "ok": true, "toolCount": 2, "tools": [{ "name": "..." }] }`. Unknown servers return `MCP_SERVER_NOT_FOUND`, upstream 401/403 returns `MCP_AUTH_FAILED`, transport failures return `MCP_NETWORK_ERROR`, and timeouts return `MCP_TIMEOUT`. Error messages are sanitized and do not echo header or env values.
+Success returns `{ "ok": true, "toolCount": 2, "tools": [{ "name": "..." }] }`. Unknown servers return `MCP_SERVER_NOT_FOUND`, upstream 401/403 returns `MCP_AUTH_FAILED`, transport failures return `MCP_NETWORK_ERROR`, and timeouts return `MCP_TIMEOUT`. Error messages are sanitized and do not echo header or env values. `/test`, `/call` and the health check never follow a redirect: a 3xx is `MCP_NETWORK_ERROR` (health: `HTTP 3xx`) and the credential never goes to the target.
 
-**Registered http servers go through the credential relay:** the Claude runtime inside the gateway gets a loopback URL (`http://127.0.0.1:<port>/mcp/<token>`, one token per run and server) instead of the registered URL and headers; the gateway's relay forwards to the registered server with the run's headers (static headers merged with the override). When the server refuses the token, the runtime never sees the refusal and never starts an OAuth login inside the gateway: a refused `tools/call` reaches the model as a tool error result (`MCP server "<name>" refused the credential`), a refused `initialize` leaves that server's tools out of the run, and redirects, other errors or an unreachable server answer `MCP server "<name>" unavailable`. The relay forwards only the MCP endpoint (never `/.well-known/*`, registration, authorize or token paths), answers the GET event stream with 405, and returns only `Content-Type` and `Mcp-Session-Id` to the runtime. Tokens are revoked when the run ends; after that the relay sends nothing more upstream for them, and a request still in progress is closed. If the relay could not start, registered http servers are left out of runs (`mcp.server.omitted ... reason=relay_unavailable`) instead of being connected directly. Request-supplied `mcpServers` and registered `sse` servers keep the direct path. With Claude Code 2.0.77, an upstream that lost its MCP session (404) makes the current tool call fail, as with a direct connection.
+**Registered servers go through the credential relay:** every registered server (http, SSE and stdio) reaches the Claude runtime only as a loopback URL (`http://127.0.0.1:<port>/mcp/<token>`, one token per run and server) instead of the registered URL, headers, `args` and `env`; the relay holds the run's binding (upstream, merged headers or env, grant) and forwards what the grant allows (details in [Tool mediation](#tool-mediation)). When the server refuses the credential, the runtime never sees the refusal and never starts an OAuth login inside the gateway: a refused `tools/call` reaches the model as a `TOOL_AUTH_UNAVAILABLE` tool result, a refused `initialize` leaves that server's tools out of the run, and redirects, other errors or an unreachable server answer with the matching [tool error](#tool-errors). The relay forwards only the MCP endpoint (never `/.well-known/*`, registration, authorize or token paths), answers the GET event stream with 405, and returns only `Content-Type` and `Mcp-Session-Id` to the runtime. Tokens are revoked when the run ends or is cancelled; after that the relay sends nothing more upstream for them, and a request still in progress is closed. With Claude Code 2.0.77, an upstream that lost its MCP session (404) makes the current tool call fail, as with a direct connection.
 
 **The runtime's own log files are not kept:** each run gets a private directory under the OS temp directory for the runtime's debug log and MCP logs (which record connection options, including header and env values); it is deleted once the runtime process has exited, and leftovers are removed at gateway startup. `DEBUG_CLAUDE_AGENT_SDK` is ignored: the gateway removes it at startup and logs a warning, because the SDK would write its full runtime arguments, including MCP configuration, to `~/.claude/debug/sdk-*.txt`.
 
@@ -657,6 +770,8 @@ A **tool-level error is still HTTP 200** with `isError: true` (the upstream call
 ```jsonc
 { "content": [ /* ... */ ], "isError": true }
 ```
+
+For a server with `requireUserCredentials: true` and no user credential in the call, the route answers 401 `MCP_AUTH_FAILED` ("this server requires the user's credential and none was provided") **before** any upstream request. No redirect is followed: a 3xx is `MCP_NETWORK_ERROR`.
 
 **Gateway-level failures** (never tool errors) return the structured envelope `{ "error": { "code": "...", "message": "..." } }` and never hang past the per-call deadline:
 

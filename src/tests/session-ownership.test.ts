@@ -1,9 +1,9 @@
 /**
- * Conversation ownership and legacy refusal (MVP-7678, sessions.ts, query.ts): the exact-owner rule
- * (label and user id, null and a present user id being different owners), admission without any
- * change to the entry, legacy entries, caller-scoped list and delete, the recorded sandbox home
- * name, persistence across a restart, and the query route's refusals (fixed texts, 0 runs, no
- * session change). The agent run is mocked here; the real-runtime rows are in
+ * Conversation ownership and legacy refusal (MVP-7678, sessions.ts, query.ts): conversations are keyed by
+ * (API-key label, client id) (MVP-7679), within a label the exact-owner rule (user id, null and a present user id
+ * being different owners), admission without any change to the entry, legacy entries, caller-scoped list and delete,
+ * the recorded sandbox home name, persistence across a restart, and the query route's refusals (fixed texts, 0 runs,
+ * no session change). The agent run is mocked here; the real-runtime rows are in
  * session-isolation-process.test.ts.
  */
 import fs from "node:fs";
@@ -55,30 +55,64 @@ describe("the owner rule", () => {
     const other = m.getSession("c2", "sys", "model", true, A);
     expect(other.sandboxDirId).not.toBe(created.sandboxDirId);
     expect(m.flushSessions()).toBe(true);
-    const saved = JSON.parse(fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8")) as { sessions: Record<string, { owner: unknown; sandboxDirId: string }> };
-    expect(saved.sessions.c1.owner).toEqual(A);
-    expect(saved.sessions.c1.sandboxDirId).toBe(created.sandboxDirId);
+    const saved = JSON.parse(fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8")) as {
+      sessions: Record<string, unknown>;
+      sessionsByLabel: Record<string, Record<string, { owner: unknown; sandboxDirId: string }>>;
+    };
+    // MVP-7679: the conversation lives below its label; the raw-id map holds only legacy entries.
+    expect(saved.sessions).toEqual({});
+    expect(saved.sessionsByLabel.reqlift.c1.owner).toEqual(A);
+    expect(saved.sessionsByLabel.reqlift.c1.sandboxDirId).toBe(created.sandboxDirId);
   });
 
   it("the exact owner resumes, with the same sandbox home", async () => {
     const m = await sessionsModule();
     const created = m.getSession("c1", "sys", "model", true, A);
-    m.updateSessionSdkId("c1", "sdk-1");
+    m.updateSessionSdkId("c1", "sdk-1", A.label);
     expect(m.admitSession("c1", { ...A })).toEqual({ kind: "resume", sandboxDirId: created.sandboxDirId });
     const resumed = m.getSession("c1", "sys", "model", true, A);
     expect(resumed).toEqual({ sessionId: "sdk-1", isNew: false, sandboxDirId: created.sandboxDirId });
   });
 
   it.each([
-    ["another API-key label with the same user id", { label: "diemai", userId: "user-1" }],
     ["the same label with another user id", { label: "reqlift", userId: "user-2" }],
     ["the same label without a user id (null is not a user)", { label: "reqlift", userId: null }],
-    ["another label without a user id", { label: "diemai", userId: null }],
   ])("%s is refused as another owner", async (_label, caller) => {
     const m = await sessionsModule();
     m.getSession("c1", "sys", "model", true, A);
-    m.updateSessionSdkId("c1", "sdk-1");
+    m.updateSessionSdkId("c1", "sdk-1", A.label);
     expect(m.admitSession("c1", caller)).toEqual({ kind: "refused", reason: "other_owner" });
+  });
+
+  it.each([
+    ["another API-key label with the same user id", { label: "diemai", userId: "user-1" }],
+    ["another label without a user id", { label: "diemai", userId: null }],
+  ])("%s does not see the conversation: it starts its own", async (_label, caller) => {
+    const m = await sessionsModule();
+    const mine = m.getSession("c1", "sys", "model", true, A);
+    m.updateSessionSdkId("c1", "sdk-1", A.label);
+    // No refusal: nothing tells the other label that this id exists.
+    expect(m.admitSession("c1", caller)).toEqual({ kind: "new" });
+    const theirs = m.getSession("c1", "sys", "model", true, caller);
+    expect(theirs.isNew).toBe(true);
+    expect(theirs.sandboxDirId).not.toBe(mine.sandboxDirId);
+    // Each label resumes its own.
+    m.updateSessionSdkId("c1", "sdk-2", caller.label);
+    expect(m.admitSession("c1", A)).toEqual({ kind: "resume", sandboxDirId: mine.sandboxDirId });
+    expect(m.getSession("c1", "sys", "model", true, A).sessionId).toBe("sdk-1");
+    expect(m.getSession("c1", "sys", "model", true, caller).sessionId).toBe("sdk-2");
+  });
+
+  it("an id that looks like another label's key (`reqlift:abc`) is just an id: label B learns nothing about reqlift's conversation `abc`", async () => {
+    const m = await sessionsModule();
+    const abc = m.getSession("abc", "sys", "model", true, A);
+    m.updateSessionSdkId("abc", "sdk-abc", A.label);
+    expect(m.admitSession("reqlift:abc", B)).toEqual({ kind: "new" });
+    const b = m.getSession("reqlift:abc", "sys", "model", true, B);
+    expect(b.isNew).toBe(true);
+    expect(b.sandboxDirId).not.toBe(abc.sandboxDirId);
+    expect(m.listSessions("reqlift").map((x) => x.id)).toEqual(["abc"]);
+    expect(m.listSessions("diemai").map((x) => x.id)).toEqual(["reqlift:abc"]);
   });
 
   it("a conversation created without a user id is not continued with one", async () => {
@@ -91,11 +125,12 @@ describe("the owner rule", () => {
   it("admission changes nothing: a refused caller leaves the entry exactly as it was", async () => {
     const m = await sessionsModule();
     m.getSession("c1", "original system prompt", "model-a", true, A);
-    m.updateSessionSdkId("c1", "sdk-1");
+    m.updateSessionSdkId("c1", "sdk-1", A.label);
     m.flushSessions();
     const before = fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8");
     await new Promise((r) => setTimeout(r, 20));
-    expect(m.admitSession("c1", B)).toEqual({ kind: "refused", reason: "other_owner" });
+    expect(m.admitSession("c1", { label: A.label, userId: "user-2" })).toEqual({ kind: "refused", reason: "other_owner" });
+    expect(m.admitSession("c1", B)).toEqual({ kind: "new" });
     m.flushSessions();
     expect(fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8")).toBe(before);
   });
@@ -148,8 +183,9 @@ describe("legacy conversations (created before the update)", () => {
     seed(process.env.SESSION_PERSIST_PATH!);
     const m = await sessionsModule();
     m.loadSessions();
-    // Entries with no recorded owner are visible to every label; `ownerOnly` has an owner and is its label's.
-    expect(m.listSessions("anyone").map((s) => s.id).sort()).toEqual(["dirOnly", "legacyConfirmed", "legacyUnconfirmed"]);
+    // An entry without a complete owner and home (`ownerOnly` lacks the home) stays a legacy entry under its raw id,
+    // visible to every label (MVP-7679: only complete entries move into their label's map).
+    expect(m.listSessions("anyone").map((s) => s.id).sort()).toEqual(["dirOnly", "legacyConfirmed", "legacyUnconfirmed", "ownerOnly"]);
     expect(m.listSessions("reqlift").map((s) => s.id).sort()).toEqual(["dirOnly", "legacyConfirmed", "legacyUnconfirmed", "ownerOnly"]);
     expect(m.deleteSession("legacyConfirmed", "anyone")).toBe(true);
     expect(m.deleteSession("legacyConfirmed", "anyone")).toBe(false);
@@ -191,13 +227,14 @@ describe("restart", () => {
   it("owner and sandbox home name survive a restart, and the same owner resumes", async () => {
     const m1 = await sessionsModule();
     const created = m1.getSession("c1", "sys", "model", true, A);
-    m1.updateSessionSdkId("c1", "sdk-1");
+    m1.updateSessionSdkId("c1", "sdk-1", A.label);
     expect(m1.flushSessions()).toBe(true);
     vi.resetModules();
     const m2 = await sessionsModule();
     m2.loadSessions();
     expect(m2.admitSession("c1", A)).toEqual({ kind: "resume", sandboxDirId: created.sandboxDirId });
-    expect(m2.admitSession("c1", B)).toEqual({ kind: "refused", reason: "other_owner" });
+    expect(m2.admitSession("c1", { label: A.label, userId: "user-2" })).toEqual({ kind: "refused", reason: "other_owner" });
+    expect(m2.admitSession("c1", B)).toEqual({ kind: "new" });
   });
 });
 
@@ -240,16 +277,31 @@ describe("the query route", () => {
 
     const snapshot = JSON.stringify(sessions.listSessions());
     for (const [label, body] of [
-      ["diemai", { user_id: "user-1" }],
       ["reqlift", { user_id: "user-2" }],
       ["reqlift", {}],
     ] as const) {
-      const refused = await ask(server, { queryId: `q-${label}`, sessionId: "c1", ...body }, label);
+      const refused = await ask(server, { queryId: `q-${label}-${JSON.stringify(body)}`, sessionId: "c1", ...body }, label);
       expect(refused.events).toEqual([{ seq: 0, type: "error", content: "This conversation cannot be continued from your account. Please start a new conversation." }]);
     }
     // 0 runs for the refusals, and the conversation is untouched.
     expect(runQuery).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(sessions.listSessions())).toBe(snapshot);
+
+    // Another label using the same id is not refused and learns nothing: it gets its own new conversation
+    // (MVP-7679), with its own home, and reqlift's conversation is untouched.
+    const other = await ask(server, { queryId: "q-other-label", sessionId: "c1", user_id: "user-1" }, "diemai");
+    expect(other.events.at(-1)?.type).toBe("done");
+    expect(runQuery).toHaveBeenCalledTimes(3);
+    const otherCall = runQuery.mock.calls[2][0] as { sandboxDirId?: string; isResume?: boolean };
+    expect(otherCall.isResume).toBe(false);
+    expect(otherCall.sandboxDirId).toMatch(/^[0-9a-f]{24}$/);
+    expect(otherCall.sandboxDirId).not.toBe(firstDir);
+    expect(sessions.listSessions("reqlift").map((x) => x.id)).toEqual(["c1"]);
+    expect(sessions.listSessions("diemai").map((x) => x.id)).toEqual(["c1"]);
+    // reqlift resumes its own conversation, not the other label's.
+    const resumed = await ask(server, { queryId: "q-again", sessionId: "c1", user_id: "user-1" });
+    expect(resumed.events.at(-1)?.type).toBe("done");
+    expect(runQuery.mock.calls[3][0]).toMatchObject({ sandboxDirId: firstDir, isResume: true });
   });
 
   it("a legacy conversation is refused with the fixed text, no run, no change; with the exact NDJSON shape (one error event, no done)", async () => {
@@ -305,5 +357,62 @@ describe("the query route", () => {
     expect(b.events.at(-1)?.type).toBe("done");
     for (const call of runQuery.mock.calls) expect((call[0] as { sandboxDirId?: string }).sandboxDirId).toBeUndefined();
     expect(sessions.getSessionCount()).toBe(0);
+  });
+});
+
+describe("conversations per label (MVP-7679)", () => {
+  const now = Date.now();
+  const entry = (label: string, extra: Record<string, unknown> = {}) => ({
+    sessionId: "gw",
+    sdkSessionId: "sdk",
+    systemPrompt: "",
+    model: "m",
+    lastUsed: now,
+    owner: { label, userId: null },
+    sandboxDirId: "0123456789abcdef01234567",
+    ...extra,
+  });
+
+  it("an entry written by the isolation update (owner and home, raw id) moves into its label's map on load and is still resumed", async () => {
+    fs.writeFileSync(
+      process.env.SESSION_PERSIST_PATH!,
+      JSON.stringify({ sessions: { c1: entry("reqlift"), "diemcrm:123": { sessionId: "gw", systemPrompt: "", model: "m", lastUsed: now } }, settings: { sessionIdleTimeoutMs: 0 } }),
+    );
+    const m = await sessionsModule();
+    m.loadSessions();
+    expect(m.admitSession("c1", { label: "reqlift", userId: null })).toEqual({ kind: "resume", sandboxDirId: "0123456789abcdef01234567" });
+    // Another label's id c1 is a new conversation for it.
+    expect(m.admitSession("c1", B)).toEqual({ kind: "new" });
+    // A legacy ownerless id that looks like `<label>:<id>` stays refused for every label.
+    expect(m.admitSession("diemcrm:123", { label: "diemcrm", userId: null })).toEqual({ kind: "refused", reason: "legacy" });
+    expect(m.admitSession("diemcrm:123", A)).toEqual({ kind: "refused", reason: "legacy" });
+    m.flushSessions();
+    const saved = JSON.parse(fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8")) as { sessions: Record<string, unknown>; sessionsByLabel: Record<string, Record<string, unknown>> };
+    expect(Object.keys(saved.sessions)).toEqual(["diemcrm:123"]);
+    expect(Object.keys(saved.sessionsByLabel.reqlift)).toEqual(["c1"]);
+  });
+
+  it("the public routes keep raw ids: list shows the caller's ids, delete removes the caller's own entry first", async () => {
+    const m = await sessionsModule();
+    m.getSession("same", "", "m", true, A);
+    m.getSession("same", "", "m", true, B);
+    expect(m.listSessions("reqlift").map((x) => x.id)).toEqual(["same"]);
+    expect(m.deleteSession("same", "reqlift")).toBe(true);
+    expect(m.listSessions("reqlift")).toEqual([]);
+    expect(m.listSessions("diemai").map((x) => x.id)).toEqual(["same"]);
+    expect(m.deleteSession("same", "reqlift")).toBe(false);
+  });
+
+  it.each([
+    ["a per-label entry without an owner", { sessionsByLabel: { reqlift: { c1: { sessionId: "gw", systemPrompt: "", model: "m", lastUsed: now } } } }],
+    ["a per-label entry under another label", { sessionsByLabel: { reqlift: { c1: entry("diemai") } } }],
+    ["a per-label map that is not an object", { sessionsByLabel: { reqlift: [] } }],
+    ["a per-label entry without a home", { sessionsByLabel: { reqlift: { c1: entry("reqlift", { sandboxDirId: undefined }) } } }],
+  ])("%s sets the whole file aside instead of loading it (MVP-7616)", async (_label, extra) => {
+    fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, JSON.stringify({ sessions: {}, settings: { sessionIdleTimeoutMs: 0 }, ...extra }));
+    const m = await sessionsModule();
+    m.loadSessions();
+    expect(m.getSessionCount()).toBe(0);
+    expect(fs.readdirSync(dir).some((f) => f.startsWith("sessions.json.corrupt"))).toBe(true);
   });
 });

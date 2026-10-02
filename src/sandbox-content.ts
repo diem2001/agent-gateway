@@ -22,13 +22,21 @@ import { log } from "./logging.js";
 export const SANDBOX_HOME = "/home/node";
 export const SANDBOX_CLAUDE_DIR = `${SANDBOX_HOME}/.claude`;
 
-/** Global workspace entries an agent may read: (name, kind). */
-export const GLOBAL_ENTRIES: readonly { name: string; kind: "file" | "dir" }[] = [
-  { name: "CLAUDE.md", kind: "file" },
-  { name: "skills", kind: "dir" },
-  { name: "agents", kind: "dir" },
-  { name: "memory", kind: "dir" },
-  { name: "commands", kind: "dir" },
+/**
+ * Global workspace entries an agent may read: (name, kind). `trusted` entries are configuration or extensions the
+ * runtime loads from `~/.claude` (instructions, skills, agents, commands, output styles, plugins, hooks): a file the
+ * agent writes there can carry hooks or MCP servers, so the sandbox always sees the workspace entry read-only, or a
+ * trusted EMPTY one when the workspace has none (never the agent-writable directory underneath). `memory` is data.
+ */
+export const GLOBAL_ENTRIES: readonly { name: string; kind: "file" | "dir"; trusted: boolean }[] = [
+  { name: "CLAUDE.md", kind: "file", trusted: true },
+  { name: "skills", kind: "dir", trusted: true },
+  { name: "agents", kind: "dir", trusted: true },
+  { name: "memory", kind: "dir", trusted: false },
+  { name: "commands", kind: "dir", trusted: true },
+  { name: "output-styles", kind: "dir", trusted: true },
+  { name: "plugins", kind: "dir", trusted: true },
+  { name: "hooks", kind: "dir", trusted: true },
 ];
 
 /** A repository or entry name that is used in a mount destination. */
@@ -209,6 +217,89 @@ export function prepareMountPoints(homeDir: string, mounts: { src: string; dest:
       }
     }
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*  The clean home and the work area                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What the agent may leave under `~/.claude` between two starts: data only, nothing the runtime reads as
+ * configuration or extension. Measured on the real runtime (2.0.77): it writes `projects/` (session transcripts,
+ * needed for resume), `todos/` and `plans/` there, and `memory` is the mount point of the workspace memory. Every
+ * other entry is removed at every start, so a name the runtime reads today (`commands`, `agents`, `skills`,
+ * `output-styles`, `plugins`, `hooks`, `settings.local.json`, `CLAUDE.md`, `.config.json`, `shell-snapshots` that are
+ * sourced as scripts) or learns to read later is untrusted by default; the runtime recreates what it needs.
+ */
+export const RUNTIME_WRITABLE_DIRS: readonly string[] = ["memory", "plans", "projects", "todos"];
+
+/**
+ * The sandbox's working directory and the agent's persistent scratch space for one conversation (a conversation's
+ * `work` directory, bound read-write). It is not the home: the runtime and its children read the home by name at
+ * start, nothing of the work area (project settings are not a configuration source of a run).
+ */
+export const SANDBOX_WORK = "/work";
+
+/**
+ * Rebuilds the agent's home from nothing before every sandbox start (operator decision A2, MVP-7679). The home is
+ * agent-writable and the runtime and its children read it by name at start: the shell snapshot runs `bash -l`
+ * (`.bash_profile`, `.bash_login`, `.profile`, `.bashrc`), `git` reads `.gitconfig` and `.config/git/config` and
+ * `core.fsmonitor` of a repository at the working directory, the runtime reads `.claude.json` and `.claude/.config.json`.
+ * Closing those names one by one failed three QA rounds, so everything in the home root except `.claude` is removed
+ * (no link is followed) and `.claude` keeps only the runtime's data (`RUNTIME_WRITABLE_DIRS`, and below `projects`
+ * only its own transcript directories); the runtime rebuilds its state file, shell snapshot and caches itself. Runs
+ * before the sandbox of a conversation exists (the conversation lock guarantees no process of its previous run is
+ * left). Throws when an entry cannot be removed: the caller fails closed.
+ */
+export function prepareSandboxHome(homeDir: string): void {
+  for (const entry of fs.readdirSync(homeDir)) {
+    if (entry === ".claude") continue;
+    fs.rmSync(path.join(homeDir, entry), { recursive: true, force: true });
+  }
+  purgeConfigDir(homeDir);
+}
+
+/**
+ * Allow-list of the runtime's config directory (`~/.claude`, which the agent can write): everything not in
+ * `RUNTIME_WRITABLE_DIRS` is removed without following links, and an allowed name that is not a real directory
+ * is removed too. Below `projects` only the runtime's own transcript directories (names starting with `-`, the
+ * working directory's name with `/` replaced) stay: the repository mount points are made fresh by the mount step.
+ * A `.claude` that is not a real directory is removed itself.
+ */
+function purgeConfigDir(homeDir: string): void {
+  const dir = path.join(homeDir, ".claude");
+  const stat = lstatOrNull(dir);
+  if (!stat) return;
+  if (!stat.isDirectory()) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return;
+  }
+  for (const entry of fs.readdirSync(dir)) {
+    const full = path.join(dir, entry);
+    if (RUNTIME_WRITABLE_DIRS.includes(entry) && lstatOrNull(full)?.isDirectory()) continue;
+    fs.rmSync(full, { recursive: true, force: true });
+  }
+  const projects = path.join(dir, "projects");
+  if (!lstatOrNull(projects)) return;
+  for (const entry of fs.readdirSync(projects)) {
+    const full = path.join(projects, entry);
+    if (entry.startsWith("-") && lstatOrNull(full)?.isDirectory()) continue;
+    fs.rmSync(full, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The runtime runs `git status` in its working directory at start, and the agent can write the work area. Two layers
+ * keep that git from reading anything the agent wrote: here, ANY `.git` entry at the work root (file, link or
+ * directory) is removed at every start without following links (a repository there is not a supported scenario;
+ * repositories are central read-only mounts); and the sandbox environment carries trusted command-scope git
+ * configuration (`GIT_TRUSTED_CONFIG` in sandbox.ts) that refuses an implicit bare layout at the work root and
+ * switches fsmonitor and hooks off. Repositories below the work area are not touched: git run from the work root does
+ * not discover them (git finds nothing in the directory itself or above it), and the work area is the agent's own
+ * data. Project settings in it are inert (the runtime reads the user source only).
+ */
+export function prepareWorkArea(workDir: string): void {
+  fs.rmSync(path.join(workDir, ".git"), { recursive: true, force: true });
 }
 
 /* ------------------------------------------------------------------ */
@@ -470,6 +561,16 @@ export interface PlanOptions {
   scanner?: KnownValueScanner;
 }
 
+/** An empty read-only stand-in below the trusted directory (created once per start, shared by every entry of that kind). */
+function trustedEmpty(trustedDir: string, kind: "file" | "dir"): string {
+  const target = path.join(trustedDir, kind === "dir" ? "empty-dir" : "empty-file");
+  if (!lstatOrNull(target)) {
+    if (kind === "dir") fs.mkdirSync(target, { mode: 0o555 });
+    else fs.writeFileSync(target, "", { flag: "wx", mode: 0o444 });
+  }
+  return target;
+}
+
 function audit(kind: string, name: string, reason: SkipReason | "known_value"): void {
   log("audit", `sandbox.content.skipped kind=${kind} name=${SAFE_NAME.test(name) ? name : "invalid"} reason=${reason}`);
 }
@@ -538,7 +639,7 @@ export function planTrustedContent(options: PlanOptions): MountPlan {
   const scanner = options.scanner ?? contentScanner;
   const plan: MountPlan = { mounts: [], hidden: [], skipped: 0, hiddenCount: 0 };
   const root = realpathOrNull(options.workspaceRoot);
-  if (!root) return plan;
+  fs.mkdirSync(options.trustedDir, { recursive: true, mode: 0o700 });
   const skip = (kind: string, name: string, reason: SkipReason): void => {
     plan.skipped++;
     audit(kind, name, reason);
@@ -551,10 +652,12 @@ export function planTrustedContent(options: PlanOptions): MountPlan {
   };
 
   for (const entry of GLOBAL_ENTRIES) {
-    const source = path.join(root, entry.name);
-    const check = checkTrusted(source, entry.kind, root);
+    const source = root ? path.join(root, entry.name) : "";
+    const check: TrustCheck = root ? checkTrusted(source, entry.kind, root) : { ok: false, reason: "missing" };
     if (!check.ok) {
       if (check.reason !== "missing") skip("global", entry.name, check.reason);
+      // No trusted workspace entry: the sandbox sees an empty read-only one, never the agent-writable directory.
+      if (entry.trusted) plan.mounts.push({ src: trustedEmpty(options.trustedDir, entry.kind), dest: `${SANDBOX_CLAUDE_DIR}/${entry.name}` });
       continue;
     }
     if (entry.kind === "file") {
@@ -569,6 +672,7 @@ export function planTrustedContent(options: PlanOptions): MountPlan {
     if (entry.kind === "dir") hide("global", entry.name, source, `${SANDBOX_CLAUDE_DIR}/${entry.name}`);
   }
 
+  if (!root) return plan;
   const settings = generatedSettings(root, options.trustedDir);
   if (settings) plan.mounts.push({ src: settings, dest: `${SANDBOX_CLAUDE_DIR}/settings.json` });
 

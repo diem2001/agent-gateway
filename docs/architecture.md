@@ -51,19 +51,19 @@ Installed by `server.ts` only when it is the process entry point. Handles `SIGTE
 Parses `API_KEYS` env var at startup into a `Map<key, label>` for O(1) lookup. Validates `Authorization: Bearer <key>` on all routes except `/health`. Attaches `clientLabel` to the request for audit logging.
 
 ### query.ts -- Query Endpoint
-- **POST /v1/query**: Accepts a prompt, optional system prompt, model, session ID, tool restrictions, and `mcpCredentialOverrides`. Creates an event cache entry, runs the query through the retry layer, and streams NDJSON events as they occur. Returns `Content-Type: application/x-ndjson`.
-- **GET /v1/query/:queryId/events**: Replays cached events for a completed or in-progress query. Supports `?after=<seq>` for resuming from a specific sequence number. For in-progress queries, keeps the connection open and streams new events in real time.
+- **POST /v1/query**: Accepts a prompt, optional system prompt, model, session ID, tool restrictions, and `mcpCredentialOverrides`. Computes the run's tool grant from the caller's API-key label (see [Tool Trust Boundary](#tool-trust-boundary-mvp-7679)), creates an event cache entry keyed by label and `queryId`, runs the query through the retry layer, and streams NDJSON events as they occur. Returns `Content-Type: application/x-ndjson`.
+- **GET /v1/query/:queryId/events**: Replays cached events of a completed or in-progress query that the calling label started (another label's entry answers the same 404 as an unknown id). Supports `?after=<seq>` for resuming from a specific sequence number. For in-progress queries, keeps the connection open and streams new events in real time.
 
 The `mcpCredentialOverrides` field carries per-request `headers` (http/sse) or `env` (stdio) values keyed by registered MCP server name. Overrides are validated up-front (`mcp-overrides.ts`), shallow-merged over the static registry config when the SDK builds its `mcpServers` map, and discarded after the query completes — they are never persisted.
 
 ### agent.ts -- Claude SDK Wrapper
 Calls `query()` from `@anthropic-ai/claude-agent-sdk` with configured tools, permissions, and the merged `mcpServers` map. Translates SDK message types (assistant text, tool_use, tool_result, system status, rate limits) into typed stream events emitted via the `onEvent` callback.
 
-Default tools: `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebSearch`, `WebFetch`.
+Default tools: `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, `Skill`, `TodoWrite`, narrowed by the run's grant. Runs read only the user setting source (`settingSources: ["user"]`; enforced runs read none) and always use the permission-bypass mode (enforced runs: `dontAsk`); built-ins outside the grant are not offered to the runtime (`tools`, `disallowedTools`).
 
-**Isolation (MVP-7678):** the runtime is started only through the SDK's `spawnClaudeCodeProcess` hook, which is `SandboxRun.spawnHook` (`sandbox.ts`): the runtime and everything it starts run inside a bubblewrap sandbox, and `options.env` holds no secret (`runtimeEnvFrom(process.env)` plus the per-run log variables; the sandbox builds its own allowlist). A start problem is thrown as an `IsolationFailure` (fixed text, never retried) instead of the SDK's generic exit error. `runQuery` waits for the sandbox process to exit before it returns, so the conversation lock of `query.ts` frees only when no process is left in the conversation's home.
+**Isolation (MVP-7678):** the runtime is started only through the SDK's `spawnClaudeCodeProcess` hook, which is `SandboxRun.spawnHook` (`sandbox.ts`): the runtime and everything it starts run inside a bubblewrap sandbox, and `options.env` holds no secret (`runtimeEnvFrom(process.env)` plus the per-run log variables; the sandbox builds its own allowlist). Before every sandbox start `sandbox-content.ts` rebuilds the agent's home from nothing (`prepareSandboxHome`): every home-root entry except `.claude` is removed without following links, and `.claude` keeps only the runtime's data (`RUNTIME_WRITABLE_DIRS`: `projects` with its `-*` transcript directories, `todos`, `plans`, `memory`), because the runtime and its children read the home by name at every start (the shell snapshot runs `bash -l`: `.bash_profile`, `.bash_login`, `.profile`, `.bashrc`; `git` reads `.gitconfig`, `.config/git/config` and the repository at the working directory; the runtime reads `.claude.json` and `.claude/.config.json`, `QF()` in 2.0.77). The agent's persistent files live in the conversation's work area `<root>/sessions/<sandboxDirId>/work`, bound read-write at `/work`, which is the working directory (so transcripts are in `projects/-work/` and resume works); `prepareWorkArea` removes any `.git` entry at the `/work` root (directory, file or link, without following links; a `commondir` pointer or a worktree config would defeat a configuration-only rewrite), because the runtime runs `git status` there at start. Repositories are central read-only mounts, so a work-root repository is not a supported scenario. Removing `.git` is only one layer: git also treats a working directory holding `HEAD`, `objects/`, `refs/` and `config` as an implicit bare repository, so the sandbox environment carries trusted command-scope git configuration (`GIT_CONFIG_COUNT/KEY_n/VALUE_n`, highest precedence, `GIT_TRUSTED_CONFIG` in `sandbox.ts`): `safe.bareRepository=explicit`, `core.fsmonitor=false`, `core.hooksPath=/dev/null`. With no repository discovered in `/work`, the start-time git reads no agent-written file. Repositories below `/work` are not discovered from `/work` (git run inside them works, with fsmonitor and hooks off; a bare repository there needs `--git-dir`). Project settings in `/work` are never loaded (`settingSources: ["user"]`). The extension directories and `CLAUDE.md` are mounted read-only from the workspace, or from an empty trusted stand-in when the workspace has no such entry. A start problem is thrown as an `IsolationFailure` (fixed text, never retried) instead of the SDK's generic exit error. `runQuery` waits for the sandbox process to exit before it returns, so the conversation lock of `query.ts` frees only when no process is left in the conversation's home.
 
-If registered webhook tools exist, they are wrapped as in-process MCP servers via `createToolMcpServer()` and injected into the SDK query alongside the built-in tools. The webhook context (user_id, session_id, api_key_label) and the client's Bearer token are passed to each webhook call. External MCP servers from the MCP Server Registry are merged into the same `mcpServers` map (per-server credentials applied), so the agent can call their tools over the MCP protocol. A registered **http** server reaches the SDK as a credential-relay URL with a per-run token and no headers (see [Credential Relay Flow](#credential-relay-flow)); the tokens are revoked when the run ends. The SDK child environment points the runtime's own log files into a private per-run directory (`sdk-run-logs.ts`), deleted after the runtime child has exited.
+If registered webhook tools exist, they are wrapped as in-process MCP servers via `createToolMcpServer()` and injected into the SDK query alongside the built-in tools. The webhook context (user_id, session_id, api_key_label) and the client's Bearer token are passed to each webhook call. External MCP servers from the MCP Server Registry are merged into the same `mcpServers` map (per-server credentials applied), so the agent can call their tools over the MCP protocol. Every registered server (http, SSE and stdio) reaches the SDK only as a credential-relay URL with a per-run token and no headers, args or env (see [Credential Relay Flow](#credential-relay-flow)); the tokens are revoked when the run ends. The `tool_result` event of a failed call carries `success: false`. The SDK child environment points the runtime's own log files into a private per-run directory (`sdk-run-logs.ts`), deleted after the runtime child has exited.
 
 **Run failures:** on a provider rejection the Claude runtime writes its diagnostic to stdout (a `system/init` message with `claude_code_version`, an assistant message with a non-null SDK `error` and the text `API Error: <status> <raw provider body>`, and a `result` with `is_error: true`, often with `subtype: "success"`) and then exits 1; the SDK yields those messages and only then throws `Claude Code process exited with code 1`. `agent.ts` keeps the classifier inputs of the attempt (the init version, error-flagged assistant messages, the result) and, on that throw or on a completed result with `is_error: true`, throws a `RunFailure` from `run-failure.ts` instead. Every other error thrown during iteration (for example an SDK JSON `SyntaxError`, whose message quotes runtime stdout) is wrapped too; only a client abort (`AbortError`) passes through unchanged. Error-flagged assistant text is never added to the answer, and ordinary assistant text is never classified.
 
@@ -88,8 +88,20 @@ Configuration (`ISOLATION_STARTUP_TIMEOUT_MS`, `AGENT_RUN_TIMEOUT_MS`, `AGENT_SA
 
 Permanent kinds beat `transient`, and `transient` beats `unknown`. The exact public messages are listed in the README ("Failed queries"). The installed version comes only from the init message and the required one only from an explicit "`<version>` or newer" or ">= `<version>`" in `error.message`.
 
+### tool-grant.ts -- Trusted Tool Grant
+Parses `AGENT_TOOL_POLICY` (fixed `FATAL config key=AGENT_TOOL_POLICY reason=<reason>` lines, one startup audit line per label) and computes a run's `ToolGrant`: the policy for the caller's label intersected with the caller's narrowing (`enforcedTools` or `allowedTools`). It answers `allows(name)`, `allowsServer(server)`, `coversServer(server)` and the built-in lists handed to the runtime. Deny beats allow; an absent `allow` means everything a run gets without a policy; `allow: []` means nothing; a label entry replaces `default`.
+
+### tool-mediation.ts -- Tool Request/Reply Contract
+The internal contract of every mediated call: `ToolRequest { runId, callId, toolId, input }` and `ToolReply` (`ok` with `output`, or an error with one of the five codes `TOOL_DENIED`, `TOOL_AUTH_UNAVAILABLE`, `TOOL_UNAVAILABLE`, `TOOL_TIMEOUT`, `TOOL_RESPONSE_INVALID` and its fixed text). One mapper (`describeFailure`) turns every failure into a text without upstream body, header, URL or secret; one renderer writes it into the existing public shapes (an MCP `isError` result or a JSON-RPC error). No new client-facing envelope exists. It also holds `webhookRejectionText()` (the model-facing text of a webhook 4xx that is the tool's own refusal), secret masking and the `AGENT_MCP_TOOL_TIMEOUT_MS` parser.
+
+### mcp-bridge.ts -- SSE Bridge
+For an upstream that speaks the legacy MCP HTTP-with-SSE transport, the relay hands each already-checked JSON-RPC message to this bridge, which opens the stream with the run's headers, accepts the `endpoint` event only on the registered origin, answers server requests locally (`ping`, `roots/list`, method-not-found) and drops server notifications. It returns each answer as one JSON message or a `ToolFailure`.
+
+### mcp-stdio-sandbox.ts -- Stdio Tool Sandbox
+Runs every registered stdio server, stdio overrides and request stdio servers with `env` in their own bubblewrap sandbox (built with `sandbox.ts`'s argv builder and launcher), with a bridge that speaks one JSON message per line over stdin/stdout. See the tool sandbox below.
+
 ### mcp-credential-relay.ts -- Credential Relay
-A `node:http` listener on 127.0.0.1 (ephemeral port, never an Express route). `register()` binds a 128-bit token to a run's upstream URL and header snapshot; `revoke()` ends it: requests still uploading are closed, in-flight upstream requests are destroyed, and no upstream request is sent with its headers afterwards. Only `POST` and `DELETE` on the exact `/mcp/<token>` path are forwarded; see the flow below for header allowlists and refusal answers.
+A `node:http` listener on 127.0.0.1 (ephemeral port, never an Express route). `register()` binds a 128-bit token to a run's binding (upstream or bridge, merged credential headers or env, the run's grant); `revoke()` ends it: requests still uploading are closed, in-flight upstream requests are destroyed, and no upstream request is sent with its headers afterwards. Only `POST` and `DELETE` on the exact `/mcp/<token>` path are forwarded; see the flow below for header allowlists and refusal answers.
 
 ### sdk-run-logs.ts -- Per-Run Runtime Logs
 Creates the per-run directory (0700, prefix `agent-gateway-run-` under the OS temp directory) and the SDK child environment additions `CLAUDE_CODE_DEBUG_LOGS_DIR=<dir>/debug/run.txt` and `XDG_CACHE_HOME=<dir>/cache`. A `spawnClaudeCodeProcess` hook spawns the runtime like the SDK's default and reports the child; the directory is deleted once the child has exited (after 10 s it is killed first). Also sweeps leftovers at startup (every `agent-gateway-run-*` directory in the OS temp directory, so one gateway per temp directory is assumed, as in the Docker image) and strips `DEBUG_CLAUDE_AGENT_SDK`.
@@ -103,7 +115,8 @@ Maps client-provided session IDs to internal Claude SDK session IDs. Sessions ar
 - **Persisted** to disk (debounced, atomic; see `persistence.ts`) at `SESSION_PERSIST_PATH`
 - **Restored** from disk on startup (expired sessions filtered out)
 - **Cleaned** every 5 minutes if `SESSION_IDLE_TIMEOUT_MS > 0`
-- **Owned** (MVP-7678): a new entry records its `owner` (`{label, userId|null}`) and a random `sandboxDirId` (the conversation's sandbox home). `admitSession()` runs before anything else and changes nothing: no entry means new, the exact owner resumes, another owner is refused, and an entry without a recorded owner and home (created before the update) is refused for everyone and counted in one audit line. `listSessions(label)` and `deleteSession(id, label)` are scoped to the caller's label (ownerless entries stay visible to all).
+- **Keyed by label** (MVP-7679): conversations live in `sessionsByLabel[<label>][<client id>]` (additive map of `sessions.json`); public routes keep raw ids. Another label using the same id gets its own new conversation, with no refusal and nothing learned; ownerless legacy entries stay under their raw id and are refused for every label. A previous gateway version ignores and drops the map, so conversations started or moved under this version start fresh after a rollback.
+- **Owned** (MVP-7678): a new entry records its `owner` (`{label, userId|null}`) and a random `sandboxDirId` (the conversation's sandbox home). `admitSession()` runs before anything else and changes nothing: no entry means new, the exact owner resumes, another owner is refused, and an entry without a recorded owner and home (created before the update) is refused for everyone and counted in one audit line. `listSessions(label)` and `deleteSession(id, label)` are scoped to the caller's label (`deleteSession` removes the caller's own entry first, then a legacy entry).
 - **Validated at load**: a present `owner` or `sandboxDirId` of the wrong shape sets the whole file aside like other unexpected content (`persistence.ts`).
 
 Session continuity uses two SDK options:
@@ -118,7 +131,7 @@ Wraps `runQuery` with up to 3 retries. Retries on:
 Permanent failures (`runtime_version_unsupported`, `authentication`, `unknown`) are thrown at once. Uses exponential backoff (1s, 2s, 4s) with a 60-second total budget. Emits `rate_limited` events so clients can show retry status. Respects `AbortController` for cancellation. A retry resumes only an established session (the request resumed one, or an earlier attempt of a request with a session ID ended with a result that is not `is_error` and has a `session_id`); otherwise it starts fresh with a new SDK session ID. Retry log lines carry the query ID, `kind` and attempt, never an error message.
 
 ### event-cache.ts -- Event Cache
-Stores NDJSON events in memory keyed by `queryId`. Used by `GET /v1/query/:queryId/events` for replay and real-time streaming. Entries are marked "done" when the query completes. A background timer (every 60s) garbage-collects entries older than `EVENT_CACHE_TTL_MS` (default 30 minutes).
+Stores NDJSON events in memory keyed by (API-key label, `queryId`), so a label can replay only its own queries. Used by `GET /v1/query/:queryId/events` for replay and real-time streaming. Entries are marked "done" when the query completes. A background timer (every 60s) garbage-collects entries older than `EVENT_CACHE_TTL_MS` (default 30 minutes).
 
 ### workspace.ts -- File Operations
 Provides safe file CRUD for three workspace sections: `memory`, `agents`, `skills`. All paths are resolved relative to `WORKSPACE_ROOT` (default `$HOME/.claude`). Includes path traversal protection via `safePath()` which validates against directory escape, absolute paths, null bytes, and symlink attacks.
@@ -153,13 +166,13 @@ All paths are resolved through `resolveProjectPath()` which rejects absolute pat
 - **Limits**: git removes its `index.lock` on SIGTERM but not after the SIGKILL fallback; the next operation on that checkout then fails with git's lock error, and the lock is not removed automatically (agents may run git in the same checkout). Descendants killed after a timeout are re-parented to the gateway process, which does not reap them, until the container gets an init process.
 
 ### tools.ts -- Tool Registry
-Manages CRUD operations for webhook-backed tool definitions. Tools are stored in-memory in a `Map<name, ToolDefinition>` and persisted to disk (debounced) at `TOOLS_PERSIST_PATH` (default `./data/tools.json`, Docker override: `/home/node/.claude/tools.json`). Each tool definition includes: `name`, `description`, `input_schema` (JSON Schema), `webhook_url`, and optional `timeout_ms` (default 30s). Tools are loaded from disk on startup via `loadTools()`.
+Manages CRUD operations for webhook-backed tool definitions. Tools are stored in-memory in a `Map<name, ToolDefinition>` and persisted to disk (debounced) at `TOOLS_PERSIST_PATH` (default `./data/tools.json`, Docker override: `/home/node/.claude/tools.json`). Each tool definition includes: `name`, `description`, `input_schema` (JSON Schema), `webhook_url`, optional `timeout_ms` (default 30s) and `owner` (the registering API-key label; legacy entries have none). Tools are loaded from disk on startup via `loadTools()`, which logs `tools.legacy.ownerless count=<n>` when entries have no owner.
 
 ### webhook.ts -- Webhook Executor
-Executes tool calls by POSTing to the tool's `webhook_url`. The request body contains `tool_use_id`, `tool_name`, `input`, and `context` (user_id, conversation_id, session_id, api_key_label). The client's Bearer token is forwarded in the `Authorization` header. Supports configurable timeouts per tool. Returns either `WebhookResponse` (with output + optional metadata) or `WebhookError` on failure (timeout, HTTP error, network error).
+Executes tool calls by POSTing to the tool's `webhook_url`. The request body contains `tool_use_id`, `tool_name`, `input`, and `context` (user_id, conversation_id, session_id, api_key_label). The calling client's Bearer token is forwarded in the `Authorization` header only to tools its label owns (a legacy ownerless tool keeps today's forwarding, with one `tool.webhook.legacy_forward` audit line per call). `X-Webhook-Context` comes only from the authenticated request. Never follows a redirect; answers over 8 MiB are refused. Supports configurable timeouts per tool. Failures map to the fixed `TOOL_*` texts of `tool-mediation.ts`; a 4xx that is the tool's own refusal reaches the model as `The tool rejected the request (HTTP <status>): <message>`.
 
 ### tool-server.ts -- MCP Server Factory (webhook tools)
-Creates an in-process MCP server wrapping all registered webhook tools for injection into the Claude Agent SDK. Called once per query so the webhook context (session, user, auth) is correctly scoped. Each tool's registered `input_schema` is converted by `tool-input-schema.ts`: the model sees the declared field types, required fields and descriptions, and the SDK validates every call against them before the handler runs. Webhooks keep their own validation. Uses `createSdkMcpServer()` from the Agent SDK.
+Creates an in-process MCP server wrapping the registered webhook tools the run is offered (its own label's plus legacy ownerless ones, and only granted ones) for injection into the Claude Agent SDK. Called once per query so the webhook context (session, user, auth) is correctly scoped. Each tool's registered `input_schema` is converted by `tool-input-schema.ts`: the model sees the declared field types, required fields and descriptions, and the SDK validates every call against them before the handler runs. Webhooks keep their own validation. Uses `createSdkMcpServer()` from the Agent SDK.
 
 ### tool-input-schema.ts -- Webhook Tool Input Schemas
 Converts a webhook tool's `input_schema` (JSON Schema) into the Zod shape the SDK MCP server uses for `tools/list` (what the model is told) and for `tools/call` argument validation. Closed allowlist:
@@ -181,10 +194,10 @@ The SDK builds `tools/list` with its own bundled zod, so each property carries i
 
 ### routes/tools.ts -- Tool Registry Endpoints
 REST endpoints for webhook tool management:
-- **PUT /v1/tools/:name**: Register or update a tool (validates description, input_schema, webhook_url)
-- **GET /v1/tools**: List all registered tools
-- **GET /v1/tools/:name**: Get a single tool definition
-- **DELETE /v1/tools/:name**: Remove a tool
+- **PUT /v1/tools/:name**: Register or update a tool (validates description, input_schema, webhook_url); records the authenticated label as `owner` (an `owner` in the body is ignored); another label's owned tool answers 403 `TOOL_OWNED_BY_OTHER_CLIENT`; the first label that registers a legacy ownerless tool again claims it
+- **GET /v1/tools**: List all registered tools (with `owner`)
+- **GET /v1/tools/:name**: Get a single tool definition (with `owner`)
+- **DELETE /v1/tools/:name**: Remove a tool (403 for another label's owned tool)
 
 ### routes/workspace.ts -- Workspace CRUD
 Generates GET/PUT/DELETE routes for each workspace section (`memory`, `agents`, `skills`). GET on the section root lists all files. GET/PUT/DELETE on sub-paths reads/writes/deletes individual files.
@@ -192,20 +205,23 @@ Generates GET/PUT/DELETE routes for each workspace section (`memory`, `agents`, 
 ### mcp-registry.ts -- External MCP Server Registry
 Registry for *external* MCP servers — distinct from the webhook Tool Registry. Each entry describes an existing MCP server (`type`: `http`, `sse`, or `stdio`) plus optional per-server credential schema. Definitions are kept in a `Map<name, McpServerDefinition>` and persisted to `MCP_SERVERS_PERSIST_PATH` (default `./data/mcp-servers.json`, Docker override `/home/node/.claude/mcp-servers.json`).
 
-`buildMcpServersForSdk()` produces the `mcpServers` map handed to the Agent SDK on every query: HTTP/SSE servers contribute `{type, url, headers}`; stdio servers contribute `{type, command, args, env}`. Disabled servers (`enabled: false`) are skipped. Per-server `allowedToolsPattern` globs (e.g. `mcp__jira__*`) are aggregated into the SDK's `allowedTools` list. Under `bypassPermissions` that list only pre-approves tools: it removes none, and an unlisted tool of an attached server still runs. It is not a filter; the only per-run restriction is `enforcedTools` (see **Enforced tool set** below).
+`buildMcpServersForSdk()` produces the `mcpServers` map handed to the Agent SDK on every query. Disabled servers (`enabled: false`) are skipped. Every enabled registered server then reaches the runtime only as `{type: "http", url: <relay URL>}` (see [Credential Relay Flow](#credential-relay-flow)); its credentials stay in the relay binding. Per-server `allowedToolsPattern` globs (e.g. `mcp__jira__*`) are aggregated into the SDK's `allowedTools` list, which only pre-approves tools: the pattern is not part of the grant and has no authorization effect (the grant is described in [Tool Trust Boundary](#tool-trust-boundary-mvp-7679)).
 
-`requireUserCredentials` (optional boolean, not allowed with `sse`) marks a server that needs the requesting user's own credential. `selectRegistryServersForRun()` in `mcp-overrides.ts` leaves such a server out of a run whose `mcpCredentialOverrides` entry has no non-empty value for the transport's target (or misses a `userCredentialSchema` output key: `headers` keys are matched case-insensitively and every match must be non-empty, `env` keys exactly); `agent.ts` then drops its SDK entry, its allowed-tool pattern and any request-supplied server of the same name, and logs `mcp.server.omitted serverName=<name> reason=missing_user_credential`.
+`requireUserCredentials` (optional boolean, not allowed with `sse`) marks a server that needs the requesting user's own credential. `selectRegistryServersForRun()` in `mcp-overrides.ts` leaves such a server out of a run whose `mcpCredentialOverrides` entry has no non-empty value for the transport's target (or misses a `userCredentialSchema` output key: `headers` keys are matched case-insensitively and every match must be non-empty, `env` keys exactly); `agent.ts` then drops its SDK entry and its allowed-tool pattern, and logs `mcp.server.omitted serverName=<name> reason=missing_user_credential`.
 
 `userCredentialSchema` lets the registry advertise the form a user has to fill in to derive credentials at query time. `fields[]` declares form input definitions (`text`, `password`, `url`, `email`); `outputs[]` declares how those values compose into either `headers` (http/sse) or `env` (stdio) targets via plain substitution (`"{key}"`) or HTTP Basic encoding (`"basic:{email}:{apiToken}"`). Transport-target mismatches are rejected with `SCHEMA_TARGET_MISMATCH` at registration time.
 
 ### mcp-overrides.ts -- Per-Request Credential Overrides
 Validates the `mcpCredentialOverrides` body field on `POST /v1/query` against the current registry. Each override entry references a registered server by name; unknown names return `MCP_SERVER_NOT_FOUND`, disabled names return `MCP_SERVER_DISABLED`. HTTP/SSE servers may only carry `headers`; stdio servers may only carry `env`. Validated overrides are shallow-merged over the static registry config when the SDK invocation is built. Overrides are request-scoped only — they never write back to disk. `credentialMapsError()` is the shared check for `headers`/`env` maps (string maps, headers Node can send, no NUL in env), used by the overrides, the registry `PUT`, `/test` and `/call`.
 
+### mcp-request-servers.ts -- Request MCP Servers
+Validates and normalizes the request `mcpServers` map on the trusted side: name `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`; reserved name `agent-gateway-tools`; a server has either `command` (stdio, no `type`) or `url` (`type` only `http` or `sse`, default `http`); `headers`/`env` are string maps with sendable values; unknown fields are dropped; a name equal to any registered server (enabled, disabled or left out of the run) is HTTP 400 `MCP_SERVER_NAME_CONFLICT`. Routing in `agent.ts`: http/SSE servers with headers (or a URL with a user name, password or query) go through the relay, stdio servers with `env` run in their own tool sandbox, servers without headers/env connect directly or run inside the agent sandbox. A request `command` server is attached only when the trusted policy lets the label run `Bash` or names the server in its `allow` list (`mcp.server.omitted ... reason=command_not_granted`).
+
 ### credential-composer.ts -- Credential Template Substitution
 Lightweight template engine used both by the MCP registry's `userCredentialSchema.outputs[]` validation and by future per-user credential composition. Supports plain field substitution (`"{fieldKey}"`, `"prefix-{a}-{b}"`) and HTTP Basic auth shorthand (`"basic:{email}:{apiToken}"`, emitted as `Basic <base64(email:apiToken)>`). `getCredentialTemplateFieldKeys(template)` returns the set of `{...}` placeholders so the registry can reject templates that reference fields not declared in the same schema.
 
 ### mcp-test-client.ts -- MCP Credential Test Client
-Implements `POST /v1/mcp-servers/:name/test` — given a registered server name and an override payload (`headers` for http/sse, `env` for stdio), the gateway connects to the upstream MCP server, calls `tools/list`, and returns `{ ok: true, toolCount, tools[] }`. The client accepts both plain `application/json` and streamable `text/event-stream` MCP responses (MVP-3689) so providers that emit one-shot SSE responses for HTTP requests are supported. Auth failures (401/403) surface as `MCP_AUTH_FAILED`, transport problems as `MCP_NETWORK_ERROR`, and the per-test deadline as `MCP_TIMEOUT` (configurable via `MCP_TEST_TIMEOUT_MS`, default 10s).
+Implements `POST /v1/mcp-servers/:name/test` — given a registered server name and an override payload (`headers` for http/sse, `env` for stdio), the gateway connects to the upstream MCP server, calls `tools/list`, and returns `{ ok: true, toolCount, tools[] }`. The client accepts both plain `application/json` and streamable `text/event-stream` MCP responses (MVP-3689) so providers that emit one-shot SSE responses for HTTP requests are supported. It never follows a redirect (a 3xx is `MCP_NETWORK_ERROR`, the credential never goes to the target) and uses the same case-insensitive header merge as the relay. Auth failures (401/403) surface as `MCP_AUTH_FAILED`, transport problems as `MCP_NETWORK_ERROR`, and the per-test deadline as `MCP_TIMEOUT` (configurable via `MCP_TEST_TIMEOUT_MS`, default 10s).
 
 ### mcp-upload-relay.ts -- Streaming Upload Relay
 The raw-path rule shared by the body-parser skip, the pre-auth guard (`Connection: close`, bounded drain) and target extraction; strict `X-MCP-Credential-Headers` parsing (only `Authorization` is used); the upstream request builder (origin of the registered url + `/uploads/` + raw target + raw query, filtered static headers); and `UploadRelay`, which forwards chunks with backpressure, owns the idle timer and writes one audit line. See [Upload Relay Flow](#upload-relay-flow).
@@ -220,6 +236,7 @@ REST endpoints for the external MCP server registry:
 - **GET /v1/mcp-servers/:name**: Get a single server definition
 - **DELETE /v1/mcp-servers/:name**: Remove a server
 - **POST /v1/mcp-servers/:name/test**: Probe `tools/list` with optional override credentials, returning the discovered tool list or a typed error
+- **POST /v1/mcp-servers/:name/call**: Direct `tools/call` without an LLM; answers 401 `MCP_AUTH_FAILED` before any upstream request for a `requireUserCredentials` server without a user credential; never follows a redirect
 - **POST /v1/mcp-servers/:name/restart**: Bumps the server's `updatedAt` so the SDK reconnects (http/sse) or respawns (stdio) on the next query
 - **GET /v1/mcp-servers/:name/health**: Cheap connectivity probe (no `tools/list`) — returns `{ ok, latencyMs, error? }`
 - **POST /v1/mcp-servers/:name/uploads/\***: Streaming upload relay to `<origin>/uploads/*` of an http/sse server (see [Upload Relay Flow](#upload-relay-flow))
@@ -230,18 +247,18 @@ REST endpoints for the external MCP server registry:
 2. Auth middleware validates Bearer token
 3. `validateMcpCredentialOverrides()` confirms every overridden server is registered + enabled and that the override targets match transport (`headers` for http/sse, `env` for stdio)
 4. Event cache entry created for `queryId`
-5. Conversation admission (`query.ts`): another owner, a legacy entry or a busy conversation ends the request here with one fixed `error` event and no run. Then the session is resolved: existing session reused (with `resume`) or new one created (with `sessionId`, an owner and a sandbox home name), and the conversation lock is held until the request ends
-6. Registered webhook tools are wrapped as in-process MCP servers via `createToolMcpServer()`. External MCP servers are pulled from `mcp-registry.ts`, merged with per-request overrides, and added to the same `mcpServers` map handed to the SDK
+5. Conversation admission (`query.ts`), keyed by (label, `sessionId`): another `user_id`, a legacy entry or a busy conversation ends the request here with one fixed `error` event and no run. Then the session is resolved: existing session of the label reused (with `resume`) or new one created (with `sessionId`, an owner and a sandbox home name), and the conversation lock is held until the request ends. The tool grant is computed from the caller's label and the request's `enforcedTools`/`allowedTools` (a bad `allowedTools` is HTTP 400 before streaming)
+6. Registered webhook tools the run is offered (own label plus legacy ownerless, granted only) are wrapped as in-process MCP servers via `createToolMcpServer()`. External MCP servers are pulled from `mcp-registry.ts`, merged with per-request overrides, bound in the relay (token, upstream or bridge, merged credentials, grant) and added to the `mcpServers` map handed to the SDK as relay URLs; a server with no granted tool is not attached
 7. `runQueryWithRetry` starts the run deadline (`AGENT_RUN_TIMEOUT_MS`) and calls `runQuery` (agent.ts), which starts the runtime in the sandbox (see Agent Isolation)
 8. Agent SDK streams messages; `agent.ts` translates to events:
    - `text` -- assistant text chunks
    - `tool_use` -- tool invocation (name, input summary)
-   - `tool_result` -- tool output (truncated to 3000 chars)
+   - `tool_result` -- tool output (truncated to 3000 chars); `success: false` when the result is an error
    - `rate_limited` -- rate limit detected, retrying
    - `sdk_status` -- SDK status changes (compacting)
    - `sdk_compact_complete` -- context compaction completed
-9. For registered webhook tools, the in-process MCP server handler POSTs to the webhook URL and returns the result. For registered http MCP servers, the SDK speaks MCP to the credential relay, which forwards to the upstream with the run's headers; stdio, sse and request-supplied servers use their transport directly
-10. Events are written to response stream (NDJSON) and cached
+9. For registered webhook tools, the in-process MCP server handler POSTs to the webhook URL and returns the result. For registered MCP servers (http, SSE, stdio), the SDK speaks MCP to the credential relay, which checks the grant and forwards to the upstream (http), the SSE bridge or the stdio tool sandbox with the run's credentials; request servers with headers or env take the same path, other request servers connect directly or run inside the agent sandbox
+10. Events are written to response stream (NDJSON) and cached under (label, `queryId`)
 11. On completion, `done` event emitted with token usage, cost, context stats; SDK session ID synced via `updateSessionSdkId()`
 12. On failure, exactly one `error` event `{seq, type, content}` emitted by one helper in `query.ts`: `content` is the `RunFailure` message (the SDK's text for a client abort); no `done` and no `updateSessionSdkId()`. The log line is `Error queryId=<id> kind=<kind> apiStatus=<n|none> providerType=<type|other|none> installed=<v|none> required=<v|none>`
 13. Event cache entry marked "done"; per-request overrides are dropped (never persisted)
@@ -286,9 +303,9 @@ Sessions persist across server restarts via `SESSION_PERSIST_PATH`. The cleanup 
 +---------------------------------------------------------------+   +------------------------------------------+
 | API keys, provider key, OAuth tokens, state files, SSH keys   |   | bubblewrap sandbox: user, PID, IPC, UTS, |
 | model proxy  127.0.0.1:<p>  (run token -> provider call)  <---+---+-- cgroup namespaces; shared network        |
-| credential relay 127.0.0.1:<q> (registered http MCP servers)<-+---+-- Claude runtime, Bash, interpreters,        |
-| session lock, owner check, content validation and scan        |   |   Read/Write/Edit/Glob/Grep, stdio MCP   |
-+---------------------------------------------------------------+   |   servers, sub-agents                    |
+| credential relay 127.0.0.1:<q> (registered MCP servers)   <---+---+-- Claude runtime, Bash, interpreters,        |
+| session lock, owner check, content validation and scan        |   |   Read/Write/Edit/Glob/Grep, MCP servers |
++---------------------------------------------------------------+   |   without credentials, sub-agents        |
         |  starts bwrap --args 3 (options on a pipe), env allowlist  |                                          |
         +----------------------------------------------------------->|  sees: read-only system + runtime +      |
                                                                      |  global dirs + repositories (masked git  |
@@ -296,17 +313,57 @@ Sessions persist across server restarts via `SESSION_PERSIST_PATH`. The cleanup 
                                                                      +------------------------------------------+
 ```
 
-**Trust boundary.** The gateway never gives the runtime a secret: the environment is an allowlist built from nothing, the provider credential stays behind the model proxy (the runtime holds a random run token, valid for this run only), registered MCP servers stay behind the relay, and trusted files are never mounted. Everything an agent can run is the runtime process or its child, so it is inside the sandbox; there is no command filtering to bypass.
+**Trust boundary.** The gateway never gives the runtime a secret: the environment is an allowlist built from nothing, the provider credential stays behind the model proxy (the runtime holds a random run token, valid for this run only), registered MCP servers stay behind the relay (credential-bearing stdio servers in their own tool sandbox), and trusted files are never mounted. The agent can write its own home and its work area, so nothing the runtime or its children read at start comes from them: the home is rebuilt from nothing before every sandbox start (only the runtime's transcripts, todos, plans and the memory mount point carry over), runs read only the user setting source (`settingSources: ["user"]`; enforced runs none) so project settings in `/work` are inert, any `/work/.git` is removed before the runtime's `git status`, and the extension directories are mounted read-only (empty when the workspace has none). Everything an agent can run is the runtime process or its child, so it is inside the sandbox; there is no command filtering to bypass.
 
-**Data flow of a run.** caller query -> owner check -> conversation lock -> sandbox home and content validation (no-follow checks, git config masks, known-value scan) -> `bwrap` start and check (`unshare -U` must fail inside) -> runtime inside the sandbox -> provider calls to the model proxy with the run token -> tool calls (shell and files inside the sandbox; http MCP through the relay; webhook tools in-process through the SDK control channel) -> events and the transcript in the conversation's home -> `done` -> token revoked, process exited, lock released, run directory removed.
+**Data flow of a run.** caller query -> owner check -> conversation lock -> sandbox home and content validation (no-follow checks, git config masks, known-value scan) -> `bwrap` start and check (`unshare -U` must fail inside) -> runtime inside the sandbox -> provider calls to the model proxy with the run token -> tool calls (shell and files inside the sandbox; MCP servers through the relay after the grant check; webhook tools in-process through the SDK control channel) -> events and the transcript in the conversation's home -> `done` -> token revoked, process exited, lock released, run directory removed.
 
 **Failure flows.** Cancel (client close) or gateway stop or kill ends every sandbox process (`--die-with-parent`, and the PID namespace ends every child). A restart resumes an admitted conversation from its home. A start fault is refused with the permanent or the transient isolation text, never retried, and nothing runs unsandboxed. The run deadline aborts the run, discards its answer and saves nothing to the conversation.
 
-**Conversation lifecycle.** `POST /v1/query` with a `sessionId`: new conversation -> owner and `sandboxDirId` recorded, home `<AGENT_SANDBOX_ROOT>/sessions/<sandboxDirId>/home` created on first use; later requests by the same owner reuse that home and the runtime's own transcript in it; a request by another owner or for a pre-update conversation is refused before anything is touched. Deleting a conversation removes its entry only (the home stays until MVP-7402 defines retention).
+**Conversation lifecycle.** `POST /v1/query` with a `sessionId`: new conversation under the caller's label -> owner and `sandboxDirId` recorded, home `<AGENT_SANDBOX_ROOT>/sessions/<sandboxDirId>/home` and work area `.../work` created on first use; later requests by the same owner reuse the work area and the runtime's own transcript (the home root is rebuilt at each start); a request by another `user_id` of the label or for a pre-update conversation is refused before anything is touched (another label with the same id gets its own new conversation). Deleting a conversation removes its entry only (home and work area stay until MVP-7402 defines retention). The global `memory` directory is the workspace's `memory/`, written only through `PUT /v1/memory/*` and mounted read-only into every sandbox, so no conversation can write it; the per-run directory under `runs/` is removed when the request ends.
 
 **Container profile.** One container, running as `node`: `cap_drop: ALL`, `no-new-privileges`, `pids_limit`, a committed seccomp profile, `systempaths=unconfined` (needed for the sandbox's fresh `/proc`) and an AppArmor profile (committed, loaded by the operator) or none. Host prerequisite: unprivileged user namespaces allowed. The Docker socket is never mounted and no port is added.
 
-**Known residuals (MVP-7679).** Content an agent planted in a mounted tree before the update is not fully neutralized (files over 1 MiB, `~/.ssh` key contents and `tools.json` webhook values are not in the scan; trusted `git` and `/v1/auth/login` read configuration planted in `/home/node`); an id refusal reveals that the id exists and the first caller to use an unknown id claims it; conversation homes are never removed (MVP-7402), have no size cap, and `pids_limit` is shared. MCP configuration values of non-relayed servers are readable inside the owning run's sandbox (the SDK passes the whole configuration on the runtime's command line); the network is shared (loopback listeners need a run token, egress is not restricted); `GET /v1/query/:id/events` and the OAuth login routes are caller-level, not agent-level, surfaces.
+**Known residuals.** The sandbox shares the network namespace (agent code can reach network peers, credential-free MCP servers and the gateway's public port, where it gets 401 without a key); there is no agent-side ssh mediation (no caller uses it); the MCP server registry has no owner (any label can change a registered server's URL, after which per-user override credentials go to that URL; reachable by callers, not by agent code); `/v1/auth/login` hardening and content planted before the deploy (files over 1 MiB, `~/.ssh` key contents and `tools.json` webhook values are not in the scan; trusted `git` and the login read configuration planted in `/home/node`) are tracked separately (MVP-7919); legacy ownerless webhook tools keep today's forwarding until registered again; the per-tool grant of a credential-free request server is not enforced on the trusted side; global agents, skills and commands are trusted content whose frontmatter hooks and agent `mcpServers` execute commands: an agent cannot write them, but any API-key holder can through `PUT /v1/agents` and `PUT /v1/skills` (reachable by callers, not by agent code);  conversation homes and work areas are never removed (MVP-7402), have no size cap, and `pids_limit` is shared; a file the agent writes in its home is rebuilt away only at the next start, so a process of the same run can still read it (no trusted step does); an ownerless pre-update id stays visible.
+
+## Tool Trust Boundary (MVP-7679)
+
+Every tool call that needs a credential leaves the agent sandbox through a trusted channel bound to the run; the identity and the credential come from the trusted side, never from a field the agent sends.
+
+**Grant layers.** (1) `AGENT_TOOL_POLICY` for the caller's API-key label (`tool-grant.ts`); (2) the caller's narrowing, `enforcedTools` (exact set) or `allowedTools` (names and `mcp__<server>__*`), which can only make the grant smaller; (3) built-in tools are enforced by what the runtime is offered (`tools`, `disallowedTools`), so a built-in outside the grant is refused by the runtime itself (`<tool_use_error>Error: No such tool available: <name></tool_use_error>`) for the main agent, a configured agent, a skill, a sub-agent and a resumed conversation, even under the permission-bypass mode; (4) a tool that is offered but not granted (a tool of an attached MCP server) is refused at call time on the trusted side with the `TOOL_DENIED` text, before any upstream request; (5) a server with no granted tool is not attached. `allowedToolsPattern` of a registry server is not part of the grant. When `enforcedTools` names a tool the policy denies, the request is accepted, the `tool_policy` acknowledgment echoes the requested set, `tool.policy.narrowed queryId=<id> denied=<names>` is audited, and the tool is refused at call time.
+
+**Binding kinds.** One relay token per run and server; the runtime sees only `http://127.0.0.1:<port>/mcp/<token>`.
+
+| Binding | Upstream | Token and grant | Deadline | Revoke |
+|---------|----------|-----------------|----------|--------|
+| http (registered; request with `headers`) | Registered URL with the merged headers | Token per run and server; the relay checks the grant and the method rules before any upstream request | 120 s no progress, `AGENT_MCP_TOOL_TIMEOUT_MS` (default 600 s) per `tools/call` | Run end or cancel |
+| sse (registered; request with `headers`) | `mcp-bridge.ts`: SSE stream opened with the run's headers, `endpoint` event only on the registered origin | Same | Same | Run end or cancel; stream closed |
+| stdio (registered; overrides; request with `env`) | `mcp-stdio-sandbox.ts`: own tool sandbox, one JSON message per line | Same | Same | Run end, cancel or gateway stop (`--die-with-parent`) |
+| webhook tools | In-process server `agent-gateway-tools`, `webhook.ts` | Closure of the run; grant and owner checked before the request | Per-tool `timeout_ms` (default 30 s) | Run end |
+
+**Tool sandbox.** A stdio server never runs next to the agent. It runs in its own bubblewrap sandbox (own user, PID, IPC, UTS and cgroup namespaces, a private empty home and `/tmp`, read-only system directories only, no gateway content), with the environment `HOME`, `USER`, `PATH`, `LANG`, `LC_*`, `TERM`, `TMPDIR` plus the server's own env after overrides (never the model proxy token or URL or the run-log path). It starts with the run's first message within `ISOLATION_STARTUP_TIMEOUT_MS`, restarts once if it dies before answering `initialize`, is killed on revoke, cancel or gateway stop, and its stderr is discarded. It sees only `/usr` and the system directories, so its command must live there.
+
+**Data flow.**
+
+```
+POST /v1/query (label from the API key)
+    |  grant = policy(label) ∩ caller narrowing
+    v
+runQuery: offered built-ins (tools/disallowedTools), attached servers (only those with a granted tool),
+          relay bindings (token, upstream or bridge, merged credentials, grant), webhook tools of the label
+    v
+runtime (sandbox) --- tools/call mcp__<server>__<tool> ---> relay 127.0.0.1:<q>/mcp/<token>
+    |   refused locally, zero upstream requests: not strict UTF-8 JSON, batch, no `method`,
+    |   method or tool name outside the grant (TOOL_DENIED)
+    v
+upstream: http | SSE bridge | stdio tool sandbox   (credentials added here, never in the runtime)
+    |   deadline AGENT_MCP_TOOL_TIMEOUT_MS; answer buffered (25 MiB) and validated
+    v
+one JSON message to the runtime, or a fixed TOOL_* text
+    v
+tool_result event (success:false on an error) -> NDJSON stream and event cache (label, queryId)
+```
+
+**Failure texts.** `tool-mediation.ts` owns the contract: `ToolRequest { runId, callId, toolId, input }` and `ToolReply` (ok with output, or an error with one of `TOOL_DENIED`, `TOOL_AUTH_UNAVAILABLE`, `TOOL_UNAVAILABLE`, `TOOL_TIMEOUT`, `TOOL_RESPONSE_INVALID` and its fixed text). A webhook, relay or bridge failure always maps to a fixed text, never an upstream body. A tool's own answer is not a mediation failure (an MCP `isError` result passes through; a webhook 4xx other than 401/403/408/429 reaches the model as `The tool rejected the request (HTTP <status>): <message>`).
 
 ## Tool Surfaces: Webhook Registry vs MCP Server Registry
 
@@ -317,10 +374,11 @@ Two distinct extension points feed tools into every Claude query. Both are merge
 | **Primary use case**  | Expose a custom HTTP integration as a single tool             | Embed an existing MCP server (Jira, Confluence, custom)              |
 | **Transport**         | HTTP `POST` to `webhook_url`                                  | MCP protocol — `http`, `sse`, or `stdio`                             |
 | **Tool schema**       | Provided by the registrar (`input_schema` JSON Schema)        | Discovered by the agent on connect (`tools/list`)                    |
-| **Auth**              | Client's Bearer token forwarded; webhook context body         | Per-server `headers` (http/sse) or `env` (stdio); per-request override possible |
-| **Allowlist**         | All registered tools always exposed                           | `allowedToolsPattern` glob per server, aggregated into SDK filter    |
+| **Auth**              | The owning client's Bearer token forwarded; webhook context body | Per-server `headers` (http/sse) or `env` (stdio), held in the relay binding; per-request override possible |
+| **Allowlist**         | A run is offered its own label's tools plus legacy ownerless ones, subject to the grant | Subject to the grant; `allowedToolsPattern` only pre-approves (no authorization effect) |
+| **Owner**             | `owner` = registering label                                   | None (any label can change a registration)                            |
 | **Per-user creds**    | Caller provides via headers / context                         | `userCredentialSchema` + `mcpCredentialOverrides` request field      |
-| **State**             | In-process per query (factory)                                | Connected/spawned per query; `restart` forces fresh handshake        |
+| **State**             | In-process per query (factory)                                | Relay binding per run; `restart` forces fresh handshake              |
 
 ## Webhook Tool Execution Flow
 
@@ -342,7 +400,7 @@ executeWebhook() POSTs to webhook_url:
   tool_use_id, tool_name, input,
   context: { user_id, conversation_id, session_id, api_key_label }
 }
-+ Authorization: Bearer <client-token>
++ Authorization: Bearer <client-token>   (only for tools the calling label owns)
     |
     v
 External service processes request
@@ -357,7 +415,7 @@ MCP server returns result to Agent SDK
 Agent continues with tool result
 ```
 
-Timeouts are configurable per tool (default 30s). On failure (timeout, HTTP error, network error), an error result is returned to the agent, which can decide to retry or use an alternative approach.
+Timeouts are configurable per tool (default 30s). The call never follows a redirect and answers over 8 MiB are refused. On failure (timeout, 5xx, network error, auth refusal, redirect, invalid answer), an error result with one of the fixed `TOOL_*` texts is returned to the agent, which can decide to retry or use an alternative approach; a 4xx that is the tool's own refusal reaches the model as `The tool rejected the request (HTTP <status>): <message>`.
 
 ## External MCP Server Flow (with overrides)
 
@@ -375,13 +433,13 @@ buildMcpServersForSdk() merges static registry config with overrides:
   - stdio:   shallow-merge `env`     (override wins per key)
     |
     v
-Agent SDK opens MCP transport per server:
-  - http:    connects to the credential relay URL (no headers); the relay adds the merged headers
-  - sse:     connects directly, uses merged headers
-  - stdio:   spawns command with merged env, talks MCP over stdin/stdout
+Agent SDK opens one MCP transport per server, always to the credential relay URL (no headers, args or env):
+  - http:    the relay adds the merged headers (one case-insensitive merge, the per-user value replaces the shared one)
+  - sse:     the relay's SSE bridge opens the stream with the merged headers
+  - stdio:   the relay's bridge talks MCP over stdin/stdout to a server started with the merged env in its own tool sandbox
     |
     v
-Agent calls discovered tools (filtered through allowedToolsPattern)
+Agent calls discovered tools (the relay refuses anything outside the grant)
     |
     v
 Query completes -> overrides discarded; static registry config unchanged on disk
@@ -391,36 +449,50 @@ Query completes -> overrides discarded; static registry config unchanged on disk
 
 ## Credential Relay Flow
 
-Registered http MCP servers are reached only through the gateway's credential relay (MVP-7667). The runtime never holds their URL or credential, so an upstream refusal cannot start the runtime's MCP OAuth login and header values stay out of its command line and log files.
+Every registered MCP server (http, SSE and stdio) is reached only through the gateway's credential relay (MVP-7667, extended by MVP-7679). The runtime never holds their URL, `args`, `env` or credential, so an upstream refusal cannot start the runtime's MCP OAuth login and no credential reaches its command line or log files.
 
 ```
 runQuery (agent.ts)
-    | credentialRelay.register({ serverName, url, headers: static + override }) -> http://127.0.0.1:<port>/mcp/<token>
+    | credentialRelay.register({ serverName, upstream | bridge, merged headers or env, grant }) -> http://127.0.0.1:<port>/mcp/<token>
     v
 Claude runtime (SDK child)  -- POST/DELETE http://127.0.0.1:<port>/mcp/<token>, no credential
     v
 relay listener (127.0.0.1, own node:http server)
     | Host must be 127.0.0.1:<port>; only the exact /mcp/<token> path; anything else (/.well-known/*, /register,
     | /authorize, /token, sub-paths, unknown or revoked token) -> local 404, never forwarded; GET -> 405
-    | request headers upstream: Accept, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID + bound headers
-    | (a runtime Authorization or Cookie is dropped); POST bodies buffered up to 25 MiB (larger -> JSON-RPC error)
+    | body: strict UTF-8 JSON only (no BOM or other encoding), no batch, a `method` on every message, up to 25 MiB;
+    |   anything else is refused locally; only the re-serialized parsed message is forwarded (content-type: application/json)
+    | methods: initialize, ping, tools/list and notifications/initialized|cancelled|progress|roots/list_changed pass;
+    |   tools/call only with params.name exactly in the grant; resources/*, prompts/*, completion/* and anything else
+    |   only when the grant covers the whole server (mcp__<server>__*); every refusal -> TOOL_DENIED, zero upstream requests
+    | credential schema with header/env outputs and no value in the run: tools/call -> TOOL_AUTH_UNAVAILABLE ("no credential")
+    |   before any upstream request (the handshake still goes upstream)
     v
-upstream MCP server (registered url)
-    | 2xx: streamed back with backpressure; only Content-Type and Mcp-Session-Id are returned
+upstream (http: registered url | sse: bridge | stdio: tool sandbox bridge)
+    | http request headers: Accept, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID + bound headers
+    |   (a runtime Authorization or Cookie is dropped); redirects are never followed
+    | the answer is buffered and validated (JSON-RPC, JSON or event stream, at most 25 MiB) and returned as ONE JSON message;
+    |   only Content-Type and Mcp-Session-Id go back to the runtime
     | 404 on a request with Mcp-Session-Id: a bodiless 404 (session miss)
-    | 401/403 -> "refused the credential"; 3xx, other non-2xx, unreachable, idle > 120 s -> "unavailable":
-    |   tools/call -> HTTP 200 JSON-RPC result isError:true naming the server
-    |   initialize / list requests -> HTTP 200 JSON-RPC error (the server contributes no tools)
-    |   notifications -> 202; batches -> an array of these answers; DELETE -> 204; no upstream body is echoed
+    | failures map to the fixed texts: 401/403 -> TOOL_AUTH_UNAVAILABLE (user or gateway credential); 3xx, 5xx, 429, 408, connect
+    |   errors -> TOOL_UNAVAILABLE; idle > 120 s or > AGENT_MCP_TOOL_TIMEOUT_MS -> TOOL_TIMEOUT; invalid or oversized 2xx -> TOOL_RESPONSE_INVALID
+    |   tools/call -> HTTP 200 JSON-RPC result isError:true with the fixed text; initialize / list -> HTTP 200 JSON-RPC error
+    |   (the server contributes no tools); notifications -> 202; DELETE -> 204; no upstream body is echoed
     v
-run ends (answer, error, abort) -> credentialRelay.revoke(token): the URL answers 404 on every method, requests still uploading are closed, in-flight upstream requests destroyed; nothing more is sent upstream
+run ends (answer, error, abort) -> credentialRelay.revoke(token): the URL answers 404 on every method, requests still uploading are closed, in-flight upstream requests destroyed, the bridge is closed (the stdio tool sandbox is killed); nothing more is sent upstream
 ```
 
-If the relay is not listening, registered http servers are left out of the run (`mcp.server.omitted serverName=<name> reason=relay_unavailable`), and a request-supplied server may not take their name. Every handler is wrapped so that a relay error answers "unavailable" and never ends the gateway process. Audit lines carry the server name and reason only (`mcp.relay.refused serverName=<name> reason=credential_refused|unavailable|body_too_large [status=<code>]`); the URL, path and token are never logged.
+**SSE bridge** (`mcp-bridge.ts`). Opens the stream with the run's headers and accepts the `endpoint` event only on the registered origin (otherwise the redirect text; the credential is never sent elsewhere). It answers server requests locally (`ping` with `{}`, `roots/list` with no roots, others method-not-found) and drops server notifications.
+
+**Stdio bridge** (`mcp-stdio-sandbox.ts`). Every registered stdio server (with or without env), stdio overrides and request stdio servers with env run in their own tool sandbox (see [Tool Trust Boundary](#tool-trust-boundary-mvp-7679)); the bridge writes one JSON message per line to stdin and reads one per line from stdout. For stdio the gateway can observe only `TOOL_DENIED`, `TOOL_UNAVAILABLE` (failed to start or exited), `TOOL_TIMEOUT` and `TOOL_RESPONSE_INVALID`; a stdio server's own authentication failure is its tool-level `isError` result.
+
+**Header merge.** One case-insensitive merge for the relay, the SSE bridge, the direct call and the test: the per-user value replaces the shared header of the same name in any casing. There is no broader-credential fallback and no OAuth login; no redirect is followed anywhere (webhook, relay, SSE bridge, direct call, test, health).
+
+If the relay is not listening, registered servers (and request servers with headers or env) are left out of the run (`mcp.server.omitted serverName=<name> reason=relay_unavailable`), and a request-supplied server may not take a registered name (HTTP 400 `MCP_SERVER_NAME_CONFLICT`). Every handler is wrapped so that a relay error answers with a fixed text and never ends the gateway process. Audit lines carry the server name and reason only; the URL, path and token are never logged.
 
 Observed with Claude Code 2.0.77: after a session-miss 404 the runtime does not initialize a new session; it reports that tool call as failed, as it does with a direct connection.
 
-Not covered: request-supplied `mcpServers` (per-query servers such as chrome-devtools) and registered `sse` servers keep the direct path; stdio `env` values are passed to the runtime as before. While a run lasts, its relay tokens and stdio env values are in the runtime's `--mcp-config` argument; isolation between concurrent runs is owned by Epic MVP-7676.
+Not covered: request servers without `headers`/`env` (per-query servers such as chrome-devtools) connect directly or run inside the agent sandbox and are granted per server only; callers must pass credentials for request servers only through `env` or `headers`, never in `args` or `url`, because the agent can read those. The `mcp.server.credential_in_runtime_args` audit line no longer exists. The upload relay (`mcp-upload-relay.ts`) is unchanged.
 
 ## Upload Relay Flow
 
@@ -511,11 +583,12 @@ In the image `tini` is process 1 and forwards the signal, so the container exit 
 - **Path Traversal Protection**: `safePath()` (workspace) and `resolveProjectPath()` (git) prevent directory escape via `../`, absolute paths, null bytes, and symlink resolution.
 - **SSH Key Validation**: Filename restricted to `[a-zA-Z0-9_-]` to prevent injection. Inline keys for the git routes are written, only once the request holds a git slot, to a private per-request temp directory (`0700`, key file created exclusively with `0600`) and removed in `finally`; the key path is quoted inside `GIT_SSH_COMMAND`.
 - **Git Arguments and Credentials**: git runs without a shell, with `--` before clone and fetch positionals, an explicit fetch refspec, leading-dash branches rejected and the `ext::` transport disabled. Error text and git log lines carry no user-info credentials of `http(s)://` URLs, whatever characters the token contains (on each line everything from the first `scheme://` to the last `@` is hidden; query-string tokens are not redacted). `ssh://`, `git://` and `file://` transports do not use URL passwords, and ssh/git may echo such a URL's user-info without `scheme://` or `@` (e.g. `Could not resolve hostname user:<password>`), which the redaction cannot recognize, and the debug log redacts `sshKey` values and, in every string under a `url` key, everything from `scheme://` to the last `@`.
-- **Agent Isolation (MVP-7678)**: every agent run executes in a bubblewrap sandbox with an allowlisted view, an allowlisted environment and a per-run model proxy token as its only provider credential; conversations belong to one exact owner, run one request at a time, and pre-update conversations are refused. See "Agent Isolation".
-- **Tool Permissions**: without `enforcedTools` the Claude SDK runs with `bypassPermissions` -- the gateway trusts the SDK's tool execution, and every built-in tool, registered webhook tool and registered MCP server is available.
-- **MCP Tool Allowlist**: `allowedToolsPattern` per registered MCP server only adds that server's tools to the pre-approved `allowedTools` list. It does not stop the agent from calling other tools; it is no security boundary.
-- **Enforced tool set (MVP-7637)**: a caller that sends `enforcedTools` gets a run in which every tool outside the set is refused before its handler runs (`src/tool-policy.ts`). The layers: `settingSources: []` (nothing from the writable HOME — settings, hooks, permission rules, `.mcp.json`, user-scope MCP servers — applies), `permissionMode: "dontAsk"` with `allowedTools` exactly the set (the primary deny: an unlisted tool is denied, not asked for), `tools` limited to the listed built-ins, `agent-gateway-tools` and registry/request MCP servers attached only for listed tools, a `PreToolUse` hook that denies every other name (it never answers "allow", because under `dontAsk` an allow would override the mode, and any internal error denies; it is the `tool.denied` audit point), and no per-user skill bundle. The query route validates the field (400) and emits a `tool_policy` event echoing the set before any other event and before the retry loop. Measured on SDK 0.1.77 with the real runtime (`src/tests/tool-policy-process.test.ts`): the refusal holds with a HOME seeded like `entrypoint.sh`, with a hostile HOME (hooks disabled, allow rules, an allow hook, a parent `.mcp.json`, user-scope servers), with the hook throwing and with the hook never deciding. Residual risk outside this feature: an unrestricted run can still rewrite gateway state files (`tools.json`, `mcp-servers.json`), including a webhook URL an enforced run would then call (tracked separately).
-- **Credential Boundaries**: `userCredentialSchema` enforces transport-appropriate output targets (`SCHEMA_TARGET_MISMATCH`); per-request overrides are never written back to `MCP_SERVERS_PERSIST_PATH`; test-client errors are sanitized so header/env values do not leak in error messages.
+- **Agent Isolation (MVP-7678)**: every agent run executes in a bubblewrap sandbox with an allowlisted view, an allowlisted environment and a per-run model proxy token as its only provider credential; conversations are keyed by API-key label and belong to one exact owner, run one request at a time, and pre-update conversations are refused. See "Agent Isolation".
+- **Tool trust boundary (MVP-7679)**: the effective grant is `AGENT_TOOL_POLICY` for the caller's label intersected with the caller's narrowing; credential-bearing MCP servers (http, SSE, stdio) are reached only through relay bindings and never put a credential into the runtime's configuration; the grant check runs before any upstream request; failures map to fixed `TOOL_*` texts. Registered webhook tools record an owner, and the caller's key is forwarded only to its own label's tools. See "Tool Trust Boundary".
+- **Tool Permissions**: the Claude SDK runs with `bypassPermissions` (enforced runs: `dontAsk`), so the gateway never relies on permission prompts: tools are limited by what the runtime is offered and by the trusted grant. Without a policy and without `allowedTools`/`enforcedTools` the grant is everything a run gets by default.
+- **MCP Tool Allowlist**: `allowedToolsPattern` per registered MCP server only adds that server's tools to the pre-approved `allowedTools` list. It is not part of the grant and has no authorization effect.
+- **Enforced tool set (MVP-7637)**: a caller that sends `enforcedTools` gets a run in which every tool outside the set is refused before its handler runs (`src/tool-policy.ts`). The layers: `settingSources: []` (nothing from the writable HOME — settings, hooks, permission rules, `.mcp.json`, user-scope MCP servers — applies), `permissionMode: "dontAsk"` with `allowedTools` exactly the set (the primary deny: an unlisted tool is denied, not asked for), `tools` limited to the listed built-ins, `agent-gateway-tools` and registry/request MCP servers attached only for listed tools (further narrowed by the trusted policy), a `PreToolUse` hook that denies every other name with the `TOOL_DENIED` text (it never answers "allow", because under `dontAsk` an allow would override the mode, and any internal error denies; it is the `tool.denied` audit point), and no per-user skill bundle. The query route validates the field (400) and emits a `tool_policy` event echoing the set before any other event and before the retry loop. Measured on SDK 0.1.77 with the real runtime (`src/tests/tool-policy-process.test.ts`): the refusal holds with a HOME seeded like `entrypoint.sh`, with a hostile HOME (hooks disabled, allow rules, an allow hook, a parent `.mcp.json`, user-scope servers), with the hook throwing and with the hook never deciding.
+- **Credential Boundaries**: `userCredentialSchema` enforces transport-appropriate output targets (`SCHEMA_TARGET_MISMATCH`); per-request overrides are never written back to `MCP_SERVERS_PERSIST_PATH`; test-client errors are sanitized so header/env values do not leak in error messages; no registry `args`/`env`, override or request `env` value and no header reaches the runtime's command line; `/call` refuses a user-credential server without a credential before any upstream request.
 - **Token Expiry Surfacing**: `/v1/auth/status` exposes `tokenExpired` + `expiresAt` so clients can warn users before queries fail with auth errors.
 - **Docker Isolation**: Container runs as the `node` user from the start (`user: node`, no root step), SSH keys, sessions, tools, and MCP server definitions persist on a named volume.
 - **State File Protection**: temp files are created with `O_EXCL` and mode 0600 (no symlink follow, never more readable than the owner while credentials are written); `.corrupt-*` copies keep the original bytes and permissions; ERROR lines and `/health` carry only area, problem, paths, a fixed reason and the errno.

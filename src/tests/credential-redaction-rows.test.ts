@@ -128,7 +128,7 @@ describe("credential values never reach the log (every Examples row)", { timeout
     const build = (pad: string) => ({
       queryId: "q-headers",
       prompt: `p${pad}`,
-      mcpServers: { remote: { type: "http", url: "http://127.0.0.1:9/mcp", headers: { Authorization: `Bearer ${secret}` } } },
+      mcpServers: { remote: { type: "http", url: `${upstream!.origin}/remote`, headers: { Authorization: `Bearer ${secret}` } } },
     });
     const body = build(padFor(build, `Bearer ${secret}`, REQUEST_CUT - INSIDE_CUT));
     expect(JSON.stringify(body).indexOf(secret)).toBeLessThan(REQUEST_CUT);
@@ -141,8 +141,12 @@ describe("credential values never reach the log (every Examples row)", { timeout
     // The cut falls right after the credential's position, so only the start of the marker is visible.
     expect(logs.join("\n")).toContain('"headers":{"Authorization":"[REDACT');
     expect(leakedFragments(logs, [secret])).toEqual([]);
-    const servers = (await sdkOptions()).mcpServers as Record<string, { headers?: Record<string, string> }>;
-    expect(servers.remote.headers?.Authorization).toBe(`Bearer ${secret}`);
+    // MVP-7679: a request server with headers is reached through the relay, so the runtime's options carry no header
+    // value; the upstream still receives the real one.
+    const servers = (await sdkOptions()).mcpServers as Record<string, { url?: string; headers?: Record<string, string> }>;
+    expect(servers.remote.headers).toBeUndefined();
+    expect(servers.remote.url).toMatch(RELAY_URL);
+    expect(upstream!.headersAt("/remote").map((h) => h.authorization)).toEqual([`Bearer ${secret}`]);
   });
 
   it("POST /v1/query with mcpServers[*].env: the log shows [REDACTED], the MCP client gets the real value", async () => {
@@ -161,8 +165,12 @@ describe("credential values never reach the log (every Examples row)", { timeout
     expect(res.status).toBe(200);
     expect(logs.join("\n")).toContain('"env":{"API_TOKEN":"[REDACT');
     expect(leakedFragments(logs, [secret])).toEqual([]);
-    const servers = (await sdkOptions()).mcpServers as Record<string, { env?: Record<string, string> }>;
-    expect(servers.local.env?.API_TOKEN).toBe(secret);
+    // MVP-7679: a request stdio server with env runs in its own tool sandbox behind the relay: the runtime's options
+    // hold a relay URL and no env value (the bridge holds it; the real-runtime proof is in stdio-sandbox-process).
+    const servers = (await sdkOptions()).mcpServers as Record<string, { type?: string; url?: string; env?: Record<string, string> }>;
+    expect(servers.local.env).toBeUndefined();
+    expect(servers.local.url).toMatch(RELAY_URL);
+    expect(JSON.stringify(servers)).not.toContain(secret);
   });
 
   it("POST /v1/query with mcpCredentialOverrides: unchanged redaction, the MCP client gets the real value", async () => {

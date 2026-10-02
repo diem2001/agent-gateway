@@ -131,8 +131,19 @@ function lastResults(api: FakeAnthropicApi, prompt: string): string[] {
 }
 
 function conversationHomes(gateway: SpawnedGateway, onlyFor: string[]): string[] {
-  const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as { sessions: Record<string, { sandboxDirId?: string }> };
-  return onlyFor.flatMap((id) => (saved.sessions[id]?.sandboxDirId ? [path.join(gateway.dirs.home, ".agent-sandbox", "sessions", saved.sessions[id].sandboxDirId!, "home")] : []));
+  // Since MVP-7679 a conversation is stored below its API-key label.
+  const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as {
+    sessions?: Record<string, { sandboxDirId?: string }>;
+    sessionsByLabel?: Record<string, Record<string, { sandboxDirId?: string }>>;
+  };
+  const entryFor = (id: string): { sandboxDirId?: string } | undefined => {
+    for (const entries of Object.values(saved.sessionsByLabel ?? {})) if (entries[id]) return entries[id];
+    return saved.sessions?.[id];
+  };
+  return onlyFor.flatMap((id) => {
+    const dirId = entryFor(id)?.sandboxDirId;
+    return dirId ? [path.join(gateway.dirs.home, ".agent-sandbox", "sessions", dirId, "home")] : [];
+  });
 }
 
 function homeText(home: string): string {
@@ -241,8 +252,8 @@ function scriptsFor(gateway: SpawnedGateway): ExactToolScript[] {
   const ws = gateway.dirs.workspace;
   return [
     // The Scenario: an ordinary chat, no agent, no skill. Turn 1 shows the environment and writes a fixture; turn 2 resumes and reads it.
-    bash(PROMPTS.turn1, "env | sort; echo FIXTURE-RESULT-7678 > /home/node/fixture.txt; echo WROTE-FIXTURE"),
-    read(PROMPTS.turn2, "/home/node/fixture.txt"),
+    bash(PROMPTS.turn1, "env | sort; echo FIXTURE-RESULT-7678 > /work/fixture.txt; echo WROTE-FIXTURE"),
+    read(PROMPTS.turn2, "/work/fixture.txt"),
     // The route matrix.
     bash(PROMPTS.interpreters, `python3 -c "import os; print(dict(os.environ))"; node -e "console.log(JSON.stringify(process.env))"; perl -e 'print join(",", %ENV)'; sh -c env; cat /proc/self/environ | tr '\\0' '\\n'; cat /proc/[0-9]*/environ 2>/dev/null | tr '\\0' '\\n'`),
     read(PROMPTS.readCreds, "/home/node/.claude/.credentials.json"),
@@ -400,7 +411,8 @@ describe("the fail-closed rows end with the exact text within their deadline and
     f.scripts.push(bash("OUTCOME-LONG", "sleep 6; echo LONG-DONE"));
     const first = await queryAs(f.gateway.port, KEY_ALPHA, { queryId: "q-own", sessionId: "conv-own", prompt: PROMPTS.turn1, user_id: "user-1", useSession: true });
     expect(first.at(-1)?.type).toBe("done");
-    await ends(f, { queryId: "q-steal", sessionId: "conv-own", prompt: PROMPTS.turn2, user_id: "user-1" }, KEY_BETA, FIXED_TEXTS.otherOwner, 2000);
+    // Another user of the same API-key label is refused; another label does not see the conversation at all (MVP-7679).
+    await ends(f, { queryId: "q-steal", sessionId: "conv-own", prompt: PROMPTS.turn2, user_id: "user-2" }, KEY_ALPHA, FIXED_TEXTS.otherOwner, 2000);
     await ends(f, { queryId: "q-legacy", sessionId: "legacy-conv", prompt: PROMPTS.turn2, user_id: "user-1" }, KEY_ALPHA, FIXED_TEXTS.legacy, 2000);
     const long = queryAs(f.gateway.port, KEY_ALPHA, { queryId: "q-long", sessionId: "conv-long", prompt: "OUTCOME-LONG", user_id: "user-1", useSession: true });
     const end = Date.now() + 30_000;
@@ -429,8 +441,8 @@ describe("the fail-closed rows end with the exact text within their deadline and
   });
 });
 
-describe("known S2 residuals (reported separately, NOT counted as passes)", () => {
-  it("an MCP server given in the request body with an env value or a header: the value sits on the runtime's own command line, inside this run's sandbox only; an audit line names the server", async () => {
+describe("former S2 residuals, closed by MVP-7679 (credential-bearing MCP servers run behind the trusted relay)", () => {
+  it("an MCP server given in the request body with an env value or a header: the value is on no process's command line or environment inside the run's sandbox, and no audit line reports it", async () => {
     const f = await fixture("api-key", () => [
       bash("OUTCOME-RESIDUAL", "echo STDIO_ENV_VISIBLE=$(cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\\0' ' ' | grep -c 'SYNTH-STDIO-ENV-7[6]78'); echo SSE_HEADER_VISIBLE=$(cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\\0' ' ' | grep -c 'SYNTH-SSE-HEADER-7[6]78'); echo RELAYED_HEADER_VISIBLE=$(cat /proc/[0-9]*/cmdline /proc/[0-9]*/environ 2>/dev/null | tr '\\0' ' ' | grep -c 'SYNTH-REGISTRY-HEADE[R]-7678')"),
     ]);
@@ -449,12 +461,11 @@ describe("known S2 residuals (reported separately, NOT counted as passes)", () =
     const result = lastResults(f.api, "OUTCOME-RESIDUAL")[0] ?? "";
     const residual = { stdioEnvVisibleInsideOwnSandbox: /STDIO_ENV_VISIBLE=([1-9])/.test(result), sseHeaderVisibleInsideOwnSandbox: /SSE_HEADER_VISIBLE=([1-9])/.test(result) };
     report(`OUTCOME-RESIDUAL-S2 ${JSON.stringify(residual)}`);
-    // Observed state today: visible to the run that owns the server. The relayed registry header is not visible at all.
-    expect(residual).toEqual({ stdioEnvVisibleInsideOwnSandbox: true, sseHeaderVisibleInsideOwnSandbox: true });
+    // Closed: the stdio server runs in its own tool sandbox and the SSE server is reached through the relay, so
+    // neither value is anywhere the agent's processes can read; the relayed registry header never was.
+    expect(residual).toEqual({ stdioEnvVisibleInsideOwnSandbox: false, sseHeaderVisibleInsideOwnSandbox: false });
     expect(result).toContain("RELAYED_HEADER_VISIBLE=0");
-    // Not a leak to the model or the events of another conversation: only this run's own request body carries them (it supplied them).
-    expect(f.gateway.output()).toContain("[audit] mcp.server.credential_in_runtime_args serverName=stdiosrv type=stdio");
-    expect(f.gateway.output()).toContain("[audit] mcp.server.credential_in_runtime_args serverName=ssesrv type=sse");
+    expect(f.gateway.output()).not.toContain("credential_in_runtime_args");
     expect(f.gateway.output()).not.toContain(STDIO_ENV);
     expect(f.gateway.output()).not.toContain(SSE_HEADER);
   });

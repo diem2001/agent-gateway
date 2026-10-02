@@ -115,9 +115,25 @@ function requestsFor(api: FakeAnthropicApi, prompt: string) {
   return api.requests.filter((r) => r.userTexts.some((t) => t.includes(prompt)));
 }
 
+/** A persisted conversation by client id: below its API-key label since MVP-7679 (the label is not needed by these rows). */
+function savedEntry(gateway: SpawnedGateway, clientId: string): { sandboxDirId?: string } | undefined {
+  const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as {
+    sessions?: Record<string, { sandboxDirId?: string }>;
+    sessionsByLabel?: Record<string, Record<string, { sandboxDirId?: string }>>;
+  };
+  for (const entries of Object.values(saved.sessionsByLabel ?? {})) if (entries[clientId]) return entries[clientId];
+  return saved.sessions?.[clientId];
+}
+
+/** The home of the conversation `clientId` of API-key label `label` (the label's own entry). */
+function savedEntryFor(gateway: SpawnedGateway, label: string, clientId: string): string | undefined {
+  const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as { sessionsByLabel?: Record<string, Record<string, { sandboxDirId?: string }>> };
+  const id = saved.sessionsByLabel?.[label]?.[clientId]?.sandboxDirId;
+  return id ? path.join(gateway.dirs.home, ".agent-sandbox", "sessions", id, "home") : undefined;
+}
+
 function sessionHome(gateway: SpawnedGateway, clientId: string): string {
-  const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as { sessions: Record<string, { sandboxDirId?: string }> };
-  const id = saved.sessions[clientId]?.sandboxDirId;
+  const id = savedEntry(gateway, clientId)?.sandboxDirId;
   if (!id) throw new Error(`no sandbox home recorded for ${clientId}`);
   return path.join(gateway.dirs.home, ".agent-sandbox", "sessions", id, "home");
 }
@@ -126,8 +142,7 @@ async function waitForSessionsFile(gateway: SpawnedGateway, clientId: string): P
   const end = Date.now() + 10_000;
   while (Date.now() < end) {
     try {
-      const saved = JSON.parse(fs.readFileSync(path.join(gateway.dirs.persist, "sessions.json"), "utf8")) as { sessions: Record<string, unknown> };
-      if (saved.sessions[clientId]) return;
+      if (savedEntry(gateway, clientId)) return;
     } catch {
       // Not written yet.
     }
@@ -211,8 +226,9 @@ describe("conversations of different owners that run at the same time", () => {
     const probeFor = (mine: string, file: string, otherPattern: string, otherFile: string): string =>
       [
         `echo ${mine} > /home/node/${file}`,
+        `echo ${mine} > /work/${file}`,
         "sleep 8",
-        `echo HITS=$(grep -rl --exclude-dir=proc --exclude-dir=sys '${otherPattern}' /home /tmp /etc /var /srv /opt /root /mnt 2>/dev/null | wc -l)`,
+        `echo HITS=$(grep -rl --exclude-dir=proc --exclude-dir=sys '${otherPattern}' /home /work /tmp /etc /var /srv /opt /root /mnt 2>/dev/null | wc -l)`,
         `echo FILES=$(find / -xdev -name '${otherFile}' 2>/dev/null | wc -l)`,
         `echo PROCS=$(cat /proc/[0-9]*/cmdline /proc/[0-9]*/environ 2>/dev/null | tr '\\0' '\\n' | grep -c '${otherPattern}')`,
         `echo OWN=$(cat /home/node/${file})`,
@@ -255,10 +271,11 @@ describe("conversations of different owners that run at the same time", () => {
     expect(grepTree(homeA, SECRET_A).length).toBeGreaterThan(0);
     expect(grepTree(homeB, SECRET_B).length).toBeGreaterThan(0);
 
-    // Neither owner can continue the other's conversation, nor list or delete it.
+    // Neither owner can continue the other's conversation, nor list or delete it. Another API-key label does not see
+    // the conversation at all (MVP-7679): it is not refused, it gets its own new conversation under the same id.
     const before = r.api.requests.length;
-    const stolen = await queryAs(r.gateway.port, KEY_BETA, { queryId: "q-steal", sessionId: "conv-A", prompt: "PROBE-A", user_id: "user-b" });
-    expect(stolen.events).toEqual([{ seq: 0, type: "error", content: "This conversation cannot be continued from your account. Please start a new conversation." }]);
+    const sameLabelOtherUser0 = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-steal0", sessionId: "conv-A", prompt: "PROBE-A", user_id: "user-b" });
+    expect(sameLabelOtherUser0.events).toEqual([{ seq: 0, type: "error", content: "This conversation cannot be continued from your account. Please start a new conversation." }]);
     const sameLabelOtherUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-steal2", sessionId: "conv-A", prompt: "PROBE-A", user_id: "user-other" });
     expect(sameLabelOtherUser.events[0]?.content).toBe("This conversation cannot be continued from your account. Please start a new conversation.");
     const noUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-steal3", sessionId: "conv-A", prompt: "PROBE-A" });
@@ -268,20 +285,27 @@ describe("conversations of different owners that run at the same time", () => {
     expect((listBeta.json?.sessions as { id: string }[]).map((s) => s.id)).toEqual(["conv-B"]);
     expect((await getAs(r.gateway.port, KEY_BETA, "DELETE", "/v1/sessions/conv-A")).status).toBe(404);
     expect((await getAs(r.gateway.port, KEY_ALPHA, "GET", "/v1/sessions")).json?.count).toBe(1);
+    // Beta using alpha's id gets its OWN conversation: a different home with none of alpha's files.
+    const betaSameId = await queryAs(r.gateway.port, KEY_BETA, { queryId: "q-beta-same", sessionId: "conv-A", prompt: "PROBE-B", user_id: "user-b" });
+    expect(betaSameId.events.at(-1)?.type, JSON.stringify(betaSameId.events.at(-1))).toBe("done");
+    const homeOfBetaA = savedEntryFor(r.gateway, "beta", "conv-A");
+    expect(homeOfBetaA).toBeDefined();
+    expect(homeOfBetaA).not.toBe(homeA);
+    expect(fs.existsSync(path.join(homeOfBetaA!, "a.txt"))).toBe(false);
   });
 });
 
 describe("a conversation created after the update", () => {
   it("resumes after a gateway restart in its own home, with its earlier turn, and still cannot read credentials", async () => {
     const r = await rig([
-      bash("PROBE-TURN1", "echo SYNTH-PERSIST-7678 > /home/node/persist.txt; echo WROTE"),
-      bash("PROBE-TURN2", "echo PERSISTED=$(cat /home/node/persist.txt); echo CREDS=$(cat /home/node/.claude/.credentials.json 2>&1 | grep -c 'SYNTH-OAUTH-ACCES[S]'); echo CREDS_ANYWHERE=$(grep -rl --exclude-dir=proc --exclude-dir=sys 'SYNTH-OAUTH-ACCES[S]' / 2>/dev/null | wc -l)"),
+      bash("PROBE-TURN1", "echo SYNTH-PERSIST-7678 > /work/persist.txt; echo WROTE"),
+      bash("PROBE-TURN2", "echo PERSISTED=$(cat /work/persist.txt); echo CREDS=$(cat /home/node/.claude/.credentials.json 2>&1 | grep -c 'SYNTH-OAUTH-ACCES[S]'); echo CREDS_ANYWHERE=$(grep -rl --exclude-dir=proc --exclude-dir=sys 'SYNTH-OAUTH-ACCES[S]' / 2>/dev/null | wc -l)"),
     ]);
     const first = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-1", sessionId: "keep", prompt: "PROBE-TURN1", user_id: "user-1", useSession: true });
     expect(first.events.at(-1)?.type, JSON.stringify(first.events.at(-1))).toBe("done");
     await waitForSessionsFile(r.gateway, "keep");
     const home = sessionHome(r.gateway, "keep");
-    expect(fs.readFileSync(path.join(home, "persist.txt"), "utf8").trim()).toBe("SYNTH-PERSIST-7678");
+    expect(fs.readFileSync(path.join(path.dirname(home), "work", "persist.txt"), "utf8").trim()).toBe("SYNTH-PERSIST-7678");
 
     // Restart: stop the gateway cleanly, start a new process on the same directories.
     const old = r.gateway;
@@ -302,8 +326,8 @@ describe("a conversation created after the update", () => {
     expect(result?.text).toContain("PERSISTED=SYNTH-PERSIST-7678");
     expect(result?.text).toContain("CREDS=0");
     expect(result?.text).toContain("CREDS_ANYWHERE=0");
-    // Still the same owner, still refused for anyone else.
-    const other = await queryAs(restarted.port, KEY_BETA, { queryId: "q-3", sessionId: "keep", prompt: "PROBE-TURN2", user_id: "user-1" });
+    // Still the same owner, still refused for any other user of the label (another label has its own conversations).
+    const other = await queryAs(restarted.port, KEY_ALPHA, { queryId: "q-3", sessionId: "keep", prompt: "PROBE-TURN2", user_id: "user-2" });
     expect(other.events[0]?.content).toBe("This conversation cannot be continued from your account. Please start a new conversation.");
     // The home is the same directory before and after.
     expect(sessionHome(restarted, "keep")).toBe(home);

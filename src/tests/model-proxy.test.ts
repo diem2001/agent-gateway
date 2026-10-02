@@ -307,7 +307,7 @@ describe("refusals cause no upstream request", () => {
     const relay = new CredentialRelay();
     await relay.start();
     cleanups.push(() => relay.close());
-    const { token: relayToken } = relay.register({ serverName: "x", url: "http://127.0.0.1:1/mcp", headers: {} });
+    const { token: relayToken } = relay.register({ serverName: "x", url: "http://127.0.0.1:1/mcp", headers: {}, grant: { allowsTool: () => true, coversServer: true } });
     expect((await call(s, { token: relayToken })).status).toBe(401);
     // and the proxy token means nothing to the relay (404 for an unknown path token)
     expect(s.up.seen).toHaveLength(0);

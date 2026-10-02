@@ -222,9 +222,11 @@ export async function checkMcpServerHealth(
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
 
+    // The health request carries the registered credential, so a redirect is never followed (MVP-7679).
     const res = await fetch(healthUrl, {
       signal: controller.signal,
       headers: def.headers,
+      redirect: "manual",
     });
     clearTimeout(timeout);
 

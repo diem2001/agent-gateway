@@ -30,9 +30,10 @@
 
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "./logging.js";
+import { describeFailure } from "./tool-mediation.js";
 
-/** The tool_result text of a refused call. */
-export const TOOL_DENIED_REASON = "Refused: this tool is not allowed for this run.";
+/** The tool_result text of a refused call: the one TOOL_DENIED text of every surface (MVP-7679, tool-mediation.ts). */
+export const TOOL_DENIED_REASON = describeFailure({ kind: "denied" }).message;
 
 export const MAX_ENFORCED_TOOLS = 64;
 export const MAX_TOOL_NAME_LENGTH = 128;
