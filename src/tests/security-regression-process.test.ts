@@ -69,7 +69,7 @@ import {
   type ToolStep,
   type TurnObservation,
 } from "./helpers/security-matrix.js";
-import { ROUTE_IDS, credentialSteps, routeTurn, type RouteId, type RouteTurn } from "./helpers/security-routes.js";
+import { ROUTE_IDS, credentialSteps, regressionRowIds, routeTurn, type RouteId, type RouteTurn } from "./helpers/security-routes.js";
 
 const ROW_TEST_TIMEOUT_MS = 600_000;
 vi.setConfig({ testTimeout: ROW_TEST_TIMEOUT_MS });
@@ -82,17 +82,7 @@ const markers: SecurityMarkers = createMarkers();
 type Mode = "fresh" | "resumed" | "restarted";
 const MODES: Mode[] = ["fresh", "resumed", "restarted"];
 
-const EXPECTED_ROWS = [
-  "RP.regression",
-  ...MODES.flatMap((mode) => ROUTE_IDS.map((route) => `RT.${route}.${mode}`)),
-  ...MODES.flatMap((mode) => [`NC.chat.${mode}`, `NC.interpreter.${mode}`, `NC.read.${mode}`]),
-  "X.gitconfig",
-  "X.leftovers",
-  "X.extension-writes",
-  "X.run-leftovers",
-  "RP.negative-control",
-  "RP.negative-control.file-detector",
-];
+const EXPECTED_ROWS = regressionRowIds();
 const recorder = new MatrixRecorder("security-regression-process", EXPECTED_ROWS);
 
 const cleanups: Cleanup[] = [];

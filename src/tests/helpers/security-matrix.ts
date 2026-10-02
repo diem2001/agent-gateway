@@ -265,6 +265,7 @@ export class MatrixRecorder {
 export const AC_ROWS: Record<string, string> = {
   "RP.regression": "Real-process regression: an ordinary chat shows its environment, nothing leaks, the authorized operation works",
   "RP.negative-control": "Real-process regression: the suite fails on a deliberately exposed credential",
+  "RP.negative-control.file-detector": "Negative control: a credential file bound into the sandbox is found by the config route",
   "RT.env": "Route: inherited environment of the agent and its subprocesses",
   "RT.proc": "Route: gateway, parent, sibling and trusted-worker process information",
   "RT.config": "Route: gateway key files, provider OAuth state and MCP configuration",
@@ -295,6 +296,11 @@ export const AC_ROWS: Record<string, string> = {
   "IF.timeout": "Failure: upstream timeout",
   "IF.unavailable": "Failure: upstream connection reset",
   "IF.legacy": "Failure: resume of a legacy session",
+  "X.gitconfig": "The trusted git configuration reaches the runtime's own git and the agent's git; the start-time git runs nothing planted",
+  "X.leftovers": "Leftovers of an earlier version planted in a conversation home start nothing and are gone at the next start",
+  "X.extension-writes": "Writes into the read-only extension directories fail",
+  "X.run-leftovers": "Per-run runtime and sandbox directories hold no marker during a held run and after SIGKILL; the next start sweeps them",
+  "RT.config.subject": "The config route as the file detector's subject row (child run of the negative control)",
 };
 
 /* ------------------------------------------------------------------ */

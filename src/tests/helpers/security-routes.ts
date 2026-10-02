@@ -597,3 +597,29 @@ export async function routeTurn(rig: SecurityRig, route: RouteId, options: { pro
   const verdict = verifyRoute(route, turn.results[credentialCount]?.text ?? "", ctx);
   return { phase: options.phase ?? "probe", turn, verdict, problems: [...turnProblems(turn), ...credentialProblems(rig, turn), ...verdict.failures], extraResults: turn.results.slice(credentialCount + 1) };
 }
+
+/** The row ids of the regression suite (`security-regression-process.test.ts`) that the summary requires. */
+export function regressionRowIds(): string[] {
+  const modes = ["fresh", "resumed", "restarted"];
+  return [
+    "RP.regression",
+    ...modes.flatMap((mode) => ROUTE_IDS.map((route) => `RT.${route}.${mode}`)),
+    ...modes.flatMap((mode) => [`NC.chat.${mode}`, `NC.interpreter.${mode}`, `NC.read.${mode}`]),
+    "X.gitconfig",
+    "X.leftovers",
+    "X.extension-writes",
+    "X.run-leftovers",
+    "RP.negative-control",
+    "RP.negative-control.file-detector",
+  ];
+}
+
+/** The row ids of the entry-point suite. */
+export function entrypointRowIds(): string[] {
+  return ["EP.ordinary", "EP.agent", "EP.skill", "EP.subagent", "EP.mcp-direct", "EP.upload", "EP.denied", "EP.enlarge"];
+}
+
+/** The row ids of the failure suite (`security-failure-process.test.ts`). */
+export function failureRowIds(): string[] {
+  return ["IF.startup-exit", "IF.startup-hang", "IF.policy", "IF.cancel", "IF.restart-term", "IF.restart-kill", "IF.cred-missing", "IF.cred-refused", "IF.timeout", "IF.unavailable", "IF.legacy"];
+}

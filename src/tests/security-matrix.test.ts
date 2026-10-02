@@ -30,7 +30,7 @@ import {
   type MatrixRow,
   type Surface,
 } from "./helpers/security-matrix.js";
-import { ROUTE_IDS, credentialSteps, parseReport, routeSource, routeSteps, verifyRoute, type RouteContext, type RouteReport } from "./helpers/security-routes.js";
+import { ROUTE_IDS, credentialSteps, entrypointRowIds, failureRowIds, regressionRowIds, parseReport, routeSource, routeSteps, verifyRoute, type RouteContext, type RouteReport } from "./helpers/security-routes.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -155,6 +155,13 @@ describe("evidence lines", () => {
     recorder.record(row({ id: "A" }));
     recorder.record(row({ id: "B", observed: "fail" }));
     expect(recorder.summary()).toEqual({ expected: 3, observed: 2, pass: 1, fail: 1, hits: 0, missing: ["C"] });
+  });
+
+  it("every row id a suite requires has an AC description (the map is the single list of stable ids), and no id is listed twice", () => {
+    const all = [...regressionRowIds(), ...entrypointRowIds(), ...failureRowIds()];
+    expect(new Set(all).size).toBe(all.length);
+    const base = (id: string): string => (AC_ROWS[id] !== undefined ? id : id.replace(/\.(fresh|resumed|restarted)$/, ""));
+    expect(all.filter((id) => AC_ROWS[base(id)] === undefined)).toEqual([]);
   });
 
   it("every AC row id of the map has a description", () => {

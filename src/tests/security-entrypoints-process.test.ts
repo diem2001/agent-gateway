@@ -48,13 +48,14 @@ import {
   type ToolStep,
   type TurnObservation,
 } from "./helpers/security-matrix.js";
+import { entrypointRowIds } from "./helpers/security-routes.js";
 import { MiB, sendUpload, startUploadStub } from "./helpers/upload-relay-stub.js";
 
 vi.setConfig({ testTimeout: 300_000 });
 
 const markers: SecurityMarkers = createMarkers();
 const NO_SUCH_TOOL = (tool: string): string => `<tool_use_error>Error: No such tool available: ${tool}</tool_use_error>`;
-const EXPECTED_ROWS = ["EP.ordinary", "EP.agent", "EP.skill", "EP.subagent", "EP.mcp-direct", "EP.upload", "EP.denied", "EP.enlarge"];
+const EXPECTED_ROWS = entrypointRowIds();
 const recorder = new MatrixRecorder("security-entrypoints-process", EXPECTED_ROWS);
 
 const cleanups: Cleanup[] = [];
