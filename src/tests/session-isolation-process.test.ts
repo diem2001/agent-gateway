@@ -199,6 +199,8 @@ describe("legacy conversations (created before the update)", () => {
     const other = await queryAs(r.gateway.port, KEY_BETA, { queryId: "q-other", sessionId: "legacy-clean", prompt: "x" });
     expect(other.events).toEqual([{ seq: 0, type: "error", content: expectedText }]);
     // The audit line carries counts only.
+    // The audit line travels through the gateway's output pipe after the answer: give the last one a moment to arrive on a loaded host.
+    for (const end = Date.now() + 3000; r.gateway.output().split("\n").filter((l) => l.includes("sessions.legacy.refused")).length < 3 && Date.now() < end; ) await new Promise((resolve) => setTimeout(resolve, 50));
     const audit = r.gateway.output().split("\n").filter((l) => l.includes("sessions.legacy.refused"));
     expect(audit).toEqual(["[audit] sessions.legacy.refused total=1", "[audit] sessions.legacy.refused total=2", "[audit] sessions.legacy.refused total=3"]);
     expect(r.gateway.output()).not.toContain(LEGACY_CONTAMINATED);

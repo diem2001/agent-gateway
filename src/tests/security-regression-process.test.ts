@@ -32,7 +32,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createFakeGit, type FakeGit } from "./helpers/fake-git.js";
-import { REPO_ROOT, gatewayRequest, type Cleanup } from "./helpers/git-process-gateway.js";
+import { REPO_ROOT, descendants, gatewayRequest, type Cleanup } from "./helpers/git-process-gateway.js";
 import {
   MatrixRecorder,
   STDIO_SOURCE,
@@ -183,7 +183,7 @@ async function startRoles(rig: SecurityRig, fake: FakeGit): Promise<Roles> {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   // The trusted git clone: slow (so it is running during the scans), with a token URL and an ssh key in its request.
-  fake.setSlow({ sleepMs: 25_000, on: ["clone"] });
+  fake.setSlow({ sleepMs: 120_000, on: ["clone"] });
   const clone = gatewayRequest(rig.gateway.port, "POST", "/v1/workspace/git/clone", { url: rig.remote.authUrl, path: tags.git, sshKey: v.sshKey }, rig.keys.diemcrm);
   await fake.waitForStart((inv) => inv.subcommand === "clone" && inv.argv.some((arg) => arg.includes(tags.git)), 20_000);
   const seen = Date.now() + 20_000;
@@ -201,6 +201,17 @@ async function startRoles(rig: SecurityRig, fake: FakeGit): Promise<Roles> {
       for (const session of [b1Session, b2Session]) {
         const dir = conversationDirs(rig.gateway, [session])[0];
         if (dir) fs.writeFileSync(path.join(dir, "work", "stop"), "stop");
+      }
+      // The clone sleeps well past any scan (a loaded host stretches the scans): end it now by stopping its wrapper.
+      const running = fake.invocations().find((inv) => inv.subcommand === "clone" && inv.argv.some((arg) => arg.includes(tags.git)) && inv.end === undefined);
+      if (running) {
+        for (const pid of [...descendants(running.pid), running.pid]) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {
+            // Already gone.
+          }
+        }
       }
       await Promise.all([b1, b2, clone]);
       sampler.stop();

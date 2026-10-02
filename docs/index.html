@@ -131,7 +131,7 @@
       <li><a href="#session-mgmt">Session Management</a></li>
       <li><a href="#isolation">Agent Isolation</a></li>
       <li><a href="#tool-mediation">Tool Mediation</a></li>
-      <li><a href="#deployment">Deployment Guide</a></li>
+      <li><a href="#deployment">Deployment Guide</a> (<a href="#runbook">security acceptance and deployment runbook</a>)</li>
       <li><a href="#architecture">Architecture</a></li>
     </ol>
   </div>
@@ -576,7 +576,7 @@ curl -X PUT http://localhost:3001/v1/settings \
 
     <p>Changes the log level at runtime. Valid levels: <code>off</code>, <code>info</code>, <code>debug</code>.</p>
 
-    <p><strong>Credentials in the debug log:</strong> at <code>debug</code> the gateway logs request bodies (first 2000 characters) and response previews (first 500 characters). The whole value of every <code>headers</code> and <code>env</code> key, at any depth, is logged as <code>"[REDACTED]"</code> with the keys visible: <code>mcpServers[*]</code> and <code>mcpCredentialOverrides</code> of <code>POST /v1/query</code>, the <code>/test</code> and <code>/call</code> bodies, and MCP server definitions in registry create/update bodies and in the create/update, detail and list answers. Every <code>sshKey</code> value is logged as <code>"[REDACTED]"</code> and every string under a <code>url</code> key without its credentials (<code>scheme://***@host/...</code>, everything up to the last <code>@</code>), which covers the clone URLs and inline SSH keys of <code>/v1/workspace/git/*</code>. Redaction runs before the cut, so no prefix of a value appears. The API answers themselves are unchanged. <code>text/*</code> request bodies are logged as their length, a non-JSON registry answer is not previewed, and an unparseable JSON body is logged as <code>request body rejected type=&lt;type&gt; status=&lt;code&gt;</code>.</p>
+    <p><strong>Credentials in the debug log:</strong> at <code>debug</code> the gateway logs request bodies (first 2000 characters) and response previews (first 500 characters). The whole value of every <code>headers</code> and <code>env</code> key, at any depth, is logged as <code>"[REDACTED]"</code> with the keys visible: <code>mcpServers[*]</code> and <code>mcpCredentialOverrides</code> of <code>POST /v1/query</code>, the <code>/test</code> and <code>/call</code> bodies, and MCP server definitions in registry create/update bodies and in the create/update, detail and list answers. The <code>args</code> of a stdio server definition (an object with a string <code>command</code>) are logged as one <code>"[REDACTED]"</code> per element: a credential can be passed on the command line. At <code>debug</code> the log also holds the request text of every conversation, so it is an operator-only surface. Every <code>sshKey</code> value is logged as <code>"[REDACTED]"</code> and every string under a <code>url</code> key without its credentials (<code>scheme://***@host/...</code>, everything up to the last <code>@</code>), which covers the clone URLs and inline SSH keys of <code>/v1/workspace/git/*</code>. Redaction runs before the cut, so no prefix of a value appears. The API answers themselves are unchanged. <code>text/*</code> request bodies are logged as their length, a non-JSON registry answer is not previewed, and an unparseable JSON body is logged as <code>request body rejected type=&lt;type&gt; status=&lt;code&gt;</code>.</p>
 
     <h3>Request Body</h3>
 <pre><code>{"level": "debug"}</code></pre>
@@ -1680,17 +1680,78 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
   <h3>Container security profile and host prerequisites</h3>
   <p><code>docker-compose.yml</code> runs the container as <code>node</code> (uid 1000; <code>./agent_home</code> must be owned by it) with <code>cap_drop: ALL</code>, <code>no-new-privileges</code>, <code>pids_limit: 512</code>, the committed seccomp profile <code>security/agent-gateway-seccomp.json</code> (Docker's default plus <code>clone</code>, <code>unshare</code>, <code>setns</code>, <code>mount</code>, <code>umount2</code>, <code>pivot_root</code> for a process without capabilities) and <code>systempaths=unconfined</code> (Docker's masked <code>/proc</code> paths make the sandbox's own <code>/proc</code> mount fail). This loosens the boundary between container and host, so every other control above is on. <strong>Host prerequisites:</strong> unprivileged user namespaces allowed (<code>kernel.apparmor_restrict_unprivileged_userns=0</code> on Ubuntu 24.04 and later, <code>user.max_user_namespaces</code> above 0). Docker's default AppArmor profile also blocks the sandbox's mounts: by default the compose file runs without an AppArmor profile; to keep one, load <code>security/agent-gateway-apparmor</code> (<code>sudo apparmor_parser -r security/agent-gateway-apparmor</code>) and start with <code>AGENT_GATEWAY_APPARMOR_PROFILE=agent-gateway-isolation</code>. Tested once (2026-10-01, Ubuntu 24.04, kernel 6.8, Docker 29.2): a task-owned container under a copy of this profile loaded with a different name (identical rules; only the profile name and its two self-references differ) ran in enforce mode with <code>isolation: ok</code>, and a cancelled run, <code>docker stop</code> during a run and a SIGKILL of the gateway process behaved as without a profile. The committed file under its own name and other kernels are not tested; <code>PROBE_APPARMOR_PROFILE=&lt;loaded profile&gt; npm run probe:docker-isolation</code> repeats the check.</p>
 
-  <h3>Updating a running gateway</h3>
+  <h3 id="runbook">Security acceptance and deployment runbook</h3>
+  <p>The one procedure for putting an isolation-capable gateway into service, checking it, recovering it and rolling it back. It replaces the earlier "Updating a running gateway" list; every step that list held is below. Terms: this page says <em>sandbox</em> and <em>conversation</em>; the acceptance wording of the Epic MVP-7676 says "isolation runtime" (the sandbox) and "legacy-session admission" (the refusal of conversations started before the update).</p>
+
+  <p><strong>Before: decisions that must be closed (stop if any is open).</strong></p>
+  <table>
+    <thead><tr><th>Decision</th><th>Where it is recorded</th><th>State when this was written (2026-10-02)</th></tr></thead>
+    <tbody>
+      <tr><td>Accept the container profile: no AppArmor profile unless the committed one is selected, and <code>systempaths=unconfined</code></td><td>Epic MVP-7676, comment 37950</td><td>open</td></tr>
+      <tr><td>Accept that every conversation started before the update is refused (8,339 stored on the production gateway on 2026-09-30, 3,834 with a saved transcript, 1,216 used in the last 14 days; callers must start a new conversation, reqlift does not recover by itself). Not implemented: admitting them after a scan and binding each to its first caller, which keeps old conversations but lets whoever knows an id first claim it</td><td>Epic MVP-7676, comment 37950</td><td>open</td></tr>
+      <tr><td>reqlift continuing shared (public or folder-shared) conversations: the continuing user's <code>user_id</code> differs from the owner's and is refused after the update</td><td>Epic MVP-7676, comment 38039</td><td>open</td></tr>
+      <tr><td>Review of what agents planted before the update (MVP-7919, see Known residuals)</td><td>this runbook, Prepare step 2</td><td>an operator task before the first deploy</td></tr>
+    </tbody>
+  </table>
+  <p>Check the comments before deploying; the table is a snapshot.</p>
+
+  <p><strong>Prepare.</strong></p>
   <ol>
-    <li><strong>Risk acceptance (operator):</strong> accepting the container profile above is a prerequisite for redeploying the shared gateway; it is recorded on the Epic MVP-7676.</li>
-    <li><strong>Every conversation started before this update is refused after it.</strong> On the production gateway that counted 8,339 stored conversations on 2026-09-30: 3,834 with a saved transcript, 1,216 used in the last 14 days. Callers get the "started before a gateway security update" text and must start a new conversation (reqlift does not recover by itself; replaying from its database is a caller follow-up). Not implemented alternative: admit them after a secret scan and bind each to its first caller, which keeps old conversations but lets whoever knows an id first claim it.</li>
-    <li>Recreate the container so image, user and security options apply: <code>docker compose up -d --build</code>.</li>
-    <li>Check <code>curl -s http://localhost:3001/health | jq .isolation</code>: it must print <code>"ok"</code> (the container is then also <code>healthy</code>).</li>
-    <li>The first message of a conversation that starts an <code>npx</code> MCP server can be slower: that run's home is empty, so the package is downloaded again (about 7 s for a small server); later messages reuse it.</li>
-    <li><strong>Tool mediation update (MVP-7679):</strong> after the new image runs, re-register the webhook tools so each records its owner (reqlift does it at boot; diemcrm with its registration command). Then read back two things: <code>GET /v1/tools</code> shows no entry without an <code>owner</code>, and the audit line <code>tool.webhook.legacy_forward</code> has count 0 since the update (<code>tools.legacy.ownerless count=&lt;n&gt;</code> at startup should read 0 after the re-registration and a restart).</li>
-    <li><strong>Operator warning for <code>AGENT_TOOL_POLICY</code> and key rotation:</strong> removing or renaming a label in <code>API_KEYS</code> while the policy still names it stops the gateway at startup (<code>FATAL config key=AGENT_TOOL_POLICY reason=label not in API_KEYS</code>). The container restarts automatically, so it keeps restarting until both settings agree: update <code>API_KEYS</code> and <code>AGENT_TOOL_POLICY</code> together.</li>
-    <li><strong>Rollback to the previous gateway version</strong> ignores and then drops the <code>sessionsByLabel</code> map of <code>sessions.json</code>: conversations started or moved under the new version start fresh after the rollback.</li>
+    <li><code>./agent_home</code> and everything below it must be owned by uid 1000 (<code>sudo chown -R 1000:1000 agent_home</code>). The old entrypoint ran <code>chown -R</code> as root; the new one does not, and a root-owned file is left out of runs with an <code>audit</code> log line only.</li>
+    <li>Review and remove what agents planted in <code>agent_home</code> before the update. The trusted <code>git</code> calls and <code>/v1/auth/login</code> (tmux) run with <code>HOME=/home/node</code> and read <code>~/.gitconfig</code>, repository hooks, <code>core.fsmonitor</code> in a repository's configuration and <code>~/.tmux.conf</code>; the secret scan skips files over 1 MiB and does not know <code>~/.ssh</code> private keys or the webhook authentication values of <code>tools.json</code>.</li>
+    <li>Tag the image that runs now, so a rollback target exists: <code>docker tag agent-gateway-agent-gateway:latest agent-gateway:rollback-$(date +%Y%m%d)-&lt;first 12 characters of its digest&gt;</code> (the digest: <code>docker image inspect --format '{{.Id}}' agent-gateway-agent-gateway:latest</code>). See Rollback for which images are valid targets.</li>
+    <li>Set <code>MCP_SERVER_OWNERS=&lt;server&gt;:&lt;label&gt;,...</code> for every registered MCP server that exists today (live: <code>jira:reqlift</code>), and change <code>AGENT_TOOL_POLICY</code> and <code>API_KEYS</code> together: a label named in the policy that is missing from <code>API_KEYS</code> stops the gateway at startup (<code>FATAL config key=AGENT_TOOL_POLICY reason=label not in API_KEYS</code>) and the restart policy then loops.</li>
+    <li>Check that no run is in flight, as a separate step before the swap (a swap kills running queries; the 2026-09-28 deploy lost one publish run this way).</li>
   </ol>
+
+  <p><strong>Swap.</strong> <code>docker compose build &amp;&amp; docker compose up -d</code> in the checkout. Never chain it with the in-flight check.</p>
+
+  <p><strong>Verify.</strong> Each read-back with its expected output; names and counts only, never a value:</p>
+  <table>
+    <thead><tr><th>Check</th><th>Expected</th></tr></thead>
+    <tbody>
+      <tr><td><code>curl -s http://localhost:3001/health | jq .isolation</code></td><td><code>"ok"</code> (the container is then also <code>healthy</code>)</td></tr>
+      <tr><td><code>docker logs agent-gateway 2&gt;&amp;1 | grep 'mcp.registry.ownerless'</code></td><td><code>mcp.registry.ownerless count=0 names= saved=true</code> (another count lists the names that stay ownerless; <code>saved=false</code> means an assignment could not be written to the state file)</td></tr>
+      <tr><td><code>docker logs agent-gateway 2&gt;&amp;1 | grep 'mcp.registry.owner_'</code></td><td>one <code>owner_assigned serverName=&lt;name&gt;</code> line per mapped name (<code>owner_mapping ... result=already_assigned</code> on a later restart)</td></tr>
+      <tr><td><code>jq '.[] | select(.name=="jira") | .owner' &lt;MCP_SERVERS_PERSIST_PATH&gt;</code></td><td>the mapped label</td></tr>
+      <tr><td><code>/health</code> <code>persistence</code> is ok and no new <code>mcp-servers.json.corrupt-*</code> file exists</td><td>after a <code>corrupt-preserved</code> issue for <code>mcpServers</code>, restore the preserved copy before normal use: an empty registry lets any label create any name</td></tr>
+      <tr><td><code>docker image inspect --format '{{.Id}}' agent-gateway-agent-gateway:latest</code></td><td>equals <code>image.id</code> in the evidence JSON of the revision you built (<code>npm run probe:epic-integration</code> writes it)</td></tr>
+    </tbody>
+  </table>
+  <p>The first message of a conversation that starts an <code>npx</code> MCP server can be slower: that run's home is empty, so the package is downloaded again (about 7 s for a small server).</p>
+
+  <p><strong>Callers.</strong> Re-register the webhook tools so each records its owner (reqlift does it at boot, diemcrm with <code>RegisterGatewayToolsCommand</code>), then read back that <code>GET /v1/tools</code> shows no entry without an <code>owner</code> and that no <code>tools.legacy.ownerless count=&lt;n&gt;</code> line with <code>n &gt; 0</code> appears after a restart; the audit line <code>tool.webhook.legacy_forward</code> must have count 0 since the update. reqlift's admin edits of an ownerless MCP server are refused with 403 until the mapping is applied. Expect reqlift's admin tool success rate to drop: failed calls stop counting as successes (<code>"success": false</code>).</p>
+
+  <p><strong>Done when:</strong> <code>/health</code> isolation is <code>ok</code>, the three registry and tool read-backs above are as expected, the image digest equals the tested digest, both callers registered their tools, and a caller's new conversation answers.</p>
+
+  <p><strong>No secret probe is run against the live gateway.</strong> The acceptance evidence is the task-owned deployment of the same image (<code>npm run probe:epic-integration</code>); a probe with real credentials on the live service would put them in front of a test agent, and rotating shared test credentials is out of scope (DEC-ISO-002).</p>
+
+  <p><strong>Recovery.</strong> What a caller sees and what the operator does:</p>
+  <table>
+    <thead><tr><th>Symptom</th><th>What callers see</th><th>Operator action</th></tr></thead>
+    <tbody>
+      <tr><td><code>/health</code> <code>isolation</code> is <code>starting</code></td><td>nothing yet (a few hundred ms)</td><td>wait</td></tr>
+      <tr><td><code>isolation</code> is <code>unavailable</code> (log line <code>ERROR isolation problem=&lt;word&gt; reason=&lt;fixed text&gt; (see /health)</code>)</td><td>every query ends with "The gateway cannot start a protected workspace ..."; nothing runs unsandboxed</td><td>read the <code>problem</code> word in the table above and fix the profile, the storage directory or the host setting it names; the next successful sandbox start clears it (<code>proxy_unavailable</code> only a restart)</td></tr>
+      <tr><td>the container keeps restarting; <code>docker logs</code> ends in <code>FATAL config key=&lt;KEY&gt; reason=&lt;fixed text&gt;</code> and <code>docker inspect --format '{{.RestartCount}}' agent-gateway</code> keeps rising</td><td>connection refused or a proxy error (a restart loop answers nothing for long)</td><td>fix the value the line names and <code>docker compose up -d</code>; the loop ends at the next start</td></tr>
+      <tr><td><code>ERROR persistence ... problem=&lt;word&gt;</code></td><td>requests work; the named state is not saved or was set aside (<code>.corrupt-*</code>)</td><td>see State Files, Recovery and Shutdown: restore the preserved copy, check disk space and the owner of <code>./agent_home/.claude</code></td></tr>
+      <tr><td>the gateway restarted or was stopped during a run</td><td>the stream ends without a <code>done</code> event (the killed process cannot send a terminal event; the stream contract is unchanged); a replay of that query id answers "Query not found or expired"</td><td>resume the conversation with a new request: it runs inside a fresh sandbox</td></tr>
+      <tr><td>the gateway is stopped on purpose</td><td>connection refused until it runs again</td><td>decide beforehand; callers must tolerate it</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>Rollback.</strong> A valid rollback target is an image whose commit and digest passed this acceptance suite and both Docker probes: the revision that contains the isolation (S1), the tool mediation (S2) and the registry ownership (MVP-7925) together, identified by the tag and digest recorded in step 3 of Prepare and in the evidence JSON, <strong>not by <code>/health</code> alone</strong>. An image with the isolation only also reports <code>isolation: ok</code>, but it puts MCP credentials on the runtime command line and ignores <code>AGENT_TOOL_POLICY</code>. A revision from before the isolation is not a rollback target: it restores unrestricted agent execution. Stop the gateway instead (<code>docker compose stop</code>) and decide explicitly.</p>
+  <p>To roll back to a recorded tag: <code>docker tag agent-gateway:rollback-&lt;tag&gt; agent-gateway-agent-gateway:latest &amp;&amp; docker compose up -d --no-build</code>, then repeat the Verify table (isolation <code>ok</code>, the digest equals the digest recorded for that tag).</p>
+  <p>At the first deploy of this Epic no valid target exists. Recovery is then to stop the gateway (<code>docker compose stop</code>) and fix forward; callers see connection refused while it is stopped, and the operator decides that before deploying.</p>
+  <p>Data effects of moving between revisions of the Epic: an older version ignores and then drops the <code>sessionsByLabel</code> map of <code>sessions.json</code>, so conversations started or moved under the newer version start fresh; registered tools and MCP servers keep their <code>owner</code> field, which older versions do not use (they would let any label change or delete a registered server).</p>
+
+  <p><strong>Running the acceptance (pre-merge checks).</strong> There is no CI in this repository: the required checks are these commands, run by the author before a merge and recorded in the pull request. <code>npm run build &amp;&amp; npm test</code> for every change (the real-process security files are part of <code>npm test</code>). In addition both Docker probes, <code>npm run probe:epic-integration</code> and <code>npm run probe:docker-isolation</code>, for every change that touches one of these paths: <code>src/sandbox*.ts</code>, <code>src/agent.ts</code>, <code>src/model-proxy.ts</code>, <code>src/mcp-*</code>, <code>Dockerfile</code>, <code>docker-compose.yml</code>, <code>entrypoint.sh</code>, <code>security/*</code>, <code>scripts/*probe*</code>. Expected durations on the development host: the security regression and entry-point files about 8 minutes together, the failure file about 1.5 minutes, each Docker probe about 3 to 4 minutes including the image build; the full <code>npm test</code> takes longer than all of them (the evidence record of a revision names its measured time). Host prerequisites: Linux, <code>bwrap</code>, unprivileged user namespaces, <code>unshare</code>, <code>git</code>, <code>python3</code> and <code>perl</code>; for the probes also uid 1000, <code>sudo -n docker</code> and 2 GiB free in the temp directory. A missing prerequisite fails with a fixed <code>host prerequisite missing: &lt;name&gt;</code> line; a suite never skips. Run heavy checks through the workflow kit's <code>scripts/run-verification.mjs --wait --cwd &lt;worktree&gt; -- &lt;command&gt;</code> from a detached worktree at the committed revision, so an edit while a run waits in the queue cannot invalidate it (the runner serializes expensive runs across sessions of the same user).</p>
+
+  <p><strong>Reading the evidence.</strong> Every security row prints one line; the suites and the probe print only case names, booleans and counts, never a secret value:</p>
+<pre><code>grep -a '^SECURITY-' &lt;runner log&gt;
+# SECURITY-EVIDENCE: revision, tree, runtime versions, non-secret configuration, deadlines
+# SECURITY-MATRIX:   one per row: id, expected, observed, result, hits, duration, deadline, controls, surfaces with byte counts
+# SECURITY-SUMMARY:  expected rows, observed rows, pass, fail, missing ids</code></pre>
+  <p>A deliberately vulnerable negative control reads <code>expected=fail observed=fail result=pass</code>. A clean run has <code>fail=0 missing=none</code> in every <code>SECURITY-SUMMARY</code>. The Docker probe writes an evidence JSON (revision, image digest, configuration, every row and an overall verdict) and ends with <code>EPIC-INTEGRATION-RESULT verdict=PASS</code>.</p>
 
   <h3>Behavior changes</h3>
   <ul>
@@ -1726,6 +1787,9 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
     <li>A file an agent writes in its home is rebuilt away only at the next start, so a process of the same run (for example a shell the agent starts itself when Bash is granted) can still read it; no trusted step does.</li>
     <li>Conversation homes and work areas are never removed (MVP-7402), there is no size cap on a home or a private <code>/tmp</code>, and <code>pids_limit</code> is shared by all runs: an availability risk, not a credential exposure.</li>
     <li>An ownerless pre-update conversation id stays visible: a refusal versus a fresh conversation reveals that such an id exists.</li>
+    <li>The gateway process can exit when a client closes its connection while a hook or an in-process tool call is in flight (SDK 0.1.77 handles control requests unawaited; pre-existing, tracked as MVP-7866). The acceptance cancel row cancels during a Bash call, which is not that path, and does not claim it closed.</li>
+    <li>The runtime in the sandbox shares the network namespace and can make its own credential-free calls to its vendor host (egress residual, TD-9 of the Epic). The acceptance records non-loopback destinations held by the gateway's processes and runs the negative controls offline; it does not block them.</li>
+    <li>The known-value scan hides a mounted file that holds a secret value the gateway knows now. A copy of a credential value that was rotated before the run (for example an OAuth token before a refresh) is not recognized; this is the same limit class as MVP-7919.</li>
   </ul>
 
   <!-- ============================================================ -->
@@ -1802,8 +1866,10 @@ cp .env.example .env
 # Build and start
 docker compose up -d --build
 
-# Verify
-curl http://localhost:3001/health</code></pre>
+# Verify: isolation must be "ok"
+curl -s http://localhost:3001/health | jq .isolation</code></pre>
+
+  <p>Before a first or shared deployment follow the <a href="#runbook">Security acceptance and deployment runbook</a>: decisions to close, preparation, read-backs with their expected output, recovery, and a rollback that never restores unrestricted agent execution.</p>
 
   <h3>Environment Variables</h3>
 
