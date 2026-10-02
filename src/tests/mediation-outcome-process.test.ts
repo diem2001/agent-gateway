@@ -211,7 +211,7 @@ for candidate in find_urls():
 if url is None:
     out('no-url', 0, '')
     sys.exit(0)
-open('/home/node/relay-url', 'w').write(url)
+open('/work/relay-url', 'w').write(url)
 token = url.rsplit('/', 1)[1]
 for label, raw, hdr in [
     ('ungranted', rpc('tools/call', 11, {'name': 'delete_record', 'arguments': {}}), None),
@@ -475,7 +475,7 @@ describe("Outcome Probe: authorized integrations work behind the boundary and no
     expect(Object.keys(cases).filter((k) => k.startsWith("proxy-token ")).length).toBe(6);
 
     // 5. After the run: the saved relay URL is dead and nothing reaches any double.
-    const retryScript = "python3 - <<'PY'\nimport urllib.request, urllib.error, json\nurl = open('/home/node/relay-url').read()\nreq = urllib.request.Request(url, data=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'lookup_record','arguments':{}}}).encode(), headers={'Content-Type':'application/json'}, method='POST')\ntry:\n    r = urllib.request.urlopen(req, timeout=20); print(r.status)\nexcept urllib.error.HTTPError as e:\n    print(e.code)\nPY";
+    const retryScript = "python3 - <<'PY'\nimport urllib.request, urllib.error, json\nurl = open('/work/relay-url').read()\nreq = urllib.request.Request(url, data=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'lookup_record','arguments':{}}}).encode(), headers={'Content-Type':'application/json'}, method='POST')\ntry:\n    r = urllib.request.urlopen(req, timeout=20); print(r.status)\nexcept urllib.error.HTTPError as e:\n    print(e.code)\nPY";
     const before = { feed: f.feed.requests.length, jira: f.jira.requests.length };
     f.scripts.push({ name: "Bash", prompt: "OUTCOME-RETRY", input: { command: retryScript, description: "retry" } });
     await ask(f, { prompt: "OUTCOME-RETRY", sessionId: "outcome", useSession: true, user_id: "user-1", allowedTools: ["Bash"] });

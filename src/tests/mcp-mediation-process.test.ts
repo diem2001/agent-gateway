@@ -264,7 +264,7 @@ url = find_url()
 if url is None:
     print(json.dumps({'case': 'no-url', 'status': 0, 'body': ''}))
     sys.exit(0)
-open('/home/node/relay-url', 'w').write(url)
+open('/work/relay-url', 'w').write(url)
 def send(label, raw, headers=None):
     h = {'Content-Type': 'application/json'}
     h.update(headers or {})
@@ -291,7 +291,7 @@ describe("a process in the sandbox that finds the relay URL (real runtime)", () 
     const feed = await sse({ toolNames: ["lookup_record", "delete_record"] });
     const r = await rig([
       { name: "Bash", prompt: "A1-ATTACK", input: { command: ATTACK, description: "probe" } },
-      { name: "Bash", prompt: "A2-RETRY", input: { command: "python3 - <<'PY'\nimport urllib.request, urllib.error, json\nurl = open('/home/node/relay-url').read()\nreq = urllib.request.Request(url, data=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'lookup_record','arguments':{}}}).encode(), headers={'Content-Type':'application/json'}, method='POST')\ntry:\n    r = urllib.request.urlopen(req, timeout=20); print(r.status)\nexcept urllib.error.HTTPError as e:\n    print(e.code)\nPY", description: "probe" } },
+      { name: "Bash", prompt: "A2-RETRY", input: { command: "python3 - <<'PY'\nimport urllib.request, urllib.error, json\nurl = open('/work/relay-url').read()\nreq = urllib.request.Request(url, data=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'lookup_record','arguments':{}}}).encode(), headers={'Content-Type':'application/json'}, method='POST')\ntry:\n    r = urllib.request.urlopen(req, timeout=20); print(r.status)\nexcept urllib.error.HTTPError as e:\n    print(e.code)\nPY", description: "probe" } },
     ]);
     await registerServer(r, "feed", { type: "sse", url: feed.url, headers: { "X-Api-Key": FEED_KEY } });
     const grantBody = { sessionId: "atk", useSession: true, allowedTools: ["Bash", "mcp__feed__lookup_record"] };

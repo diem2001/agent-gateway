@@ -21,6 +21,7 @@ import { credentialRelay, type RelayGrant } from "./mcp-credential-relay.js";
 import { StdioBridge } from "./mcp-stdio-sandbox.js";
 import { createRunLogDir, removeRunLogDirAfterExit } from "./sdk-run-logs.js";
 import { SandboxRun, runtimeEnvFrom } from "./sandbox.js";
+import { SANDBOX_WORK } from "./sandbox-content.js";
 import { RunFailure, classifyRunFailure, isAbortError } from "./run-failure.js";
 import { builtInTools, createToolPolicyHook } from "./tool-policy.js";
 import { WEBHOOK_SERVER_NAME, computeToolGrant, mcpToolName, type ToolGrant } from "./tool-grant.js";
@@ -284,17 +285,17 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   const effectiveTools = allowedTools
     ? allowedTools.filter((name) => grant.allows(name))
     : [...DEFAULT_TOOLS.filter((name) => grant.allows(name)), ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
-  const HOME = process.env.HOME || "/home/node";
   const options: Record<string, unknown> = {
     allowedTools: effectiveTools,
     permissionMode: "bypassPermissions",
     model: model || "claude-opus-4-6",
     abortController,
     includePartialMessages: true,
-    cwd: HOME,
+    // The sandbox's working directory: the conversation's persistent work area, which the agent can write.
+    cwd: SANDBOX_WORK,
     // Only the user source (MVP-7679, Gate A): the project source reads a `.mcp.json` the agent can write in its
-    // own home and would start whatever command it names on the next turn. Global skills, configured agents and
-    // the read-only generated settings are user-source content and keep loading.
+    // working directory and would start whatever command it names on the next turn. Global skills, configured
+    // agents and the read-only generated settings are user-source content and keep loading.
     settingSources: ["user"],
   };
   if (enforced) {

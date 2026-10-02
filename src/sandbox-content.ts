@@ -220,89 +220,8 @@ export function prepareMountPoints(homeDir: string, mounts: { src: string; dest:
 }
 
 /* ------------------------------------------------------------------ */
-/*  The runtime's per-user state file                                   */
+/*  The clean home and the work area                                    */
 /* ------------------------------------------------------------------ */
-
-/**
- * `~/.claude.json` is the runtime's own state file, written by the runtime at every start and read again at the next
- * one, whatever the setting sources: its `mcpServers` (and the per-project `mcpServers` below `projects`) start a
- * command, so a file the agent writes in its own home would start one on the next turn even when the run grants it
- * no execution tool (MVP-7679, Gate A). The runtime crashes when the file is read-only, so the trusted side
- * rewrites it before every start instead: only these keys survive, each with a plain value.
- */
-export const RUNTIME_STATE_KEYS: readonly string[] = [
-  "cachedStatsigGates",
-  "firstStartTime",
-  "sonnet45MigrationComplete",
-  "opus45MigrationComplete",
-  "thinkingMigrationComplete",
-  "userID",
-  "numStartups",
-  "hasCompletedOnboarding",
-];
-
-const STATE_FILE = ".claude.json";
-const STATE_VALUE_MAX = 256;
-
-function plainStateValue(key: string, value: unknown): unknown {
-  if (key === "cachedStatsigGates") {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-    const gates: Record<string, boolean> = {};
-    for (const [name, flag] of Object.entries(value as Record<string, unknown>)) {
-      if (typeof flag === "boolean" && /^[A-Za-z0-9_.-]{1,64}$/.test(name)) gates[name] = flag;
-    }
-    return gates;
-  }
-  if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) return value;
-  if (typeof value === "string" && value.length <= STATE_VALUE_MAX) return value;
-  return undefined;
-}
-
-/**
- * Rewrites the home's runtime state file to its allowlisted keys and removes the backup copies, without following
- * any link. Runs before the sandbox of a conversation exists (the conversation lock guarantees no process of its
- * previous run is left). Throws when a file cannot be rewritten or removed: the caller fails closed.
- */
-export function sanitizeRuntimeConfig(homeDir: string): void {
-  const state = path.join(homeDir, STATE_FILE);
-  const stat = lstatOrNull(state);
-  if (stat) {
-    let kept: Record<string, unknown> | null = null;
-    if (stat.isFile() && !stat.isSymbolicLink() && ownedByGatewayUser(stat)) {
-      const raw = readFileNoFollow(state);
-      if (raw) {
-        try {
-          const parsed: unknown = JSON.parse(raw.toString("utf8"));
-          if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-            kept = {};
-            for (const key of RUNTIME_STATE_KEYS) {
-              const value = plainStateValue(key, (parsed as Record<string, unknown>)[key]);
-              if (value !== undefined) kept[key] = value;
-            }
-          }
-        } catch {
-          kept = null;
-        }
-      }
-    }
-    if (kept === null) {
-      fs.rmSync(state, { recursive: true, force: true });
-    } else {
-      const temp = path.join(homeDir, `${STATE_FILE}.sanitize-${randomDirName()}`);
-      fs.writeFileSync(temp, `${JSON.stringify(kept)}\n`, { flag: "wx", mode: 0o600 });
-      fs.renameSync(temp, state);
-    }
-  }
-  // Backups and temporary copies of the state file: the runtime restores a damaged state from them.
-  for (const entry of fs.readdirSync(homeDir)) {
-    if (entry !== STATE_FILE && entry.startsWith(`${STATE_FILE}.`)) fs.rmSync(path.join(homeDir, entry), { recursive: true, force: true });
-  }
-  purgeConfigDir(homeDir);
-  // The runtime runs `git status` in its working directory (the home) at start: a `core.fsmonitor` command or a
-  // filter driver in a repository the agent planted there would run, so the home itself is never a repository
-  // (a `.git` directory, file or link is removed, never followed; repositories below the home are not touched).
-  fs.rmSync(path.join(homeDir, ".git"), { recursive: true, force: true });
-}
 
 /**
  * What the agent may leave under `~/.claude` between two starts: data only, nothing the runtime reads as
@@ -315,10 +234,37 @@ export function sanitizeRuntimeConfig(homeDir: string): void {
 export const RUNTIME_WRITABLE_DIRS: readonly string[] = ["memory", "plans", "projects", "todos"];
 
 /**
+ * The sandbox's working directory and the agent's persistent scratch space for one conversation (a conversation's
+ * `work` directory, bound read-write). It is not the home: the runtime and its children read the home by name at
+ * start, nothing of the work area (project settings are not a configuration source of a run).
+ */
+export const SANDBOX_WORK = "/work";
+
+/**
+ * Rebuilds the agent's home from nothing before every sandbox start (operator decision A2, MVP-7679). The home is
+ * agent-writable and the runtime and its children read it by name at start: the shell snapshot runs `bash -l`
+ * (`.bash_profile`, `.bash_login`, `.profile`, `.bashrc`), `git` reads `.gitconfig` and `.config/git/config` and
+ * `core.fsmonitor` of a repository at the working directory, the runtime reads `.claude.json` and `.claude/.config.json`.
+ * Closing those names one by one failed three QA rounds, so everything in the home root except `.claude` is removed
+ * (no link is followed) and `.claude` keeps only the runtime's data (`RUNTIME_WRITABLE_DIRS`, and below `projects`
+ * only its own transcript directories); the runtime rebuilds its state file, shell snapshot and caches itself. Runs
+ * before the sandbox of a conversation exists (the conversation lock guarantees no process of its previous run is
+ * left). Throws when an entry cannot be removed: the caller fails closed.
+ */
+export function prepareSandboxHome(homeDir: string): void {
+  for (const entry of fs.readdirSync(homeDir)) {
+    if (entry === ".claude") continue;
+    fs.rmSync(path.join(homeDir, entry), { recursive: true, force: true });
+  }
+  purgeConfigDir(homeDir);
+}
+
+/**
  * Allow-list of the runtime's config directory (`~/.claude`, which the agent can write): everything not in
  * `RUNTIME_WRITABLE_DIRS` is removed without following links, and an allowed name that is not a real directory
- * is removed too. The runtime also prefers `<config dir>/.config.json` over `~/.claude.json` whenever it exists
- * (2.0.77, `cli.js` `QF()`), which this covers. A `.claude` that is not a real directory is removed itself.
+ * is removed too. Below `projects` only the runtime's own transcript directories (names starting with `-`, the
+ * working directory's name with `/` replaced) stay: the repository mount points are made fresh by the mount step.
+ * A `.claude` that is not a real directory is removed itself.
  */
 function purgeConfigDir(homeDir: string): void {
   const dir = path.join(homeDir, ".claude");
@@ -333,6 +279,42 @@ function purgeConfigDir(homeDir: string): void {
     if (RUNTIME_WRITABLE_DIRS.includes(entry) && lstatOrNull(full)?.isDirectory()) continue;
     fs.rmSync(full, { recursive: true, force: true });
   }
+  const projects = path.join(dir, "projects");
+  if (!lstatOrNull(projects)) return;
+  for (const entry of fs.readdirSync(projects)) {
+    const full = path.join(projects, entry);
+    if (entry.startsWith("-") && lstatOrNull(full)?.isDirectory()) continue;
+    fs.rmSync(full, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The runtime runs `git status` in its working directory at start, and the agent can write the work area, so a
+ * repository planted at its root would run `core.fsmonitor` (or a filter driver) there. A `.git` that is not a real
+ * directory owned by the gateway user (a gitdir pointer file or a link can name a directory the agent controls) is
+ * removed without being followed, and the configuration of a real one is rebuilt from the same allowlist as the
+ * repository views (`allowlistGitConfig`: no fsmonitor, hooks path, filters, includes or user info in URLs). The
+ * agent's other files, and repositories below the work area, are not touched: project settings in the work area are
+ * inert (the runtime reads the user source only) and the work area is the agent's own data.
+ */
+export function prepareWorkArea(workDir: string): void {
+  const git = path.join(workDir, ".git");
+  const stat = lstatOrNull(git);
+  if (!stat) return;
+  if (stat.isSymbolicLink() || !stat.isDirectory() || !ownedByGatewayUser(stat)) {
+    fs.rmSync(git, { recursive: true, force: true });
+    return;
+  }
+  const config = path.join(git, "config");
+  if (!lstatOrNull(config)) return;
+  const raw = readFileNoFollow(config);
+  if (raw === null) {
+    fs.rmSync(config, { recursive: true, force: true });
+    return;
+  }
+  const temp = path.join(git, `config.sanitize-${randomDirName()}`);
+  fs.writeFileSync(temp, allowlistGitConfig(raw.toString("utf8")), { flag: "wx", mode: 0o600 });
+  fs.renameSync(temp, config);
 }
 
 /* ------------------------------------------------------------------ */

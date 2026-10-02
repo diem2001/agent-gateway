@@ -10,13 +10,15 @@ import { gatewayModelProxy, type ModelProxy } from "./model-proxy.js";
 import { fixedFailure, isolationTimeoutMessage, isolationUnavailableMessage, RunFailure } from "./run-failure.js";
 import {
   SANDBOX_HOME,
+  SANDBOX_WORK,
   checkTrusted,
   contentScanner,
   knownSecretValues,
   lstatOrNull,
   planTrustedContent,
   prepareMountPoints,
-  sanitizeRuntimeConfig,
+  prepareSandboxHome,
+  prepareWorkArea,
   randomDirName,
   type MountPlan,
   type SandboxMount,
@@ -205,6 +207,8 @@ export interface BwrapSpec {
   procMasks: ProcMasks;
   /** Host session home, bound read-write at `/home/node`. */
   homeDir: string;
+  /** Host work area of the conversation, bound read-write at `/work`, the working directory; without one the home is the working directory (tool sandboxes). */
+  workDir?: string;
   /** Read-only binds of trusted content (applied after the home bind, in order). */
   mounts: SandboxMount[];
   /** Destination paths hidden behind an empty file. */
@@ -243,11 +247,12 @@ export function buildBwrapArgv(spec: BwrapSpec): string[] {
   for (const dir of spec.procMasks.dirs) argv.push("--tmpfs", `/proc/${dir}`);
   argv.push("--ro-bind", "/proc/sys", "/proc/sys");
   argv.push("--bind", spec.homeDir, SANDBOX_HOME);
+  if (spec.workDir) argv.push("--bind", spec.workDir, SANDBOX_WORK);
   for (const mount of spec.mounts) argv.push("--ro-bind", mount.src, mount.dest);
   for (const dest of spec.hidden) argv.push("--ro-bind", spec.emptyFile, dest);
   for (const p of spec.roBinds) argv.push("--ro-bind", p, p);
   for (const p of spec.rwBinds) argv.push("--bind", p, p);
-  argv.push("--chdir", SANDBOX_HOME, "--", "/bin/sh", "-c", LAUNCH_WRAPPER, "sandbox", spec.command, ...spec.args);
+  argv.push("--chdir", spec.workDir ? SANDBOX_WORK : SANDBOX_HOME, "--", "/bin/sh", "-c", LAUNCH_WRAPPER, "sandbox", spec.command, ...spec.args);
   return argv;
 }
 
@@ -380,28 +385,36 @@ export function prepareRunsRoot(root: string): string {
   return runs;
 }
 
+/** A directory the agent writes: a real directory owned by the gateway user (never a link), private to it. */
+function ensureAgentDir(dir: string): void {
+  let stat = lstatOrNull(dir);
+  if (!stat) {
+    fs.mkdirSync(dir, { mode: 0o700 });
+    stat = lstatOrNull(dir);
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (!stat || stat.isSymbolicLink() || !stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) throw new SandboxPrepError("invalid_root");
+  fs.chmodSync(dir, 0o700);
+}
+
 /**
- * The persistent home of a conversation: `<root>/sessions/<name>/home`, created on first use. The name
- * is the random id recorded with the conversation; the directories above the home are private to the
- * gateway, the home itself is the agent's (it must stay a real directory owned by the gateway user).
- * Deleting a conversation leaves its home in place: cleanup and retention belong to MVP-7402.
+ * The persistent directories of a conversation: `<root>/sessions/<name>/home` (rebuilt at every start, only the
+ * runtime's data carries over) and `<root>/sessions/<name>/work` (the agent's work area, bound at `/work`), both
+ * created on first use. The name is the random id recorded with the conversation; the directories above are
+ * private to the gateway, the two below are the agent's. Deleting a conversation leaves both in place: cleanup and
+ * retention belong to MVP-7402.
  */
-function sessionHome(root: string, dirId: string): string {
+function sessionDirs(root: string, dirId: string): { home: string; work: string } {
   if (!/^[0-9a-f]{24}$/.test(dirId)) throw new SandboxPrepError("content_invalid");
   const sessions = path.join(root, "sessions");
   ensurePrivateDir(sessions);
   const dir = path.join(sessions, dirId);
   ensurePrivateDir(dir);
   const home = path.join(dir, "home");
-  let stat = lstatOrNull(home);
-  if (!stat) {
-    fs.mkdirSync(home, { mode: 0o700 });
-    stat = lstatOrNull(home);
-  }
-  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  if (!stat || stat.isSymbolicLink() || !stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) throw new SandboxPrepError("invalid_root");
-  fs.chmodSync(home, 0o700);
-  return home;
+  const work = path.join(dir, "work");
+  ensureAgentDir(home);
+  ensureAgentDir(work);
+  return { home, work };
 }
 
 /** Removes every run directory a crashed gateway left behind. Called once at start. */
@@ -670,8 +683,16 @@ export class SandboxRun {
     fs.chmodSync(runDir, 0o700);
     const trustedDir = path.join(runDir, "trusted");
     fs.mkdirSync(trustedDir, { mode: 0o700 });
-    const homeDir = this.options.sessionDirId ? sessionHome(config.sandboxRoot, this.options.sessionDirId) : path.join(runDir, "home");
-    if (!this.options.sessionDirId) fs.mkdirSync(homeDir, { mode: 0o700 });
+    let homeDir: string;
+    let workDir: string;
+    if (this.options.sessionDirId) {
+      ({ home: homeDir, work: workDir } = sessionDirs(config.sandboxRoot, this.options.sessionDirId));
+    } else {
+      homeDir = path.join(runDir, "home");
+      workDir = path.join(runDir, "work");
+      fs.mkdirSync(homeDir, { mode: 0o700 });
+      fs.mkdirSync(workDir, { mode: 0o700 });
+    }
 
     const workspaceRoot = this.options.workspaceRoot ?? getWorkspaceRoot();
     const needles = knownSecretValues(process.env, path.join(workspaceRoot, ".credentials.json"), registryExtraSecrets());
@@ -698,7 +719,8 @@ export class SandboxRun {
     }
 
     try {
-      sanitizeRuntimeConfig(homeDir);
+      prepareSandboxHome(homeDir);
+      prepareWorkArea(workDir);
     } catch {
       throw new SandboxPrepError("content_invalid");
     }
@@ -719,6 +741,7 @@ export class SandboxRun {
       layout: detectRootLayout(),
       procMasks: detectProcMasks(),
       homeDir,
+      workDir,
       mounts: plan.mounts,
       hidden: plan.hidden,
       emptyFile,
@@ -791,13 +814,16 @@ export async function runIsolationSelfCheck(configOverride?: IsolationConfig): P
     runDir = fs.mkdtempSync(path.join(runs, "run-"));
     fs.chmodSync(runDir, 0o700);
     const homeDir = path.join(runDir, "home");
+    const workDir = path.join(runDir, "work");
     fs.mkdirSync(homeDir, { mode: 0o700 });
+    fs.mkdirSync(workDir, { mode: 0o700 });
     const canary = path.join(runDir, `canary-${randomDirName()}`);
     fs.writeFileSync(canary, "canary", { mode: 0o600 });
     const argv = buildBwrapArgv({
       layout: detectRootLayout(),
       procMasks: detectProcMasks(),
       homeDir,
+      workDir,
       mounts: [],
       hidden: [],
       emptyFile: "/dev/null",

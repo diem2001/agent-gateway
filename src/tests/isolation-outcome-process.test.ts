@@ -252,8 +252,8 @@ function scriptsFor(gateway: SpawnedGateway): ExactToolScript[] {
   const ws = gateway.dirs.workspace;
   return [
     // The Scenario: an ordinary chat, no agent, no skill. Turn 1 shows the environment and writes a fixture; turn 2 resumes and reads it.
-    bash(PROMPTS.turn1, "env | sort; echo FIXTURE-RESULT-7678 > /home/node/fixture.txt; echo WROTE-FIXTURE"),
-    read(PROMPTS.turn2, "/home/node/fixture.txt"),
+    bash(PROMPTS.turn1, "env | sort; echo FIXTURE-RESULT-7678 > /work/fixture.txt; echo WROTE-FIXTURE"),
+    read(PROMPTS.turn2, "/work/fixture.txt"),
     // The route matrix.
     bash(PROMPTS.interpreters, `python3 -c "import os; print(dict(os.environ))"; node -e "console.log(JSON.stringify(process.env))"; perl -e 'print join(",", %ENV)'; sh -c env; cat /proc/self/environ | tr '\\0' '\\n'; cat /proc/[0-9]*/environ 2>/dev/null | tr '\\0' '\\n'`),
     read(PROMPTS.readCreds, "/home/node/.claude/.credentials.json"),

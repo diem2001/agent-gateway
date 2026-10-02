@@ -226,8 +226,9 @@ describe("conversations of different owners that run at the same time", () => {
     const probeFor = (mine: string, file: string, otherPattern: string, otherFile: string): string =>
       [
         `echo ${mine} > /home/node/${file}`,
+        `echo ${mine} > /work/${file}`,
         "sleep 8",
-        `echo HITS=$(grep -rl --exclude-dir=proc --exclude-dir=sys '${otherPattern}' /home /tmp /etc /var /srv /opt /root /mnt 2>/dev/null | wc -l)`,
+        `echo HITS=$(grep -rl --exclude-dir=proc --exclude-dir=sys '${otherPattern}' /home /work /tmp /etc /var /srv /opt /root /mnt 2>/dev/null | wc -l)`,
         `echo FILES=$(find / -xdev -name '${otherFile}' 2>/dev/null | wc -l)`,
         `echo PROCS=$(cat /proc/[0-9]*/cmdline /proc/[0-9]*/environ 2>/dev/null | tr '\\0' '\\n' | grep -c '${otherPattern}')`,
         `echo OWN=$(cat /home/node/${file})`,
@@ -297,14 +298,14 @@ describe("conversations of different owners that run at the same time", () => {
 describe("a conversation created after the update", () => {
   it("resumes after a gateway restart in its own home, with its earlier turn, and still cannot read credentials", async () => {
     const r = await rig([
-      bash("PROBE-TURN1", "echo SYNTH-PERSIST-7678 > /home/node/persist.txt; echo WROTE"),
-      bash("PROBE-TURN2", "echo PERSISTED=$(cat /home/node/persist.txt); echo CREDS=$(cat /home/node/.claude/.credentials.json 2>&1 | grep -c 'SYNTH-OAUTH-ACCES[S]'); echo CREDS_ANYWHERE=$(grep -rl --exclude-dir=proc --exclude-dir=sys 'SYNTH-OAUTH-ACCES[S]' / 2>/dev/null | wc -l)"),
+      bash("PROBE-TURN1", "echo SYNTH-PERSIST-7678 > /work/persist.txt; echo WROTE"),
+      bash("PROBE-TURN2", "echo PERSISTED=$(cat /work/persist.txt); echo CREDS=$(cat /home/node/.claude/.credentials.json 2>&1 | grep -c 'SYNTH-OAUTH-ACCES[S]'); echo CREDS_ANYWHERE=$(grep -rl --exclude-dir=proc --exclude-dir=sys 'SYNTH-OAUTH-ACCES[S]' / 2>/dev/null | wc -l)"),
     ]);
     const first = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-1", sessionId: "keep", prompt: "PROBE-TURN1", user_id: "user-1", useSession: true });
     expect(first.events.at(-1)?.type, JSON.stringify(first.events.at(-1))).toBe("done");
     await waitForSessionsFile(r.gateway, "keep");
     const home = sessionHome(r.gateway, "keep");
-    expect(fs.readFileSync(path.join(home, "persist.txt"), "utf8").trim()).toBe("SYNTH-PERSIST-7678");
+    expect(fs.readFileSync(path.join(path.dirname(home), "work", "persist.txt"), "utf8").trim()).toBe("SYNTH-PERSIST-7678");
 
     // Restart: stop the gateway cleanly, start a new process on the same directories.
     const old = r.gateway;

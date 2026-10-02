@@ -470,17 +470,20 @@ describe("what the sandbox sees of the trusted workspace", () => {
 });
 
 describe("homes of conversations", () => {
-  it("a conversation's home persists between runs; a run without a conversation leaves nothing behind", async () => {
-    const first = await probe(`echo first > /home/node/state.txt; echo DONE=1`, { sessionDirId: dirId("conv-A") });
+  it("a conversation's work area and runtime data persist between runs, its home root does not; a run without a conversation leaves nothing behind", async () => {
+    const first = await probe(`echo first > /work/state.txt; echo home > /home/node/state.txt; mkdir -p /home/node/.claude/todos; echo todo > /home/node/.claude/todos/t.json; echo DONE=1`, { sessionDirId: dirId("conv-A") });
     expect(first.lines.get("DONE")).toBe("1");
-    const second = await probe(`echo SEEN=$(cat /home/node/state.txt 2>&1)`, { sessionDirId: dirId("conv-A") });
+    const second = await probe(`echo SEEN=$(cat /work/state.txt 2>&1); echo HOME_SEEN=$(cat /home/node/state.txt 2>&1 | grep -c '^home$'); echo TODO=$(cat /home/node/.claude/todos/t.json)`, { sessionDirId: dirId("conv-A") });
     expect(second.lines.get("SEEN")).toBe("first");
+    expect(second.lines.get("HOME_SEEN")).toBe("0");
+    expect(second.lines.get("TODO")).toBe("todo");
     // Another conversation does not see it.
-    const other = await probe(`echo SEEN=$(cat /home/node/state.txt 2>&1 | grep -c first)`, { sessionDirId: dirId("conv-B") });
+    const other = await probe(`echo SEEN=$(cat /work/state.txt 2>&1 | grep -c first); echo TODO=$(cat /home/node/.claude/todos/t.json 2>&1 | grep -c '^todo$')`, { sessionDirId: dirId("conv-B") });
     expect(other.lines.get("SEEN")).toBe("0");
-    // A run without a conversation: its home is removed with its run directory.
+    expect(other.lines.get("TODO")).toBe("0");
+    // A run without a conversation: its home and work area are removed with its run directory.
     const before = fs.readdirSync(path.join(sandboxRoot, "runs"));
-    const stateless = await probe(`echo x > /home/node/leftover.txt; echo DONE=1`);
+    const stateless = await probe(`echo x > /home/node/leftover.txt; echo x > /work/leftover.txt; echo DONE=1`);
     expect(stateless.lines.get("DONE")).toBe("1");
     expect(fs.readdirSync(path.join(sandboxRoot, "runs"))).toEqual(before);
   });

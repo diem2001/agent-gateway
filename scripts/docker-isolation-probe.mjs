@@ -405,8 +405,8 @@ async function main() {
   row("the compose health command succeeds while isolation is ok", healthOk === "HEALTHY", { command: "compose healthcheck (port substituted)" });
 
   // An ordinary chat: `env | sort`, a fixture file, and (after a container restart) a resumed turn.
-  const first = await query(port, { queryId: "q-env", sessionId: "conv-docker", prompt: `PROBE-ENV ${bash("env | sort; echo FIXTURE-7678 > /home/node/fixture.txt; echo WROTE")}`, user_id: "user-1" });
-  const envResult = api.results.get(bash("env | sort; echo FIXTURE-7678 > /home/node/fixture.txt; echo WROTE"));
+  const first = await query(port, { queryId: "q-env", sessionId: "conv-docker", prompt: `PROBE-ENV ${bash("env | sort; echo FIXTURE-7678 > /work/fixture.txt; echo WROTE")}`, user_id: "user-1" });
+  const envResult = api.results.get(bash("env | sort; echo FIXTURE-7678 > /work/fixture.txt; echo WROTE"));
   row("an ordinary chat answers and shows its environment", first.at(-1)?.type === "done" && !!envResult && envResult.text.includes("HOME=/home/node") && /ANTHROPIC_API_KEY=mpt_/.test(envResult.text), { done: first.at(-1)?.type === "done" });
   const leaked = Object.entries(MARKERS).filter(([, v]) => (envResult?.text ?? "").includes(v)).map(([k]) => k);
   const surfaces = [JSON.stringify(first), await docker("logs", id).catch(() => "")].join("\n");
@@ -462,7 +462,7 @@ async function main() {
   // The conversation resumes after a container restart, in its own home.
   await docker("restart", "-t", "10", id);
   await waitHealth(port, "ok");
-  const readTag = readTool("/home/node/fixture.txt");
+  const readTag = readTool("/work/fixture.txt");
   const resumed = await query(port, { queryId: "q-resume", sessionId: "conv-docker", prompt: `PROBE-RESUME ${readTag}`, user_id: "user-1" });
   const resumedResult = api.results.get(readTag);
   row("after a container restart the conversation resumes and finds its file", resumed.at(-1)?.type === "done" && !!resumedResult && resumedResult.text.includes("FIXTURE-7678"), { done: resumed.at(-1)?.type === "done" });
