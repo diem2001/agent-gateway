@@ -533,9 +533,9 @@ describe("the clean home and the work area (A2, real runtime)", () => {
 
   describe("a repository the agent writes at the root of /work runs nothing at a later start, with Bash denied (the finding of QA 38335)", () => {
     const skeleton = (dir: string, extra: ExactToolScript[]): ExactToolScript[] => [
-      write(`${dir.toUpperCase()}-HEAD`, `${dir}/HEAD`, "ref: refs/heads/main\n"),
-      write(`${dir.toUpperCase()}-OBJ`, `${dir}/objects/.keep`, ""),
-      write(`${dir.toUpperCase()}-REFS`, `${dir}/refs/.keep`, ""),
+      write(`SK${dir.toUpperCase()}-HEAD`, `${dir}/HEAD`, "ref: refs/heads/main\n"),
+      write(`SK${dir.toUpperCase()}-OBJ`, `${dir}/objects/.keep`, ""),
+      write(`SK${dir.toUpperCase()}-REFS`, `${dir}/refs/.keep`, ""),
       ...extra,
     ];
     const runRow = async (id: string, scripts: ExactToolScript[]): Promise<Rig> => {
@@ -565,6 +565,22 @@ describe("the clean home and the work area (A2, real runtime)", () => {
         write("RH-WORKTREE", "/work/.git/config.worktree", "[core]\n\tfsmonitor = touch /work/m-worktreecfg\n"),
       ]));
       expect(fs.existsSync(path.join(sessionWork(r, "rh"), ".git"))).toBe(false);
+    });
+
+    it("row B: a bare layout at the root of /work (HEAD, objects, refs, config) with core.bare=false, core.worktree=/work and core.fsmonitor (the finding of QA 38369)", async () => {
+      const r = await runRow("rb", skeleton("/work", [
+        write("RB-CONFIG", "/work/config", "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tworktree = /work\n\tfsmonitor = touch /work/m-bare\n"),
+      ]));
+      expect(fs.readFileSync(path.join(sessionWork(r, "rb"), "config"), "utf8")).toContain("fsmonitor");
+    });
+
+    it("row B2: the same layout reaching the command through an include and a worktree configuration", async () => {
+      const r = await runRow("rb2", skeleton("/work", [
+        write("RB2-INC", "/work/inc.cfg", "[core]\n\tfsmonitor = touch /work/m-bare-include\n"),
+        write("RB2-CONFIG", "/work/config", "[core]\n\trepositoryformatversion = 1\n\tbare = false\n\tworktree = /work\n[extensions]\n\tworktreeConfig = true\n[include]\n\tpath = /work/inc.cfg\n"),
+        write("RB2-WT", "/work/config.worktree", "[core]\n\tfsmonitor = touch /work/m-bare-worktreecfg\n"),
+      ]));
+      expect(fs.existsSync(path.join(sessionWork(r, "rb2"), "config.worktree"))).toBe(true);
     });
 
     it("a repository in a subdirectory of /work (a copied project) is not consulted by the start-time git, and stays", async () => {

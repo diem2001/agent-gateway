@@ -222,6 +222,13 @@ describe("sandbox environment", () => {
         "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
         "CLAUDE_CODE_ENTRYPOINT",
         "DISABLE_AUTOUPDATER",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_KEY_1",
+        "GIT_CONFIG_KEY_2",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_VALUE_1",
+        "GIT_CONFIG_VALUE_2",
         "HOME",
         "LANG",
         "LC_ALL",
@@ -244,6 +251,10 @@ describe("sandbox environment", () => {
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     });
     expect(env.PATH).toBe("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    // Trusted, highest-precedence git configuration: no fsmonitor, no hooks, no implicit bare repository.
+    const gitConfig = Object.fromEntries([0, 1, 2].map((i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+    expect(env.GIT_CONFIG_COUNT).toBe("3");
+    expect(gitConfig).toEqual({ "core.fsmonitor": "false", "core.hooksPath": "/dev/null", "safe.bareRepository": "explicit" });
     const text = JSON.stringify(env);
     for (const secret of Object.values(secrets).filter((v) => v.length >= 8)) expect(text).not.toContain(secret);
     for (const name of ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "NODE_OPTIONS", "LD_PRELOAD", "SSH_AUTH_SOCK", "MCP_TIMEOUT", "DEBUG_CLAUDE_AGENT_SDK", "GITHUB_TOKEN", "API_KEYS", "CLAUDE_CODE_OAUTH_TOKEN"]) expect(env[name], name).toBeUndefined();

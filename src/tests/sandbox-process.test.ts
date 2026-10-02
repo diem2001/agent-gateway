@@ -593,6 +593,49 @@ describe("the clean home and the work area (MVP-7679, A2)", () => {
     }
   });
 
+  it("every way a repository can be discovered at the root of /work runs nothing at the next start: a gitfile, an implicit bare layout (with includes, includeIf, a worktree configuration, a filter driver) and a plain directory", async () => {
+    // Each plant makes git, run from /work WITHOUT the sandbox's trusted configuration, run `touch /work/MARK`.
+    const BARE = `git init -q --bare /work && git -C /work config core.bare false && git -C /work config core.worktree /work`;
+    const MON = `printf '[core]\\n\\tfsmonitor = touch /work/MARK\\n' > /work/inc.cfg`;
+    const rows: Array<{ name: string; plant: string }> = [
+      { name: "m-gitfile", plant: `mkdir -p /work/evil && git init -q --bare /work/evil && git -C /work/evil config core.fsmonitor 'touch /work/MARK' && git -C /work/evil config core.bare false && git -C /work/evil config core.worktree /work && echo 'gitdir: /work/evil' > /work/.git` },
+      { name: "m-bare", plant: `${BARE} && git -C /work config core.fsmonitor 'touch /work/MARK'` },
+      { name: "m-include", plant: `${BARE} && ${MON} && git -C /work config include.path /work/inc.cfg` },
+      { name: "m-includeif", plant: `${BARE} && ${MON} && git -C /work config 'includeIf.gitdir:/work.path' /work/inc.cfg` },
+      { name: "m-worktreecfg", plant: `${BARE} && git -C /work config extensions.worktreeConfig true && git -C /work config core.repositoryformatversion 1 && printf '[core]\\n\\tfsmonitor = touch /work/MARK\\n' > /work/config.worktree` },
+      { name: "m-filter", plant: `${BARE} && git -C /work config filter.x.clean 'touch /work/MARK; cat' && echo '* filter=x' > /work/.gitattributes && echo one > /work/tracked.txt && GIT_DIR=/work git add tracked.txt .gitattributes 2>/dev/null; echo two > /work/tracked.txt; rm -f /work/MARK` },
+      { name: "m-plaindir", plant: `git init -q /work && git -C /work config core.fsmonitor 'touch /work/MARK'` },
+    ];
+    for (const row of rows) {
+      const plant = row.plant.replaceAll("MARK", row.name);
+      const check = `git -C /work status --porcelain >/dev/null 2>&1; echo MARKER=$(ls /work/${row.name} 2>&1 | grep -c -v 'No such')`;
+      const id = dirId(`work-vec-${row.name}`);
+      const planted = await probe(`${plant}; echo DONE=1`, { sessionDirId: id });
+      expect(planted.lines.get("DONE"), row.name).toBe("1");
+      // The planted layout is still there (only a .git entry is removed at the start), and the next start's git runs nothing.
+      const second = await probe(check, { sessionDirId: id });
+      expect(second.lines.get("MARKER"), row.name).toBe("0");
+      // Control: without the sandbox's trusted git configuration the same planted files DO run the command (the vector is producible).
+      const control = await probe(`${plant}; env -u GIT_CONFIG_COUNT git -C /work status >/dev/null 2>&1; echo MARKER=$(ls /work/${row.name} 2>&1 | grep -c -v 'No such')`, { sessionDirId: dirId(`work-vec-c-${row.name}`) });
+      expect(control.lines.get("MARKER"), `${row.name} control`).toBe("1");
+    }
+  });
+
+  it("the trusted git configuration of the sandbox has the highest precedence and leaves legitimate git alone: a copied repository below /work still works, an agent's own repository cannot re-enable fsmonitor, a bare repository must be named explicitly", async () => {
+    const r = await probe(
+      `git init -q /work/sub && git -C /work/sub config core.fsmonitor 'touch /work/m-sub' && echo x > /work/sub/f && git -C /work/sub add f && git -C /work/sub -c user.name=a -c user.email=a@b.c commit -q -m c && echo SUBLOG=$(git -C /work/sub log --oneline | wc -l);
+       git -C /work/sub status --porcelain >/dev/null 2>&1; echo SUBMARKER=$(ls /work/m-sub 2>&1 | grep -c -v 'No such');
+       git init -q --bare /work/b.git; echo IMPLICIT=$(cd /work/b.git && git rev-parse --git-dir 2>&1 | head -1 | grep -c '^fatal: cannot use bare repository'); echo EXPLICIT=$(git --git-dir=/work/b.git rev-parse --is-bare-repository 2>&1);
+       echo CFGCOUNT=$(git config --show-scope --list | grep -c '^command'); echo DONE=1`,
+      { sessionDirId: dirId("work-git-config") },
+    );
+    expect(r.lines.get("SUBLOG")).toBe("1");
+    expect(r.lines.get("SUBMARKER")).toBe("0");
+    expect(r.lines.get("IMPLICIT")).toBe("1");
+    expect(r.lines.get("EXPLICIT")).toBe("true");
+    expect(r.lines.get("CFGCOUNT")).toBe("3");
+  });
+
   it("a repository below /work (a copied project) is not consulted by the start-time git: its fsmonitor does not run, and git from /work does not see it", async () => {
     const id = dirId("work-git-nested");
     await probe(`mkdir -p /work/sub && git init -q /work/sub && git -C /work/sub config core.fsmonitor 'touch /work/m-nested' && echo DONE=1`, { sessionDirId: id });
@@ -605,7 +648,7 @@ describe("the clean home and the work area (MVP-7679, A2)", () => {
     expect(control.lines.get("MARKER")).toBe("1");
   });
 
-  it("the start-time git cannot be steered elsewhere: no GIT_* variable, nothing an earlier run wrote above /work survives, and every configuration file it reads is outside the agent's reach", async () => {
+  it("the start-time git cannot be steered elsewhere: no GIT_* variable but the trusted configuration, nothing an earlier run wrote above /work survives, and every configuration file it reads is outside the agent's reach", async () => {
     const id = dirId("work-git-origins");
     // Whatever the agent writes outside /work, the home and /tmp (the sandbox root is a fresh tmpfs per start) is gone at the next start.
     const planted = await probe(`mkdir -p /.git/objects /.git/refs && echo 'ref: refs/heads/main' > /.git/HEAD && printf '[core]\\n\\tfsmonitor = touch /work/m-root\\n' > /.git/config && echo DONE=1; git -C /work status >/dev/null 2>&1; echo CONTROL=$(cd / && git status >/dev/null 2>&1; ls /work/m-root 2>&1 | grep -c -v 'No such'); echo STOP=$(git -C /work rev-parse --git-dir 2>&1 | head -1 | tr ' ' '_'); rm -f /work/m-root`, { sessionDirId: id });
@@ -614,7 +657,7 @@ describe("the clean home and the work area (MVP-7679, A2)", () => {
     expect(planted.lines.get("CONTROL")).toBe("1");
     expect(planted.lines.get("STOP")).toBe("fatal:_not_a_git_repository_(or_any_parent_up_to_mount_point_/)");
     const result = await probe(
-      `echo GITENV=$(env | grep -c '^GIT_'); echo ROOTGIT=$(ls -A /.git 2>&1 | grep -c -v 'No such');
+      `echo GITENV=$(env | grep '^GIT_' | grep -v -c '^GIT_CONFIG_\\(COUNT\\|KEY_[0-9]\\|VALUE_[0-9]\\)='); echo ROOTGIT=$(ls -A /.git 2>&1 | grep -c -v 'No such');
        git -C /work status >/dev/null 2>&1; echo MARKER=$(ls /work/m-root 2>&1 | grep -c -v 'No such');
        echo SEARCH=$(git -C /work rev-parse --git-dir 2>&1 | head -1 | grep -c -v '^fatal');
        for origin in $(git -C /work config --list --show-origin 2>/dev/null | cut -f1 | sort -u); do echo ORIGIN=$origin; done; echo DONE=1`,
