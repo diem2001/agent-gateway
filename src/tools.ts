@@ -1,11 +1,5 @@
 import { log } from "./logging.js";
-import { createPersistentStore, isNamedEntryList } from "./persistence.js";
-
-/** A persisted entry's `owner`, when present, must be a non-empty string; otherwise the whole file is set aside (MVP-7616). */
-function hasValidOwners(data: unknown): boolean {
-  if (!isNamedEntryList(data)) return false;
-  return (data as { owner?: unknown }[]).every((entry) => entry.owner === undefined || (typeof entry.owner === "string" && entry.owner.length > 0));
-}
+import { createPersistentStore, hasValidOwners } from "./persistence.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */

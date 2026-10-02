@@ -81,6 +81,7 @@ async function registerServer(def: {
   registerMcpServer({
     description: "",
     enabled: true,
+    owner: "caller",
     createdAt: now,
     updatedAt: now,
     ...def,

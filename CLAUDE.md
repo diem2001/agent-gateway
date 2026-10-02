@@ -42,6 +42,7 @@ npm run probe:docker-stop       # Docker Outcome Probe for the clean stop (same 
 | `AGENT_RUN_TIMEOUT_MS` | No | `7200000` | Deadline of one query request, retries and backoff included; expiry ends the run with the deadline text and saves nothing; an invalid value stops startup |
 | `AGENT_MCP_TOOL_TIMEOUT_MS` | No | `600000` | Overall deadline of one mediated MCP `tools/call` in an agent run (http, SSE, stdio), in ms; empty = default; an invalid value stops startup (`FATAL config key=AGENT_MCP_TOOL_TIMEOUT_MS reason=must be a positive whole number of milliseconds`). The relay's 120 s no-progress timeout stays |
 | `AGENT_TOOL_POLICY` | No | unset | Tool grant per API-key label, JSON `{"default":{allow?,deny?},"labels":{"<label>":{allow?,deny?}}}` of built-in names, `mcp__<server>__*` and `mcp__<server>__<tool>`; empty/unset = no restriction; an invalid value or a label not in `API_KEYS` stops startup (`FATAL config key=AGENT_TOOL_POLICY reason=<reason>`) |
+| `MCP_SERVER_OWNERS` | No | unset | Deploy-step mapping `<server>:<label>,...` applied at startup: assigns the owner of registered MCP servers that have none (never transfers an owned one); entries trimmed, split at the last `:`; a malformed entry or a duplicate name stops startup (`FATAL config key=MCP_SERVER_OWNERS reason=<reason>`, the restart policy then loops: fix the value); read-back lines `mcp.registry.owner_assigned`, `mcp.registry.owner_mapping`, `mcp.registry.ownerless count=<n> names=<list> saved=<bool>` |
 | `AGENT_SANDBOX_ROOT` | No | `$HOME/.agent-sandbox` | Trusted storage of the sandbox homes (never mounted as a whole); must be an absolute path to a private directory without symlinks, else every run fails closed |
 | `AGENT_SANDBOX_BWRAP` | No | `/usr/bin/bwrap` | Path of the isolation runtime; must be an absolute path |
 | `MODEL_PROXY_IDLE_TIMEOUT_MS` | No | `600000` | No-progress timeout per proxied provider request (trusted model proxy); an invalid value (non-numeric, 0, negative) stops startup |
@@ -122,7 +123,8 @@ src/
   tool-mediation.ts  # Internal ToolRequest/ToolReply contract, the five TOOL_* codes with fixed texts, webhook rejection text, secret masking, AGENT_MCP_TOOL_TIMEOUT_MS
   tool-policy.ts     # enforcedTools: request validation, built-in/server selection, deny-only PreToolUse hook (per-run enforced tool set)
   tool-input-schema.ts # Webhook tool input_schema -> typed, described SDK shape; per-property "any value" fallback, per-tool untyped fallback
-  mcp-registry.ts    # External MCP server registry CRUD + persistence (MCP_SERVERS_PERSIST_PATH)
+  mcp-registry.ts    # External MCP server registry CRUD + persistence (MCP_SERVERS_PERSIST_PATH); owner per entry (registering API-key label, never returned by a route), ownerless = registered before ownership
+  mcp-server-owners.ts # MCP_SERVER_OWNERS parser (fatal fixed lines) and startup applier (only ownerless entries, read-back lines)
   mcp-upload-relay.ts # Streaming upload relay: raw-path rule, parser skip, pre-auth guard, X-MCP-Credential-Headers, relay core
   mcp-credential-relay.ts # Loopback relay for every registered MCP server (http, SSE, stdio) and request servers with headers/env: per-run token and binding, grant check, message rules, buffered and validated answers, fixed TOOL_* failures (no OAuth login in the runtime)
   mcp-bridge.ts      # SSE bridge of the relay (endpoint event only on the registered origin, local answers to server requests)
@@ -141,7 +143,7 @@ src/
     workspace.ts     # CRUD for /v1/memory/*, /v1/agents/*, /v1/skills/*
     git.ts           # POST /v1/workspace/git/clone|pull, GET /v1/workspace/git/status
     tools.ts         # PUT/GET/DELETE /v1/tools (Tool Registry REST endpoints)
-    mcp.ts           # PUT/GET/DELETE /v1/mcp-servers + /restart + /health + /test + /call (MCP Server Registry; PUT refuses a NEW name outside ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ with 400 MCP_SERVER_NAME_INVALID, existing names stay editable/deletable; /call = direct LLM-free tools/call passthrough, gates on enabled unlike /test; /uploads/* = streaming upload relay)
+    mcp.ts           # PUT/GET/DELETE /v1/mcp-servers + /restart + /health + /test + /call (MCP Server Registry; PUT/DELETE of an existing name only for its owner, else 403 MCP_SERVER_OWNER_MISMATCH before any validation, ownerless entries refused for every label and for credential-bearing /call, /test, /uploads/*; PUT refuses a NEW name outside ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ with 400 MCP_SERVER_NAME_INVALID, existing names stay editable/deletable; /call = direct LLM-free tools/call passthrough, gates on enabled unlike /test; /uploads/* = streaming upload relay)
   tests/
     e2e-session.test.ts    # E2E session continuity tests
     routes.tools.test.ts   # Tool routes unit tests
@@ -174,7 +176,9 @@ src/
     tool-grant-process.test.ts / mcp-mediation-process.test.ts / mcp-stdio-sandbox-process.test.ts # Real-runtime probes: built-in refusal for every actor, relay mediation, stdio tool sandbox (need `npm run build`)
     public-auth-matrix-process.test.ts / mediation-outcome-process.test.ts # Public auth matrix per label; end-to-end Outcome Probe of the mediation (need `npm run build`)
     helpers/sse-mcp-stub.ts         # SSE MCP server stub for the bridge tests
-    mcp-overrides.test.ts           # Override merge + requireUserCredentials header-key casing
+    mcp-overrides.test.ts           # Override merge + requireUserCredentials header-key casing + ownerless left out of credential-bearing runs
+    mcp-server-owner.test.ts / mcp-server-owners.test.ts # Registry ownership routes (two labels, real authMiddleware) and the MCP_SERVER_OWNERS parser/applier
+    mcp-server-owner-process.test.ts # Outcome Probe: another label cannot redirect a registered server; restart, deploy step, ownerless run (spawned gateway, needs `npm run build`)
     routes.mcp.test.ts              # Registry PUT schema validation + new-entry name rule
     require-user-credentials.test.ts # requireUserCredentials + header/env validation
     credential-redaction-rows.test.ts # Debug-log redaction for every credential entry point

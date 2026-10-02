@@ -39,6 +39,7 @@ async function registerServer(def: Partial<McpServerDefinition> & Pick<McpServer
   registerMcpServer({
     description: "",
     enabled: true,
+    owner: "isolation-test",
     createdAt: now,
     updatedAt: now,
     ...def,

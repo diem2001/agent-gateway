@@ -52,7 +52,7 @@ async function stub(handler?: StubHandler): Promise<UploadStub> {
 async function register(def: Partial<McpServerDefinition> & Pick<McpServerDefinition, "name" | "type">) {
   const { registerMcpServer } = await import("../mcp-registry.js");
   const now = new Date().toISOString();
-  registerMcpServer({ description: "", enabled: true, createdAt: now, updatedAt: now, ...def } as McpServerDefinition);
+  registerMcpServer({ description: "", enabled: true, owner: "relay", createdAt: now, updatedAt: now, ...def } as McpServerDefinition);
 }
 
 function send(options: Omit<SendOptions, "port">) {
@@ -350,6 +350,31 @@ describe("refusals before any upstream connection", () => {
     const reply = await refused({ path: "/v1/mcp-servers/local/uploads/jira/issue/MVP-1", headers: BEARER });
     expect(reply.status).toBe(400);
     expect(reply.body.error.code).toBe("MCP_UPLOAD_UNSUPPORTED");
+  });
+
+  it("ownerless server with a credential header → 403 MCP_SERVER_OWNER_MISMATCH, nothing reaches the MCP server (MVP-7925)", async () => {
+    const upstream = await stub();
+    await register({ name: "legacy", type: "http", url: upstream.url, owner: undefined });
+    const result = await send({
+      path: "/v1/mcp-servers/legacy/uploads/jira/issue/MVP-1",
+      total: 4096,
+      headers: { ...BEARER, "X-MCP-Credential-Headers": credentialHeader({ Authorization: USER_BASIC }) },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(result.status).toBe(403);
+    expect(JSON.parse(result.text)).toEqual({
+      error: { code: "MCP_SERVER_OWNER_MISMATCH", message: 'MCP server "legacy" is registered by another application' },
+    });
+    expect(upstream.connections()).toBe(0);
+    expect(upstream.requests).toHaveLength(0);
+  });
+
+  it("ownerless server without a credential header is relayed as before (MVP-7925)", async () => {
+    const upstream = await stub();
+    await register({ name: "legacy", type: "http", url: upstream.url, owner: undefined });
+    const result = await send({ path: "/v1/mcp-servers/legacy/uploads/jira/issue/MVP-1", total: 4096, headers: { ...BEARER } });
+    expect(result.status).toBe(201);
+    expect(upstream.requests).toHaveLength(1);
   });
 
   const invalidOverrides: [string, string | string[]][] = [

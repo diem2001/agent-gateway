@@ -13,6 +13,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServerDefinition } from "../mcp-registry.js";
 import { mergeHeaders } from "../mcp-overrides.js";
+import { TEST_OWNER, mountOwnerAuth } from "./helpers/owner-auth.js";
 
 let tempDir: string;
 const closers: (() => Promise<void>)[] = [];
@@ -65,6 +66,7 @@ async function app() {
   const { default: mcpRoutes } = await import("../routes/mcp.js");
   const server = express();
   server.use(express.json());
+  await mountOwnerAuth(server);
   server.use(mcpRoutes);
   return server;
 }
@@ -72,7 +74,7 @@ async function app() {
 async function register(def: Partial<McpServerDefinition> & Pick<McpServerDefinition, "name" | "type">) {
   const { registerMcpServer } = await import("../mcp-registry.js");
   const now = new Date().toISOString();
-  registerMcpServer({ description: "", enabled: true, createdAt: now, updatedAt: now, ...def } as McpServerDefinition);
+  registerMcpServer({ description: "", enabled: true, owner: TEST_OWNER, createdAt: now, updatedAt: now, ...def } as McpServerDefinition);
 }
 
 describe("mergeHeaders", () => {
