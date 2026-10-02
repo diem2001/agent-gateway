@@ -99,7 +99,7 @@ function redactCredentialValue(value: unknown): unknown {
 }
 
 /**
- * The `args` of a stdio server definition (an object with a string `command`): a credential can be passed on the
+ * The `args` of a stdio server definition (an object with a `command` key or `type: "stdio"`): a credential can be passed on the
  * command line, so every element is redacted and the count stays visible; any other shape becomes "[REDACTED]".
  */
 function redactStdioArgs(value: unknown): unknown {
@@ -119,7 +119,8 @@ export function redactCredentialsForLog(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactCredentialsForLog);
   if (!value || typeof value !== "object") return value;
   const copy: Record<string, unknown> = {};
-  const stdioDefinition = typeof (value as Record<string, unknown>).command === "string";
+  // A definition is recognized by its shape before any validation has run (a malformed one is rejected only after the preview).
+  const stdioDefinition = "command" in (value as Record<string, unknown>) || (value as Record<string, unknown>).type === "stdio";
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
     if (CREDENTIAL_KEYS.has(key)) copy[key] = redactCredentialValue(entry);
     else if (key === "args" && stdioDefinition) copy[key] = redactStdioArgs(entry);
