@@ -616,7 +616,7 @@ export interface QueryOutcome {
 }
 
 /** One `POST /v1/query` as `key`, streamed to the end. `deadlineMs` ends a hanging request (the result then has `aborted`). */
-export function queryAs(port: number, key: string, body: Record<string, unknown>, deadlineMs = 180_000): Promise<QueryOutcome> {
+export function queryAs(port: number, key: string, body: Record<string, unknown>, deadlineMs = 180_000, control?: { abort?: () => void }): Promise<QueryOutcome> {
   return new Promise((resolve) => {
     const started = Date.now();
     const payload = Buffer.from(JSON.stringify({ model: "claude-sonnet-4-5", ...body }), "utf8");
@@ -662,6 +662,14 @@ export function queryAs(port: number, key: string, body: Record<string, unknown>
       req.destroy();
       finish(0);
     }, deadlineMs);
+    // A caller that goes away: the client closes its connection (the gateway cancels the run on that close).
+    if (control) {
+      control.abort = () => {
+        aborted = true;
+        req.destroy();
+        finish(0);
+      };
+    }
     req.on("error", () => {
       aborted = true;
       finish(0);
@@ -831,6 +839,63 @@ export async function startRedirectMcp(target: string): Promise<RedirectMcp> {
   };
 }
 
+export interface FaultMcp {
+  url: string;
+  /** JSON-RPC methods received, in order. */
+  methods: string[];
+  /** Number of `tools/call` requests that arrived. */
+  calls: () => number;
+  close: () => Promise<void>;
+}
+
+/** An http MCP server whose handshake and tool list work and whose `tools/call` never answers (`hang`) or resets the connection (`reset`). */
+export async function startFaultMcp(mode: "hang" | "reset"): Promise<FaultMcp> {
+  const methods: string[] = [];
+  const sockets = new Set<net.Socket>();
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      let message: { id?: number; method?: string } = {};
+      try {
+        message = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as { id?: number; method?: string };
+      } catch {
+        // An unparsable body is answered like an empty one.
+      }
+      methods.push(String(message.method));
+      if (message.method === "tools/call") {
+        if (mode === "reset") req.socket.destroy();
+        return;
+      }
+      if (message.id === undefined) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      const result =
+        message.method === "tools/list"
+          ? { tools: [{ name: "get_page", description: "get a page", inputSchema: { type: "object", properties: { id: { type: "string" } } } }] }
+          : { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "faulty", version: "1" } };
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+    });
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  return {
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`,
+    methods,
+    calls: () => methods.filter((method) => method === "tools/call").length,
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
 /** An MCP server over stdio whose `echo` tool reports the length of its `SERVER_TOKEN` env value. The first argv names the tag. */
 export const STDIO_SOURCE = String.raw`// SECURITY-STDIO-SERVER
 const rl = require('node:readline').createInterface({ input: process.stdin });
@@ -885,8 +950,8 @@ export interface SecurityRig {
   remote: DumbHttpGitRemote;
   /** Gateway output since the rig started (survives restarts: each process's output is appended). */
   log: () => string;
-  /** `POST /v1/query` as `label`. */
-  ask: (label: "reqlift" | "diemcrm", body: Record<string, unknown>, deadlineMs?: number) => Promise<QueryOutcome>;
+  /** `POST /v1/query` as `label`; `control.abort()` closes the caller's connection. */
+  ask: (label: "reqlift" | "diemcrm", body: Record<string, unknown>, deadlineMs?: number, control?: { abort?: () => void }) => Promise<QueryOutcome>;
   /** Stops the gateway with `signal` (SIGTERM by default), waits for the exit and starts a new process on the same directories. */
   restart: (signal?: "SIGTERM" | "SIGKILL") => Promise<void>;
   /** Registered ownership aware helper: `PUT /v1/mcp-servers/<name>` as `label`. */
@@ -1023,7 +1088,7 @@ export async function createRig(cleanups: Cleanup[], options: RigOptions = {}): 
     log: () => output,
     baseEnv,
     logLevel: options.logLevel ?? "info",
-    ask: (label, body, deadlineMs) => queryAs(rig.gateway.port, keys[label], body, deadlineMs),
+    ask: (label, body, deadlineMs, control) => queryAs(rig.gateway.port, keys[label], body, deadlineMs, control),
     register: async (label, name, body) => {
       const put = await gatewayRequest(rig.gateway.port, "PUT", `/v1/mcp-servers/${name}`, body, keys[label]);
       if (put.status !== 201 && put.status !== 200) throw new Error(`registering ${name} as ${label} answered ${put.status}`);
@@ -1275,6 +1340,8 @@ export interface RowInput {
    * row's controls so the evidence shows it.
    */
   allowedOn?: { surface: string; markers: string[] };
+  /** Lower byte floors for rows whose observation is legitimately short (a fixed failure text). */
+  floors?: Record<string, number>;
 }
 
 /**
@@ -1286,7 +1353,8 @@ export function finishRow(recorder: MatrixRecorder, rig: SecurityRig, row: RowIn
     const allowed = row.allowedOn && row.allowedOn.surface === surface.name ? new Set(row.allowedOn.markers) : new Set<string>();
     return detect([surface], Object.fromEntries(Object.entries(rig.markers.values).filter(([name]) => !allowed.has(name))));
   });
-  const thin = row.surfaces.filter((surface) => surface.text.length < (SURFACE_FLOORS[surface.name] ?? 1)).map((surface) => surface.name);
+  const floors = { ...SURFACE_FLOORS, ...row.floors };
+  const thin = row.surfaces.filter((surface) => surface.text.length < (floors[surface.name] ?? 1)).map((surface) => surface.name);
   const problems = [...row.problems, ...(thin.length > 0 ? [`below the byte floor: [${thin.join(", ")}]`] : [])];
   const observed: RowExpectation = hits.length === 0 && problems.length === 0 ? "pass" : "fail";
   const expected = row.expected ?? "pass";
