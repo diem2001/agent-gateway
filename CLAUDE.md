@@ -162,7 +162,8 @@ src/
     tools.test.ts          # Tool registry unit tests
     webhook.test.ts        # Webhook executor tests
     session-ownership.test.ts / session-isolation-process.test.ts # Owner rule, legacy refusal, list/delete scoping, persistence, query refusals (mocked run); real runtime: legacy transcripts, concurrent owners, restart resume, one active request per conversation (needs `npm run build`)
-    sandbox.test.ts / sandbox-content.test.ts # Isolation config, exact argv, env allowlist, failure texts; no-follow validation, git config allowlist, known-value scan, mount plan
+    sandbox.test.ts / sandbox-content.test.ts # Isolation config, exact argv, env allowlist, failure texts; no-follow validation, git config allowlist, known-value scan (chunked, any size up to 64 MiB, SSH key lines, webhook URL parts), mount plan
+    scan-residuals-process.test.ts # Outcome Probe (MVP-7919): spawned gateway, real bwrap; planted known credential, SSH key and webhook URL values of every size in a global directory, a repository and a 2 MiB CLAUDE.md stay unreadable on every surface, clean small and 2 MiB files stay available, per-surface negative control; `SCAN_RESIDUALS_DIST` points it at another compiled server for the red run (needs `npm run build`)
     sandbox-process.test.ts # Real bwrap: env, /proc, trusted files, planted links, git masks, read-only content, fail-closed rows, cancel and SIGKILL, plus the real runtime through the gateway (needs `npm run build`)
     model-proxy.test.ts / model-proxy-process.test.ts # Trusted model proxy: token, path, header and refresh rules; real runtime through it
     sdk-login-guard-process.test.ts # Real-runtime probe: spawned gateway, OAuth-capable MCP stub, scripted Anthropic API (needs `npm run build`)
