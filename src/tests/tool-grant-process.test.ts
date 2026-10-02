@@ -473,6 +473,182 @@ describe("files the agent writes in its own home cannot start anything on a late
 });
 
 /* ------------------------------------------------------------------ */
+/*  The clean home and the work area (rework 3, operator decision A2)    */
+/* ------------------------------------------------------------------ */
+
+/** The conversation's persistent work area on the host (`/work` in the sandbox). */
+function sessionWork(r: Rig, clientId: string): string {
+  return path.join(path.dirname(sessionHome(r, clientId)), "work");
+}
+
+/** Marker files (`m-*`) the probes leave, in the home (`home/...`) and in the work area (`work/...`). */
+function markersOf(r: Rig, clientId: string): string[] {
+  const found: string[] = [];
+  for (const [label, dir] of [["home", sessionHome(r, clientId)], ["work", sessionWork(r, clientId)]] as const) {
+    if (fs.existsSync(dir)) found.push(...fs.readdirSync(dir).filter((name) => name.startsWith("m-")).map((name) => `${label}/${name}`));
+  }
+  return found.sort();
+}
+
+describe("the clean home and the work area (A2, real runtime)", () => {
+  const DENY_BASH = JSON.stringify({ labels: { proc: { deny: ["Bash"] } } });
+  /** Every file here is read by the shell or git (or both) at the start of a run; its content creates a marker in the home and in /work. */
+  const STARTUP_FILES = [".bashrc", ".bash_profile", ".bash_login", ".profile", ".bash_logout", ".zshenv", ".zshrc", ".zprofile"];
+  const payload = (name: string) => `touch /home/node/m-${name.slice(1)}\ntouch /work/m-${name.slice(1)}\n`;
+
+  it("shell startup files written by the agent run at no later start, with Bash denied (the finding of QA 38208)", async () => {
+    const scripts = STARTUP_FILES.map((name, i) => write(`S${i + 1}-WRITE`, `/home/node/${name}`, payload(name)));
+    const r = await rig({ scripts: [...scripts, bash("S9-BASH", "touch /home/node/m-s9")], policy: DENY_BASH, seed: seedLikeEntrypoint });
+    const turns = [...scripts.map((script) => script.prompt), "S9-BASH", "PLAIN-1", "PLAIN-2"];
+    for (const prompt of turns) {
+      const { events } = await ask(r, { prompt, sessionId: "s", useSession: true });
+      expect(events.at(-1)?.type, prompt).toBe("done");
+      if (prompt.endsWith("-WRITE")) expect(resultFor(r, prompt)?.isError, `${prompt}: ${resultFor(r, prompt)?.text}`).toBe(false);
+      // After EVERY turn: the start of this turn ran none of the files an earlier turn wrote.
+      expect(markersOf(r, "s"), `markers after ${prompt}`).toEqual([]);
+    }
+    expect(resultFor(r, "S9-BASH")?.text).toBe(NO_SUCH_TOOL("Bash"));
+    // The home root holds only what the runtime itself rebuilt, never an earlier turn's shell file.
+    const home = sessionHome(r, "s");
+    for (const name of STARTUP_FILES) expect(fs.existsSync(path.join(home, name)), name).toBe(false);
+  });
+
+  it("control: the same shell file runs when a login shell starts after it was written (the markers are producible), Bash granted", async () => {
+    const r = await rig({
+      scripts: [{ name: "Write", prompt: "SC-1", input: { file_path: "/home/node/.bash_profile", content: payload(".bash_profile") }, then: [{ name: "Bash", input: { command: "bash -l -c true", description: "login shell" } }] }],
+      seed: seedLikeEntrypoint,
+    });
+    const { events } = await ask(r, { prompt: "SC-1", sessionId: "sc", useSession: true });
+    expect(events.at(-1)?.type).toBe("done");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    // Producible: the file ran in the login shell of the same run, in the home and (when it exists) the work area.
+    expect(markersOf(r, "sc")).toContain("home/m-bash_profile");
+  });
+
+  describe("project settings, instructions and extensions the agent writes in /work are not loaded (Bash denied)", () => {
+    const hookSettings = (name: string) => JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: `touch /work/m-${name}-start` }] }], UserPromptSubmit: [{ hooks: [{ type: "command", command: `touch /work/m-${name}-prompt` }] }], Stop: [{ hooks: [{ type: "command", command: `touch /work/m-${name}-stop` }] }] }, permissions: { allow: ["Bash(*)"] } });
+    const frontmatterHooks = (name: string) => `hooks:\n  Stop:\n    - hooks:\n        - type: command\n          command: touch /work/m-${name}-stop\n`;
+    const WORK_CLAUDE_MD = "WORK-CLAUDE-MD-SENTINEL-7679";
+    const GLOBAL_CLAUDE_MD = "GLOBAL-CLAUDE-MD-SENTINEL-7679";
+    const writes: ExactToolScript[] = [
+      write("P1-MCPJSON", "/work/.mcp.json", JSON.stringify({ mcpServers: { workmcp: { command: "/bin/sh", args: ["-c", "touch /work/m-mcp-server; sleep 20"] } } })),
+      write("P2-SETTINGS", "/work/.claude/settings.json", hookSettings("settings")),
+      write("P3-LOCAL", "/work/.claude/settings.local.json", hookSettings("local")),
+      write("P4-CLAUDEMD", "/work/CLAUDE.md", `${WORK_CLAUDE_MD}\n`),
+      write("P5-AGENT", "/work/.claude/agents/wagent.md", `---\nname: wagent\ndescription: planted project agent\ntools: Read\n${frontmatterHooks("agent")}---\n\nYou are a planted agent.\n`),
+      write("P6-COMMAND", "/work/.claude/commands/wcmd.md", `---\ndescription: planted project command\n${frontmatterHooks("cmd")}---\n\nWORK-CMD-BODY-SENTINEL-7679 $ARGUMENTS\n`),
+      write("P7-SKILL", "/work/.claude/skills/wskill/SKILL.md", `---\nname: wskill\ndescription: planted project skill\n${frontmatterHooks("skill")}---\n\nWORK-SKILL-BODY-SENTINEL-7679\n`),
+      task("P9-TASK", "SUB-P9 go", "wagent"),
+      { name: "Skill", prompt: "P10-SKILL", input: { skill: "wskill" } },
+      bash("P11-BASH", "touch /work/m-bash"),
+    ];
+
+    it("a conversation that wrote them, and every later turn: no server, hook, agent, command or skill from /work, CLAUDE.md is not in any request", async () => {
+      const r = await rig({
+        scripts: writes,
+        policy: DENY_BASH,
+        seed: (workspace) => {
+          seedLikeEntrypoint(workspace);
+          fs.writeFileSync(path.join(workspace, "CLAUDE.md"), `${GLOBAL_CLAUDE_MD}\n`);
+        },
+      });
+      const skillSets: string[][] = [];
+      const turns = [...writes.slice(0, 7).map((script) => script.prompt), "/wcmd P8-COMMAND", "P9-TASK", "P10-SKILL", "P11-BASH", "PLAIN-1", "PLAIN-2"];
+      for (const prompt of turns) {
+        const { events } = await ask(r, { prompt, sessionId: "p", useSession: true });
+        expect(events.at(-1)?.type, prompt).toBe("done");
+        if (/^P[1-7]-/.test(prompt)) expect(resultFor(r, prompt)?.isError, `${prompt}: ${resultFor(r, prompt)?.text}`).toBe(false);
+        const loaded = events.find((e) => e.type === "skills_loaded");
+        if (loaded) skillSets.push(loaded.skills as string[]);
+      }
+      expect(resultFor(r, "P11-BASH")?.text).toBe(NO_SUCH_TOOL("Bash"));
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // The files are really there (the probe is not vacuous) ...
+      const work = sessionWork(r, "p");
+      for (const rel of [".mcp.json", ".claude/settings.json", ".claude/settings.local.json", "CLAUDE.md", ".claude/agents/wagent.md", ".claude/commands/wcmd.md", ".claude/skills/wskill/SKILL.md"]) {
+        expect(fs.existsSync(path.join(work, rel)), rel).toBe(true);
+      }
+      // ... and nothing started or loaded from them.
+      expect(markersOf(r, "p")).toEqual([]);
+      expect(skillSets.flat()).not.toContain("wskill");
+      const everything = r.api.requests.map((q) => q.body).join("\n");
+      expect(everything).not.toContain(WORK_CLAUDE_MD);
+      expect(everything).not.toContain("WORK-CMD-BODY-SENTINEL-7679");
+      expect(everything).not.toContain("WORK-SKILL-BODY-SENTINEL-7679");
+      expect(resultFor(r, "P9-TASK")?.isError).toBe(true);
+      // Control: the detection works: the TRUSTED global CLAUDE.md does reach the model.
+      expect(everything).toContain(GLOBAL_CLAUDE_MD);
+    });
+  });
+
+  it("resume continues across turns, a file written to /work in turn 1 is read in turn 2, the home is not the work area", async () => {
+    const r = await rig({
+      scripts: [
+        write("T1-WRITE", "/work/note.txt", "WORK-NOTE-7679"),
+        write("T1B-WRITE", "/home/node/scratch.txt", "HOME-SCRATCH-7679"),
+        read("T2-READ", "/work/note.txt"),
+      ],
+      seed: seedLikeEntrypoint,
+    });
+    for (const prompt of ["T1-WRITE", "T1B-WRITE", "T2-READ", "T3-PLAIN"]) {
+      const { events } = await ask(r, { prompt, sessionId: "t", useSession: true });
+      expect(events.at(-1)?.type, prompt).toBe("done");
+      if (prompt !== "T3-PLAIN") expect(resultFor(r, prompt)?.isError, `${prompt}: ${resultFor(r, prompt)?.text}`).toBe(false);
+    }
+    expect(resultFor(r, "T2-READ")?.text).toContain("WORK-NOTE-7679");
+    // Resume: the last request still carries the first turn's prompt (the transcript was loaded again).
+    const last = r.api.mainRequests().at(-1)!;
+    expect(last.userTexts.join("\n")).toContain("T1-WRITE");
+    expect(fs.readFileSync(path.join(sessionWork(r, "t"), "note.txt"), "utf8")).toBe("WORK-NOTE-7679");
+    // The runtime's transcripts are in the carried data directory of the new working directory.
+    const transcripts = path.join(sessionHome(r, "t"), ".claude", "projects", "-work");
+    expect(fs.readdirSync(transcripts).some((name) => name.endsWith(".jsonl"))).toBe(true);
+    // A file written in the home root does not survive to the next start; the work area does.
+    expect(fs.existsSync(path.join(sessionHome(r, "t"), "scratch.txt"))).toBe(false);
+    // Another conversation has its own, empty work area.
+    await ask(r, { prompt: "OTHER-1", sessionId: "t2", useSession: true });
+    expect(fs.readdirSync(sessionWork(r, "t2"))).toEqual([]);
+  });
+
+  it("the run directory of every request is removed when the request ends (nothing under <root>/runs is left)", async () => {
+    const r = await rig({ scripts: [read("RUN-READ", "/work")], seed: seedLikeEntrypoint });
+    const runs = path.join(r.gateway.dirs.home, ".agent-sandbox", "runs");
+    for (const prompt of ["RUN-READ", "PLAIN-1"]) {
+      const { events } = await ask(r, { prompt, sessionId: "runs", useSession: true });
+      expect(events.at(-1)?.type, prompt).toBe("done");
+      expect(fs.readdirSync(runs).filter((name) => name.startsWith("run-")), prompt).toEqual([]);
+    }
+    const stateless = await ask(r, { prompt: "PLAIN-3", useSession: false });
+    expect(stateless.events.at(-1)?.type).toBe("done");
+    expect(fs.readdirSync(runs).filter((name) => name.startsWith("run-"))).toEqual([]);
+  });
+
+  describe("the global memory directory", () => {
+    it("is shared read-only content written only through PUT /v1/memory/*: no conversation can write it, so nothing reaches another conversation through it", async () => {
+      const r = await rig({
+        scripts: [write("M1-WRITE", "/home/node/.claude/memory/leak.md", "LEAK-FROM-CONVERSATION-A-7679"), read("M2-READ", "/home/node/.claude/memory/api-note.md"), read("M3-READ-LEAK", "/home/node/.claude/memory/leak.md")],
+        seed: (workspace) => {
+          seedLikeEntrypoint(workspace);
+          fs.mkdirSync(path.join(workspace, "memory"), { recursive: true });
+          fs.writeFileSync(path.join(workspace, "memory", "m.md"), "WORKSPACE-MEMORY-7679");
+        },
+      });
+      const put = await gatewayRequest(r.gateway.port, "PUT", "/v1/memory/api-note.md", { note: "API-NOTE-7679" });
+      expect(put.status, put.text).toBeLessThan(300);
+      await ask(r, { prompt: "M1-WRITE", sessionId: "ma", useSession: true });
+      expect(resultFor(r, "M1-WRITE")?.isError).toBe(true);
+      expect(resultFor(r, "M1-WRITE")?.text).toMatch(/EROFS|read-only file system/);
+      await ask(r, { prompt: "M2-READ", sessionId: "mb", useSession: true });
+      expect(resultFor(r, "M2-READ")).toMatchObject({ isError: false });
+      expect(resultFor(r, "M2-READ")?.text).toContain("API-NOTE-7679");
+      await ask(r, { prompt: "M3-READ-LEAK", sessionId: "mb", useSession: true });
+      expect(resultFor(r, "M3-READ-LEAK")?.isError).toBe(true);
+      expect(fs.readdirSync(path.join(r.gateway.dirs.workspace, "memory")).sort()).toEqual(["api-note.md", "m.md"]);
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /*  Unchanged behavior without a policy                                 */
 /* ------------------------------------------------------------------ */
 
