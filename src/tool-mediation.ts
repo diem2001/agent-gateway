@@ -13,7 +13,8 @@
 
 import path from "node:path";
 import { getEnabledMcpServers } from "./mcp-registry.js";
-import { knownSecretValues } from "./sandbox-content.js";
+import { knownSecretValues, sshPrivateKeyValues, webhookUrlValues } from "./sandbox-content.js";
+import { getAllTools } from "./tools.js";
 import { getWorkspaceRoot } from "./workspace.js";
 
 export type ToolErrorCode = "TOOL_DENIED" | "TOOL_AUTH_UNAVAILABLE" | "TOOL_UNAVAILABLE" | "TOOL_TIMEOUT" | "TOOL_RESPONSE_INVALID";
@@ -150,17 +151,29 @@ export function maskSecrets(text: string, secrets: readonly string[]): string {
 }
 
 /**
- * The values to mask in a tool's refusal message: the gateway's own secrets (S1's known-value list: API keys,
- * provider credentials, OAuth tokens), every enabled registry server's header and env values, and `extra`
- * (for example the bearer forwarded to the webhook).
+ * The gateway's known secret values, the one list behind both the sandbox's hidden files and the masking of tool
+ * refusal texts: secret-looking environment values (API keys, provider credentials), the OAuth tokens of the
+ * trusted credentials file, every enabled registry server's header and env values, the private-key lines of
+ * `$HOME/.ssh`, the credential parts of every registered webhook URL, and `extra` (for example the bearer
+ * forwarded to the webhook).
  */
-export function secretValuesForMasking(extra: readonly string[] = []): string[] {
+export function gatewayKnownValues(workspaceRoot: string, extra: readonly string[] = []): Buffer[] {
   const registry: string[] = [];
   for (const def of getEnabledMcpServers()) {
     registry.push(...Object.values(def.headers ?? {}), ...Object.values(def.env ?? {}));
   }
-  const known = knownSecretValues(process.env, path.join(getWorkspaceRoot(), ".credentials.json"), [...registry, ...extra]);
-  return known.map((value) => value.toString("utf8"));
+  const sshDir = path.join(process.env.HOME || "/home/node", ".ssh");
+  return knownSecretValues(process.env, path.join(workspaceRoot, ".credentials.json"), [
+    ...registry,
+    ...sshPrivateKeyValues(sshDir),
+    ...webhookUrlValues(getAllTools()),
+    ...extra,
+  ]);
+}
+
+/** The values to mask in a tool's refusal message: the gateway's known values (`gatewayKnownValues`) and `extra`. */
+export function secretValuesForMasking(extra: readonly string[] = []): string[] {
+  return gatewayKnownValues(getWorkspaceRoot(), extra).map((value) => value.toString("utf8"));
 }
 
 /* ------------------------------------------------------------------ */

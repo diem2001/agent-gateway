@@ -11,8 +11,9 @@ import { log } from "./logging.js";
  * following symlinks: it must be a regular file or directory owned by the gateway
  * user whose real path is exactly the path it was found at, inside the tree it is
  * expected in. Anything else is left out with an audit line (never the content).
- * Mounted content is also scanned for the gateway's known secret values; a file
- * that holds one is hidden behind an empty file.
+ * Mounted content is also scanned for the gateway's known secret values (files of any
+ * size up to a ceiling); a file that holds one, cannot be read safely or is above the
+ * ceiling is hidden behind an empty file.
  *
  * Nothing here logs a secret value, a path below the workspace root or file
  * content: audit lines carry fixed words, entry names that pass `SAFE_NAME` and counts.
@@ -42,8 +43,13 @@ export const GLOBAL_ENTRIES: readonly { name: string; kind: "file" | "dir"; trus
 /** A repository or entry name that is used in a mount destination. */
 export const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
-/** Files larger than this are not scanned for secret values (credential files are small). */
-export const SCAN_MAX_FILE_BYTES = 1024 * 1024;
+/**
+ * Per-file ceiling of the known-value scan: a file above it is never read and never mounted,
+ * it is hidden behind an empty file with the audit reason `too_large`.
+ */
+export const SCAN_MAX_FILE_BYTES = 64 * 1024 * 1024;
+/** Read size of the streamed scan. */
+export const SCAN_CHUNK_BYTES = 1024 * 1024;
 const CONFIG_MAX_BYTES = 1024 * 1024;
 
 export type SkipReason = "missing" | "symlink" | "not_owned" | "wrong_type" | "outside_root" | "unsafe_name" | "unsafe_git" | "unreadable";
@@ -420,7 +426,8 @@ const MIN_SECRET_LENGTH = 8;
 /**
  * The gateway's known secret values: its own secret-looking environment values
  * (provider key, OAuth token variable, every `API_KEYS` key, ...), the OAuth tokens
- * of the trusted credentials file and any `extra` values (registry headers and env).
+ * of the trusted credentials file and any `extra` values (registry headers and env,
+ * SSH private-key lines, webhook URL parts).
  * Shorter than 8 characters is ignored (a short value would match ordinary text).
  */
 export function knownSecretValues(env: NodeJS.ProcessEnv, credentialsFile: string | null, extra: string[] = []): Buffer[] {
@@ -455,16 +462,131 @@ export function knownSecretValues(env: NodeJS.ProcessEnv, credentialsFile: strin
   return [...values].sort().map((value) => Buffer.from(value, "utf8"));
 }
 
+/* ------------------------------------------------------------------ */
+/*  Known values that are not environment variables                     */
+/* ------------------------------------------------------------------ */
+
+const SSH_KEY_FILE_MAX_BYTES = 256 * 1024;
+const KEY_LINE_MIN_LENGTH = 16;
+const SSH_BEGIN = /^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----$/;
+const SSH_END = /^-----END [A-Z0-9 ]*PRIVATE KEY-----$/;
+const KEY_HEADER_LINE = /^[A-Za-z][A-Za-z0-9-]*:\s/;
+
+/**
+ * The private-key body lines of the armored key files directly inside `sshDir` (regular files owned by the
+ * gateway user, never links): every line of 16 or more characters between the BEGIN and END marker, trimmed,
+ * so a verbatim, partial, re-wrapped-at-line-boundaries or newline-stripped copy (LF or CRLF) of the key
+ * contains at least one of them. Public keys, `known_hosts`, `authorized_keys` and `config` hold no armored
+ * private key and contribute nothing. Nothing is logged.
+ */
+export function sshPrivateKeyValues(sshDir: string): string[] {
+  const values = new Set<string>();
+  let names: string[];
+  try {
+    names = fs.readdirSync(sshDir);
+  } catch {
+    return [];
+  }
+  for (const name of names) {
+    const raw = readFileNoFollow(path.join(sshDir, name), SSH_KEY_FILE_MAX_BYTES);
+    if (!raw) continue;
+    let inside = false;
+    for (const rawLine of raw.toString("latin1").split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (SSH_BEGIN.test(line)) inside = true;
+      else if (SSH_END.test(line)) inside = false;
+      else if (inside && line.length >= KEY_LINE_MIN_LENGTH && !KEY_HEADER_LINE.test(line)) values.add(line);
+    }
+  }
+  return [...values];
+}
+
+const URL_SECRET_PARAM = /(key|token|secret|password|credential|auth|sig|code)/i;
+const URL_PART_MIN_LENGTH = 16;
+const URL_SECRET_PARAM_MIN_LENGTH = 8;
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * The credential parts of registered webhook URLs: the full URL, everything from the path onward, every path
+ * segment of 16 or more characters (Slack, Discord and Teams style tokens), every query or fragment value of 16
+ * or more characters (8 or more when its name looks like a secret) and the user info. Raw and percent-decoded
+ * forms are both known. A URL that does not parse contributes nothing. Nothing is logged.
+ */
+export function webhookUrlValues(tools: readonly { webhook_url?: unknown }[]): string[] {
+  const values = new Set<string>();
+  const add = (value: string, minLength: number): void => {
+    const trimmed = value.trim();
+    if (trimmed.length >= minLength) values.add(trimmed);
+    const decoded = safeDecode(trimmed);
+    if (decoded !== trimmed && decoded.length >= minLength) values.add(decoded);
+  };
+  const addPairs = (text: string): void => {
+    for (const pair of text.split(/[&;]/)) {
+      const eq = pair.indexOf("=");
+      if (eq < 0) continue;
+      const name = safeDecode(pair.slice(0, eq));
+      add(pair.slice(eq + 1), URL_SECRET_PARAM.test(name) ? URL_SECRET_PARAM_MIN_LENGTH : URL_PART_MIN_LENGTH);
+    }
+  };
+  for (const tool of tools) {
+    if (typeof tool.webhook_url !== "string") continue;
+    let url: URL;
+    try {
+      url = new URL(tool.webhook_url.trim());
+    } catch {
+      continue;
+    }
+    add(tool.webhook_url, MIN_SECRET_LENGTH);
+    add(url.href, MIN_SECRET_LENGTH);
+    add(`${url.pathname}${url.search}${url.hash}`, URL_PART_MIN_LENGTH);
+    for (const segment of url.pathname.split("/")) add(segment, URL_PART_MIN_LENGTH);
+    if (url.search.length > 1) {
+      add(url.search.slice(1), URL_PART_MIN_LENGTH);
+      addPairs(url.search.slice(1));
+    }
+    if (url.hash.length > 1) {
+      add(url.hash.slice(1), URL_PART_MIN_LENGTH);
+      addPairs(url.hash.slice(1));
+    }
+    add(url.username, URL_SECRET_PARAM_MIN_LENGTH);
+    add(url.password, URL_SECRET_PARAM_MIN_LENGTH);
+  }
+  return [...values];
+}
+
 function needleDigest(needles: Buffer[]): string {
   const hash = createHash("sha256");
   for (const needle of needles) hash.update(createHash("sha256").update(needle).digest());
   return hash.digest("hex");
 }
 
+type ScanVerdict = "clean" | "hit" | "too_large";
+
 interface CachedScan {
   mtimeMs: number;
   size: number;
-  hit: boolean;
+  verdict: ScanVerdict;
+}
+
+export interface ScanResult {
+  /** Files that hold a known value or cannot be read safely. */
+  hits: string[];
+  /** Files above the per-file ceiling; never read. */
+  tooLarge: string[];
+}
+
+export interface ScannerOptions {
+  /** Per-file ceiling in bytes (default `SCAN_MAX_FILE_BYTES`). */
+  maxFileBytes?: number;
+  /** Read size in bytes (default `SCAN_CHUNK_BYTES`). */
+  chunkBytes?: number;
 }
 
 /** `name` inside `dir` is a git object store (`.git/objects` and the object stores below `.git/modules`): compressed, never scanned or searched for configs. */
@@ -474,13 +596,22 @@ function isObjectsDir(dir: string, name: string): boolean {
 }
 
 /**
- * Scans trees for the known values. Results are cached per file by mtime and size,
- * so a run only re-reads files that changed since the last scan; a different set of
- * values (or `invalidate`) rescans everything.
+ * Scans trees for the known values. Every regular file is read in fixed chunks through one `O_NOFOLLOW`
+ * descriptor; consecutive chunks overlap by the longest value minus one byte, so a value that straddles a chunk
+ * boundary is found. A file above the ceiling is not read (`tooLarge`), a file that cannot be read safely counts
+ * as a hit. Results are cached per file by mtime and size, so a run only re-reads files that changed since the
+ * last scan; a different set of values (or `invalidate`) rescans everything.
  */
 export class KnownValueScanner {
   private cache = new Map<string, CachedScan>();
   private digest = "";
+  private readonly maxFileBytes: number;
+  private readonly chunkBytes: number;
+
+  constructor(options: ScannerOptions = {}) {
+    this.maxFileBytes = options.maxFileBytes ?? SCAN_MAX_FILE_BYTES;
+    this.chunkBytes = options.chunkBytes ?? SCAN_CHUNK_BYTES;
+  }
 
   /** Forget cached results below `prefix` (after a trusted git sync), or all of them. */
   invalidate(prefix?: string): void {
@@ -491,15 +622,68 @@ export class KnownValueScanner {
     for (const key of [...this.cache.keys()]) if (isInside(prefix, key)) this.cache.delete(key);
   }
 
-  /** Absolute paths of the files below `root` that hold a known value. Symlinks are not followed or entered. */
-  scan(root: string, needles: Buffer[]): string[] {
+  private useNeedles(needles: Buffer[]): void {
     const digest = needleDigest(needles);
     if (digest !== this.digest) {
       this.cache.clear();
       this.digest = digest;
     }
-    const hits: string[] = [];
-    if (needles.length === 0) return hits;
+  }
+
+  /** The longest needle's length minus one: how much of a chunk the next one repeats. */
+  private streamHolds(file: string, needles: Buffer[]): ScanVerdict {
+    const overlap = needles.reduce((longest, needle) => Math.max(longest, needle.length), 1) - 1;
+    const buffer = Buffer.alloc(this.chunkBytes + overlap);
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || !ownedByGatewayUser(stat)) return "hit";
+      if (stat.size > this.maxFileBytes) return "too_large";
+      let carried = 0;
+      let total = 0;
+      for (;;) {
+        const read = fs.readSync(fd, buffer, carried, this.chunkBytes, null);
+        if (read === 0) return "clean";
+        total += read;
+        // A file that grew past the ceiling while it was read is treated like one that was too large to begin with.
+        if (total > this.maxFileBytes) return "too_large";
+        const window = buffer.subarray(0, carried + read);
+        if (needles.some((needle) => window.includes(needle))) return "hit";
+        carried = Math.min(overlap, window.length);
+        if (carried > 0) buffer.copyWithin(0, window.length - carried, window.length);
+      }
+    } catch {
+      // A file that cannot be read safely is treated as a hit: it is hidden, never shown.
+      return "hit";
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+  }
+
+  private verdict(full: string, stat: fs.Stats, needles: Buffer[]): ScanVerdict {
+    const cached = this.cache.get(full);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.verdict;
+    const verdict = stat.size > this.maxFileBytes ? "too_large" : this.streamHolds(full, needles);
+    this.cache.set(full, { mtimeMs: stat.mtimeMs, size: stat.size, verdict });
+    return verdict;
+  }
+
+  /** One regular file (a global file entry): `clean`, `hit` (known value or unreadable) or `too_large`. */
+  scanFile(file: string, needles: Buffer[]): ScanVerdict {
+    this.useNeedles(needles);
+    if (needles.length === 0) return "clean";
+    const stat = lstatOrNull(file);
+    if (!stat || !stat.isFile()) return "hit";
+    if (stat.size === 0) return "clean";
+    return this.verdict(file, stat, needles);
+  }
+
+  /** The files below `root` that hold a known value or are too large. Symlinks are not followed or entered. */
+  scanDetailed(root: string, needles: Buffer[]): ScanResult {
+    this.useNeedles(needles);
+    const result: ScanResult = { hits: [], tooLarge: [] };
+    if (needles.length === 0) return result;
     const walk = (dir: string): void => {
       let entries: fs.Dirent[];
       try {
@@ -515,22 +699,20 @@ export class KnownValueScanner {
           if (!isObjectsDir(dir, entry.name)) walk(full);
           continue;
         }
-        if (!stat.isFile() || stat.size === 0 || stat.size > SCAN_MAX_FILE_BYTES) continue;
-        const cached = this.cache.get(full);
-        let hit: boolean;
-        if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-          hit = cached.hit;
-        } else {
-          const content = readFileNoFollow(full, SCAN_MAX_FILE_BYTES);
-          // A file that cannot be read safely is treated as a hit: it is hidden, never shown.
-          hit = content === null ? true : needles.some((needle) => content.includes(needle));
-          this.cache.set(full, { mtimeMs: stat.mtimeMs, size: stat.size, hit });
-        }
-        if (hit) hits.push(full);
+        if (!stat.isFile() || stat.size === 0) continue;
+        const verdict = this.verdict(full, stat, needles);
+        if (verdict === "hit") result.hits.push(full);
+        else if (verdict === "too_large") result.tooLarge.push(full);
       }
     };
     walk(root);
-    return hits;
+    return result;
+  }
+
+  /** Absolute paths of the files below `root` that must be hidden (a known value, unreadable or too large). */
+  scan(root: string, needles: Buffer[]): string[] {
+    const result = this.scanDetailed(root, needles);
+    return [...result.hits, ...result.tooLarge];
   }
 }
 
@@ -571,7 +753,7 @@ function trustedEmpty(trustedDir: string, kind: "file" | "dir"): string {
   return target;
 }
 
-function audit(kind: string, name: string, reason: SkipReason | "known_value"): void {
+function audit(kind: string, name: string, reason: SkipReason | "known_value" | "too_large"): void {
   log("audit", `sandbox.content.skipped kind=${kind} name=${SAFE_NAME.test(name) ? name : "invalid"} reason=${reason}`);
 }
 
@@ -645,10 +827,11 @@ export function planTrustedContent(options: PlanOptions): MountPlan {
     audit(kind, name, reason);
   };
   const hide = (kind: string, name: string, base: string, baseDest: string): void => {
-    const hits = scanner.scan(base, options.needles);
-    for (const hit of hits) plan.hidden.push(path.posix.join(baseDest, ...path.relative(base, hit).split(path.sep)));
-    plan.hiddenCount += hits.length;
+    const { hits, tooLarge } = scanner.scanDetailed(base, options.needles);
+    for (const hit of [...hits, ...tooLarge]) plan.hidden.push(path.posix.join(baseDest, ...path.relative(base, hit).split(path.sep)));
+    plan.hiddenCount += hits.length + tooLarge.length;
     if (hits.length > 0) audit(kind, name, "known_value");
+    if (tooLarge.length > 0) audit(kind, name, "too_large");
   };
 
   for (const entry of GLOBAL_ENTRIES) {
@@ -661,11 +844,12 @@ export function planTrustedContent(options: PlanOptions): MountPlan {
       continue;
     }
     if (entry.kind === "file") {
-      const content = readFileNoFollow(source);
-      if (content && options.needles.some((needle) => content.includes(needle))) {
+      // Same streamed scan as every other file: any size, a file that cannot be read safely is hidden too.
+      const verdict = scanner.scanFile(source, options.needles);
+      if (verdict !== "clean") {
         plan.hidden.push(`${SANDBOX_CLAUDE_DIR}/${entry.name}`);
         plan.hiddenCount++;
-        audit("global", entry.name, "known_value");
+        audit("global", entry.name, verdict === "too_large" ? "too_large" : "known_value");
       }
     }
     plan.mounts.push({ src: source, dest: `${SANDBOX_CLAUDE_DIR}/${entry.name}` });
