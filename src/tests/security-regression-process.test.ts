@@ -3,18 +3,25 @@
  * Claude Agent SDK, its bundled runtime, real `bwrap`, a scripted model double and recording MCP, webhook and git
  * doubles. Every credential in it is a synthetic marker with a random suffix; the observation surfaces are the raw
  * tool outputs, the model-bound request bodies, the NDJSON events, the gateway log and the conversation's own
- * transcripts, `/work` and home. Only case names, booleans and counts are printed (`SECURITY-MATRIX` lines).
+ * transcripts, `/work`, home and per-run leftovers. Only case names, booleans and counts are printed
+ * (`SECURITY-MATRIX` lines, one per row, with a stable AC row id).
  *
- * - `RP.regression` is the Real-process regression scenario: an ordinary chat (no agent, no skill) shows its
- *   environment with `env | sort` and resumes; the authorized operations of the three request-scoped credentials still
- *   produce their fixtures; no marker is on any surface; the runtime never runs outside the sandbox.
- * - The route rows run the probes of `helpers/security-routes.ts` in fresh, resumed and restarted execution.
+ * - `RP.regression`: the Real-process regression scenario (an ordinary chat shows its environment and resumes; the
+ *   authorized operations of the request-scoped credentials still work; no marker on any surface).
+ * - `RT.<route>.<mode>`: the eight secret routes of the outline in fresh, resumed and restarted execution. Every
+ *   route run carries the request-scoped credentials live, and the doubles confirm they received them in that run.
+ *   Concurrent roles overlap the process and session scans: a conversation of another label and one of the same
+ *   label with another user (each holding its marker in `/work`), a stdio tool sandbox and a slow trusted git clone.
+ * - `NC.*.<mode>`: the exact normal-chat route: three turns of `env | sort` in one ordinary conversation, then an
+ *   allowed workspace command, an alternate interpreter environment read and a built-in Read of a credential file.
+ * - `X.*`: rows for leftovers of an earlier version in a conversation home, writes into the read-only extension
+ *   directories and the trusted git configuration.
  * - The negative controls prove the detector end to end: a child vitest run of the same row against a deliberately
  *   vulnerable copy of `dist/` (offline, in a loopback-only namespace) must exit nonzero, name the row and report
  *   hits, and print no marker value.
  *
  * The child run selects rows with `-t`, so a row's test name carries its selector: `regression row` for the regression
- * scenario, `route config probe` for the file detector.
+ * scenario, `route config probe` for the file detector. No other test name may contain either phrase.
  *
  * Needs `npm run build`, `bwrap`, user namespaces, `unshare`, `git` and `python3`; a missing prerequisite fails with
  * `host prerequisite missing: <name>`. Linux only.
@@ -23,38 +30,45 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { REPO_ROOT, type Cleanup } from "./helpers/git-process-gateway.js";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { createFakeGit, type FakeGit } from "./helpers/fake-git.js";
+import { REPO_ROOT, gatewayRequest, type Cleanup } from "./helpers/git-process-gateway.js";
 import {
   MatrixRecorder,
-  SURFACE_FLOORS,
-  conversationText,
+  STDIO_SOURCE,
+  TURN_DEADLINE_MS,
+  chatTurn,
+  conversationDirs,
   createMarkers,
   createRig,
-  detect,
   emit,
   evidenceLine,
+  finishRow,
   offlineAvailable,
   offlinePrefix,
-  requestCredentials,
-  requestsFor,
+  pinnedProblems,
   registerStandardServers,
+  requestsFor,
   requireHost,
   resultsFor,
   runChild,
   runLeftoversText,
-  startEgressSampler,
+  scriptOf,
+  shellQuote,
   startProcessSampler,
-  type MatrixRow,
-  type QueryOutcome,
+  surfacesOf,
+  turnProblems,
+  credentialProblems,
+  waitForIsolation,
+  type RowInput,
   type SecurityMarkers,
   type SecurityRig,
-  type Surface,
+  type ToolStep,
+  type TurnObservation,
 } from "./helpers/security-matrix.js";
-import { ROUTE_ALLOWED_TOOLS, credentialSteps, routeSteps, verifyRoute, type RouteContext, type RouteId, type RouteStep } from "./helpers/security-routes.js";
+import { ROUTE_IDS, credentialSteps, routeTurn, type RouteId, type RouteTurn } from "./helpers/security-routes.js";
 
-const TURN_DEADLINE_MS = 120_000;
-const ROW_TEST_TIMEOUT_MS = 300_000;
+const ROW_TEST_TIMEOUT_MS = 600_000;
 vi.setConfig({ testTimeout: ROW_TEST_TIMEOUT_MS });
 
 /** A child run of this file (the negative control) shares the parent's marker seed and runs offline. */
@@ -62,7 +76,20 @@ const IS_CHILD = process.env.SECURITY_CHILD === "1";
 const NEGATIVE_CONTROL_DIST = process.env.SECURITY_NEGATIVE_CONTROL;
 const markers: SecurityMarkers = createMarkers();
 
-const EXPECTED_ROWS = ["RP.regression", "RT.config.fresh", "RP.negative-control", "RP.negative-control.file-detector"];
+type Mode = "fresh" | "resumed" | "restarted";
+const MODES: Mode[] = ["fresh", "resumed", "restarted"];
+
+const EXPECTED_ROWS = [
+  "RP.regression",
+  ...MODES.flatMap((mode) => ROUTE_IDS.map((route) => `RT.${route}.${mode}`)),
+  ...MODES.flatMap((mode) => [`NC.chat.${mode}`, `NC.interpreter.${mode}`, `NC.read.${mode}`]),
+  "X.gitconfig",
+  "X.leftovers",
+  "X.extension-writes",
+  "X.run-leftovers",
+  "RP.negative-control",
+  "RP.negative-control.file-detector",
+];
 const recorder = new MatrixRecorder("security-regression-process", EXPECTED_ROWS);
 
 const cleanups: Cleanup[] = [];
@@ -75,8 +102,8 @@ beforeAll(() => {
   emit(
     evidenceLine({
       suite: "security-regression-process",
-      config: { API_KEYS: "reqlift+diemcrm", ANTHROPIC_BASE_URL: "local-double", MODEL_PROXY_OAUTH_TOKEN_URL: "local-double", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", AGENT_TOOL_POLICY: "unset" },
-      deadlines: { turn_ms: TURN_DEADLINE_MS, row_test_timeout_ms: ROW_TEST_TIMEOUT_MS },
+      config: { API_KEYS: "reqlift+diemcrm", ANTHROPIC_BASE_URL: "local-double", MODEL_PROXY_OAUTH_TOKEN_URL: "local-double", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", AGENT_TOOL_POLICY: "unset", LOG_LEVEL: "info (debug in the restarted modes)" },
+      deadlines: { turn_ms: TURN_DEADLINE_MS, row_test_timeout_ms: ROW_TEST_TIMEOUT_MS, negative_control_child_ms: 240_000 },
       offline: process.env.SECURITY_OFFLINE === "1",
       logLevel: "info",
     }),
@@ -87,146 +114,283 @@ beforeAll(() => {
 /*  Shared row machinery                                                */
 /* ------------------------------------------------------------------ */
 
-function rigOptions(extra: { distServer?: string } = {}): Parameters<typeof createRig>[1] {
-  return { markers, distServer: extra.distServer ?? NEGATIVE_CONTROL_DIST };
+async function newRig(options: { logLevel?: "info" | "debug"; fake?: FakeGit } = {}): Promise<SecurityRig> {
+  const rig = await createRig(cleanups, { markers, distServer: NEGATIVE_CONTROL_DIST, logLevel: options.logLevel, fakeGitBin: options.fake?.binDir });
+  expect(pinnedProblems(rig)).toEqual([]);
+  await registerStandardServers(rig);
+  return rig;
 }
 
-/** The pinned provider and OAuth endpoints are local doubles: nothing of a row can reach a real provider. */
-function assertPinned(rig: SecurityRig): void {
-  expect(rig.baseEnv.ANTHROPIC_BASE_URL.startsWith("http://127.0.0.1:")).toBe(true);
-  expect(rig.baseEnv.MODEL_PROXY_OAUTH_TOKEN_URL.startsWith("http://127.0.0.1:")).toBe(true);
+function newFakeGit(): FakeGit {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7677-fakegit-"));
+  cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
+  return createFakeGit(root);
 }
 
-function routeContext(rig: SecurityRig, phase?: "probe" | "replay"): RouteContext {
-  return {
-    markers: rig.markers,
-    host: { workspace: rig.gateway.dirs.workspace, home: rig.gateway.dirs.home, persist: rig.gateway.dirs.persist },
-    gatewayPort: rig.gateway.port,
-    canary: `SYNTH-CANARY-${rig.markers.seed}`,
-    phase,
-  };
+interface WarmTurn {
+  turn: TurnObservation;
+  /** Judged right after the turn: the doubles' records keep growing with later runs. */
+  problems: string[];
 }
 
-/** The scripted turn: the first step is the exact call, the rest follow after each result. */
-function scriptOf(prompt: string, steps: RouteStep[]) {
-  return { name: steps[0].name, prompt, input: steps[0].input, then: steps.slice(1) };
+/** A trivial ordinary-chat turn that only shows the conversation is alive (and carries the request-scoped credentials). */
+async function warmTurn(rig: SecurityRig, prompt: string, sessionId: string): Promise<WarmTurn> {
+  const turn = await chatTurn(rig, { prompt, sessionId, steps: [...credentialSteps(), { name: "Bash", input: { command: "echo FIRST-TURN > /work/first.txt; echo ok", description: "probe" } }] });
+  return { turn, problems: [...turnProblems(turn), ...credentialProblems(rig, turn), ...(turn.results.at(-1)?.text.includes("ok") ? [] : ["the warm-up command did not run"])] };
 }
 
-interface TurnObservation {
-  outcome: QueryOutcome;
-  results: { isError: boolean; text: string }[];
-  prompt: string;
-  sessionId: string;
-  logFrom: number;
-  unsandboxedRuntimes: number[];
-  runtimesSeen: number;
-  egress: string[];
-  jiraBefore: number;
-  reqHttpBefore: number;
+/* ------------------------------------------------------------------ */
+/*  Concurrent roles                                                    */
+/* ------------------------------------------------------------------ */
+
+interface Roles {
+  tags: { b1: string; b2: string; stdio: string; git: string };
+  b1Session: string;
+  b2Session: string;
+  sampler: ReturnType<typeof startProcessSampler>;
+  fake: FakeGit;
+  stop: () => Promise<void>;
 }
 
-/** One chat turn of an ordinary conversation with every request-scoped credential, observed from the host. */
-async function chatTurn(rig: SecurityRig, options: { prompt: string; sessionId: string; steps: RouteStep[]; label?: "reqlift" | "diemcrm"; user?: string; withCredentials?: boolean }): Promise<TurnObservation> {
-  rig.scripts.push(scriptOf(options.prompt, options.steps));
-  const logFrom = rig.log().length;
-  const jiraBefore = rig.jira.authorizations().length;
-  const reqHttpBefore = rig.reqHttp.authorizations().length;
-  const processes = startProcessSampler(() => rig.gateway.child.pid!);
-  const egress = startEgressSampler(() => rig.gateway.child.pid!);
-  const outcome = await rig.ask(
-    options.label ?? "reqlift",
+const waiterCommand = (marker: string, file: string, tag: string): string =>
+  `python3 -c ${shellQuote(`import os, sys, time\nopen('/work/${file}', 'w').write(sys.argv[1])\nend = time.time() + 150\nwhile time.time() < end and not os.path.exists('/work/stop'):\n    time.sleep(0.2)`)} ${shellQuote(marker)} ${tag}`;
+
+/**
+ * Starts the concurrent roles: a conversation of another label (and user) holding its marker in `/work` with a stdio tool
+ * sandbox attached, a conversation of the same label with another user, and a slow trusted git clone carrying a token
+ * URL and an ssh key. They run until `stop()`; the process sampler records when each existed.
+ */
+async function startRoles(rig: SecurityRig, fake: FakeGit): Promise<Roles> {
+  const v = rig.markers.values;
+  const id = randomBytes(3).toString("hex");
+  const tags = { b1: `ROLE-B1-${id}`, b2: `ROLE-B2-${id}`, stdio: `ROLE-STDIO-${id}`, git: `slow-clone-${id}` };
+  const b1Session = `conv-B1-${id}`;
+  const b2Session = `conv-B2-${id}`;
+  const sampler = startProcessSampler(() => rig.gateway.child.pid!, [tags.b1, tags.b2, tags.stdio, tags.git]);
+  rig.scripts.push(scriptOf(`ROLE-B1 ${v.sessionBTurn}`, [{ name: "mcp__bstdio__echo", input: {} }, { name: "Bash", input: { command: waiterCommand(v.sessionBFile, "b-secret.txt", tags.b1), description: "role" } }]));
+  rig.scripts.push(scriptOf(`ROLE-B2 ${v.sessionBTurn}`, [{ name: "Bash", input: { command: waiterCommand(v.sessionB2File, "b2-secret.txt", tags.b2), description: "role" } }]));
+  const b1 = rig.ask(
+    "diemcrm",
     {
-      queryId: `q-${options.sessionId}-${randomBytes(3).toString("hex")}`,
-      sessionId: options.sessionId,
-      prompt: options.prompt,
-      user_id: options.user ?? "user-1",
+      queryId: `q-b1-${id}`,
+      sessionId: b1Session,
+      prompt: `ROLE-B1 ${v.sessionBTurn}`,
+      user_id: "user-b",
       useSession: true,
-      allowedTools: ROUTE_ALLOWED_TOOLS,
-      ...(options.withCredentials === false ? {} : requestCredentials(rig)),
+      enforcedTools: ["Bash", "mcp__bstdio__echo"],
+      mcpServers: { bstdio: { command: "node", args: ["-e", STDIO_SOURCE, tags.stdio], env: { SERVER_TOKEN: v.requestStdioEnv } } },
     },
-    TURN_DEADLINE_MS,
+    200_000,
   );
-  const sample = processes.stop();
+  const b2 = rig.ask("reqlift", { queryId: `q-b2-${id}`, sessionId: b2Session, prompt: `ROLE-B2 ${v.sessionBTurn}`, user_id: "user-b2", useSession: true, enforcedTools: ["Bash"] }, 200_000);
+  const workFile = (session: string, name: string): string => path.join(conversationDirs(rig.gateway, [session])[0] ?? "/nonexistent", "work", name);
+  const end = Date.now() + 60_000;
+  while (!(fs.existsSync(workFile(b1Session, "b-secret.txt")) && fs.existsSync(workFile(b2Session, "b2-secret.txt")))) {
+    if (Date.now() > end) throw new Error("the concurrent conversations did not start in time");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  // The trusted git clone: slow (so it is running during the scans), with a token URL and an ssh key in its request.
+  fake.setSlow({ sleepMs: 25_000, on: ["clone"] });
+  const clone = gatewayRequest(rig.gateway.port, "POST", "/v1/workspace/git/clone", { url: rig.remote.authUrl, path: tags.git, sshKey: v.sshKey }, rig.keys.diemcrm);
+  await fake.waitForStart((inv) => inv.subcommand === "clone" && inv.argv.some((arg) => arg.includes(tags.git)), 20_000);
+  const seen = Date.now() + 20_000;
+  while (!([tags.b1, tags.b2, tags.stdio].every((tag) => sampler.peek().windows[tag]))) {
+    if (Date.now() > seen) throw new Error(`a concurrent role was not seen by the process sampler: ${[tags.b1, tags.b2, tags.stdio].filter((tag) => !sampler.peek().windows[tag]).join(", ")}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
   return {
-    outcome,
-    results: resultsFor(rig.api, options.prompt).slice(-options.steps.length),
-    prompt: options.prompt,
-    sessionId: options.sessionId,
-    logFrom,
-    unsandboxedRuntimes: sample.unsandboxedRuntimes,
-    runtimesSeen: sample.runtimesSeen,
-    egress: egress.stop(),
-    jiraBefore,
-    reqHttpBefore,
+    tags,
+    b1Session,
+    b2Session,
+    sampler,
+    fake,
+    stop: async () => {
+      for (const session of [b1Session, b2Session]) {
+        const dir = conversationDirs(rig.gateway, [session])[0];
+        if (dir) fs.writeFileSync(path.join(dir, "work", "stop"), "stop");
+      }
+      await Promise.all([b1, b2, clone]);
+      sampler.stop();
+    },
   };
 }
 
-/** The five observation surfaces of the given turns (and the runtime's per-run leftovers inside `transcripts`). */
-function surfacesOf(rig: SecurityRig, turns: TurnObservation[]): Surface[] {
-  const prompts = [...new Set(turns.map((turn) => turn.prompt))];
-  const requests = prompts.flatMap((prompt) => requestsFor(rig.api, prompt));
-  const unique = [...new Set(requests)];
-  const sessions = [...new Set(turns.map((turn) => turn.sessionId))];
-  const home = conversationText(rig.gateway, sessions);
-  const leftovers = runLeftoversText(rig.gateway);
-  const earliest = Math.min(...turns.map((turn) => turn.logFrom));
-  return [
-    { name: "tool-results", text: unique.flatMap((request) => request.toolResults.map((result) => result.text)).join("\n") },
-    { name: "model-requests", text: unique.map((request) => request.body).join("\n") },
-    { name: "events", text: JSON.stringify(turns.map((turn) => turn.outcome.events)) },
-    { name: "gateway-log", text: rig.log().slice(earliest) },
-    { name: "transcripts", text: `${home.text}\n${leftovers.text}` },
-  ];
-}
-
-/** Records the row, and throws with names and counts when anything but a clean pass was observed. */
-function finishRow(row: Omit<MatrixRow, "observed" | "hits" | "expected"> & { expected?: MatrixRow["expected"]; problems: string[] }, rig: SecurityRig): "pass" | "fail" {
-  const hits = detect(row.surfaces, rig.markers.values);
-  const thin = row.surfaces.filter((surface) => surface.text.length < (SURFACE_FLOORS[surface.name] ?? 1)).map((surface) => surface.name);
-  const problems = [...row.problems, ...(thin.length > 0 ? [`below the byte floor: [${thin.join(", ")}]`] : [])];
-  const observed = hits.length === 0 && problems.length === 0 ? "pass" : "fail";
-  recorder.record({ id: row.id, mode: row.mode, expected: row.expected ?? "pass", observed, hits: hits.length, durationMs: row.durationMs, deadlineMs: row.deadlineMs, surfaces: row.surfaces, controls: row.controls });
-  if (observed === "fail" && (row.expected ?? "pass") === "pass") {
-    throw new Error(`security row ${row.id}: ${hits.length > 0 ? `hits=${hits.length} [${hits.join(", ")}]` : "hits=0"}${problems.length > 0 ? `; ${problems.join("; ")}` : ""}`);
-  }
-  return observed;
-}
-
-/** What every turn of every row must show: the stream ended in `done`, no runtime outside the sandbox, no external destination. */
-function turnProblems(turn: TurnObservation): string[] {
+/** Host-side proof that every concurrent role existed for the whole scan of the probe (R2-4). */
+function overlapProblems(roles: Roles, report: { t0: number; t1: number }): string[] {
+  const windows = roles.sampler.peek().windows;
   const problems: string[] = [];
-  if (turn.outcome.events.at(-1)?.type !== "done") problems.push(`the stream did not end in done (${turn.outcome.events.at(-1)?.type ?? "no event"})`);
-  if (turn.outcome.ms > TURN_DEADLINE_MS) problems.push("the turn missed its deadline");
-  if (turn.unsandboxedRuntimes.length > 0) problems.push(`${turn.unsandboxedRuntimes.length} agent runtime(s) ran without a sandbox ancestor`);
-  if (turn.runtimesSeen < 1) problems.push("the process sampler saw no runtime");
-  if (turn.egress.length > 0) problems.push(`${turn.egress.length} non-loopback destination(s) in the gateway's network namespace`);
+  for (const [role, tag] of Object.entries({ "another-label conversation": roles.tags.b1, "same-label conversation": roles.tags.b2, "stdio tool sandbox": roles.tags.stdio })) {
+    const window = windows[tag];
+    if (!window || window.first > report.t0 || window.last < report.t1) problems.push(`the ${role} did not overlap the scan`);
+  }
+  const clone = roles.fake.invocations().find((inv) => inv.subcommand === "clone" && inv.argv.some((arg) => arg.includes(roles.tags.git)));
+  if (!clone || clone.start > report.t0 || (clone.end !== undefined && clone.end < report.t1)) problems.push("the trusted git clone did not overlap the scan");
   return problems;
 }
 
-/** The three request-scoped fixtures at the start of every route turn: each double saw its own bound credential in this run. */
-function credentialProblems(rig: SecurityRig, turn: TurnObservation): string[] {
+/* ------------------------------------------------------------------ */
+/*  Route rows                                                          */
+/* ------------------------------------------------------------------ */
+
+const LEGACY_TEXT = "This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help.";
+
+interface Checked {
+  problems: string[];
+  controls: string[];
+}
+
+/** Checks of one route turn that only the host can make: concurrent roles, the other session's files, legacy refusal, redirects, identities. */
+async function hostChecks(rig: SecurityRig, route: RouteId, turn: RouteTurn, roles: Roles | null): Promise<Checked> {
   const v = rig.markers.values;
   const problems: string[] = [];
-  const [jira, reqHttp, reqLocal] = turn.results;
-  if (!jira || jira.isError || !jira.text.includes("RECORD-7667-OK")) problems.push("the per-user override fixture did not answer");
-  if (!reqHttp || reqHttp.isError || !reqHttp.text.includes("RECORD-7667-OK")) problems.push("the request-body http fixture did not answer");
-  if (!reqLocal || reqLocal.isError || reqLocal.text !== `STDIO-RESULT:${v.requestStdioEnv.length}`) problems.push("the request-body stdio fixture did not answer with its env value");
-  const jiraNow = rig.jira.authorizations().slice(turn.jiraBefore);
-  const reqNow = rig.reqHttp.authorizations().slice(turn.reqHttpBefore);
-  if (jiraNow.length === 0 || !jiraNow.every((value) => value === `Bearer ${v.userOverrideHeader}`)) problems.push("the per-user MCP double did not receive exactly the user's credential in this run");
-  if (reqNow.length === 0 || !reqNow.every((value) => value === `Bearer ${v.requestHttpHeader}`)) problems.push("the request-body http double did not receive exactly its credential in this run");
-  return problems;
+  const controls: string[] = [];
+  const report = turn.verdict.report;
+  if ((route === "proc" || route === "session") && roles && report) {
+    const overlap = overlapProblems(roles, report);
+    problems.push(...overlap);
+    if (overlap.length === 0) controls.push("concurrent_roles_overlapped_the_scan");
+  }
+  if (route === "session" && roles) {
+    const present = (session: string, file: string, marker: string): boolean => {
+      const dir = conversationDirs(rig.gateway, [session])[0];
+      return dir !== undefined && fs.existsSync(path.join(dir, "work", file)) && fs.readFileSync(path.join(dir, "work", file), "utf8") === marker;
+    };
+    if (present(roles.b1Session, "b-secret.txt", v.sessionBFile) && present(roles.b2Session, "b2-secret.txt", v.sessionB2File)) controls.push("other_sessions_held_their_markers_on_the_host");
+    else problems.push("the other sessions' markers were not on the host during the scan");
+  }
+  if (route === "legacy") {
+    const count = (pattern: RegExp): number => [...rig.log().matchAll(pattern)].length;
+    const refusals = (): number => Number([...rig.log().matchAll(/sessions\.legacy\.refused total=(\d+)/g)].at(-1)?.[1] ?? 0);
+    const before = { requests: rig.api.requests.length, starts: count(/SDK options:/g), refusals: refusals() };
+    const resumed = await rig.ask("reqlift", { queryId: `q-legacy-${randomBytes(3).toString("hex")}`, sessionId: "legacy-conv", prompt: "ROUTE-LEGACY-RESUME", user_id: "user-1", useSession: true }, 10_000);
+    // The audit line travels through the gateway's output pipe: give it a moment to arrive.
+    for (const end = Date.now() + 3000; refusals() < before.refusals + 1 && Date.now() < end; ) await new Promise((resolve) => setTimeout(resolve, 50));
+    const after = { requests: rig.api.requests.length, starts: count(/SDK options:/g), refusals: refusals() };
+    const exact = resumed.events.length === 1 && resumed.events[0].type === "error" && resumed.events[0].content === LEGACY_TEXT;
+    if (!exact || resumed.ms > 2000) problems.push("the legacy conversation was not refused with its exact text within 2 s");
+    if (after.requests !== before.requests) problems.push("the legacy resume made a model request");
+    if (after.starts !== before.starts) problems.push("the legacy resume started a runtime");
+    if (after.refusals !== before.refusals + 1) problems.push("the legacy refusal audit count did not rise by one");
+    if (exact && after.requests === before.requests && after.starts === before.starts && after.refusals === before.refusals + 1) controls.push("legacy_resume_refused_before_any_run");
+    if (resumed.raw.includes(v.legacyTranscript)) problems.push("the legacy refusal carried the legacy marker");
+  }
+  if (route === "routing" && turn.phase === "probe") {
+    const [moved, hook] = turn.extraResults;
+    if (moved && moved.isError && /TOOL_UNAVAILABLE/.test(moved.text) && hook && hook.isError && /TOOL_UNAVAILABLE/.test(hook.text)) controls.push("redirecting_mcp_and_webhook_refused");
+    else problems.push("a credential-bearing call to a redirecting MCP server or webhook was not refused with TOOL_UNAVAILABLE");
+    if (rig.otherOrigin.hits.length > 0) problems.push(`the other origin received ${rig.otherOrigin.hits.length} request(s)`);
+    else controls.push("other_origin_received_nothing");
+    // Another label cannot read this run's events, and another label's request with this conversation's id is a new conversation.
+    const events = await gatewayRequest(rig.gateway.port, "GET", `/v1/query/${turn.turn.queryId}/events`, undefined, rig.keys.diemcrm);
+    if (events.status !== 404) problems.push(`another label read the events of the run (status ${events.status})`);
+    else controls.push("other_label_cannot_read_events");
+    const probe = `ROUTING-OTHER-LABEL-${randomBytes(3).toString("hex")}`;
+    const other = await rig.ask("diemcrm", { queryId: `q-other-${probe}`, sessionId: turn.turn.sessionId, prompt: probe, user_id: "user-1", useSession: true }, 60_000);
+    const seen = requestsFor(rig.api, probe).filter((request) => !request.warmup);
+    if (other.events.at(-1)?.type !== "done" || seen.length === 0 || seen.some((request) => request.userTexts.some((text) => text.includes(turn.turn.prompt)))) problems.push("another label with this conversation's id saw this conversation's content");
+    else controls.push("other_label_got_a_new_conversation");
+  }
+  if ((route === "env" || route === "repo") && report) {
+    const count = report.facts.git_config_env_vars;
+    controls.push(`git_config_env_vars_${String(count)}`);
+  }
+  return { problems, controls };
 }
 
-/** Runs one route probe as an ordinary chat turn and returns the observation with the route's verdict problems. */
-async function routeTurn(rig: SecurityRig, route: RouteId, options: { prompt: string; sessionId: string; phase?: "probe" | "replay" }): Promise<{ turn: TurnObservation; problems: string[]; controls: string[]; hits: number }> {
-  const ctx = routeContext(rig, options.phase);
-  const steps = [...credentialSteps(), ...routeSteps(route, ctx)];
-  const turn = await chatTurn(rig, { prompt: options.prompt, sessionId: options.sessionId, steps });
-  const probe = turn.results[credentialSteps().length];
-  const verdict = verifyRoute(route, probe?.text ?? "", ctx);
-  return { turn, problems: [...turnProblems(turn), ...credentialProblems(rig, turn), ...verdict.failures], controls: verdict.controls, hits: verdict.hits };
+/** Records one route row from its turns and the host checks. */
+async function routeRow(rig: SecurityRig, route: RouteId, mode: Mode, started: number, parts: { turns: RouteTurn[]; warm?: WarmTurn[]; problems?: string[]; roles?: Roles | null; deadlineMs?: number }): Promise<void> {
+  const problems: string[] = [...(parts.problems ?? [])];
+  const controls = new Set<string>();
+  for (const warm of parts.warm ?? []) problems.push(...warm.problems.map((problem) => `warm-up turn: ${problem}`));
+  for (const [index, turn] of parts.turns.entries()) {
+    problems.push(...turn.problems.map((problem) => `turn ${index + 1}: ${problem}`));
+    for (const control of turn.verdict.controls) controls.add(control);
+    const checked = await hostChecks(rig, route, turn, parts.roles ?? null);
+    problems.push(...checked.problems);
+    for (const control of checked.controls) controls.add(control);
+  }
+  const observations = [...(parts.warm ?? []).map((warm) => warm.turn), ...parts.turns.map((turn) => turn.turn)];
+  // At debug level the gateway log carries the request text of every conversation: a concurrent conversation's own content may be in it.
+  const debugLog = (parts.roles ?? null) !== null && rig.logLevel === "debug";
+  if (debugLog) controls.add("debug_log_holds_concurrent_conversations_own_requests");
+  finishRow(recorder, rig, {
+    id: `RT.${route}.${mode}`,
+    mode,
+    durationMs: Date.now() - started,
+    deadlineMs: parts.deadlineMs ?? TURN_DEADLINE_MS * observations.length,
+    surfaces: surfacesOf(rig, observations),
+    controls: [...controls],
+    problems,
+    ...(debugLog ? { allowedOn: { surface: "gateway-log", markers: ["sessionBTurn", "sessionBFile", "sessionB2File"] } } : {}),
+  });
 }
+
+/** Runs `body` for every route; the process and session routes run inside the concurrent roles. */
+async function forEachRoute(rig: SecurityRig, fake: FakeGit, body: (route: RouteId, roles: Roles | null) => Promise<void>): Promise<void> {
+  for (const route of ROUTE_IDS.filter((r) => r !== "proc" && r !== "session")) await body(route, null);
+  const roles = await startRoles(rig, fake);
+  try {
+    await body("proc", roles);
+    await body("session", roles);
+  } finally {
+    await roles.stop();
+  }
+}
+
+describe("route matrix", () => {
+  it("route matrix, fresh: all eight secret routes in new conversations", async () => {
+    const fake = newFakeGit();
+    const rig = await newRig({ fake });
+    await forEachRoute(rig, fake, async (route, roles) => {
+      const started = Date.now();
+      const turn = await routeTurn(rig, route, { prompt: `ROUTE-${route}-fresh`, sessionId: `conv-${route}-fresh` });
+      await routeRow(rig, route, "fresh", started, { turns: [turn], roles });
+    });
+  });
+
+  it("route matrix, resumed: each route as turn 2 of a conversation (routing: the saved relay URL and proxy token of turn 1 are dead)", async () => {
+    const fake = newFakeGit();
+    const rig = await newRig({ fake });
+    await forEachRoute(rig, fake, async (route, roles) => {
+      const started = Date.now();
+      const session = `conv-${route}-resumed`;
+      if (route === "routing") {
+        const first = await routeTurn(rig, route, { prompt: `ROUTE-${route}-resumed-1`, sessionId: session });
+        const second = await routeTurn(rig, route, { prompt: `ROUTE-${route}-resumed-2`, sessionId: session, phase: "replay" });
+        await routeRow(rig, route, "resumed", started, { turns: [first, second], roles });
+        return;
+      }
+      const warm = await warmTurn(rig, `ROUTE-${route}-resumed-1`, session);
+      const turn = await routeTurn(rig, route, { prompt: `ROUTE-${route}-resumed-2`, sessionId: session });
+      await routeRow(rig, route, "resumed", started, { turns: [turn], warm: [warm], roles });
+    });
+  });
+
+  it("route matrix, restarted: SIGTERM and a new process on the same directories; each route in a pre-restart conversation and in a new one (LOG_LEVEL=debug)", async () => {
+    const fake = newFakeGit();
+    const rig = await newRig({ fake, logLevel: "debug" });
+    // Conversations created before the restart: a trivial turn each (routing: the probe, so its URL and token are saved).
+    const pre: Record<string, { warm?: WarmTurn; probe?: RouteTurn }> = {};
+    for (const route of ROUTE_IDS) {
+      const session = `conv-${route}-pre`;
+      if (route === "routing") pre[route] = { probe: await routeTurn(rig, route, { prompt: `ROUTE-${route}-pre`, sessionId: session }) };
+      else pre[route] = { warm: await warmTurn(rig, `ROUTE-${route}-pre`, session) };
+    }
+    const started = Date.now();
+    await rig.restart();
+    expect(await waitForIsolation(rig), "/health isolation after the restart").toBe("ok");
+    await forEachRoute(rig, fake, async (route, roles) => {
+      const rowStarted = Date.now();
+      const session = `conv-${route}-pre`;
+      const resumedTurn = await routeTurn(rig, route, { prompt: `ROUTE-${route}-restarted-1`, sessionId: session, phase: route === "routing" ? "replay" : "probe", afterRestart: true });
+      const freshTurn = await routeTurn(rig, route, { prompt: `ROUTE-${route}-restarted-2`, sessionId: `conv-${route}-post` });
+      // The pre-restart probe of the routing route is a row turn too: its host checks ran in the fresh mode; here its problems and surfaces count.
+      const warm: WarmTurn[] = route === "routing" ? [{ turn: pre.routing.probe!.turn, problems: pre.routing.probe!.problems }] : [pre[route].warm!];
+      await routeRow(rig, route, "restarted", rowStarted, { turns: [resumedTurn, freshTurn], warm, roles });
+    });
+    void started;
+  });
+});
 
 /* ------------------------------------------------------------------ */
 /*  The regression row                                                  */
@@ -234,9 +398,7 @@ async function routeTurn(rig: SecurityRig, route: RouteId, options: { prompt: st
 
 describe("real-process regression", () => {
   it("regression row: an ordinary chat shows its environment and resumes, the authorized operations work, and no marker reaches any surface", async () => {
-    const rig = await createRig(cleanups, rigOptions());
-    assertPinned(rig);
-    await registerStandardServers(rig);
+    const rig = await newRig();
     const started = Date.now();
     const turn1 = await chatTurn(rig, {
       prompt: "REGRESSION-TURN1",
@@ -260,28 +422,16 @@ describe("real-process regression", () => {
     check("resumed_turn_has_the_prior_context", (resumed[0]?.userTexts.join(" ") ?? "").includes("REGRESSION-TURN1"));
     check("gateway_still_running", rig.gateway.child.exitCode === null);
 
-    finishRow(
-      { id: "RP.regression", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS * 2, surfaces: surfacesOf(rig, [turn1, turn2]), controls, problems },
-      rig,
-    );
+    finishRow(recorder, rig, { id: "RP.regression", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS * 2, surfaces: surfacesOf(rig, [turn1, turn2]), controls, problems });
   });
 });
 
-/* ------------------------------------------------------------------ */
-/*  Route rows                                                          */
-/* ------------------------------------------------------------------ */
-
 describe("route probes", () => {
-  it("route config probe, fresh: trusted files, OAuth state and MCP configuration are unreachable from the sandbox", async () => {
-    const rig = await createRig(cleanups, rigOptions());
-    assertPinned(rig);
-    await registerStandardServers(rig);
+  it("route config probe, fresh: trusted files, OAuth state and MCP configuration are unreachable from the sandbox (the file detector's subject)", async () => {
+    const rig = await newRig();
     const started = Date.now();
-    const row = await routeTurn(rig, "config", { prompt: "ROUTE-CONFIG-FRESH", sessionId: "conv-config-fresh" });
-    finishRow(
-      { id: "RT.config.fresh", mode: "fresh", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS, surfaces: surfacesOf(rig, [row.turn]), controls: row.controls, problems: row.problems },
-      rig,
-    );
+    const turn = await routeTurn(rig, "config", { prompt: "ROUTE-CONFIG-SUBJECT", sessionId: "conv-config-subject" });
+    finishRow(recorder, rig, { id: "RT.config.subject", mode: "fresh", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS, surfaces: surfacesOf(rig, [turn.turn]), controls: turn.verdict.controls, problems: turn.problems });
   });
 });
 
@@ -368,7 +518,7 @@ describe("negative control", () => {
       'argv.push("--bind", spec.homeDir, SANDBOX_HOME);\n    argv.push("--ro-bind", `${process.env.HOME}/.claude/.credentials.json`, `${SANDBOX_HOME}/.claude/.credentials.json`);',
     );
     const started = Date.now();
-    const result = await runChildRow("route config probe", "RT.config.fresh", dist, randomBytes(4).toString("hex"));
+    const result = await runChildRow("route config probe", "RT.config.subject", dist, randomBytes(4).toString("hex"));
     expect(result.timedOut).toBe(false);
     expect(result.failed).toBe(true);
     expect(result.namesTheRow).toBe(true);
@@ -390,8 +540,8 @@ describe("summary", () => {
   });
 });
 
-afterAll(() => {
-  // Child runs and filtered runs print the summary too; only the last test of a full run asserts it.
-  if (IS_CHILD) recorder.finish();
-});
-
+// Kept for the rows added next to the route matrix (X.*), which read the same helpers.
+void ([] as ToolStep[]);
+void resultsFor;
+void runLeftoversText;
+void (null as unknown as RowInput);

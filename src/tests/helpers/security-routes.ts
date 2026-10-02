@@ -13,7 +13,16 @@
  *
  * The built-in tools of the route (Read, Grep, Glob) are separate steps whose results the model-bound surfaces scan.
  */
-import { splitNeedles, type SecurityMarkers } from "./security-matrix.js";
+import {
+  chatTurn,
+  credentialProblems,
+  splitNeedles,
+  turnProblems,
+  type SecurityMarkers,
+  type SecurityRig,
+  type ToolStep,
+  type TurnObservation,
+} from "./security-matrix.js";
 
 export type RouteId = "env" | "proc" | "config" | "repo" | "session" | "legacy" | "links" | "routing";
 
@@ -29,12 +38,11 @@ export interface RouteContext {
   canary: string;
   /** `routing`: `probe` runs the attacks and saves the run's relay URL and token; `replay` retries what an earlier run saved. */
   phase?: "probe" | "replay";
+  /** `routing` replay after a gateway restart: the old relay listener died with the old process (a refused connection is as dead as a 404). */
+  afterRestart?: boolean;
 }
 
-export interface RouteStep {
-  name: string;
-  input: Record<string, unknown>;
-}
+export type RouteStep = ToolStep;
 
 export interface RouteReport {
   route: string;
@@ -284,23 +292,26 @@ const LINKS_BODY = String.raw`
 D = '/work/route-links'
 plant_canary(D)
 open(D + '/permitted.txt', 'w').write('PERMITTED-OK')
+OPENED = []
 def attempt(label, path):
+    # Returns the number of bytes read, or -1 when the path could not be opened. An empty file (a trusted stand-in the sandbox binds over a planted copy) reads as 0.
     try:
         data = open(path, 'rb').read()
     except Exception:
-        return False
+        return -1
     scan_bytes(label, data)
-    return True
-# Traversal out of the approved workspace toward trusted files (a plain read of a permitted system file is the control).
-opened = 0
+    if len(data) > 0:
+        OPENED.append(label)
+    return len(data)
+# Traversal out of the approved workspace toward trusted files (a plain read of a permitted file is the control).
 for rel in ('../.credentials.json', '../../.claude/.credentials.json', '../home/node/.claude/.credentials.json', '../../../' + HOSTWS.lstrip('/') + '/.credentials.json'):
-    opened += 1 if attempt('traversal:' + rel, os.path.join('/work', rel)) else 0
-CONTROLS['traversal_reads_permitted_file'] = attempt('control', '/work/route-links/../route-links/permitted.txt')
+    attempt('traversal:' + rel, os.path.join('/work', rel))
+CONTROLS['traversal_reads_permitted_file'] = attempt('permitted-control', '/work/route-links/../route-links/permitted.txt') > 0
 # Links and copies planted before the update, in the global content the agent may read.
 for p in ('/home/node/.claude/skills/to-credentials', '/home/node/.claude/skills/to-credentials-relative', '/home/node/.claude/skills/hardlinked-credentials', '/home/node/.claude/memory/copy.md', '/home/node/.claude/projects/linked-home/.ssh/id_rsa'):
-    opened += 1 if attempt('planted:' + p, p) else 0
+    attempt('planted:' + p, p)
 # Links the agent creates itself, toward trusted paths, and the same links read again (a later turn reads what an earlier one made).
-targets = ['/home/node/.claude/.credentials.json', HOSTWS + '/.credentials.json', HOSTHOME + '/.ssh/id_rsa', '/proc/1/environ']
+targets = ['/home/node/.claude/.credentials.json', HOSTWS + '/.credentials.json', HOSTHOME + '/.ssh/id_rsa']
 for i, t in enumerate(targets):
     link = '/work/escape-%d' % i
     if not os.path.islink(link):
@@ -308,17 +319,18 @@ for i, t in enumerate(targets):
             os.symlink(t, link)
         except Exception:
             pass
-    opened += 1 if attempt('escape-link:%d' % i, link) and i < 3 else 0
-os.makedirs('/home/node/plant-dir', exist_ok=True)
+    attempt('escape-link:%d' % i, link)
 try:
     os.symlink('/home/node/.claude/.credentials.json', '/home/node/plant')
 except Exception:
     pass
-opened += 1 if attempt('home-link', '/home/node/plant') else 0
-os.symlink('/work/route-links/permitted.txt', '/work/permitted-link') if not os.path.islink('/work/permitted-link') else None
+attempt('home-link', '/home/node/plant')
+if not os.path.islink('/work/permitted-link'):
+    os.symlink('/work/route-links/permitted.txt', '/work/permitted-link')
 CONTROLS['permitted_link_inside_work_readable'] = open('/work/permitted-link').read() == 'PERMITTED-OK'
-FACTS['trusted_targets_opened_through_links_or_traversal'] = opened
-CONTROLS['no_trusted_target_opened'] = opened == 0
+FACTS['trusted_content_obtained_through_links_or_traversal'] = len([l for l in OPENED if l != 'permitted-control'])
+FACTS['opened_labels'] = [l for l in OPENED if l != 'permitted-control']
+CONTROLS['no_trusted_content_obtained'] = FACTS['trusted_content_obtained_through_links_or_traversal'] == 0
 FACTS['files_scanned'] = scan_tree(D)
 finish('links')
 `;
@@ -390,8 +402,8 @@ if PHASE == 'replay':
     if old_url:
         s, b = http('POST', old_url, rpc('tools/call', 21, {'name': 'lookup_record', 'arguments': {'id': 'R-1'}}))
         CASES['old-relay-url'] = s
-        s, b = http('POST', GATEWAY + '/v1/messages', b'{}', {'x-api-key': old_token})
-        CASES['old-proxy-token-messages'] = s
+        s, b = http('POST', os.environ.get('ANTHROPIC_BASE_URL', 'http://127.0.0.1:1') + '/v1/messages', b'{"model":"m","max_tokens":1,"messages":[]}', {'x-api-key': old_token})
+        CASES['old-proxy-token-model-proxy'] = s
         for route in ('/v1/tools', '/v1/mcp-servers', '/v1/sessions'):
             s, b = http('GET', GATEWAY + route, None, {'Authorization': 'Bearer ' + old_token})
             CASES['old-proxy-token GET ' + route] = s
@@ -460,6 +472,9 @@ function builtinSteps(route: RouteId, ctx: RouteContext): RouteStep[] {
       return [{ name: "Read", input: { file_path: `${ctx.host.home}/.ssh/id_rsa` } }, { name: "Read", input: { file_path: "/home/node/.ssh/id_rsa" } }];
     case "links":
       return [{ name: "Read", input: { file_path: "/work/escape-0" } }, { name: "Read", input: { file_path: "/work/escape-1" } }];
+    case "routing":
+      // A registered MCP server and a webhook that answer a credential-bearing call with a redirect to another origin.
+      return ctx.phase === "replay" ? [] : [{ name: "mcp__moved__get_page", input: { id: "P-9" } }, { name: "mcp__agent-gateway-tools__moved_hook", input: {} }];
     default:
       return [];
   }
@@ -478,24 +493,6 @@ export function credentialSteps(): RouteStep[] {
     { name: "mcp__reqlocal__echo", input: {} },
   ];
 }
-
-/** The tools every route run is granted (an ordinary chat with Bash and every mediated tool; `delete_record` stays ungranted). */
-export const ROUTE_ALLOWED_TOOLS = [
-  "Bash",
-  "Read",
-  "Grep",
-  "Glob",
-  "Write",
-  "Edit",
-  "mcp__jira__*",
-  "mcp__feed__lookup_record",
-  "mcp__local__*",
-  "mcp__reqhttp__*",
-  "mcp__reqlocal__*",
-  "mcp__moved__*",
-  "mcp__agent-gateway-tools__probe_read",
-  "mcp__agent-gateway-tools__moved_hook",
-];
 
 /** Extracts the `SEC-REPORT` JSON of a tool result. */
 export function parseReport(text: string): RouteReport | null {
@@ -544,19 +541,21 @@ export function verifyRoute(route: RouteId, resultText: string, ctx: RouteContex
   const report = parseReport(resultText);
   if (!report) return { failures: ["no SEC-REPORT line in the tool result"], controls: [], hits: 0, report: null };
   const failures: string[] = [];
+  const opened = Array.isArray(report.facts.opened_labels) ? ` (opened: ${(report.facts.opened_labels as string[]).join(", ")})` : "";
   const hits = Object.values(report.hits).reduce((sum, count) => sum + count, 0);
   if (hits > 0) failures.push(`marker hits: ${Object.entries(report.hits).map(([name, count]) => `${name}x${count}`).join(", ")}`);
   for (const name of MUST_SUCCEED[route]) if (report.rc[name] !== 0) failures.push(`sub-command ${name} exited ${report.rc[name] ?? "never ran"}`);
   const held: string[] = [];
   for (const [name, ok] of Object.entries(report.controls)) {
     if (ok) held.push(name);
-    else if (route !== "routing" || ctx.phase !== "replay" || name === "earlier_run_saved_its_urls") failures.push(`control did not hold: ${name}`);
+    else if (route !== "routing" || ctx.phase !== "replay" || name === "earlier_run_saved_its_urls") failures.push(`control did not hold: ${name}${opened}`);
   }
   if (route === "routing") {
     const cases = (report.facts.cases ?? {}) as Record<string, number>;
     if (ctx.phase === "replay") {
-      if (cases["old-relay-url"] !== 404 && cases["old-relay-url"] !== 401) failures.push(`old relay URL answered ${cases["old-relay-url"]}`);
-      if (cases["old-proxy-token-messages"] !== 401) failures.push(`old proxy token on the model proxy answered ${cases["old-proxy-token-messages"]}`);
+      const oldRelay = cases["old-relay-url"];
+      if (oldRelay !== 404 && oldRelay !== 401 && !(ctx.afterRestart === true && oldRelay === 0)) failures.push(`old relay URL answered ${oldRelay}`);
+      if (cases["old-proxy-token-model-proxy"] !== 401) failures.push(`old proxy token on the model proxy answered ${cases["old-proxy-token-model-proxy"]}`);
       for (const [label, status] of Object.entries(cases)) if (label.startsWith("old-proxy-token GET") && status !== 401) failures.push(`${label} answered ${status}`);
     } else {
       for (const [label, status] of Object.entries(FIXED_REFUSALS)) if (cases[label] !== status) failures.push(`${label} answered ${cases[label] ?? "nothing"}`);
@@ -566,4 +565,35 @@ export function verifyRoute(route: RouteId, resultText: string, ctx: RouteContex
     }
   }
   return { failures, controls: held, hits, report };
+}
+
+/** The route context of a rig's current gateway process (host paths, port and canary). */
+export function routeContext(rig: SecurityRig, phase?: "probe" | "replay"): RouteContext {
+  return {
+    markers: rig.markers,
+    host: { workspace: rig.gateway.dirs.workspace, home: rig.gateway.dirs.home, persist: rig.gateway.dirs.persist },
+    gatewayPort: rig.gateway.port,
+    canary: `SYNTH-CANARY-${rig.markers.seed}`,
+    phase,
+  };
+}
+
+export interface RouteTurn {
+  phase: "probe" | "replay";
+  turn: TurnObservation;
+  verdict: RouteVerdict;
+  /** Everything wrong with the turn: its stream, runtime, egress, request-scoped credentials and the route's own verdict. */
+  problems: string[];
+  /** The tool results after the three credential steps and the probe itself (the route's built-in tool steps), in order. */
+  extraResults: { isError: boolean; text: string }[];
+}
+
+/** Runs one route probe as an ordinary chat turn with the three request-scoped credentials live. */
+export async function routeTurn(rig: SecurityRig, route: RouteId, options: { prompt: string; sessionId: string; phase?: "probe" | "replay"; afterRestart?: boolean; label?: "reqlift" | "diemcrm"; user?: string }): Promise<RouteTurn> {
+  const ctx = { ...routeContext(rig, options.phase), afterRestart: options.afterRestart };
+  const credentialCount = credentialSteps().length;
+  const steps = [...credentialSteps(), ...routeSteps(route, ctx)];
+  const turn = await chatTurn(rig, { prompt: options.prompt, sessionId: options.sessionId, steps, label: options.label, user: options.user });
+  const verdict = verifyRoute(route, turn.results[credentialCount]?.text ?? "", ctx);
+  return { phase: options.phase ?? "probe", turn, verdict, problems: [...turnProblems(turn), ...credentialProblems(rig, turn), ...verdict.failures], extraResults: turn.results.slice(credentialCount + 1) };
 }

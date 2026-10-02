@@ -11,6 +11,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   AC_ROWS,
   MatrixRecorder,
+  ROUTE_ALLOWED_TOOLS,
   SURFACE_FLOORS,
   assertNoLeak,
   createMarkers,
@@ -29,7 +30,7 @@ import {
   type MatrixRow,
   type Surface,
 } from "./helpers/security-matrix.js";
-import { ROUTE_IDS, ROUTE_ALLOWED_TOOLS, credentialSteps, parseReport, routeSource, routeSteps, verifyRoute, type RouteContext, type RouteReport } from "./helpers/security-routes.js";
+import { ROUTE_IDS, credentialSteps, parseReport, routeSource, routeSteps, verifyRoute, type RouteContext, type RouteReport } from "./helpers/security-routes.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -238,9 +239,12 @@ describe("route probes", () => {
     expect(verifyRoute("routing", probe, context).failures).toEqual([]);
     const open = report({ rc: {}, controls: { scanner_found_canary: true }, facts: { cases: { ...refused, "proxy-token GET /v1/tools": 200 }, ...bodies } });
     expect(verifyRoute("routing", open, context).failures.join(";")).toContain("proxy-token GET /v1/tools answered 200");
-    const replay = report({ rc: {}, controls: { earlier_run_saved_its_urls: true, scanner_found_canary: false }, facts: { cases: { "old-relay-url": 404, "old-proxy-token-messages": 401, "old-proxy-token GET /v1/tools": 401 } } });
+    const replay = report({ rc: {}, controls: { earlier_run_saved_its_urls: true, scanner_found_canary: false }, facts: { cases: { "old-relay-url": 404, "old-proxy-token-model-proxy": 401, "old-proxy-token GET /v1/tools": 401 } } });
     expect(verifyRoute("routing", replay, { ...context, phase: "replay" }).failures).toEqual([]);
-    const live = report({ rc: {}, controls: { earlier_run_saved_its_urls: true }, facts: { cases: { "old-relay-url": 200, "old-proxy-token-messages": 401 } } });
+    const refused0 = report({ rc: {}, controls: { earlier_run_saved_its_urls: true }, facts: { cases: { "old-relay-url": 0, "old-proxy-token-model-proxy": 401 } } });
+    expect(verifyRoute("routing", refused0, { ...context, phase: "replay" }).failures.join(";")).toContain("old relay URL answered 0");
+    expect(verifyRoute("routing", refused0, { ...context, phase: "replay", afterRestart: true }).failures).toEqual([]);
+    const live = report({ rc: {}, controls: { earlier_run_saved_its_urls: true }, facts: { cases: { "old-relay-url": 200, "old-proxy-token-model-proxy": 401 } } });
     expect(verifyRoute("routing", live, { ...context, phase: "replay" }).failures.join(";")).toContain("old relay URL answered 200");
   });
 
