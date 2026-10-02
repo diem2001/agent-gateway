@@ -167,39 +167,28 @@ describe("the work area", () => {
     expect(fs.readFileSync(path.join(outside, "bare", "config"), "utf8")).toContain("fsmonitor");
   });
 
-  it("a real .git keeps its repository but its configuration is rebuilt from the allowlist (no fsmonitor, filter, include, hook path or user info)", () => {
+  it("any .git at the work root is removed at every start (a real directory, a commondir pointer, a worktree config): no repository is a supported scenario there", () => {
     const git = path.join(work, ".git");
     fs.mkdirSync(path.join(git, "objects"), { recursive: true });
     fs.writeFileSync(path.join(git, "HEAD"), "ref: refs/heads/main\n");
-    fs.writeFileSync(
-      path.join(git, "config"),
-      [
-        "[core]", "\trepositoryformatversion = 0", "\tfsmonitor = touch /work/m-fsmonitor", "\thooksPath = /work/hooks",
-        "[filter \"x\"]", "\tclean = touch /work/m-filter",
-        "[include]", "\tpath = /work/evil.cfg",
-        "[remote \"origin\"]", "\turl = https://user:SYNTH-TOKEN-7679@example.test/acme/repo.git", "\tfetch = +refs/heads/*:refs/remotes/origin/*",
-        "[branch \"main\"]", "\tremote = origin",
-      ].join("\n") + "\n",
-    );
+    fs.writeFileSync(path.join(git, "config"), "[core]\n\trepositoryformatversion = 1\n\tfsmonitor = touch /work/m-fsmonitor\n[extensions]\n\tworktreeConfig = true\n");
+    fs.writeFileSync(path.join(git, "config.worktree"), "[core]\n\tfsmonitor = touch /work/m-worktreecfg\n");
+    fs.writeFileSync(path.join(git, "commondir"), "../evil\n");
+    fs.mkdirSync(path.join(work, "evil"));
+    fs.writeFileSync(path.join(work, "evil", "config"), "[core]\n\tfsmonitor = touch /work/m-commondir\n");
     prepareWorkArea(work);
-    expect(fs.readFileSync(path.join(git, "HEAD"), "utf8")).toBe("ref: refs/heads/main\n");
-    const config = fs.readFileSync(path.join(git, "config"), "utf8");
-    for (const word of ["fsmonitor", "hooksPath", "hookspath", "filter", "clean", "include", "evil.cfg", "SYNTH-TOKEN-7679", "user:"]) expect(config.toLowerCase()).not.toContain(word.toLowerCase());
-    expect(config).toContain("repositoryformatversion");
-    expect(config).toContain("https://example.test/acme/repo.git");
-    expect(config).toContain("[branch \"main\"]");
+    expect(fs.existsSync(git)).toBe(false);
+    // Only the .git entry goes: the agent's other files stay.
+    expect(fs.existsSync(path.join(work, "evil", "config"))).toBe(true);
   });
 
-  it("a .git/config that is a link or a directory is removed, never followed", () => {
+  it("a .git directory that holds a link or a directory named config is removed whole, nothing outside is followed", () => {
     const git = path.join(work, ".git");
     fs.mkdirSync(git);
     fs.symlinkSync(path.join(outside, "keep.txt"), path.join(git, "config"));
     prepareWorkArea(work);
-    expect(fs.existsSync(path.join(git, "config"))).toBe(false);
+    expect(fs.existsSync(git)).toBe(false);
     expect(kept()).toBe("keep");
-    fs.mkdirSync(path.join(git, "config"));
-    prepareWorkArea(work);
-    expect(fs.existsSync(path.join(git, "config"))).toBe(false);
   });
 
   it("repositories below the work area are not touched", () => {

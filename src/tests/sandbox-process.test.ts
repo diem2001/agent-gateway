@@ -562,11 +562,46 @@ describe("the clean home and the work area (MVP-7679, A2)", () => {
   it("a repository planted at /work/.git with core.fsmonitor runs nothing at the next start", async () => {
     const id = dirId("work-git");
     await probe(`git init -q /work && git -C /work config core.fsmonitor 'touch /work/m-fsmonitor' && echo DONE=1`, { sessionDirId: id });
-    const second = await probe(`git -C /work status --porcelain >/dev/null 2>&1; echo STATUS=$?; echo MARKER=$(ls /work/m-fsmonitor 2>&1 | grep -c -v 'No such'); echo CONFIG=$(grep -c fsmonitor /work/.git/config)`, { sessionDirId: id });
+    const second = await probe(`git -C /work status --porcelain >/dev/null 2>&1; echo STATUS=$?; echo MARKER=$(ls /work/m-fsmonitor 2>&1 | grep -c -v 'No such'); echo GIT=$(ls -A /work/.git 2>&1 | grep -c -v 'No such')`, { sessionDirId: id });
     expect(second.lines.get("MARKER")).toBe("0");
-    expect(second.lines.get("CONFIG")).toBe("0");
+    expect(second.lines.get("GIT")).toBe("0");
     // Control: the planted configuration is a working fsmonitor (git runs it inside the run that wrote it).
     const control = await probe(`git init -q /work && git -C /work config core.fsmonitor 'touch /work/m-control' && git -C /work status >/dev/null 2>&1; echo MARKER=$(ls /work/m-control 2>&1 | grep -c -v 'No such')`, { sessionDirId: dirId("work-git-control") });
+    expect(control.lines.get("MARKER")).toBe("1");
+  });
+
+  it("a repository at /work/.git is removed at every start, whatever it is: a commondir pointer, a worktree config and a plain directory run nothing", async () => {
+    const plant = (name: string, extra: string) =>
+      `mkdir -p /work/.git/objects /work/.git/refs /work/evil/objects /work/evil/refs && echo 'ref: refs/heads/main' > /work/.git/HEAD && echo 'ref: refs/heads/main' > /work/evil/HEAD && ${extra.replaceAll("MARK", name)} && echo DONE=1`;
+    const check = (name: string) =>
+      `git -C /work status --porcelain >/dev/null 2>&1; echo MARKER=$(ls /work/${name} 2>&1 | grep -c -v 'No such'); echo GIT=$(ls -A /work/.git 2>&1 | grep -c -v 'No such')`;
+    const rows: Array<{ name: string; extra: string }> = [
+      { name: "m-commondir", extra: `echo '../evil' > /work/.git/commondir && printf '[core]\\n\\trepositoryformatversion = 0\\n\\tfsmonitor = touch /work/MARK\\n' > /work/evil/config` },
+      { name: "m-worktreecfg", extra: `printf '[core]\\n\\trepositoryformatversion = 1\\n[extensions]\\n\\tworktreeConfig = true\\n' > /work/.git/config && printf '[core]\\n\\tfsmonitor = touch /work/MARK\\n' > /work/.git/config.worktree` },
+      { name: "m-plain", extra: `printf '[core]\\n\\trepositoryformatversion = 0\\n\\tfsmonitor = touch /work/MARK\\n' > /work/.git/config` },
+    ];
+    for (const row of rows) {
+      const id = dirId(`work-git-${row.name}`);
+      const planted = await probe(plant(row.name, row.extra), { sessionDirId: id });
+      expect(planted.lines.get("DONE"), row.name).toBe("1");
+      const second = await probe(check(row.name), { sessionDirId: id });
+      expect(second.lines.get("MARKER"), row.name).toBe("0");
+      expect(second.lines.get("GIT"), row.name).toBe("0");
+      // Control: the same planted repository DOES run its fsmonitor when git is started inside the run that wrote it.
+      const control = await probe(`${plant(row.name + "c", row.extra)}; git -C /work status >/dev/null 2>&1; echo MARKER=$(ls /work/${row.name}c 2>&1 | grep -c -v 'No such')`, { sessionDirId: dirId(`work-git-control-${row.name}`) });
+      expect(control.lines.get("MARKER"), row.name).toBe("1");
+    }
+  });
+
+  it("a repository below /work (a copied project) is not consulted by the start-time git: its fsmonitor does not run, and git from /work does not see it", async () => {
+    const id = dirId("work-git-nested");
+    await probe(`mkdir -p /work/sub && git init -q /work/sub && git -C /work/sub config core.fsmonitor 'touch /work/m-nested' && echo DONE=1`, { sessionDirId: id });
+    const second = await probe(`git -C /work status --porcelain >/dev/null 2>&1; echo STATUS=$?; echo MARKER=$(ls /work/m-nested 2>&1 | grep -c -v 'No such'); echo NESTED=$(grep -c fsmonitor /work/sub/.git/config); echo TOP=$(git -C /work rev-parse --show-toplevel 2>&1 | head -1 | grep -c '^/work$')`, { sessionDirId: id });
+    expect(second.lines.get("MARKER")).toBe("0");
+    expect(second.lines.get("NESTED")).toBe("1");
+    expect(second.lines.get("TOP")).toBe("0");
+    // Control: the nested repository is a working fsmonitor when git is run inside it.
+    const control = await probe(`git init -q /work/sub && git -C /work/sub config core.fsmonitor 'touch /work/m-nested-c' && git -C /work/sub status >/dev/null 2>&1; echo MARKER=$(ls /work/m-nested-c 2>&1 | grep -c -v 'No such')`, { sessionDirId: dirId("work-git-nested-control") });
     expect(control.lines.get("MARKER")).toBe("1");
   });
 
