@@ -94,7 +94,9 @@ describe("another label cannot change or delete a registered MCP server", () => 
       .set(as(KEY_ALPHA))
       .send({ type: "http", url: ORIGINAL_URL, headers: { "X-Shared": "alpha" }, userCredentialSchema: schema });
     expect(created.status).toBe(201);
-    const before = (await request(app).get("/v1/mcp-servers/jira").set(as(KEY_ALPHA))).body;
+    // The stored definition, maps included: GET no longer shows them (MVP-7936).
+    const { getMcpServer } = await import("../mcp-registry.js");
+    const before = structuredClone(getMcpServer("jira"));
 
     const attack = await request(app)
       .put("/v1/mcp-servers/jira")
@@ -104,7 +106,7 @@ describe("another label cannot change or delete a registered MCP server", () => 
     expect(attack.body).toEqual(DENIAL);
     expect(attack.text).toBe(JSON.stringify(DENIAL));
 
-    expect((await request(app).get("/v1/mcp-servers/jira").set(as(KEY_ALPHA))).body).toEqual(before);
+    expect(getMcpServer("jira")).toEqual(before);
     expect(before).toMatchObject({ url: ORIGINAL_URL, headers: { "X-Shared": "alpha" }, userCredentialSchema: schema });
     expect(attacker.requests).toEqual([]);
   });

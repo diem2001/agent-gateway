@@ -391,3 +391,26 @@ describe("an invalid map keeps its existing refusal and echoes nothing", () => {
     expect(await stored("jira")).toEqual(before);
   });
 });
+
+describe("resolveStoredCredentialMaps", () => {
+  const def = (type: "http" | "sse" | "stdio", maps: Record<string, Record<string, string>> = {}) =>
+    ({ name: "x", description: "", enabled: true, type, createdAt: "t", updatedAt: "t", ...maps }) as never;
+
+  it("omitted keeps, non-empty replaces, empty clears, per map", async () => {
+    const { resolveStoredCredentialMaps } = await import("../mcp-registry.js");
+    const existing = def("http", { headers: { A: "1" }, env: { B: "2" } });
+    expect(resolveStoredCredentialMaps(existing, { type: "http" })).toEqual({ maps: { headers: { A: "1" }, env: { B: "2" } } });
+    expect(resolveStoredCredentialMaps(existing, { type: "http", headers: { A: "9" } })).toEqual({ maps: { headers: { A: "9" }, env: { B: "2" } } });
+    expect(resolveStoredCredentialMaps(existing, { type: "http", headers: {}, env: {} })).toEqual({ maps: {} });
+    expect(resolveStoredCredentialMaps(undefined, { type: "http" })).toEqual({ maps: {} });
+  });
+
+  it("refuses a family change that leaves a non-empty omitted map, naming only property and transport", async () => {
+    const { resolveStoredCredentialMaps } = await import("../mcp-registry.js");
+    const result = resolveStoredCredentialMaps(def("http", { headers: { A: "SECRET-VALUE" } }), { type: "stdio" });
+    expect(result).toEqual({ error: { code: "MCP_CREDENTIAL_MAP_INAPPLICABLE", message: expect.stringContaining("headers") } });
+    expect(JSON.stringify(result)).not.toContain("SECRET-VALUE");
+    expect(resolveStoredCredentialMaps(def("http", { headers: {} }), { type: "stdio" })).toEqual({ maps: { headers: {} } });
+    expect(resolveStoredCredentialMaps(def("sse", { headers: { A: "1" } }), { type: "http" })).toEqual({ maps: { headers: { A: "1" } } });
+  });
+});
