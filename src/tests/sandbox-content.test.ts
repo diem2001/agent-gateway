@@ -19,7 +19,9 @@ import {
   planTrustedContent,
   prepareMountPoints,
   readFileNoFollow,
+  sshPrivateKeyValues,
   stripUrlUserInfo,
+  webhookUrlValues,
 } from "../sandbox-content.js";
 
 const SECRET = "SYNTH-CRED-ACCESS-TOKEN-7678-abcdef";
@@ -311,12 +313,160 @@ describe("known-value scan", () => {
     expect(scanner.scan(path.join(root, "tree"), [Buffer.from(SECRET.slice(0, Math.min(SECRET.length, stat.size)))])).toHaveLength(1);
   });
 
-  it("scans nothing without values and skips files over the size limit", () => {
+  it("scans nothing without values", () => {
     write("tree/a.txt", SECRET);
+    expect(new KnownValueScanner().scan(path.join(root, "tree"), [])).toEqual([]);
+  });
+
+  it("finds a value at the end of a 2 MiB file and leaves a clean 2 MiB file alone", () => {
+    const MiB = 1024 * 1024;
+    fs.mkdirSync(path.join(root, "tree"), { recursive: true });
+    fs.writeFileSync(path.join(root, "tree", "big-planted.bin"), Buffer.concat([Buffer.alloc(2 * MiB, "x"), Buffer.from(SECRET)]));
+    fs.writeFileSync(path.join(root, "tree", "big-clean.bin"), Buffer.alloc(2 * MiB, "x"));
+    write("tree/small-clean.txt", "fine");
+    expect(new KnownValueScanner().scan(path.join(root, "tree"), [Buffer.from(SECRET)]).map((h) => path.basename(h))).toEqual(["big-planted.bin"]);
+  });
+
+  it("finds a value that straddles a chunk boundary, at every offset around it", () => {
+    const MiB = 1024 * 1024;
+    const needle = Buffer.from(SECRET);
+    fs.mkdirSync(path.join(root, "tree"), { recursive: true });
+    for (let shift = 0; shift < needle.length; shift++) {
+      const body = Buffer.alloc(3 * MiB, "x");
+      needle.copy(body, MiB - shift);
+      fs.writeFileSync(path.join(root, "tree", `straddle-${shift}.bin`), body);
+    }
+    const hits = new KnownValueScanner().scan(path.join(root, "tree"), [needle]);
+    expect(hits).toHaveLength(needle.length);
+  });
+
+  it("finds a straddling value with a tiny chunk size and a value longer than the chunk", () => {
+    const needle = Buffer.from(SECRET);
+    for (const chunkBytes of [1, 7, needle.length - 1, needle.length, needle.length + 3]) {
+      const dir = path.join(root, `tiny-${chunkBytes}`);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "planted.bin"), Buffer.concat([Buffer.alloc(chunkBytes * 3 + 5, "x"), needle, Buffer.alloc(chunkBytes * 2 + 1, "y")]));
+      fs.writeFileSync(path.join(dir, "clean.bin"), Buffer.alloc(chunkBytes * 6 + needle.length, "x"));
+      const hits = new KnownValueScanner({ chunkBytes }).scan(dir, [needle]).map((h) => path.basename(h));
+      expect(hits, `chunk ${chunkBytes}`).toEqual(["planted.bin"]);
+    }
+  });
+
+  it("hides a file above the ceiling without reading it, and a file exactly at the ceiling is scanned", () => {
+    const ceiling = 4096;
+    fs.mkdirSync(path.join(root, "tree"), { recursive: true });
+    fs.writeFileSync(path.join(root, "tree", "over.bin"), Buffer.alloc(ceiling + 1, "x"));
+    fs.writeFileSync(path.join(root, "tree", "at-planted.bin"), Buffer.concat([Buffer.alloc(ceiling - SECRET.length, "x"), Buffer.from(SECRET)]));
+    fs.writeFileSync(path.join(root, "tree", "at-clean.bin"), Buffer.alloc(ceiling, "x"));
+    const scanner = new KnownValueScanner({ maxFileBytes: ceiling });
+    const result = scanner.scanDetailed(path.join(root, "tree"), [Buffer.from(SECRET)]);
+    expect(result.tooLarge.map((h) => path.basename(h))).toEqual(["over.bin"]);
+    expect(result.hits.map((h) => path.basename(h))).toEqual(["at-planted.bin"]);
+    expect(scanner.scan(path.join(root, "tree"), [Buffer.from(SECRET)]).map((h) => path.basename(h)).sort()).toEqual(["at-planted.bin", "over.bin"]);
+  });
+
+  it("scans a single file and refuses a link, a missing file and a directory as a hit", () => {
     const scanner = new KnownValueScanner();
-    expect(scanner.scan(path.join(root, "tree"), [])).toEqual([]);
-    fs.writeFileSync(path.join(root, "tree", "big.bin"), Buffer.concat([Buffer.from(SECRET), Buffer.alloc(1024 * 1024 + 10)]));
-    expect(scanner.scan(path.join(root, "tree"), [Buffer.from(SECRET)]).map((h) => path.basename(h))).toEqual(["a.txt"]);
+    const needles = [Buffer.from(SECRET)];
+    const clean = write("one/clean.txt", "fine");
+    const planted = write("one/planted.txt", SECRET);
+    const link = path.join(root, "one", "link.txt");
+    fs.symlinkSync(clean, link);
+    expect(scanner.scanFile(clean, needles)).toBe("clean");
+    expect(scanner.scanFile(planted, needles)).toBe("hit");
+    expect(scanner.scanFile(link, needles)).toBe("hit");
+    expect(scanner.scanFile(path.join(root, "one", "missing.txt"), needles)).toBe("hit");
+    expect(scanner.scanFile(path.join(root, "one"), needles)).toBe("hit");
+  });
+});
+
+describe("SSH private-key values", () => {
+  const BODY_ONE = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW";
+  const BODY_TWO = "QyNTUxOQAAACBSYNTH7919FAKEKEYBODYLINETWOabcdefghijklmnopqrstuvwxyz0";
+  const BODY_SHORT = "short=";
+  const key = (eol: string) =>
+    ["-----BEGIN OPENSSH PRIVATE KEY-----", BODY_ONE, BODY_TWO, BODY_SHORT, "-----END OPENSSH PRIVATE KEY-----", ""].join(eol);
+
+  it("takes every body line of 16 or more characters of an armored private key, nothing else", () => {
+    write("ssh/id_ed25519", key("\n"));
+    const values = sshPrivateKeyValues(path.join(root, "ssh"));
+    expect(values).toHaveLength(2);
+    expect(values.includes(BODY_ONE)).toBe(true);
+    expect(values.includes(BODY_TWO)).toBe(true);
+    expect(values.some((v) => v.includes("BEGIN") || v.includes("END") || v === BODY_SHORT)).toBe(false);
+  });
+
+  it("reads a CRLF-stored key as the same lines, so an LF or CRLF copy contains them", () => {
+    write("ssh/id_crlf", key("\r\n"));
+    const values = sshPrivateKeyValues(path.join(root, "ssh"));
+    expect(values.sort()).toEqual([BODY_ONE, BODY_TWO].sort());
+    expect(values.every((v) => !v.includes("\r"))).toBe(true);
+  });
+
+  it("skips the headers of an encrypted legacy key", () => {
+    write("ssh/id_rsa", ["-----BEGIN RSA PRIVATE KEY-----", "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF", "", BODY_ONE, "-----END RSA PRIVATE KEY-----", ""].join("\n"));
+    expect(sshPrivateKeyValues(path.join(root, "ssh"))).toEqual([BODY_ONE]);
+  });
+
+  it("ignores public keys, known_hosts, authorized_keys and config", () => {
+    write("ssh/id_ed25519.pub", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFSYNTH7919PUBLICKEYBLOBabcdefghijkl comment\n");
+    write("ssh/known_hosts", "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n");
+    write("ssh/authorized_keys", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFSYNTH7919AUTHORIZEDKEYabcdefghijklm x\n");
+    write("ssh/config", "# Managed by agent-gateway\nHost *\n  StrictHostKeyChecking accept-new\n  IdentityFile /home/node/.ssh/id_ed25519\n");
+    expect(sshPrivateKeyValues(path.join(root, "ssh"))).toEqual([]);
+  });
+
+  it("ignores a symlink, an oversized file and a subdirectory, and a missing directory gives nothing", () => {
+    const real = write("elsewhere/real-key", key("\n"));
+    fs.mkdirSync(path.join(root, "ssh"), { recursive: true });
+    fs.symlinkSync(real, path.join(root, "ssh", "linked-key"));
+    write("ssh/huge", `${key("\n")}${"x".repeat(300 * 1024)}`);
+    write("ssh/sub/nested-key", key("\n"));
+    expect(sshPrivateKeyValues(path.join(root, "ssh"))).toEqual([]);
+    expect(sshPrivateKeyValues(path.join(root, "missing"))).toEqual([]);
+  });
+
+  it("logs nothing", () => {
+    write("ssh/id_ed25519", key("\n"));
+    sshPrivateKeyValues(path.join(root, "ssh"));
+    expect(logs).toEqual([]);
+  });
+});
+
+describe("webhook URL values", () => {
+  const has = (values: string[], value: string) => values.includes(value);
+  const tool = (webhook_url: string) => [{ webhook_url }];
+
+  it("takes the full URL, a path token and the path onward", () => {
+    const values = webhookUrlValues(tool("https://hooks.example.test/services/T0SYNTH7919/B0SYNTH7919/XYZsynth7919PATHTOKEN"));
+    expect(has(values, "https://hooks.example.test/services/T0SYNTH7919/B0SYNTH7919/XYZsynth7919PATHTOKEN")).toBe(true);
+    expect(has(values, "XYZsynth7919PATHTOKEN")).toBe(true);
+    expect(has(values, "/services/T0SYNTH7919/B0SYNTH7919/XYZsynth7919PATHTOKEN")).toBe(true);
+    expect(has(values, "services")).toBe(false);
+  });
+
+  it("takes query and fragment values: unnamed ones of 16+ characters, secret-named ones of 8+", () => {
+    const values = webhookUrlValues(tool("https://hooks.example.test/h?code=ABC12345&token=SYNTHqueryTOKEN7919&mode=fast&opaque=OPAQUEvalue7919xx#access_token=FRAGsynth7919&view=list"));
+    expect(has(values, "ABC12345")).toBe(true);
+    expect(has(values, "SYNTHqueryTOKEN7919")).toBe(true);
+    expect(has(values, "OPAQUEvalue7919xx")).toBe(true);
+    expect(has(values, "FRAGsynth7919")).toBe(true);
+    expect(has(values, "fast")).toBe(false);
+    expect(has(values, "list")).toBe(false);
+  });
+
+  it("takes user info and the percent-decoded form of an encoded token", () => {
+    const values = webhookUrlValues(tool("https://synthuser7919:synth%2Fpass7919@hooks.example.test/h?api_key=a%2Bb%2Fc7919KEY"));
+    expect(has(values, "synthuser7919")).toBe(true);
+    expect(has(values, "synth%2Fpass7919")).toBe(true);
+    expect(has(values, "synth/pass7919")).toBe(true);
+    expect(has(values, "a%2Bb%2Fc7919KEY")).toBe(true);
+    expect(has(values, "a+b/c7919KEY")).toBe(true);
+  });
+
+  it("gives nothing for a URL that does not parse, a non-string and a tool without a URL, and logs nothing", () => {
+    expect(webhookUrlValues([{ webhook_url: "not a url SYNTH7919SECRETVALUE" }, { webhook_url: 42 }, {}])).toEqual([]);
+    expect(logs).toEqual([]);
   });
 });
 
@@ -461,6 +611,33 @@ describe("mount plan", () => {
     write("ws/projects/docs/readme.md", "x");
     const p = plan();
     expect(dests(p).filter((d) => d.includes("/projects/"))).toEqual(["/home/node/.claude/projects/docs", "/home/node/.claude/projects/sub"]);
+  });
+
+  it("hides a global CLAUDE.md over 1 MiB that holds a known value, and keeps a clean one over 1 MiB", () => {
+    const MiB = 1024 * 1024;
+    fs.mkdirSync(path.join(root, "ws"), { recursive: true });
+    fs.writeFileSync(path.join(root, "ws", "CLAUDE.md"), Buffer.concat([Buffer.alloc(2 * MiB, "x"), Buffer.from(SECRET)]));
+    const planted = plan([Buffer.from(SECRET)]);
+    expect(planted.hidden).toEqual(["/home/node/.claude/CLAUDE.md"]);
+    expect(logs.join("\n")).toMatch(/kind=global name=CLAUDE.md reason=known_value/);
+    fs.writeFileSync(path.join(root, "ws", "CLAUDE.md"), Buffer.alloc(2 * MiB, "x"));
+    expect(plan([Buffer.from(SECRET)]).hidden).toEqual([]);
+  });
+
+  it("hides a file or global CLAUDE.md above the ceiling with the audit reason too_large, never reading it", () => {
+    const ceiling = 2048;
+    fs.mkdirSync(path.join(root, "ws", "projects", "repo"), { recursive: true });
+    fs.writeFileSync(path.join(root, "ws", "projects", "repo", "huge.bin"), Buffer.alloc(ceiling + 1, "x"));
+    fs.writeFileSync(path.join(root, "ws", "projects", "repo", "fine.txt"), "fine");
+    fs.writeFileSync(path.join(root, "ws", "CLAUDE.md"), Buffer.alloc(ceiling + 1, "x"));
+    const trustedDir = path.join(root, "trusted");
+    const p = planTrustedContent({ workspaceRoot: path.join(root, "ws"), trustedDir, needles: [Buffer.from(SECRET)], scanner: new KnownValueScanner({ maxFileBytes: ceiling }) });
+    expect(p.hidden.sort()).toEqual(["/home/node/.claude/CLAUDE.md", "/home/node/.claude/projects/repo/huge.bin"]);
+    expect(p.hiddenCount).toBe(2);
+    const audit = logs.filter((l) => l.includes("sandbox.content.skipped")).join("\n");
+    expect(audit).toMatch(/kind=repo name=repo reason=too_large/);
+    expect(audit).toMatch(/kind=global name=CLAUDE.md reason=too_large/);
+    expect(audit).not.toMatch(/known_value/);
   });
 
   it("hides a file that holds a known value behind an empty file, in a global directory and a repository, with an audit line without the value", () => {

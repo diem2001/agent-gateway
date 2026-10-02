@@ -6,7 +6,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_MCP_TOOL_TIMEOUT_MS,
   McpToolTimeoutConfigError,
@@ -154,6 +154,40 @@ describe("the values masked in a refusal message", () => {
     ]) {
       expect(values, expected).toContain(expected);
     }
+  });
+});
+
+describe("the SSH key and webhook URL values in the masking list and the sandbox scan list", () => {
+  let dir: string;
+  const saved = { ...process.env };
+  const SSH_LINE = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABSYNTH7919MASK";
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tool-mediation-keys-"));
+    fs.mkdirSync(path.join(dir, "home", ".ssh"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "home", ".ssh", "id_ed25519"), `-----BEGIN OPENSSH PRIVATE KEY-----\n${SSH_LINE}\n-----END OPENSSH PRIVATE KEY-----\n`);
+    process.env.HOME = path.join(dir, "home");
+    process.env.MCP_SERVERS_PERSIST_PATH = path.join(dir, "mcp-servers.json");
+    process.env.TOOLS_PERSIST_PATH = path.join(dir, "tools.json");
+  });
+  afterEach(async () => {
+    process.env = { ...saved };
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("masks an SSH private-key line and a webhook URL token in a webhook refusal text, and the sandbox scan list holds the same values", async () => {
+    vi.resetModules();
+    const { registerTool } = await import("../tools.js");
+    registerTool({ name: "hook", description: "d", input_schema: { type: "object" }, webhook_url: "https://hooks.example.test/services/PATHTOKENsynth7919ABCDEF?token=QUERYTOKEN7919", owner: "reqlift" });
+    const mediation = await import("../tool-mediation.js");
+    const secrets = mediation.secretValuesForMasking();
+    const text = mediation.webhookRejectionText(400, "text/plain", `bad ${SSH_LINE} and PATHTOKENsynth7919ABCDEF and QUERYTOKEN7919`, secrets);
+    expect(text.includes(SSH_LINE)).toBe(false);
+    expect(text.includes("PATHTOKENsynth7919ABCDEF")).toBe(false);
+    expect(text.includes("QUERYTOKEN7919")).toBe(false);
+    expect(text).toContain("[REDACTED]");
+    const scan = mediation.gatewayKnownValues(path.join(dir, "ws")).map((b) => b.toString("utf8"));
+    expect([...secrets].sort()).toEqual(scan.sort());
   });
 });
 
