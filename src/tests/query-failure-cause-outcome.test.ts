@@ -55,7 +55,7 @@ function mockSdk(): void {
   vi.doMock("@anthropic-ai/claude-agent-sdk", () => ({
     createSdkMcpServer: vi.fn((options) => ({ type: "sdk", name: options.name })),
     query: vi.fn(() => {
-      const attempt = script.shift() ?? { messages: [INIT] };
+      const attempt: Attempt = script.shift() ?? { messages: [INIT] };
       return (async function* () {
         for (const message of attempt.messages) yield message;
         if (attempt.throws !== undefined) throw attempt.throws;

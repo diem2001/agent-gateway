@@ -627,6 +627,8 @@ export class SandboxRun {
   private runDir: string | null = null;
   private launch: Launch | null = null;
   private prepFailure: IsolationFailure | null = null;
+  /** Set when `dispose` itself killed the launcher: that end is the gateway's own cleanup, not a cause to report. */
+  private killedByGateway = false;
   readonly spawnHook: (spawnOptions: SpawnOptions) => SpawnedProcess;
 
   constructor(options: SandboxRunOptions) {
@@ -637,6 +639,17 @@ export class SandboxRun {
   /** The runtime's process group leader (the bwrap process), once started. */
   get child(): ChildProcess | null {
     return this.launch?.child ?? null;
+  }
+
+  /**
+   * The runtime process's own exit metadata for the failure log (MVP-7852): the exit code and signal of
+   * the launcher (bwrap) process as Node observed them, never decoded. Null without a launch and after
+   * the gateway's own cleanup kill; both fields are null while the launcher has not exited.
+   */
+  get runtimeExit(): { exitCode: number | null; signalCode: NodeJS.Signals | null } | null {
+    const child = this.launch?.child;
+    if (!child || this.killedByGateway) return null;
+    return { exitCode: child.exitCode, signalCode: child.signalCode };
   }
 
   /** The isolation failure of this run, if its start failed. */
@@ -773,6 +786,7 @@ export class SandboxRun {
       await new Promise<void>((resolve) => {
         const timer = setTimeout(() => {
           log("query", "sandbox did not exit in time; killing it");
+          this.killedByGateway = true;
           child.kill("SIGKILL");
         }, waitMs);
         child.once("exit", () => {

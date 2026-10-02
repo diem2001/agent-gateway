@@ -10,7 +10,15 @@
  * Raw diagnostic text (provider bodies, result text, stderr, prompts, headers)
  * never leaves this module: `message` is one of the fixed texts below and
  * `logFields` holds only allowlisted values. A `RunFailure` has no `cause`.
+ *
+ * The cause fields (`errorClass`, `errno`, `exit`, `signal`, MVP-7852) take their
+ * value only from structured metadata (the thrown value's prototype and `code`
+ * property, the runtime process's exit code and signal), each mapped to a finite
+ * allowlist or to `none` (absent) / `other` (present, unrecognized). No field is
+ * read from a message, stderr, stdout, a provider body or `cause`.
  */
+
+import os from "node:os";
 
 export type RunFailureKind =
   | "runtime_version_unsupported"
@@ -34,6 +42,8 @@ export interface RunDiagnostics {
   assistantErrors?: { error: unknown; text: string }[];
   /** The error the SDK iterator threw, if any. */
   thrown?: unknown;
+  /** The runtime process's own exit metadata (`SandboxRun.runtimeExit`), or null when it has none to report. */
+  runtimeExit?: { exitCode: unknown; signalCode: unknown } | null;
 }
 
 /** Operator log fields; every value is a number, a validated version, an allowlisted word or "none"/"other". */
@@ -43,6 +53,10 @@ export interface RunFailureLogFields {
   providerType: string;
   installed: string;
   required: string;
+  errorClass: string;
+  errno: string;
+  exit: string;
+  signal: string;
 }
 
 /** The failed attempt's result without its text (`result`) and without `errors`. */
@@ -173,6 +187,66 @@ function summarize(result: Record<string, unknown> | null | undefined): ResultSu
   return summary;
 }
 
+/** Error classes the log may name; the written name is the literal here, never the value's own `name`. */
+const ERROR_CLASSES: readonly (readonly [string, { prototype: object }])[] = [
+  ["Error", Error],
+  ["TypeError", TypeError],
+  ["RangeError", RangeError],
+  ["SyntaxError", SyntaxError],
+  ["ReferenceError", ReferenceError],
+  ["EvalError", EvalError],
+  ["URIError", URIError],
+  ["AggregateError", AggregateError],
+];
+
+const NO_CAUSE = { errorClass: "none", errno: "none", exit: "none", signal: "none" } as const;
+type CauseFields = Pick<RunFailureLogFields, "errorClass" | "errno" | "exit" | "signal">;
+
+function errorClassOf(thrown: unknown): string {
+  if (thrown === undefined || thrown === null) return "none";
+  if (typeof thrown !== "object") return "other";
+  const prototype = Object.getPrototypeOf(thrown);
+  for (const [name, constructor] of ERROR_CLASSES) if (prototype === constructor.prototype) return name;
+  return "other";
+}
+
+function errnoOf(thrown: unknown): string {
+  if (thrown === undefined || thrown === null || typeof thrown !== "object") return "none";
+  const code = (thrown as { code?: unknown }).code;
+  if (code === undefined) return "none";
+  return typeof code === "string" && Object.hasOwn(os.constants.errno, code) ? code : "other";
+}
+
+function exitOf(runtimeExit: RunDiagnostics["runtimeExit"]): string {
+  const code = runtimeExit?.exitCode;
+  return typeof code === "number" && Number.isSafeInteger(code) ? String(code) : "none";
+}
+
+function signalOf(runtimeExit: RunDiagnostics["runtimeExit"]): string {
+  const signal = runtimeExit?.signalCode;
+  if (signal === undefined || signal === null) return "none";
+  return typeof signal === "string" && Object.hasOwn(os.constants.signals, signal) ? signal : "other";
+}
+
+/** Runs one field's mapping; an exception (a hostile getter or Proxy) affects only that field. */
+function guarded(field: () => string): string {
+  try {
+    return field();
+  } catch {
+    return "other";
+  }
+}
+
+/** The four cause fields, evaluated independently. */
+function causeFields(thrown: unknown, runtimeExit: RunDiagnostics["runtimeExit"]): CauseFields {
+  return {
+    errorClass: guarded(() => errorClassOf(thrown)),
+    errno: guarded(() => errnoOf(thrown)),
+    exit: guarded(() => exitOf(runtimeExit)),
+    signal: guarded(() => signalOf(runtimeExit)),
+  };
+}
+
 function classify(diagnostics: RunDiagnostics, queryId: string | undefined): RunFailure {
   const installed = typeof diagnostics.installedVersion === "string" && VERSION.test(diagnostics.installedVersion) ? diagnostics.installedVersion : null;
   const result = diagnostics.result && typeof diagnostics.result === "object" ? diagnostics.result : null;
@@ -225,6 +299,7 @@ function classify(diagnostics: RunDiagnostics, queryId: string | undefined): Run
     providerType: firstType === undefined ? "none" : PROVIDER_TYPES.has(firstType) ? firstType : "other",
     installed: installed ?? "none",
     required: required ?? "none",
+    ...causeFields(diagnostics.thrown, diagnostics.runtimeExit),
   };
   return new RunFailure(kind, message, logFields, summarize(result));
 }
@@ -238,14 +313,20 @@ export function classifyRunFailure(diagnostics: RunDiagnostics, queryId?: string
   try {
     return classify(diagnostics, queryId);
   } catch {
-    const fields: RunFailureLogFields = { kind: "unknown", apiStatus: "none", providerType: "none", installed: "none", required: "none" };
+    let cause: CauseFields = NO_CAUSE;
+    try {
+      cause = causeFields(diagnostics.thrown, diagnostics.runtimeExit);
+    } catch {
+      // The classifier stays total: all `none` when even the guarded mapping fails.
+    }
+    const fields: RunFailureLogFields = { kind: "unknown", apiStatus: "none", providerType: "none", installed: "none", required: "none", ...cause };
     return new RunFailure("unknown", unknownMessage(queryId), fields, null);
   }
 }
 
-/** The operator log line tail for a failure: `kind=<kind> apiStatus=<n|none> ...`. */
+/** The operator log line tail for a failure: `kind=<kind> apiStatus=<n|none> ... errorClass=<class|other|none> ... signal=<name|other|none>`. */
 export function formatLogFields(fields: RunFailureLogFields): string {
-  return `kind=${fields.kind} apiStatus=${fields.apiStatus} providerType=${fields.providerType} installed=${fields.installed} required=${fields.required}`;
+  return `kind=${fields.kind} apiStatus=${fields.apiStatus} providerType=${fields.providerType} installed=${fields.installed} required=${fields.required} errorClass=${fields.errorClass} errno=${fields.errno} exit=${fields.exit} signal=${fields.signal}`;
 }
 
 /** The SDK's AbortError (the class sets no `name`) or a DOM AbortError: a client abort, not a run failure. */
@@ -277,7 +358,7 @@ export function runDeadlineMessage(limitMs: number, queryId: string | undefined)
 
 /** A failure with a fixed public text and no provider facts. It is never retried. */
 export function fixedFailure(kind: RunFailureKind, message: string): RunFailure {
-  const fields: RunFailureLogFields = { kind, apiStatus: "none", providerType: "none", installed: "none", required: "none" };
+  const fields: RunFailureLogFields = { kind, apiStatus: "none", providerType: "none", installed: "none", required: "none", ...NO_CAUSE };
   return new RunFailure(kind, message, fields, null);
 }
 

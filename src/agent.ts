@@ -217,8 +217,9 @@ async function* buildContentMessageStream(
  * safe public message: a result with `is_error: true`, or any error the SDK
  * iterator throws. The runtime writes its diagnostic to stdout before it exits
  * 1, so the loop sees it before the SDK throws "process exited with code 1";
- * it is kept here and classified, never forwarded. Client aborts (AbortError)
- * are rethrown unchanged.
+ * it is kept here and classified, never forwarded. The runtime process's exit
+ * code and signal come from the sandbox (`SandboxRun.runtimeExit`), not from the
+ * SDK's error text. Client aborts (AbortError) are rethrown unchanged.
  */
 export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools, sandboxDirId, label, grant: givenGrant }: QueryParams): Promise<QueryResult> {
   const enforced = enforcedTools !== undefined;
@@ -590,7 +591,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     const startFailure = sandbox.startFailure;
     if (startFailure) throw startFailure;
     if (err instanceof RunFailure) throw err;
-    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors, thrown: err }, queryId);
+    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors, thrown: err, runtimeExit: sandbox.runtimeExit }, queryId);
   } finally {
     // Every end (answer, error, abort): the relay URLs and the model proxy token stop
     // working and their in-flight upstream requests are destroyed.
@@ -609,7 +610,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // A result flagged is_error is a failure even when its subtype says "success"
   // and the runtime exited 0.
   if (resultData?.is_error === true) {
-    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors }, queryId);
+    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors, runtimeExit: sandbox.runtimeExit }, queryId);
   }
 
   return { response: fullResponse, resultData };
