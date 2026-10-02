@@ -41,6 +41,7 @@ const MARKER_NAMES: Record<string, MarkerClass> = {
   oauthAccess: "provider",
   oauthRefresh: "provider",
   registryHttpHeader: "mcp",
+  legacyRegistryHeader: "mcp",
   userOverrideHeader: "mcp",
   sseHeader: "mcp",
   stdioEnv: "mcp",
@@ -315,6 +316,10 @@ export const AC_ROWS: Record<string, string> = {
   "EI.restart": "Epic integration: docker restart, both callers resume",
   "EI.surfaces": "Epic integration: zero markers on every agent-side surface, every double received only its bound credential",
   "EI.cleanup": "Epic integration: the probe removed its own containers, network, image and temp directories",
+  "RG.read": "Registry read: list and detail as the owner, as another label and for an ownerless entry carry no headers or env property and no stored value",
+  "RG.write": "Registry write: the replies of an owner update and a new registration carry no headers or env property and no stored value",
+  "RG.refused": "Registry refused write: another label's PUT and a PUT on an ownerless entry are 403, change no stored map and disclose nothing",
+  "RG.preserve-run": "Registry preserve and run: a reqlift-style toggle keeps both stored maps and an authorized run still delivers the stored header and env value",
   "RT.config.subject": "The config route as the file detector's subject row (child run of the negative control)",
 };
 
