@@ -192,20 +192,35 @@ export function hasUserCredential(def: McpServerDefinition, override: McpCredent
   });
 }
 
+/** Whether an override carries at least one non-empty header or env value, i.e. an actual credential. */
+export function carriesCredentialValue(override: McpCredentialOverride | undefined): boolean {
+  if (!override) return false;
+  return [override.headers, override.env].some(
+    (map) => map !== undefined && Object.values(map).some((value) => typeof value === "string" && value.length > 0),
+  );
+}
+
 /**
- * Splits the enabled registry servers for one run: a server with
- * `requireUserCredentials: true` is attached only when the run carries its user
- * credential (see `hasUserCredential`); every other server is attached as before.
+ * Splits the enabled registry servers for one run. A server is left out, with its reason, when
+ * - it is ownerless (registered before ownership, MVP-7925) and the run carries a credential for it: an entry
+ *   nobody owns never receives a user's credential until the operator mapping assigns its owner, or
+ * - it has `requireUserCredentials: true` and the run lacks its user credential (see `hasUserCredential`).
+ * Every other server is attached as before.
  */
+export type OmittedRegistryServer = { name: string; reason: "ownerless" | "missing_user_credential" };
+
 export function selectRegistryServersForRun(
   enabled: McpServerDefinition[],
   overrides: McpCredentialOverrides | undefined,
-): { attached: McpServerDefinition[]; omitted: string[] } {
+): { attached: McpServerDefinition[]; omitted: OmittedRegistryServer[] } {
   const attached: McpServerDefinition[] = [];
-  const omitted: string[] = [];
+  const omitted: OmittedRegistryServer[] = [];
   for (const def of enabled) {
-    if (def.requireUserCredentials === true && !hasUserCredential(def, overrides?.[def.name])) omitted.push(def.name);
-    else attached.push(def);
+    const override = overrides?.[def.name];
+    if (def.owner === undefined && carriesCredentialValue(override)) omitted.push({ name: def.name, reason: "ownerless" });
+    else if (def.requireUserCredentials === true && !hasUserCredential(def, override)) {
+      omitted.push({ name: def.name, reason: "missing_user_credential" });
+    } else attached.push(def);
   }
   return { attached, omitted };
 }

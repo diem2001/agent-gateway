@@ -1,5 +1,5 @@
 import { log } from "./logging.js";
-import { createPersistentStore, isNamedEntryList } from "./persistence.js";
+import { createPersistentStore, hasValidOwners } from "./persistence.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */
@@ -31,6 +31,12 @@ export interface McpServerDefinition {
    * Default false: every existing server keeps its current behaviour.
    */
   requireUserCredentials?: boolean;
+  /**
+   * The API-key label that registered the server (MVP-7925). Only the owner may change or delete it. Never taken
+   * from a request, never returned by the API. An entry without one is "ownerless": refused for every label and
+   * left out of credential-bearing use until the operator mapping `MCP_SERVER_OWNERS` assigns its owner.
+   */
+  owner?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -82,7 +88,7 @@ const store = createPersistentStore({
   area: "mcpServers",
   file: PERSIST_PATH,
   snapshot: () => Array.from(servers.values()),
-  isValid: isNamedEntryList,
+  isValid: hasValidOwners,
 });
 
 /* ------------------------------------------------------------------ */
@@ -96,6 +102,33 @@ export function loadMcpServers(): void {
     servers.set(srv.name, srv);
   }
   log("mcp", `Loaded ${servers.size} MCP server(s) from disk`);
+}
+
+/** The registry entries without an owner (registered before ownership), in registration order. */
+export function getOwnerlessMcpServerNames(): string[] {
+  return Array.from(servers.values())
+    .filter((s) => s.owner === undefined)
+    .map((s) => s.name);
+}
+
+/** Records the owner of an ownerless entry (operator mapping only); false when the entry is missing or already owned. */
+export function setMcpServerOwner(name: string, owner: string): boolean {
+  const def = servers.get(name);
+  if (!def || def.owner !== undefined) return false;
+  servers.set(name, { ...def, owner });
+  persistMcpServers();
+  return true;
+}
+
+/** Whether `label` registered the entry: a non-empty label equal to the stored owner. An ownerless entry has no owner. */
+export function isMcpServerOwner(def: McpServerDefinition, label: string | undefined): boolean {
+  return typeof label === "string" && label.length > 0 && def.owner !== undefined && def.owner === label;
+}
+
+/** The entry as every API response shows it: the owner label is never revealed. */
+export function publicMcpServer(def: McpServerDefinition): Omit<McpServerDefinition, "owner"> {
+  const { owner: _owner, ...rest } = def;
+  return rest;
 }
 
 /** Debounced atomic save (src/persistence.ts). */

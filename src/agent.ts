@@ -236,7 +236,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // the user's credential: no SDK entry, no allowed-tool pattern, and a request
   // server may not take its name (it would otherwise fill the vacated slot).
   const selection = selectRegistryServersForRun(getEnabledMcpServers(), mcpCredentialOverrides);
-  const omitted = selection.omitted.map((name) => ({ name, reason: "missing_user_credential" }));
+  const omitted: { name: string; reason: string }[] = [...selection.omitted];
   let runRegistryServers = selection.attached;
   // Every registered server is reached only through the trusted relay (http, SSE and stdio alike); if it
   // is not listening they are left out, never connected directly (fail closed).
@@ -464,7 +464,9 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   }
 
   if (mcpCredentialOverrides) {
+    // Only for servers this run actually attached; a server left out received nothing.
     for (const [serverName, override] of Object.entries(mcpCredentialOverrides)) {
+      if (!runRegistryServers.some((def) => def.name === serverName)) continue;
       const keys = summarizeOverrideKeys(override);
       log("audit", `mcp.override.applied serverName=${serverName} keys=${keys.join(",") || "none"}`);
     }

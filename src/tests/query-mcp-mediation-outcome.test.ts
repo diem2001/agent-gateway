@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServerDefinition } from "../mcp-registry.js";
 import type { RelayBinding } from "../mcp-credential-relay.js";
 import { RELAY_URL, startRecordingUpstream, type RecordingUpstream } from "./helpers/relay-upstream.js";
+import { TEST_OWNER } from "./helpers/owner-auth.js";
 
 let capturedOptions: Record<string, unknown>[] = [];
 let registered: RelayBinding[] = [];
@@ -84,7 +85,7 @@ async function createApp() {
 async function register(def: Partial<McpServerDefinition> & Pick<McpServerDefinition, "name" | "type">) {
   const { registerMcpServer } = await import("../mcp-registry.js");
   const now = new Date().toISOString();
-  registerMcpServer({ description: "", enabled: true, createdAt: now, updatedAt: now, ...def } as McpServerDefinition);
+  registerMcpServer({ description: "", enabled: true, owner: TEST_OWNER, createdAt: now, updatedAt: now, ...def } as McpServerDefinition);
 }
 
 const post = (app: express.Express, body: Record<string, unknown>) => request(app).post("/v1/query").send({ queryId: `q-${Math.random()}`, prompt: "go", useSession: false, ...body });

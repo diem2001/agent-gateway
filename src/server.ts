@@ -28,6 +28,7 @@ import workspaceRoutes from "./routes/workspace.js";
 import toolRoutes from "./routes/tools.js";
 import { loadTools } from "./tools.js";
 import { loadMcpServers } from "./mcp-registry.js";
+import { McpServerOwnersConfigError, applyMcpServerOwners, parseMcpServerOwners } from "./mcp-server-owners.js";
 import { persistenceReport } from "./persistence.js";
 import { installShutdownHandlers } from "./shutdown.js";
 import mcpRoutes from "./routes/mcp.js";
@@ -67,6 +68,16 @@ loadSessions();
 // Restore tools and MCP servers from disk
 loadTools();
 loadMcpServers();
+
+// Registered MCP servers have an owner (MVP-7925). The operator mapping assigns the owner of entries that have
+// none; a malformed mapping stops startup with one fixed line, like the other configuration keys.
+try {
+  applyMcpServerOwners(parseMcpServerOwners(process.env.MCP_SERVER_OWNERS), getApiKeyLabels());
+} catch (e) {
+  if (!(e instanceof McpServerOwnersConfigError)) throw e;
+  logAlways("server", e.logLine);
+  process.exit(1);
+}
 
 // Runtime log files and credentials (MVP-7667): no SDK debug log, no leftover
 // run directories, and the loopback relay every registered http MCP server is

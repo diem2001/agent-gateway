@@ -15,6 +15,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServerDefinition, UserCredentialSchema } from "../mcp-registry.js";
 import { RELAY_URL, startRecordingUpstream, touchHttpMcpServers, type RecordingUpstream } from "./helpers/relay-upstream.js";
+import { TEST_OWNER, mountOwnerAuth } from "./helpers/owner-auth.js";
 
 let capturedOptions: Array<Record<string, unknown>> = [];
 let logs: string[] = [];
@@ -64,6 +65,7 @@ async function createApp() {
   const { default: mcpRoutes } = await import("../routes/mcp.js");
   const app = express();
   app.use(express.json());
+  await mountOwnerAuth(app);
   app.use(queryRouter);
   app.use(mcpRoutes);
   return app;
@@ -325,5 +327,86 @@ describe("header and env values that cannot be sent are refused on every credent
     const query = await request(app).post("/v1/query").send({ queryId: "q-env", prompt: "go", mcpCredentialOverrides: { local: { env: { TOKEN: "a\u0000b" } } } });
     expect(query.status).toBe(400);
     expect(query.body.error.code).toBe("MCP_OVERRIDE_INVALID");
+  });
+});
+
+/** An entry from before ownership: no owner (MVP-7925). */
+async function seedOwnerless(name: string, url: string) {
+  const { registerMcpServer } = await import("../mcp-registry.js");
+  const now = "2026-09-01T00:00:00.000Z";
+  registerMcpServer({ name, description: "", enabled: true, type: "http", url, headers: { "X-Static": "s" }, createdAt: now, updatedAt: now });
+}
+
+describe("an ownerless registry server never receives a user's credential in a run (MVP-7925)", () => {
+  const ownerlessLine = (name: string) => `mcp.server.omitted serverName=${name} reason=ownerless`;
+
+  it("a run with a credential for it leaves it out: no entry, no allowed tools, an audit line, no override line, no upstream request", async () => {
+    const app = await createApp();
+    await seedOwnerless("aida", `${upstream.origin}/aida`);
+    await register(app, "jira", { type: "http", url: `${upstream.origin}/jira` });
+
+    const { servers, allowedTools } = await runQuery(app, { mcpCredentialOverrides: { aida: { headers: { Authorization: "Bearer USER_SYNTH" } } } });
+
+    expect(Object.keys(servers)).not.toContain("aida");
+    expect(allowedTools).not.toContain("mcp__aida__*");
+    const text = logs.join("\n");
+    expect(text).toContain(ownerlessLine("aida"));
+    expect(text).not.toContain("mcp.override.applied serverName=aida");
+    expect(text).not.toContain("USER_SYNTH");
+    expect(upstream.headersAt("/aida")).toEqual([]);
+    // Another registered server is unaffected.
+    expect(servers.jira).toEqual({ type: "http", url: expect.stringMatching(RELAY_URL) });
+  });
+
+  it("a run without a credential for it uses it as before, with its shared header only", async () => {
+    const app = await createApp();
+    await seedOwnerless("aida", `${upstream.origin}/aida`);
+
+    const { servers, allowedTools } = await runQuery(app, {});
+
+    expect(servers.aida).toEqual({ type: "http", url: expect.stringMatching(RELAY_URL) });
+    expect(allowedTools).toContain("mcp__aida__*");
+    expect(logs.join("\n")).not.toContain(ownerlessLine("aida"));
+    expect(upstream.headersAt("/aida")).toEqual([expect.objectContaining({ "x-static": "s" })]);
+  });
+
+  it("an empty credential value carries nothing: the server is attached", async () => {
+    const app = await createApp();
+    await seedOwnerless("aida", `${upstream.origin}/aida`);
+
+    const { servers } = await runQuery(app, { mcpCredentialOverrides: { aida: { headers: { Authorization: "" } } } });
+
+    expect(Object.keys(servers)).toContain("aida");
+  });
+
+  it("an owned server receives the credential and the override line is written", async () => {
+    const app = await createApp();
+    await register(app, "aida", { type: "http", url: `${upstream.origin}/aida` });
+
+    const { servers } = await runQuery(app, { mcpCredentialOverrides: { aida: { headers: { Authorization: "Bearer USER_SYNTH" } } } });
+
+    expect(Object.keys(servers)).toContain("aida");
+    expect(logs.join("\n")).toContain("mcp.override.applied serverName=aida keys=headers.Authorization");
+    expect(upstream.headersAt("/aida")).toEqual([expect.objectContaining({ authorization: "Bearer USER_SYNTH" })]);
+  });
+
+  it("a request-supplied server cannot take the name of the left-out ownerless server", async () => {
+    const app = await createApp();
+    await seedOwnerless("aida", `${upstream.origin}/aida`);
+
+    capturedOptions = [];
+    const res = await request(app)
+      .post("/v1/query")
+      .send({
+        queryId: "q-impostor-owner",
+        prompt: "go",
+        useSession: false,
+        mcpCredentialOverrides: { aida: { headers: { Authorization: "Bearer USER_SYNTH" } } },
+        mcpServers: { aida: { type: "http", url: "http://127.0.0.1:9/mcp" } },
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("MCP_SERVER_NAME_CONFLICT");
+    expect(capturedOptions).toHaveLength(0);
   });
 });

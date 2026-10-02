@@ -15,13 +15,14 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServerDefinition } from "../mcp-registry.js";
 import { RELAY_URL, startRecordingUpstream, touchHttpMcpServers, type RecordingUpstream } from "./helpers/relay-upstream.js";
+import { TEST_OWNER, mountOwnerAuth } from "./helpers/owner-auth.js";
 
 let logs: string[] = [];
 
 async function registerServer(def: Partial<McpServerDefinition> & Pick<McpServerDefinition, "name" | "type">) {
   const { registerMcpServer } = await import("../mcp-registry.js");
   const now = new Date().toISOString();
-  registerMcpServer({ description: "", enabled: true, createdAt: now, updatedAt: now, ...def } as McpServerDefinition);
+  registerMcpServer({ description: "", enabled: true, owner: TEST_OWNER, createdAt: now, updatedAt: now, ...def } as McpServerDefinition);
 }
 
 const BASE62 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -109,6 +110,7 @@ describe("credential values never reach the log (every Examples row)", { timeout
     app.use(express.json({ limit: "25mb" }));
     app.use(express.text({ limit: "10mb", type: "text/*" }));
     app.use(requestLoggingMiddleware);
+    await mountOwnerAuth(app);
     app.use(queryRouter);
     app.use(mcpRoutes);
     app.use(globalErrorHandler);

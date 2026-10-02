@@ -3,6 +3,7 @@ import {
   applyMcpCredentialOverride,
   applyMcpCredentialOverrides,
   hasUserCredential,
+  carriesCredentialValue,
   selectRegistryServersForRun,
   summarizeOverrideKeys,
 } from "../mcp-overrides.js";
@@ -16,6 +17,7 @@ function perUserServer(overrides: Partial<McpServerDefinition> = {}): McpServerD
     type: "http",
     url: "http://aida-sim:8080/mcp",
     requireUserCredentials: true,
+    owner: "reqlift",
     createdAt: "2026-09-28T00:00:00.000Z",
     updatedAt: "2026-09-28T00:00:00.000Z",
     ...overrides,
@@ -135,7 +137,7 @@ describe("requireUserCredentials header output keys (MVP-7763)", () => {
     const def = perUserServer({ userCredentialSchema: headerSchema("Authorization") });
     const override = { headers: { Authorization: "Bearer USER_X", authorization: "" } };
     expect(hasUserCredential(def, override)).toBe(false);
-    expect(selectRegistryServersForRun([def], { aida: override })).toEqual({ attached: [], omitted: ["aida"] });
+    expect(selectRegistryServersForRun([def], { aida: override })).toEqual({ attached: [], omitted: [{ name: "aida", reason: "missing_user_credential" }] });
   });
 
   it("is not satisfied by an empty Authorization header alone", () => {
@@ -162,8 +164,49 @@ describe("requireUserCredentials header output keys (MVP-7763)", () => {
     expect(hasUserCredential(def, { env: { API_TOKEN: "USER_X" } })).toBe(true);
     expect(selectRegistryServersForRun([def], { aida: { env: { api_token: "USER_X" } } })).toEqual({
       attached: [],
-      omitted: ["aida"],
+      omitted: [{ name: "aida", reason: "missing_user_credential" }],
     });
   });
 });
 
+
+describe("ownerless servers (MVP-7925)", () => {
+  const ownerless = (): McpServerDefinition => {
+    const { owner: _owner, ...rest } = perUserServer({ requireUserCredentials: undefined });
+    return rest;
+  };
+
+  it("carriesCredentialValue needs one non-empty header or env value", () => {
+    expect(carriesCredentialValue(undefined)).toBe(false);
+    expect(carriesCredentialValue({})).toBe(false);
+    expect(carriesCredentialValue({ headers: { Authorization: "" }, env: { TOKEN: "" } })).toBe(false);
+    expect(carriesCredentialValue({ headers: { Authorization: "Bearer X" } })).toBe(true);
+    expect(carriesCredentialValue({ env: { TOKEN: "x" } })).toBe(true);
+  });
+
+  it("leaves an ownerless server out of a run that carries a credential for it, with the reason", () => {
+    const def = ownerless();
+    expect(selectRegistryServersForRun([def], { aida: { headers: { Authorization: "Bearer USER_X" } } })).toEqual({
+      attached: [],
+      omitted: [{ name: "aida", reason: "ownerless" }],
+    });
+    expect(selectRegistryServersForRun([def], { aida: { env: { TOKEN: "USER_X" } } }).omitted).toEqual([{ name: "aida", reason: "ownerless" }]);
+  });
+
+  it("attaches an ownerless server when the run carries no credential for it", () => {
+    const def = ownerless();
+    expect(selectRegistryServersForRun([def], undefined)).toEqual({ attached: [def], omitted: [] });
+    expect(selectRegistryServersForRun([def], { aida: {} })).toEqual({ attached: [def], omitted: [] });
+    expect(selectRegistryServersForRun([def], { aida: { headers: { Authorization: "" } } })).toEqual({ attached: [def], omitted: [] });
+    // A credential for another server does not matter.
+    expect(selectRegistryServersForRun([def], { other: { headers: { Authorization: "Bearer X" } } })).toEqual({ attached: [def], omitted: [] });
+  });
+
+  it("attaches an owned server with a credential, and leaves a flagged ownerless one out for the ownership reason", () => {
+    const owned = perUserServer({ requireUserCredentials: undefined });
+    expect(selectRegistryServersForRun([owned], { aida: { headers: { Authorization: "Bearer USER_X" } } })).toEqual({ attached: [owned], omitted: [] });
+    const flagged = { ...ownerless(), requireUserCredentials: true };
+    expect(selectRegistryServersForRun([flagged], { aida: { headers: { Authorization: "Bearer USER_X" } } }).omitted).toEqual([{ name: "aida", reason: "ownerless" }]);
+    expect(selectRegistryServersForRun([flagged], undefined).omitted).toEqual([{ name: "aida", reason: "missing_user_credential" }]);
+  });
+});

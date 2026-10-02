@@ -5,6 +5,7 @@ import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserCredentialSchema } from "../mcp-registry.js";
+import { TEST_OWNER, mountOwnerAuth } from "./helpers/owner-auth.js";
 
 let tempDir: string;
 let persistPath: string;
@@ -50,6 +51,7 @@ async function createApp() {
   const { default: mcpRoutes } = await import("../routes/mcp.js");
   const app = express();
   app.use(express.json());
+  await mountOwnerAuth(app);
   app.use(mcpRoutes);
   return app;
 }
@@ -220,6 +222,7 @@ describe("PUT /v1/mcp-servers/:name name rule for new entries (MVP-7763)", () =>
       type: "http",
       url: "http://aida-sim:8080/mcp",
       requireUserCredentials: true,
+      owner: TEST_OWNER,
       createdAt: "2026-09-01T00:00:00.000Z",
       updatedAt: "2026-09-01T00:00:00.000Z",
     });

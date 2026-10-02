@@ -6,6 +6,7 @@ import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServerDefinition } from "../mcp-registry.js";
+import { TEST_OWNER, mountOwnerAuth } from "./helpers/owner-auth.js";
 
 let tempDir: string;
 let servers: Server[] = [];
@@ -30,6 +31,7 @@ async function createApp() {
   const { default: mcpRoutes } = await import("../routes/mcp.js");
   const app = express();
   app.use(express.json());
+  await mountOwnerAuth(app);
   app.use(mcpRoutes);
   return app;
 }
@@ -52,6 +54,7 @@ async function registerServer(def: Partial<McpServerDefinition> & Pick<McpServer
   registerMcpServer({
     description: "",
     enabled: true,
+    owner: TEST_OWNER,
     createdAt: now,
     updatedAt: now,
     ...def,
