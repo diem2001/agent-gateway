@@ -321,6 +321,20 @@ export interface SandboxEnvInput {
   runLogEnv: Record<string, string>;
 }
 
+/**
+ * Trusted git configuration, injected at command scope (git 2.31+, highest precedence, above any repository file the
+ * agent writes). The runtime runs `git status` in `/work` at every start and the agent writes that directory, so git
+ * must find no repository there that it would read: `.git` is removed before the start and an implicit bare layout
+ * (HEAD, objects, refs, config in the working directory itself) is refused (`safe.bareRepository`, 2.38+; a protected
+ * key, honored only from the system, global and command scope). With no repository discovered, no repository file is
+ * read at all. fsmonitor and hooks are switched off as a second layer for the repositories git is still told to use.
+ */
+const GIT_TRUSTED_CONFIG: ReadonlyArray<readonly [string, string]> = [
+  ["safe.bareRepository", "explicit"],
+  ["core.fsmonitor", "false"],
+  ["core.hooksPath", "/dev/null"],
+];
+
 /** The complete sandbox environment: an allowlist, built from nothing. */
 export function buildSandboxEnv(input: SandboxEnvInput): Record<string, string> {
   const env: Record<string, string> = {
@@ -340,6 +354,11 @@ export function buildSandboxEnv(input: SandboxEnvInput): Record<string, string> 
     ANTHROPIC_API_KEY: input.runToken,
     DISABLE_AUTOUPDATER: "1",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    GIT_CONFIG_COUNT: String(GIT_TRUSTED_CONFIG.length),
+  });
+  GIT_TRUSTED_CONFIG.forEach(([key, value], i) => {
+    env[`GIT_CONFIG_KEY_${i}`] = key;
+    env[`GIT_CONFIG_VALUE_${i}`] = value;
   });
   return env;
 }

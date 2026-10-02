@@ -289,14 +289,14 @@ function purgeConfigDir(homeDir: string): void {
 }
 
 /**
- * The runtime runs `git status` in its working directory at start, and the agent can write the work area, so a
- * repository at its root would run `core.fsmonitor` (or a filter driver) there. Rewriting only the configuration of
- * a real `.git` was not enough: a `commondir` file names a directory the agent controls, and `extensions.worktreeConfig`
- * with a `config.worktree` file adds a configuration the allowlist never sees. A repository at the work root is not a
- * supported scenario (repositories are central read-only mounts), so ANY `.git` entry there (file, link or
- * directory) is removed at every start without following links. Repositories below the work area are not touched: git
- * run from the work root never consults them, and the work area is the agent's own data. Project settings in it are
- * inert (the runtime reads the user source only).
+ * The runtime runs `git status` in its working directory at start, and the agent can write the work area. Two layers
+ * keep that git from reading anything the agent wrote: here, ANY `.git` entry at the work root (file, link or
+ * directory) is removed at every start without following links (a repository there is not a supported scenario;
+ * repositories are central read-only mounts); and the sandbox environment carries trusted command-scope git
+ * configuration (`GIT_TRUSTED_CONFIG` in sandbox.ts) that refuses an implicit bare layout at the work root and
+ * switches fsmonitor and hooks off. Repositories below the work area are not touched: git run from the work root does
+ * not discover them (git finds nothing in the directory itself or above it), and the work area is the agent's own
+ * data. Project settings in it are inert (the runtime reads the user source only).
  */
 export function prepareWorkArea(workDir: string): void {
   fs.rmSync(path.join(workDir, ".git"), { recursive: true, force: true });
