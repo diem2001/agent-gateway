@@ -186,6 +186,8 @@ export function gatewayRequest(
   method: string,
   urlPath: string,
   body?: unknown,
+  /** The API key to authenticate with (default: the harness's own key). */
+  apiKey: string = GATEWAY_API_KEY,
 ): Promise<{ status: number; text: string; json: Record<string, unknown> | null }> {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
@@ -197,7 +199,7 @@ export function gatewayRequest(
         path: urlPath,
         agent: false,
         headers: {
-          Authorization: `Bearer ${GATEWAY_API_KEY}`,
+          Authorization: `Bearer ${apiKey}`,
           ...(payload ? { "Content-Type": "application/json", "Content-Length": payload.length } : {}),
         },
       },
