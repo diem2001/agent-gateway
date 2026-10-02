@@ -152,7 +152,7 @@ src/
     workspace.ts     # CRUD for /v1/memory/*, /v1/agents/*, /v1/skills/*
     git.ts           # POST /v1/workspace/git/clone|pull, GET /v1/workspace/git/status
     tools.ts         # PUT/GET/DELETE /v1/tools (Tool Registry REST endpoints)
-    mcp.ts           # PUT/GET/DELETE /v1/mcp-servers + /restart + /health + /test + /call (MCP Server Registry; PUT/DELETE of an existing name only for its owner, else 403 MCP_SERVER_OWNER_MISMATCH before any validation, ownerless entries refused for every label and for credential-bearing /call, /test, /uploads/*; PUT refuses a NEW name outside ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ with 400 MCP_SERVER_NAME_INVALID, existing names stay editable/deletable; /call = direct LLM-free tools/call passthrough, gates on enabled unlike /test; /uploads/* = streaming upload relay)
+    mcp.ts           # PUT/GET/DELETE /v1/mcp-servers (stored `headers`/`env` are write-only: never in a GET or PUT reply, per map omitted = keep, `{}` = clear, a transport-family change that strands a stored map = 400 `MCP_CREDENTIAL_MAP_INAPPLICABLE`; `MCP_FIELD_CLASS` in `mcp-registry.ts` classifies every stored field) + /restart + /health + /test + /call (MCP Server Registry; PUT/DELETE of an existing name only for its owner, else 403 MCP_SERVER_OWNER_MISMATCH before any validation, ownerless entries refused for every label and for credential-bearing /call, /test, /uploads/*; PUT refuses a NEW name outside ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ with 400 MCP_SERVER_NAME_INVALID, existing names stay editable/deletable; /call = direct LLM-free tools/call passthrough, gates on enabled unlike /test; /uploads/* = streaming upload relay)
   tests/
     e2e-session.test.ts    # E2E session continuity tests
     routes.tools.test.ts   # Tool routes unit tests
@@ -194,6 +194,7 @@ src/
     helpers/security-routes.ts      # The eight route probes (in-sandbox Python) and their verdicts, shared with the Docker probe
     mcp-overrides.test.ts           # Override merge + requireUserCredentials header-key casing + ownerless left out of credential-bearing runs
     mcp-server-owner.test.ts / mcp-server-owners.test.ts # Registry ownership routes (two labels, real authMiddleware) and the MCP_SERVER_OWNERS parser/applier
+    mcp-registry-write-only.test.ts / security-registry-process.test.ts # Write-only stored headers/env: route rows (owner, other label, ownerless, update semantics, transport family) and the real-gateway rows RG.* (needs `npm run build` for the process suite)
     mcp-server-owner-process.test.ts # Outcome Probe: another label cannot redirect a registered server; restart, deploy step, ownerless run (spawned gateway, needs `npm run build`)
     routes.mcp.test.ts              # Registry PUT schema validation + new-entry name rule
     require-user-credentials.test.ts # requireUserCredentials + header/env validation
