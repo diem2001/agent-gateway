@@ -198,10 +198,10 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>GET</strong></td><td><code>/v1/tools</code></td><td>Yes</td><td>List all registered tools (with <code>owner</code>)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Get a single tool (with <code>owner</code>)</td></tr>
       <tr><td><strong>DELETE</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Delete a tool (another label's tool: 403 <code>TOOL_OWNED_BY_OTHER_CLIENT</code>)</td></tr>
-      <tr><td><strong>PUT</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Register/update an MCP server</td></tr>
+      <tr><td><strong>PUT</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Register/update an MCP server; records the calling label as owner on creation (another label's or an ownerless entry: <code>403 MCP_SERVER_OWNER_MISMATCH</code>)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers</code></td><td>Yes</td><td>List registered MCP servers</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Get a registered MCP server</td></tr>
-      <tr><td><strong>DELETE</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Delete a registered MCP server</td></tr>
+      <tr><td><strong>DELETE</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Delete a registered MCP server (owner only; another label's or an ownerless entry: <code>403 MCP_SERVER_OWNER_MISMATCH</code>)</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/test</code></td><td>Yes</td><td>Test MCP credentials with tools/list (accepts streamable SSE responses)</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/call</code></td><td>Yes</td><td>Directly execute a registered MCP server's tool (tools/call, no LLM turn); 401 <code>MCP_AUTH_FAILED</code> before any upstream request for a <code>requireUserCredentials</code> server without a user credential</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/mcp-servers/:name/uploads/*</code></td><td>Yes</td><td>Stream a raw file upload to a registered http/sse MCP server's <code>/uploads/*</code> route (no buffering; <a href="#ep-mcp-uploads">details</a>)</td></tr>
@@ -1357,7 +1357,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Registers a new MCP server or updates an existing one. Returns <code>201</code> for new servers and <code>200</code> for updates.</p>
+    <p>Registers a new MCP server or updates an existing one. Returns <code>201</code> for new servers and <code>200</code> for updates. The calling API-key label becomes the server's <strong>owner</strong> when it creates the entry; only the owner can change or delete it afterwards (<a href="#mcp-ownership">Registry ownership</a>).</p>
 
     <h3>Request Body</h3>
     <table class="param-table">
@@ -1470,7 +1470,15 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <span class="endpoint-path">/v1/mcp-servers/:name</span>
       <span class="auth-tag required">Auth Required</span>
     </p>
-    <p>Deletes a registered MCP server. Returns <code>204</code> on success and <code>404</code> if it does not exist.</p>
+    <p>Deletes a registered MCP server. Returns <code>204</code> on success and <code>404</code> if it does not exist. Only the owner can delete it; another label (and every label for an ownerless entry) gets <code>403 MCP_SERVER_OWNER_MISMATCH</code>.</p>
+  </div>
+
+  <div class="endpoint-section" id="mcp-ownership">
+    <h3>Registry ownership</h3>
+    <p>Every entry records its owner, the API-key label of the caller that created it; the owner is persisted with the definition, survives a restart and is never returned by any route (an <code>owner</code> in a request body is ignored). <code>PUT</code> and <code>DELETE</code> of an existing name succeed only for the owner. Any other label gets:</p>
+<pre><code>HTTP 403
+{"error":{"code":"MCP_SERVER_OWNER_MISMATCH","message":"MCP server \"&lt;name&gt;\" is registered by another application"}}</code></pre>
+    <p>The answer is the same for <code>PUT</code>, <code>DELETE</code>, an entry owned by another label and an ownerless entry, and never names the owner. The check runs before the name rule and any body validation. Entries registered before ownership are <em>ownerless</em>: refused for every label, left out of a run that carries a user credential for them (<code>mcp.server.omitted ... reason=ownerless</code>) and refused with the same 403 on <code>/call</code>, <code>/test</code> and <code>/uploads/*</code> when the caller sends a credential. The operator assigns their owners with <code>MCP_SERVER_OWNERS=&lt;server&gt;:&lt;label&gt;,...</code> at startup (only ownerless entries; read-back line <code>mcp.registry.ownerless count=&lt;n&gt; names=&lt;list&gt; saved=&lt;true|false&gt;</code>); a malformed value stops startup with <code>FATAL config key=MCP_SERVER_OWNERS reason=...</code>. <code>POST /restart</code> stays callable by any label.</p>
   </div>
 
   <!-- ============================================================ -->
@@ -1710,7 +1718,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
   <ul>
     <li>The sandbox shares the network namespace: agent code can reach network peers, credential-free MCP servers and the gateway's public port (where it gets 401 without a key). Loopback listeners of the proxy and relay need a run token.</li>
     <li>There is no agent-side ssh mediation (no caller uses it).</li>
-    <li>The MCP server registry has no owner: any API-key label can change a registered server's URL, after which per-user override credentials go to that URL. This is reachable by callers, not by agent code.</li>
+    <li>Registry ownership covers <code>PUT</code> and <code>DELETE</code> only: <code>POST /v1/mcp-servers/:name/restart</code> stays callable by any label, any label's run or direct call may still use another label's owned server with its own users' credentials, and <code>GET /v1/mcp-servers</code> still returns every server's stored shared headers and env values to every label (MVP-7936). When an owner deletes its server another label may register the same name.</li>
     <li><code>/v1/auth/login</code> hardening and content planted before the deploy are tracked separately (MVP-7919). The secret scan skips files over 1 MiB and does not know the contents of <code>~/.ssh</code> private keys or the <code>tools.json</code> webhook authentication values, and the trusted <code>git</code> calls and <code>/v1/auth/login</code> run with <code>HOME=/home/node</code> and read configuration planted there before the update (<code>~/.gitconfig</code>, repository hooks, <code>core.fsmonitor</code>, <code>~/.tmux.conf</code>); the operator reviews or removes it before the first deploy.</li>
     <li>Legacy webhook tools without an <code>owner</code> keep today's forwarding until they are registered again.</li>
     <li>A credential-free request MCP server runs inside the agent sandbox and is granted per server only: a grant that names only some of its tools is not enforced on the trusted side.</li>
@@ -1817,6 +1825,7 @@ curl http://localhost:3001/health</code></pre>
       <tr><td><code>USER_SKILLS_MAX_BYTES</code></td><td><code>1048576</code></td><td>Max total per-user SKILL.md bytes loaded per query (overflow → <code>skills_truncated</code>)</td></tr>
       <tr><td><code>TOOLS_PERSIST_PATH</code></td><td><code>/home/node/.claude/tools.json</code></td><td>Tool registry persistence file</td></tr>
       <tr><td><code>MCP_SERVERS_PERSIST_PATH</code></td><td><code>/home/node/.claude/mcp-servers.json</code></td><td>External MCP server registry persistence file</td></tr>
+      <tr><td><code>MCP_SERVER_OWNERS</code></td><td>--</td><td>Deploy-step mapping <code>&lt;server&gt;:&lt;label&gt;,...</code> that assigns the owner of registered MCP servers that have none (applied at startup, never transfers an owned server); malformed value stops startup</td></tr>
       <tr><td><code>MCP_TEST_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-test deadline for <code>POST /v1/mcp-servers/:name/test</code></td></tr>
       <tr><td><code>MCP_CALL_TIMEOUT_MS</code></td><td><code>10000</code></td><td>Per-call deadline for <code>POST /v1/mcp-servers/:name/call</code></td></tr>
       <tr><td><code>MCP_UPLOAD_IDLE_TIMEOUT_MS</code></td><td><code>60000</code></td><td>No-progress timeout for one relayed upload (<code>POST /v1/mcp-servers/:name/uploads/*</code>); 504 <code>UPLOAD_TIMEOUT</code> on expiry, no overall deadline</td></tr>
@@ -1923,6 +1932,7 @@ curl http://localhost:3001/health</code></pre>
       - SESSION_IDLE_TIMEOUT_MS=${SESSION_IDLE_TIMEOUT_MS:-0}
       - AGENT_TOOL_POLICY=${AGENT_TOOL_POLICY:-}
       - AGENT_MCP_TOOL_TIMEOUT_MS=${AGENT_MCP_TOOL_TIMEOUT_MS:-}
+      - MCP_SERVER_OWNERS=${MCP_SERVER_OWNERS:-}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:3001/health"]
       interval: 30s

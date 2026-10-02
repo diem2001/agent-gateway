@@ -45,6 +45,10 @@ services:
       - AGENT_TOOL_POLICY=${AGENT_TOOL_POLICY:-}
       # Overall deadline of one mediated MCP tools/call in an agent run, in ms; empty = 600000.
       - AGENT_MCP_TOOL_TIMEOUT_MS=${AGENT_MCP_TOOL_TIMEOUT_MS:-}
+      # Deploy-step mapping "<server>:<label>,..." that assigns the owner of registered MCP servers that have none (README
+      # "Registry ownership"). A malformed value or the same server twice stops the gateway at startup (and it restarts in a
+      # loop): fix the value. Empty = assign nothing; entries without an owner stay unusable for credential-bearing runs.
+      - MCP_SERVER_OWNERS=${MCP_SERVER_OWNERS:-}
     # Healthy only while agent runs can be isolated: /health must report "isolation":"ok".
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3001/health | grep -q '\"isolation\":\"ok\"'"]
