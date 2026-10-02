@@ -605,6 +605,29 @@ describe("the clean home and the work area (MVP-7679, A2)", () => {
     expect(control.lines.get("MARKER")).toBe("1");
   });
 
+  it("the start-time git cannot be steered elsewhere: no GIT_* variable, nothing an earlier run wrote above /work survives, and every configuration file it reads is outside the agent's reach", async () => {
+    const id = dirId("work-git-origins");
+    // Whatever the agent writes outside /work, the home and /tmp (the sandbox root is a fresh tmpfs per start) is gone at the next start.
+    const planted = await probe(`mkdir -p /.git/objects /.git/refs && echo 'ref: refs/heads/main' > /.git/HEAD && printf '[core]\\n\\tfsmonitor = touch /work/m-root\\n' > /.git/config && echo DONE=1; git -C /work status >/dev/null 2>&1; echo CONTROL=$(cd / && git status >/dev/null 2>&1; ls /work/m-root 2>&1 | grep -c -v 'No such'); echo STOP=$(git -C /work rev-parse --git-dir 2>&1 | head -1 | tr ' ' '_'); rm -f /work/m-root`, { sessionDirId: id });
+    expect(planted.lines.get("DONE")).toBe("1");
+    // Control: that repository is a working fsmonitor for git run at /, but git's discovery from /work stops at the /work mount point and never crosses into it (the work area is its own mount).
+    expect(planted.lines.get("CONTROL")).toBe("1");
+    expect(planted.lines.get("STOP")).toBe("fatal:_not_a_git_repository_(or_any_parent_up_to_mount_point_/)");
+    const result = await probe(
+      `echo GITENV=$(env | grep -c '^GIT_'); echo ROOTGIT=$(ls -A /.git 2>&1 | grep -c -v 'No such');
+       git -C /work status >/dev/null 2>&1; echo MARKER=$(ls /work/m-root 2>&1 | grep -c -v 'No such');
+       echo SEARCH=$(git -C /work rev-parse --git-dir 2>&1 | head -1 | grep -c -v '^fatal');
+       for origin in $(git -C /work config --list --show-origin 2>/dev/null | cut -f1 | sort -u); do echo ORIGIN=$origin; done; echo DONE=1`,
+      { sessionDirId: id },
+    );
+    expect(result.lines.get("GITENV")).toBe("0");
+    expect(result.lines.get("ROOTGIT")).toBe("0");
+    expect(result.lines.get("MARKER")).toBe("0");
+    expect(result.lines.get("SEARCH")).toBe("0");
+    // Whatever configuration files git lists (the system file at most) are not below /work, the home or /tmp.
+    for (const line of result.stdout.split("\n").filter((l) => l.startsWith("ORIGIN="))) expect(line).not.toMatch(/\/work|\/home\/node|\/tmp/);
+  });
+
   it("read-only git commands reach another branch of a mounted repository; git's ownership check does not block them; the repository stays read-only", async () => {
     const repo = path.join(ws, "projects", "repo");
     const branchesBefore = fs.readdirSync(path.join(repo, ".git", "refs", "heads")).sort();

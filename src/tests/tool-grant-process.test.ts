@@ -465,7 +465,7 @@ describe("files the agent writes in its own home cannot start anything on a late
     for (const prompt of ["PLAIN-1", "PLAIN-2"]) expect((await ask(r, { prompt, sessionId: "g", useSession: true })).events.at(-1)?.type, prompt).toBe("done");
     await new Promise((resolve) => setTimeout(resolve, 1500));
     expect(fs.existsSync(path.join(home, ".git"))).toBe(false);
-    expect(fs.readFileSync(path.join(work, ".git", "config"), "utf8")).not.toContain("fsmonitor");
+    expect(fs.existsSync(path.join(work, ".git"))).toBe(false);
     expect(markersOf(r, "g")).toEqual([]);
   });
 
@@ -529,6 +529,48 @@ describe("the clean home and the work area (A2, real runtime)", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     // Producible: the file ran in the login shell of the same run, in the home and (when it exists) the work area.
     expect(markersOf(r, "sc")).toContain("home/m-bash_profile");
+  });
+
+  describe("a repository the agent writes at the root of /work runs nothing at a later start, with Bash denied (the finding of QA 38335)", () => {
+    const skeleton = (dir: string, extra: ExactToolScript[]): ExactToolScript[] => [
+      write(`${dir.toUpperCase()}-HEAD`, `${dir}/HEAD`, "ref: refs/heads/main\n"),
+      write(`${dir.toUpperCase()}-OBJ`, `${dir}/objects/.keep`, ""),
+      write(`${dir.toUpperCase()}-REFS`, `${dir}/refs/.keep`, ""),
+      ...extra,
+    ];
+    const runRow = async (id: string, scripts: ExactToolScript[]): Promise<Rig> => {
+      const r = await rig({ scripts, policy: DENY_BASH, seed: seedLikeEntrypoint });
+      for (const prompt of [...scripts.map((script) => script.prompt), "PLAIN-1", "PLAIN-2"]) {
+        const { events } = await ask(r, { prompt, sessionId: id, useSession: true });
+        expect(events.at(-1)?.type, prompt).toBe("done");
+        if (!prompt.startsWith("PLAIN")) expect(resultFor(r, prompt)?.isError, `${prompt}: ${resultFor(r, prompt)?.text}`).toBe(false);
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        expect(markersOf(r, id), `markers after ${prompt}`).toEqual([]);
+      }
+      return r;
+    };
+
+    it("row G: a commondir file in /work/.git naming an agent-written directory", async () => {
+      const r = await runRow("rg", skeleton("/work/.git", [
+        write("RG-COMMONDIR", "/work/.git/commondir", "../evil\n"),
+        ...skeleton("/work/evil", [write("RG-CONFIG", "/work/evil/config", "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = touch /work/m-commondir\n")]),
+      ]));
+      expect(fs.existsSync(path.join(sessionWork(r, "rg"), ".git"))).toBe(false);
+      expect(fs.existsSync(path.join(sessionWork(r, "rg"), "evil", "config"))).toBe(true);
+    });
+
+    it("row H: extensions.worktreeConfig with a planted .git/config.worktree", async () => {
+      const r = await runRow("rh", skeleton("/work/.git", [
+        write("RH-CONFIG", "/work/.git/config", "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tworktreeConfig = true\n"),
+        write("RH-WORKTREE", "/work/.git/config.worktree", "[core]\n\tfsmonitor = touch /work/m-worktreecfg\n"),
+      ]));
+      expect(fs.existsSync(path.join(sessionWork(r, "rh"), ".git"))).toBe(false);
+    });
+
+    it("a repository in a subdirectory of /work (a copied project) is not consulted by the start-time git, and stays", async () => {
+      const r = await runRow("rn", skeleton("/work/sub/.git", [write("RN-CONFIG", "/work/sub/.git/config", "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = touch /work/m-nested\n")]));
+      expect(fs.readFileSync(path.join(sessionWork(r, "rn"), "sub", ".git", "config"), "utf8")).toContain("fsmonitor");
+    });
   });
 
   describe("project settings, instructions and extensions the agent writes in /work are not loaded (Bash denied)", () => {

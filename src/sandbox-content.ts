@@ -290,31 +290,16 @@ function purgeConfigDir(homeDir: string): void {
 
 /**
  * The runtime runs `git status` in its working directory at start, and the agent can write the work area, so a
- * repository planted at its root would run `core.fsmonitor` (or a filter driver) there. A `.git` that is not a real
- * directory owned by the gateway user (a gitdir pointer file or a link can name a directory the agent controls) is
- * removed without being followed, and the configuration of a real one is rebuilt from the same allowlist as the
- * repository views (`allowlistGitConfig`: no fsmonitor, hooks path, filters, includes or user info in URLs). The
- * agent's other files, and repositories below the work area, are not touched: project settings in the work area are
- * inert (the runtime reads the user source only) and the work area is the agent's own data.
+ * repository at its root would run `core.fsmonitor` (or a filter driver) there. Rewriting only the configuration of
+ * a real `.git` was not enough: a `commondir` file names a directory the agent controls, and `extensions.worktreeConfig`
+ * with a `config.worktree` file adds a configuration the allowlist never sees. A repository at the work root is not a
+ * supported scenario (repositories are central read-only mounts), so ANY `.git` entry there (file, link or
+ * directory) is removed at every start without following links. Repositories below the work area are not touched: git
+ * run from the work root never consults them, and the work area is the agent's own data. Project settings in it are
+ * inert (the runtime reads the user source only).
  */
 export function prepareWorkArea(workDir: string): void {
-  const git = path.join(workDir, ".git");
-  const stat = lstatOrNull(git);
-  if (!stat) return;
-  if (stat.isSymbolicLink() || !stat.isDirectory() || !ownedByGatewayUser(stat)) {
-    fs.rmSync(git, { recursive: true, force: true });
-    return;
-  }
-  const config = path.join(git, "config");
-  if (!lstatOrNull(config)) return;
-  const raw = readFileNoFollow(config);
-  if (raw === null) {
-    fs.rmSync(config, { recursive: true, force: true });
-    return;
-  }
-  const temp = path.join(git, `config.sanitize-${randomDirName()}`);
-  fs.writeFileSync(temp, allowlistGitConfig(raw.toString("utf8")), { flag: "wx", mode: 0o600 });
-  fs.renameSync(temp, config);
+  fs.rmSync(path.join(workDir, ".git"), { recursive: true, force: true });
 }
 
 /* ------------------------------------------------------------------ */
