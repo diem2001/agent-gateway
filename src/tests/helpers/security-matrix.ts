@@ -383,24 +383,25 @@ export function conversationText(gateway: SpawnedGateway, clientIds: string[]): 
   return { text: parts.map((part) => part.text).join("\n"), files: parts.reduce((sum, part) => sum + part.files, 0) };
 }
 
-/** The runtime's per-run log directory and every other leftover below the sandbox root outside the conversation directories. */
+/**
+ * The runtime's per-run log directories (debug log, `mcp-logs`; under the gateway's temp directory) and every other leftover
+ * below the sandbox root outside the conversation directories (per-run sandbox directories).
+ */
 export function runLeftoversText(gateway: SpawnedGateway): { text: string; files: number } {
+  const dirs: string[] = [];
   const root = path.join(gateway.dirs.home, ".agent-sandbox");
-  let text = "";
-  let files = 0;
-  let entries: fs.Dirent[] = [];
   try {
-    entries = fs.readdirSync(root, { withFileTypes: true });
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) if (entry.name !== "sessions" && entry.isDirectory()) dirs.push(path.join(root, entry.name));
   } catch {
-    return { text, files };
+    // No sandbox root yet.
   }
-  for (const entry of entries) {
-    if (entry.name === "sessions" || !entry.isDirectory()) continue;
-    const part = treeText(path.join(root, entry.name));
-    text += part.text;
-    files += part.files;
+  try {
+    for (const entry of fs.readdirSync(gateway.dirs.tmp, { withFileTypes: true })) if (entry.isDirectory() && entry.name.startsWith("agent-gateway-run-")) dirs.push(path.join(gateway.dirs.tmp, entry.name));
+  } catch {
+    // No temp directory.
   }
-  return { text, files };
+  const parts = dirs.map(treeText);
+  return { text: parts.map((part) => part.text).join("\n"), files: parts.reduce((sum, part) => sum + part.files, 0) };
 }
 
 /* ------------------------------------------------------------------ */
