@@ -619,6 +619,11 @@ export function entrypointRowIds(): string[] {
   return ["EP.ordinary", "EP.agent", "EP.skill", "EP.subagent", "EP.mcp-direct", "EP.upload", "EP.denied", "EP.enlarge"];
 }
 
+/** The row ids of the registry write-only suite (`security-registry-process.test.ts`, MVP-7936). */
+export function registryRowIds(): string[] {
+  return ["RG.read", "RG.write", "RG.refused", "RG.preserve-run"];
+}
+
 /** The row ids of the failure suite (`security-failure-process.test.ts`). */
 export function failureRowIds(): string[] {
   return ["IF.startup-exit", "IF.startup-hang", "IF.policy", "IF.cancel", "IF.restart-term", "IF.restart-kill", "IF.cred-missing", "IF.cred-refused", "IF.timeout", "IF.unavailable", "IF.legacy"];

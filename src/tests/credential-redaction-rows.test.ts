@@ -27,7 +27,6 @@ async function registerServer(def: Partial<McpServerDefinition> & Pick<McpServer
 
 const BASE62 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 const REQUEST_CUT = 2000;
-const RESPONSE_CUT = 500;
 /** A sentinel starts this many characters before a cut, so an unredacted log line would end inside it. */
 const INSIDE_CUT = 8;
 
@@ -240,85 +239,68 @@ describe("credential values never reach the log (every Examples row)", { timeout
     expect(leakedFragments(logs, [secret, other])).toEqual([]);
   });
 
-  /** A registry definition whose credential sits `INSIDE_CUT` characters before the response preview cut. */
-  function registryBody(name: string, transport: "http" | "stdio", secret: string, listPrefix = 0) {
-    const credentials =
-      transport === "http"
-        ? { url: "http://127.0.0.1:9/mcp", headers: { Authorization: `Bearer ${secret}` } }
-        : { command: "node", args: ["server.js"], env: { API_TOKEN: secret } };
-    // Same key order as the stored definition, which is what the API answers with.
-    const shape = (description: string) =>
-      transport === "http"
-        ? { name, description, enabled: true, type: transport, ...credentials }
-        : { name, description, enabled: true, type: transport, ...credentials };
-    const description = padFor(shape, secret, RESPONSE_CUT - INSIDE_CUT - listPrefix);
-    return { type: transport, description, ...credentials };
-  }
-
-  function expectCutInsideSecret(responseText: string, secret: string) {
-    const index = responseText.indexOf(secret);
-    expect(index).toBeGreaterThan(RESPONSE_CUT - secret.length);
-    expect(index).toBeLessThan(RESPONSE_CUT);
+  /** A registry definition that carries the credential in the transport's map. */
+  function registryBody(transport: "http" | "stdio", secret: string) {
+    return transport === "http"
+      ? { type: transport, url: "http://127.0.0.1:9/mcp", headers: { Authorization: `Bearer ${secret}` } }
+      : { type: transport, command: "node", args: ["server.js"], env: { API_TOKEN: secret } };
   }
 
   for (const transport of ["http", "stdio"] as const) {
     const key = transport === "http" ? "headers" : "env";
     const redactedMap = transport === "http" ? '"headers":{"Authorization":"[REDACTED]"}' : '"env":{"API_TOKEN":"[REDACTED]"}';
-    // The response preview is cut near the credential, so only the start of the marker is visible there.
-    const redactedPreview = transport === "http" ? '"headers":{"Authorization":"[REDACT' : '"env":{"API_TOKEN":"[REDACT';
 
-    it(`registry create and update with ${key}: request and response preview redacted, the client gets the real value`, async () => {
+    // MVP-7936: the maps are write-only, so no registry answer carries them; the request preview stays redacted.
+    it(`registry create and update with ${key}: request preview redacted, the answer has no ${key} property and no value`, async () => {
       const app = await gatewayApp();
       const created = sentinel();
       const updated = sentinel();
       logs = [];
 
-      const createRes = await request(app).put("/v1/mcp-servers/aida").send(registryBody("aida", transport, created));
-      const updateRes = await request(app).put("/v1/mcp-servers/aida").send(registryBody("aida", transport, updated));
+      const createRes = await request(app).put("/v1/mcp-servers/aida").send(registryBody(transport, created));
+      const updateRes = await request(app).put("/v1/mcp-servers/aida").send(registryBody(transport, updated));
 
       expect(createRes.status).toBe(201);
       expect(updateRes.status).toBe(200);
-      expectCutInsideSecret(createRes.text, created);
-      expectCutInsideSecret(updateRes.text, updated);
-      expect(JSON.stringify(createRes.body[key])).toContain(created);
-      expect(JSON.stringify(updateRes.body[key])).toContain(updated);
+      for (const res of [createRes, updateRes]) {
+        expect(res.body).not.toHaveProperty(key);
+        expect(leakedFragments([res.text], [created, updated])).toEqual([]);
+      }
       const reqLines = logs.filter((l) => l.startsWith("[req] PUT"));
       const resLines = logs.filter((l) => l.startsWith("[res] PUT"));
       expect(reqLines).toHaveLength(2);
       expect(resLines).toHaveLength(2);
       for (const line of reqLines) expect(line).toContain(redactedMap);
-      for (const line of resLines) expect(line).toContain(redactedPreview);
       expect(leakedFragments(logs, [created, updated])).toEqual([]);
     });
 
-    it(`registry detail read with ${key}: response preview redacted, the client gets the real value`, async () => {
+    it(`registry detail read with ${key}: the answer has no ${key} property and no value, nothing reaches the log`, async () => {
       const app = await gatewayApp();
       const secret = sentinel();
-      await request(app).put("/v1/mcp-servers/aida").send(registryBody("aida", transport, secret));
+      await request(app).put("/v1/mcp-servers/aida").send(registryBody(transport, secret));
       logs = [];
 
       const res = await request(app).get("/v1/mcp-servers/aida");
 
       expect(res.status).toBe(200);
-      expectCutInsideSecret(res.text, secret);
-      expect(JSON.stringify(res.body[key])).toContain(secret);
-      expect(logs.find((l) => l.startsWith("[res] GET"))).toContain(redactedPreview);
+      expect(res.body).not.toHaveProperty(key);
+      expect(leakedFragments([res.text], [secret])).toEqual([]);
+      expect(logs.find((l) => l.startsWith("[res] GET"))).toBeDefined();
       expect(leakedFragments(logs, [secret])).toEqual([]);
     });
 
-    it(`registry list read with ${key}: response preview redacted, the client gets the real value`, async () => {
+    it(`registry list read with ${key}: the answer has no ${key} property and no value, nothing reaches the log`, async () => {
       const app = await gatewayApp();
       const secret = sentinel();
-      const listPrefix = '{"servers":['.length;
-      await request(app).put("/v1/mcp-servers/aida").send(registryBody("aida", transport, secret, listPrefix));
+      await request(app).put("/v1/mcp-servers/aida").send(registryBody(transport, secret));
       logs = [];
 
       const res = await request(app).get("/v1/mcp-servers");
 
       expect(res.status).toBe(200);
-      expectCutInsideSecret(res.text, secret);
-      expect(JSON.stringify(res.body.servers[0][key])).toContain(secret);
-      expect(logs.find((l) => l.startsWith("[res] GET"))).toContain(redactedPreview);
+      expect(res.body.servers[0]).not.toHaveProperty(key);
+      expect(leakedFragments([res.text], [secret])).toEqual([]);
+      expect(logs.find((l) => l.startsWith("[res] GET"))).toBeDefined();
       expect(leakedFragments(logs, [secret])).toEqual([]);
     });
   }

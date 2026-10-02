@@ -8,6 +8,7 @@ import {
   checkMcpServerHealth,
   isMcpServerOwner,
   publicMcpServer,
+  resolveStoredCredentialMaps,
   type McpServerDefinition,
   type UserCredentialSchema,
 } from "../mcp-registry.js";
@@ -220,6 +221,13 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     return;
   }
 
+  // headers and env are write-only: a body that omits a map keeps the stored one (see resolveStoredCredentialMaps).
+  const resolved = resolveStoredCredentialMaps(existing, body as { type: McpServerDefinition["type"] });
+  if ("error" in resolved) {
+    res.status(400).json({ error: resolved.error });
+    return;
+  }
+
   const now = new Date().toISOString();
 
   const def: McpServerDefinition = {
@@ -228,10 +236,10 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     enabled: body.enabled !== false,
     type: body.type,
     url: body.url,
-    headers: body.headers,
+    ...(resolved.maps.headers ? { headers: resolved.maps.headers } : {}),
     command: body.command,
     args: body.args,
-    env: body.env,
+    ...(resolved.maps.env ? { env: resolved.maps.env } : {}),
     allowedToolsPattern: body.allowedToolsPattern,
     userCredentialSchema: body.userCredentialSchema,
     // Stored and returned only when sent.

@@ -125,10 +125,86 @@ export function isMcpServerOwner(def: McpServerDefinition, label: string | undef
   return typeof label === "string" && label.length > 0 && def.owner !== undefined && def.owner === label;
 }
 
-/** The entry as every API response shows it: the owner label is never revealed. */
-export function publicMcpServer(def: McpServerDefinition): Omit<McpServerDefinition, "owner"> {
-  const { owner: _owner, ...rest } = def;
-  return rest;
+/**
+ * What an API response may do with each stored field (MVP-7936). `public` fields are returned as stored; `write-only`
+ * fields (the credential maps) can be set and cleared through PUT but are never returned, to any caller; `internal`
+ * fields never leave the gateway. A new field without a class here does not compile.
+ */
+const MCP_FIELD_CLASS: Record<keyof McpServerDefinition, "public" | "write-only" | "internal"> = {
+  name: "public",
+  description: "public",
+  enabled: "public",
+  type: "public",
+  url: "public",
+  headers: "write-only",
+  command: "public",
+  args: "public",
+  env: "write-only",
+  allowedToolsPattern: "public",
+  userCredentialSchema: "public",
+  requireUserCredentials: "public",
+  owner: "internal",
+  createdAt: "public",
+  updatedAt: "public",
+};
+
+export type PublicMcpServer = Omit<McpServerDefinition, "owner" | "headers" | "env">;
+
+/**
+ * The entry as every API response shows it: an allowlist copy of the `public` fields. The owner label and the
+ * stored `headers`/`env` are never revealed, and a key a legacy persisted file carries that no field names is not
+ * copied either.
+ */
+export function publicMcpServer(def: McpServerDefinition): PublicMcpServer {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(def)) {
+    if (MCP_FIELD_CLASS[key as keyof McpServerDefinition] === "public") out[key] = value;
+  }
+  return out as unknown as PublicMcpServer;
+}
+
+export interface StoredCredentialMaps {
+  headers?: Record<string, string>;
+  env?: Record<string, string>;
+}
+
+export type CredentialMapResolution =
+  | { maps: StoredCredentialMaps }
+  | { error: { code: "MCP_CREDENTIAL_MAP_INAPPLICABLE"; message: string } };
+
+const credentialFamily = (type: McpServerDefinition["type"]) => (type === "stdio" ? "stdio" : "http");
+
+/**
+ * The credential maps an owner-authorized PUT stores. The maps are write-only, so a client that sends none must not
+ * erase them: per map, omitted keeps the stored map, a non-empty map replaces it and `{}` clears it (no property
+ * stored). Both maps are already validated as string maps. A change between the http/sse and stdio families with a
+ * non-empty stored map whose property the body omits is refused, since the old map would silently stay behind on a
+ * transport that does not use it or be dropped; the refusal names only the property and transport, never a value.
+ */
+export function resolveStoredCredentialMaps(
+  existing: McpServerDefinition | undefined,
+  body: { type: McpServerDefinition["type"]; headers?: Record<string, string>; env?: Record<string, string> },
+): CredentialMapResolution {
+  const familyChanged = existing !== undefined && credentialFamily(existing.type) !== credentialFamily(body.type);
+  const maps: StoredCredentialMaps = {};
+  for (const property of ["headers", "env"] as const) {
+    const sent = body[property];
+    const stored = existing?.[property];
+    if (sent === undefined) {
+      if (familyChanged && stored !== undefined && Object.keys(stored).length > 0) {
+        return {
+          error: {
+            code: "MCP_CREDENTIAL_MAP_INAPPLICABLE",
+            message: `The stored ${property} map does not apply to ${body.type} transport: send ${property}: {} to clear it or a new ${property} map to replace it`,
+          },
+        };
+      }
+      if (stored !== undefined) maps[property] = stored;
+    } else if (Object.keys(sent).length > 0) {
+      maps[property] = sent;
+    }
+  }
+  return { maps };
 }
 
 /** Debounced atomic save (src/persistence.ts). */
