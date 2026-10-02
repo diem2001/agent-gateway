@@ -188,12 +188,14 @@ export function gatewayRequest(
   body?: unknown,
   /** The API key to authenticate with (default: the harness's own key). */
   apiKey: string = GATEWAY_API_KEY,
+  /** The gateway's address (default 127.0.0.1; the Docker integration probe uses a container address). */
+  host = "127.0.0.1",
 ): Promise<{ status: number; text: string; json: Record<string, unknown> | null }> {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
     const req = http.request(
       {
-        host: "127.0.0.1",
+        host,
         port,
         method,
         path: urlPath,

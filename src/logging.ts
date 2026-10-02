@@ -99,8 +99,17 @@ function redactCredentialValue(value: unknown): unknown {
 }
 
 /**
+ * The `args` of a stdio server definition (an object with a `command` key or `type: "stdio"`): a credential can be passed on the
+ * command line, so every element is redacted and the count stays visible; any other shape becomes "[REDACTED]".
+ */
+function redactStdioArgs(value: unknown): unknown {
+  if (value === undefined) return undefined;
+  return Array.isArray(value) ? value.map(() => REDACTED) : REDACTED;
+}
+
+/**
  * A copy of a parsed JSON value for the log, with every `headers` and `env` key
- * redacted at any depth. This covers `mcpServers[*]` and `mcpCredentialOverrides`
+ * redacted at any depth, and the `args` of every stdio server definition. This covers `mcpServers[*]` and `mcpCredentialOverrides`
  * of POST /v1/query, the /test and /call bodies, and registry definitions in
  * request and response bodies. Every `sshKey` value becomes "[REDACTED]" and
  * every string under a `url` key loses its URL credentials (the git routes'
@@ -110,8 +119,11 @@ export function redactCredentialsForLog(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactCredentialsForLog);
   if (!value || typeof value !== "object") return value;
   const copy: Record<string, unknown> = {};
+  // A definition is recognized by its shape before any validation has run (a malformed one is rejected only after the preview).
+  const stdioDefinition = "command" in (value as Record<string, unknown>) || (value as Record<string, unknown>).type === "stdio";
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
     if (CREDENTIAL_KEYS.has(key)) copy[key] = redactCredentialValue(entry);
+    else if (key === "args" && stdioDefinition) copy[key] = redactStdioArgs(entry);
     else if (SECRET_VALUE_KEYS.has(key)) copy[key] = entry === undefined ? undefined : REDACTED;
     else if (key === "url") copy[key] = redactUrlEntry(entry);
     else copy[key] = redactCredentialsForLog(entry);

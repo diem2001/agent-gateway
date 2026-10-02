@@ -175,6 +175,33 @@ describe("credential values never reach the log (every Examples row)", { timeout
     expect(JSON.stringify(servers)).not.toContain(secret);
   });
 
+  it("stdio server args (a credential passed on the command line, MVP-7679): the request body, the registry create, detail and list previews redact every element, the client gets the real value", async () => {
+    const app = await gatewayApp();
+    const requestSecret = sentinel();
+    const registrySecret = sentinel();
+    logs = [];
+
+    const query = await request(app)
+      .post("/v1/query")
+      .send({ queryId: "q-args", prompt: "p", mcpServers: { local: { command: "node", args: ["server.js", `--token=${requestSecret}`] } } });
+    const created = await request(app).put("/v1/mcp-servers/argsrv").send({ type: "stdio", command: "node", args: ["server.js", registrySecret] });
+    const detail = await request(app).get("/v1/mcp-servers/argsrv");
+    const list = await request(app).get("/v1/mcp-servers");
+
+    // A malformed definition is rejected only after the preview: its args are redacted as well.
+    const malformedSecret = sentinel();
+    await request(app).post("/v1/query").send({ queryId: "q-args-odd", prompt: "p", mcpServers: { odd: { command: 12345, args: [`--token=${malformedSecret}`] }, odd2: { type: "stdio", args: [malformedSecret] } } });
+
+    expect(query.status).toBe(200);
+    expect(created.status).toBe(201);
+    expect(JSON.stringify(detail.body.args)).toContain(registrySecret);
+    expect(JSON.stringify(list.body.servers[0].args)).toContain(registrySecret);
+    const lines = logs.filter((l) => l.startsWith("[req] POST /v1/query") || l.startsWith("[req] PUT") || l.startsWith("[res]"));
+    expect(lines.length).toBeGreaterThanOrEqual(5);
+    for (const line of lines.filter((l) => l.includes('"args"') && !l.includes("q-args-odd"))) expect(line).toContain('"args":["[REDACTED]","[REDACTED]"]');
+    expect(leakedFragments(logs, [requestSecret, registrySecret, malformedSecret])).toEqual([]);
+  });
+
   it("POST /v1/query with mcpCredentialOverrides: unchanged redaction, the MCP client gets the real value", async () => {
     await registerServer({ name: "jira", type: "http", url: `${upstream!.origin}/mcp` });
     const app = await gatewayApp();

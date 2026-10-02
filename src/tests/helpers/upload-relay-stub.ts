@@ -63,7 +63,7 @@ export const answerCreated: StubHandler = async ({ res, record, consume }) => {
   res.end(body);
 };
 
-export async function startUploadStub(handler: StubHandler = answerCreated): Promise<UploadStub> {
+export async function startUploadStub(handler: StubHandler = answerCreated, host = "127.0.0.1"): Promise<UploadStub> {
   const requests: StubRequest[] = [];
   let connections = 0;
   const sockets = new Set<net.Socket>();
@@ -121,11 +121,11 @@ export async function startUploadStub(handler: StubHandler = answerCreated): Pro
     socket.on("close", () => sockets.delete(socket));
   });
 
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  await new Promise<void>((resolve) => server.listen(0, host, () => resolve()));
   const { port } = server.address() as AddressInfo;
   return {
     port,
-    url: `http://127.0.0.1:${port}/mcp`,
+    url: `http://${host}:${port}/mcp`,
     requests,
     connections: () => connections,
     close: () =>
@@ -150,6 +150,8 @@ export async function closedPort(): Promise<number> {
 /* ------------------------------------------------------------------ */
 
 export interface SendOptions {
+  /** The gateway's address (default 127.0.0.1; the Docker integration probe uses a container address). */
+  host?: string;
   port: number;
   path: string;
   headers?: Record<string, string>;
@@ -227,7 +229,7 @@ export function sendUpload(options: SendOptions): Promise<SendResult> {
 
   return new Promise((resolve, reject) => {
     const req = http.request({
-      host: "127.0.0.1",
+      host: options.host ?? "127.0.0.1",
       port: options.port,
       method: "POST",
       path: options.path,
