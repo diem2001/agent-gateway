@@ -320,13 +320,22 @@ export function sendUpload(options: SendOptions): Promise<SendResult> {
 /**
  * Sends a hand-written request over a raw socket (for request lines a client
  * library would normalize) and returns everything the server wrote until it
- * closed the connection.
+ * closed the connection. `onData` sees everything received so far after each
+ * chunk, so a test can act once specific bytes reached the caller.
  */
-export function rawRequest(port: number, head: string, body: Buffer): Promise<string> {
+export function rawRequest(
+  port: number,
+  head: string,
+  body: Buffer,
+  onData?: (receivedSoFar: string) => void,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const socket = net.connect(port, "127.0.0.1");
     const received: Buffer[] = [];
-    socket.on("data", (data: Buffer) => received.push(data));
+    socket.on("data", (data: Buffer) => {
+      received.push(data);
+      onData?.(Buffer.concat(received).toString("latin1"));
+    });
     socket.on("error", reject);
     socket.on("close", () => resolve(Buffer.concat(received).toString("latin1")));
     socket.on("connect", () => {

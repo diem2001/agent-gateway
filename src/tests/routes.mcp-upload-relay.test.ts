@@ -677,34 +677,125 @@ describe("failure behavior", () => {
     expect(JSON.parse(result.text).size).toBe(4 * MiB);
   });
 
-  it("an answer that breaks off after its status line closes the sender connection instead of completing it", async () => {
-    const upstream = await stub(async ({ req, res, consume }) => {
+  // The raw captures below hold every byte the gateway wrote to the caller's
+  // socket, so they can tell "answer headers received from the MCP server" from
+  // "answer bytes sent to the caller" (MVP-7848).
+  function uploadHead(length: number): string {
+    return `POST ${TARGET} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${API_KEY}\r\nContent-Length: ${length}\r\n\r\n`;
+  }
+
+  function auditLines(): string[] {
+    return logs.filter((line) => line.includes("mcp.upload.relayed"));
+  }
+
+  function splitCapture(capture: string): { statusLines: number; head: string; body: string } {
+    const headEnd = capture.indexOf("\r\n\r\n");
+    return {
+      statusLines: capture.split("HTTP/1.").length - 1,
+      head: headEnd === -1 ? capture : capture.slice(0, headEnd),
+      body: headEnd === -1 ? "" : capture.slice(headEnd + 4),
+    };
+  }
+
+  it("an answer whose headers arrived but of which no byte reached the caller becomes one complete 502 UPLOAD_UPSTREAM_FAILED", async () => {
+    const upstream = await stub(async ({ res, consume }) => {
       if (!(await consume())) return;
-      res.writeHead(201, { "Content-Type": "application/json", "Content-Length": "100" });
-      res.write('{"partial":');
-      setTimeout(() => req.socket.destroy(), 50);
+      res.writeHead(401, { "Content-Type": "application/json", "Content-Length": "100" });
+      res.flushHeaders();
+      setTimeout(() => res.socket?.destroy(), 50);
     });
     await register({ name: "jira", type: "http", url: upstream.url });
 
-    const outcome = await new Promise<{ status: number; complete: boolean; bytes: number }>((resolve) => {
-      const req = http.request(
-        { host: "127.0.0.1", port, method: "POST", path: TARGET, agent: false, headers: { ...BEARER, "Content-Length": 1024 } },
-        (res) => {
-          let bytes = 0;
-          res.on("data", (chunk: Buffer) => (bytes += chunk.length));
-          res.on("error", () => undefined);
-          res.on("close", () => resolve({ status: res.statusCode ?? 0, complete: res.complete, bytes }));
-        },
-      );
-      req.on("error", () => undefined);
-      req.end(Buffer.alloc(1024));
-    });
+    const capture = await rawRequest(port, uploadHead(1024), Buffer.alloc(1024));
+    const { statusLines, head, body } = splitCapture(capture);
 
-    expect(outcome.status).toBe(201);
-    expect(outcome.complete).toBe(false);
-    expect(outcome.bytes).toBeLessThan(100);
-    expect(await waitFor(() => logs.join("\n").includes("status=201 bytes=1024 result=upstream_failed"), 1000)).toBe(true);
+    // Exactly one response, and nothing of the upstream's 401 reached the caller.
+    expect(statusLines).toBe(1);
+    expect(head.startsWith("HTTP/1.1 502")).toBe(true);
+    expect(capture).not.toContain("401");
+    // Its own framing, not the refusal's stale headers (Content-Length: 100).
+    expect(head.toLowerCase()).toContain("content-type: application/json");
+    const length = /content-length: (\d+)/i.exec(head);
+    expect(Number(length?.[1])).toBe(Buffer.byteLength(body));
+    const parsed = JSON.parse(body);
+    expect(parsed.error.code).toBe("UPLOAD_UPSTREAM_FAILED");
+    expect(parsed.error.message).toBe(
+      "The connection to the MCP server jira dropped before its answer was complete; the outcome is unconfirmed. Check the target's attachments before retrying",
+    );
+    expect(await waitFor(() => auditLines().length === 1, 1000)).toBe(true);
+    expect(auditLines()).toHaveLength(1);
+    expect(auditLines()[0]).toContain("serverName=jira status=502 bytes=1024 result=upstream_failed");
+
+    // The gateway keeps serving.
+    const next = await stub();
+    await register({ name: "jira", type: "http", url: next.url });
+    expect((await send({ path: TARGET, total: 1024, headers: BEARER })).status).toBe(201);
   });
+
+  it("an answer that already reached the caller and then breaks off stays truncated: original status, no replacement status", async () => {
+    let partialSent!: () => void;
+    const reachedCaller = new Promise<void>((resolve) => (partialSent = resolve));
+    const upstream = await stub(async ({ res, consume }) => {
+      if (!(await consume())) return;
+      res.writeHead(201, { "Content-Type": "application/json", "Content-Length": "100" });
+      res.write('{"partial":');
+      // Break off only after the caller's socket received those body bytes.
+      await reachedCaller;
+      res.socket?.destroy();
+    });
+    await register({ name: "jira", type: "http", url: upstream.url });
+
+    const capture = await rawRequest(port, uploadHead(1024), Buffer.alloc(1024), (soFar) => {
+      if (soFar.includes('{"partial":')) partialSent();
+    });
+    const { statusLines, head, body } = splitCapture(capture);
+
+    expect(statusLines).toBe(1);
+    expect(head.startsWith("HTTP/1.1 201")).toBe(true);
+    expect(capture).not.toContain("502");
+    expect(body.length).toBeGreaterThan(0);
+    expect(body.length).toBeLessThan(100);
+    expect(await waitFor(() => auditLines().length === 1, 1000)).toBe(true);
+    expect(auditLines()).toHaveLength(1);
+    expect(auditLines()[0]).toContain("serverName=jira status=201 bytes=1024 result=upstream_failed");
+  }, 15_000);
+
+  it.each([
+    [204, {}, "ok"],
+    [403, { "Content-Length": "0" }, "upstream_answer"],
+  ] as const)("an answer with status %i and an empty body reaches the caller with exactly that status", async (status, headers, result) => {
+    const upstream = await stub(async ({ res, consume }) => {
+      if (!(await consume())) return;
+      res.writeHead(status, headers);
+      res.end();
+    });
+    await register({ name: "jira", type: "http", url: upstream.url });
+
+    const capture = await rawRequest(port, uploadHead(1024), Buffer.alloc(1024));
+    const { statusLines, head, body } = splitCapture(capture);
+
+    expect(statusLines).toBe(1);
+    expect(head.startsWith(`HTTP/1.1 ${status}`)).toBe(true);
+    expect(body).toBe("");
+    expect(await waitFor(() => auditLines().length === 1, 1000)).toBe(true);
+    expect(auditLines()[0]).toContain(`status=${status} bytes=1024 result=${result}`);
+  });
+
+  it("an answer whose headers arrived and then stalls: the caller connection is destroyed, no 504 is sent (idle timeout unchanged)", async () => {
+    const upstream = await stub(async ({ res, consume }) => {
+      if (!(await consume())) return;
+      res.writeHead(201, { "Content-Type": "application/json", "Content-Length": "100" });
+      res.flushHeaders();
+    });
+    await register({ name: "jira", type: "http", url: upstream.url });
+
+    const capture = await rawRequest(port, uploadHead(1024), Buffer.alloc(1024)).catch(() => "");
+
+    expect(capture).not.toContain("504");
+    expect(capture).not.toContain("UPLOAD_TIMEOUT");
+    expect(await waitFor(() => auditLines().length === 1, 1000)).toBe(true);
+    expect(auditLines()[0]).toContain("status=- bytes=1024 result=timeout");
+  }, 10_000);
 
   it("a slow but progressing upload (one chunk per second for 10 s) completes with the idle timeout at 2000 ms", async () => {
     const upstream = await stub();
