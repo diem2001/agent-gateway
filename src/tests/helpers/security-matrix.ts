@@ -711,8 +711,9 @@ export function sampleProblems(sample: ProcessSample, markers: Record<string, st
  * command line names `cli.js` or whose process title is `claude`. Each tick reads a candidate consistently (see
  * `readConsistent`) and classifies it again every time, so a launcher that later execs Node is a runtime from then on:
  * an executable that is a known non-runtime (`sh`, `bash`, `unshare`, the real bwrap) is a launcher and is not counted;
- * any other executable is a runtime, and it is sandboxed only with `sandboxProof`. A candidate that never had a
- * consistent read counts as an unsandboxed runtime. Windows of command-line tags prove that concurrent roles overlapped.
+ * any other executable is a runtime, and it is sandboxed only with `sandboxProof` (or below a process that has it: a
+ * descendant inherits the namespaces). A candidate that never had a consistent read counts as an unsandboxed runtime,
+ * except one that vanished below a process with the proof and the gateway's own `bwrap` launch. Windows of command-line tags prove that concurrent roles overlapped.
  *
  * The rule of MVP-7677 runs beside it: `clears` lists what that rule counted and this one does not, with the
  * reason, so a sandbox failure can never be absorbed silently.
