@@ -619,9 +619,9 @@ export function entrypointRowIds(): string[] {
   return ["EP.ordinary", "EP.agent", "EP.skill", "EP.subagent", "EP.mcp-direct", "EP.upload", "EP.denied", "EP.enlarge"];
 }
 
-/** The row ids of the registry write-only suite (`security-registry-process.test.ts`, MVP-7936). */
+/** The row ids of the registry write-only suite (`security-registry-process.test.ts`, MVP-7936, MVP-7957). */
 export function registryRowIds(): string[] {
-  return ["RG.read", "RG.write", "RG.refused", "RG.preserve-run"];
+  return ["RG.read", "RG.write", "RG.refused", "RG.preserve-run", "RG.args-url", "RG.failure-text"];
 }
 
 /** The row ids of the failure suite (`security-failure-process.test.ts`). */
