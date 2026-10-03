@@ -3,6 +3,7 @@
  * parsing with fatal invalid values, the exact bwrap argument list, the sandbox environment
  * allowlist, the fixed public failure texts and their kinds, and the run deadline.
  */
+import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   IsolationConfigError,
@@ -12,6 +13,7 @@ import {
   buildSandboxEnv,
   loadIsolationConfig,
   runtimeEnvFrom,
+  SandboxRun,
   type BwrapSpec,
 } from "../sandbox.js";
 import { RunFailure, fixedFailure, isolationTimeoutMessage, isolationUnavailableMessage, runDeadlineMessage } from "../run-failure.js";
@@ -317,5 +319,45 @@ describe("fixed failure texts", () => {
     expect(timeout.kind).toBe("isolation_timeout");
     expect(timeout.message).toBe(isolationTimeoutMessage("q-1"));
     expect(timeout.problem).toBe("timeout");
+  });
+});
+
+describe("runtime exit metadata (MVP-7852)", () => {
+  /** A SandboxRun whose launcher is a real process; the test owns and always reaps it. */
+  function runWithLauncher(script: string) {
+    const run = new SandboxRun({ runLogDir: "/nonexistent/run-log", runLogEnv: {} });
+    const child = spawn(process.execPath, ["-e", script], { stdio: "ignore" });
+    (run as unknown as { launch: unknown }).launch = { child, failure: () => null, ready: Promise.resolve() };
+    return { run, child };
+  }
+
+  it("is null without a launch and before the launcher has exited", () => {
+    expect(new SandboxRun({ runLogDir: "/nonexistent/run-log", runLogEnv: {} }).runtimeExit).toBeNull();
+    const { run, child } = runWithLauncher("setTimeout(() => {}, 60000)");
+    try {
+      expect(run.runtimeExit).toEqual({ exitCode: null, signalCode: null });
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  it("reports the launcher's exit code and its signal as observed", async () => {
+    const exited = runWithLauncher("process.exit(3)");
+    await new Promise((resolve) => exited.child.once("exit", resolve));
+    expect(exited.run.runtimeExit).toEqual({ exitCode: 3, signalCode: null });
+
+    const killed = runWithLauncher("setTimeout(() => {}, 60000)");
+    const gone = new Promise((resolve) => killed.child.once("exit", resolve));
+    killed.child.kill("SIGKILL");
+    await gone;
+    expect(killed.run.runtimeExit).toEqual({ exitCode: null, signalCode: "SIGKILL" });
+  });
+
+  it("a launcher that outlives the dispose wait and is killed by dispose() is not reported as an outside kill", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const { run, child } = runWithLauncher("setTimeout(() => {}, 60000)");
+    await run.dispose(50);
+    expect(child.signalCode).toBe("SIGKILL");
+    expect(run.runtimeExit).toBeNull();
   });
 });

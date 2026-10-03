@@ -4,7 +4,7 @@
  * wording or mapping change in production fails this test.
  */
 import { describe, expect, it } from "vitest";
-import { RunFailure, classifyRunFailure, formatLogFields, type RunDiagnostics } from "../run-failure.js";
+import { RunFailure, classifyRunFailure, fixedFailure, formatLogFields, type RunDiagnostics } from "../run-failure.js";
 
 const RETRY_WILL_NOT_HELP = "Retrying will not help until the administrator has done this.";
 const UPDATE = `Ask your gateway administrator to update the gateway runtime. ${RETRY_WILL_NOT_HELP}`;
@@ -320,13 +320,129 @@ describe("no raw diagnostic leaves the classifier", () => {
 
   it("log fields name the kind, status, allowlisted provider type and versions only", () => {
     expect(formatLogFields(classifyRunFailure(rejection(text), QUERY_ID).logFields)).toBe(
-      "kind=runtime_version_unsupported apiStatus=400 providerType=invalid_request_error installed=2.0.77 required=2.1.280",
+      "kind=runtime_version_unsupported apiStatus=400 providerType=invalid_request_error installed=2.0.77 required=2.1.280 errorClass=Error errno=none exit=none signal=none",
     );
     expect(formatLogFields(classifyRunFailure(rejection(apiError(418, { type: `custom_${TOKEN}` })), QUERY_ID).logFields)).toBe(
-      "kind=unknown apiStatus=418 providerType=other installed=2.0.77 required=none",
+      "kind=unknown apiStatus=418 providerType=other installed=2.0.77 required=none errorClass=Error errno=none exit=none signal=none",
     );
     expect(formatLogFields(classifyRunFailure({ thrown: new Error("x") }, QUERY_ID).logFields)).toBe(
-      "kind=unknown apiStatus=none providerType=none installed=none required=none",
+      "kind=unknown apiStatus=none providerType=none installed=none required=none errorClass=Error errno=none exit=none signal=none",
+    );
+  });
+});
+
+/** The four cause fields (MVP-7852) of a failure whose only input is `thrown` and the runtime's exit metadata. */
+function cause(thrown: unknown, runtimeExit?: RunDiagnostics["runtimeExit"]): string {
+  const tail = formatLogFields(classifyRunFailure({ thrown, runtimeExit }, QUERY_ID).logFields).split(" ");
+  return tail.slice(-4).join(" ");
+}
+
+describe("cause fields come only from trusted structured sources (MVP-7852)", () => {
+  class LeakyCustomError extends Error {}
+  const withCode = (code: unknown): Error => Object.assign(new Error("m"), { code });
+
+  it.each([
+    ["Error", new Error("x"), "Error"],
+    ["TypeError", new TypeError("x"), "TypeError"],
+    ["RangeError", new RangeError("x"), "RangeError"],
+    ["SyntaxError", new SyntaxError("x"), "SyntaxError"],
+    ["ReferenceError", new ReferenceError("x"), "ReferenceError"],
+    ["EvalError", new EvalError("x"), "EvalError"],
+    ["URIError", new URIError("x"), "URIError"],
+    ["AggregateError", new AggregateError([], "x"), "AggregateError"],
+  ])("allowlisted class %s is written as its fixed literal", (_name, thrown, expected) => {
+    expect(cause(thrown)).toBe(`errorClass=${expected} errno=none exit=none signal=none`);
+  });
+
+  it("a custom subclass, a spoofed constructor/name, a string and a Node internal class are `other`", () => {
+    expect(cause(new LeakyCustomError("x"))).toBe("errorClass=other errno=none exit=none signal=none");
+    const spoof = Object.assign(Object.create(null) as object, { constructor: { name: "Error" }, name: "Error", message: "x" });
+    expect(cause(spoof)).toBe("errorClass=other errno=none exit=none signal=none");
+    expect(cause("PRIVATE_TOKEN")).toBe("errorClass=other errno=none exit=none signal=none");
+    const internal = Object.assign(new TypeError("x"), { name: "TypeError" });
+    Object.setPrototypeOf(internal, Object.create(TypeError.prototype));
+    expect(cause(internal)).toBe("errorClass=other errno=none exit=none signal=none");
+  });
+
+  it("nothing thrown is `none`", () => {
+    expect(cause(undefined)).toBe("errorClass=none errno=none exit=none signal=none");
+    expect(cause(null)).toBe("errorClass=none errno=none exit=none signal=none");
+  });
+
+  it.each([
+    ["canonical ENOSPC", withCode("ENOSPC"), "ENOSPC"],
+    ["canonical EACCES", withCode("EACCES"), "EACCES"],
+    ["non-canonical", withCode("PRIVATE_TOKEN"), "other"],
+    ["lowercase of a canonical key", withCode("enospc"), "other"],
+    ["non-string", withCode(28), "other"],
+    ["absent", new Error("m"), "none"],
+    ["undefined", withCode(undefined), "none"],
+    ["inherited key name", withCode("toString"), "other"],
+  ])("errno: %s", (_name, thrown, expected) => {
+    expect(cause(thrown)).toBe(`errorClass=Error errno=${expected} exit=none signal=none`);
+  });
+
+  it("errno: a throwing getter gives `other`", () => {
+    const thrown = new Error("m");
+    Object.defineProperty(thrown, "code", {
+      get() {
+        throw new Error("boom");
+      },
+    });
+    expect(cause(thrown)).toBe("errorClass=Error errno=other exit=none signal=none");
+  });
+
+  it.each([
+    ["integer 3", 3, "3"],
+    ["integer 137", 137, "137"],
+    ["zero", 0, "0"],
+    ["string", "3", "none"],
+    ["non-integer", 1.5, "none"],
+    ["null", null, "none"],
+    ["NaN", Number.NaN, "none"],
+    ["unsafe integer", 2 ** 60, "none"],
+  ])("exit: %s", (_name, exitCode, expected) => {
+    expect(cause(new Error("x"), { exitCode, signalCode: null })).toBe(`errorClass=Error errno=none exit=${expected} signal=none`);
+  });
+
+  it.each([
+    ["SIGKILL", "SIGKILL", "SIGKILL"],
+    ["SIGTERM", "SIGTERM", "SIGTERM"],
+    ["hostile name", "SIGSECRET", "other"],
+    ["lowercase", "sigkill", "other"],
+    ["non-string", 9, "other"],
+    ["null", null, "none"],
+  ])("signal: %s", (_name, signalCode, expected) => {
+    expect(cause(new Error("x"), { exitCode: null, signalCode })).toBe(`errorClass=Error errno=none exit=none signal=${expected}`);
+  });
+
+  it("fields are independent: one invalid field never changes another", () => {
+    expect(cause(Object.assign(new LeakyCustomError("x"), { code: "ENOSPC" }), { exitCode: "3", signalCode: "SIGKILL" })).toBe(
+      "errorClass=other errno=ENOSPC exit=none signal=SIGKILL",
+    );
+    expect(cause(withCode("PRIVATE_TOKEN"), { exitCode: 3, signalCode: "SIGSECRET" })).toBe("errorClass=Error errno=other exit=3 signal=other");
+  });
+
+  it("a Proxy whose prototype lookup and `code` read both throw gives other/other and classification stays total", () => {
+    const hostile = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          throw new Error("boom");
+        },
+        get() {
+          throw new Error("boom");
+        },
+      },
+    );
+    const failure = classifyRunFailure({ thrown: hostile }, QUERY_ID);
+    expect(failure.kind).toBe("unknown");
+    expect(formatLogFields(failure.logFields).split(" ").slice(-4).join(" ")).toBe("errorClass=other errno=other exit=none signal=none");
+  });
+
+  it("fixed failures carry no cause", () => {
+    expect(formatLogFields(fixedFailure("run_deadline", "x").logFields)).toBe(
+      "kind=run_deadline apiStatus=none providerType=none installed=none required=none errorClass=none errno=none exit=none signal=none",
     );
   });
 });

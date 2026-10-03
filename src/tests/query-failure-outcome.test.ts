@@ -155,7 +155,7 @@ describe("failed runs end with one safe error event and no done (SDK boundary mo
 
     expectFailure(outcome, VERSION_BOTH);
     expect(sdkCalls).toHaveLength(1);
-    expect(logLines).toContain("[query] Error queryId=q-exit0 kind=runtime_version_unsupported apiStatus=400 providerType=invalid_request_error installed=2.0.77 required=2.1.280");
+    expect(logLines).toContain("[query] Error queryId=q-exit0 kind=runtime_version_unsupported apiStatus=400 providerType=invalid_request_error installed=2.0.77 required=2.1.280 errorClass=none errno=none exit=none signal=none");
   });
 
   it("a structured rejection followed by the thrown exit error keeps the diagnostic: one attempt, version message", async () => {
