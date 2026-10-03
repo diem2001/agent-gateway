@@ -137,7 +137,8 @@ describe("registry reads never disclose stored headers or env", () => {
         expect(detail.body.name).toBe(name);
       }
       const local = await request(app).get("/v1/mcp-servers/local").set(as(key));
-      expect(local.body).toMatchObject({ type: "stdio", command: "node", args: ["server.js"] });
+      expect(local.body).toMatchObject({ type: "stdio", command: "node" });
+      expect(local.body).not.toHaveProperty("args");
     });
   }
 

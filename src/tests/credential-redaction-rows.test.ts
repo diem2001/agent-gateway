@@ -174,7 +174,7 @@ describe("credential values never reach the log (every Examples row)", { timeout
     expect(JSON.stringify(servers)).not.toContain(secret);
   });
 
-  it("stdio server args (a credential passed on the command line, MVP-7679): the request body, the registry create, detail and list previews redact every element, the client gets the real value", async () => {
+  it("stdio server args (a credential passed on the command line, MVP-7679): the request body and the registry create preview redact every element, and the registry detail and list never return the args", async () => {
     const app = await gatewayApp();
     const requestSecret = sentinel();
     const registrySecret = sentinel();
@@ -193,8 +193,11 @@ describe("credential values never reach the log (every Examples row)", { timeout
 
     expect(query.status).toBe(200);
     expect(created.status).toBe(201);
-    expect(JSON.stringify(detail.body.args)).toContain(registrySecret);
-    expect(JSON.stringify(list.body.servers[0].args)).toContain(registrySecret);
+    // MVP-7957: the registry never returns stored args to a client, so the real value is only in the stored entry.
+    expect(detail.body).not.toHaveProperty("args");
+    expect(list.body.servers[0]).not.toHaveProperty("args");
+    expect(detail.text).not.toContain(registrySecret);
+    expect(list.text).not.toContain(registrySecret);
     const lines = logs.filter((l) => l.startsWith("[req] POST /v1/query") || l.startsWith("[req] PUT") || l.startsWith("[res]"));
     expect(lines.length).toBeGreaterThanOrEqual(5);
     for (const line of lines.filter((l) => l.includes('"args"') && !l.includes("q-args-odd"))) expect(line).toContain('"args":["[REDACTED]","[REDACTED]"]');
