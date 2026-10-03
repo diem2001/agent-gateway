@@ -536,7 +536,7 @@ export interface ProcessClear {
   record: ProcessRecord;
   explanation:
     | "known non-runtime executable at a consistent read"
-    | "settled into another process after an inconsistent read"
+    | "settled into another process after an inconsistent read" // the old rule read the new `comm` with the old command line, mid-exec
     | "settled after an inconsistent read"
     | "vanished before a consistent read below a process with the sandbox proof"
     | "unexplained";
@@ -776,9 +776,10 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
             // A flag stays: one tick without proof is a run outside the sandbox, whatever the next tick shows.
             unsandboxed = unsandboxed || !(proof.proven || belowProven);
           }
-        } else if (verdict === "unresolved" && info.ppid === root && info.comm === "bwrap" && comms.every((comm) => comm === "bwrap")) {
-          // The gateway's own launch of bwrap (or of a recording wrapper named bwrap) ended before it could be read: the
-          // old rule never counted a process whose comm is bwrap either, and a runtime outside the sandbox does not run as one.
+        } else if (verdict === "unresolved" && info.comm === "bwrap" && comms.every((comm) => comm === "bwrap") && ancestorPids.every((pid) => infos.get(pid)?.comm === "bwrap") && (infos.get(ancestorPids.at(-1) ?? -1)?.ppid ?? info.ppid) === root) {
+          // The gateway's own launch of bwrap (or of a recording wrapper named bwrap, and the subshells that script forks)
+          // ended before it could be read: the old rule never counted a process whose comm is bwrap either, and a runtime
+          // outside the sandbox does not run as one below nothing but bwrap-named processes.
           verdict = "launcher";
         } else if (verdict === "unresolved" && belowProven) {
           // A fork that has not exec'd yet (a copy of the runtime or of the launch wrapper) or one that already ended: it
@@ -828,7 +829,7 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
     for (const record of all) {
       if (record.oldCounted && record.verdict === "launcher") clears.push({ record, explanation: "known non-runtime executable at a consistent read" });
       else if (record.oldCounted && record.verdict === "descendant") clears.push({ record, explanation: "vanished before a consistent read below a process with the sandbox proof" });
-      else if (record.oldCounted && record.verdict === "other") clears.push({ record, explanation: record.inconsistentReads > 0 || record.comms.length > 1 ? "settled into another process after an inconsistent read" : "unexplained" });
+      else if (record.oldCounted && record.verdict === "other") clears.push({ record, explanation: "settled into another process after an inconsistent read" });
       else if (record.oldUnsandboxed && record.verdict === "runtime" && !record.unsandboxed) clears.push({ record, explanation: record.inconsistentReads > 0 || record.comms.length > 1 ? "settled after an inconsistent read" : "unexplained" });
     }
     return {
