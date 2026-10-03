@@ -270,9 +270,10 @@ async function rawStatusStub(status: string): Promise<RawStatusStub> {
  * reading any of the body. The reset reaches the gateway right behind the
  * answer, so in most attempts the gateway's next body write fails before it
  * read the answer: the case an MCP server with an early answer and an abrupt
- * close (mcp-jira) produces only now and then.
+ * close (mcp-jira) produces only now and then. With `afterwards`, that text is
+ * written one event-loop turn after `firstBytes`, and the reset follows it.
  */
-async function rawResetStub(firstBytes: string): Promise<RawStatusStub> {
+async function rawResetStub(firstBytes: string, afterwards?: string): Promise<RawStatusStub> {
   let accepted = 0;
   let closed = 0;
   const sockets = new Set<net.Socket>();
@@ -284,6 +285,10 @@ async function rawResetStub(firstBytes: string): Promise<RawStatusStub> {
       sockets.delete(socket);
     });
     socket.on("error", () => undefined);
+    // Without this, Nagle can hold the second write of a split answer in the
+    // stub's send queue behind the unacknowledged head, and the reset right
+    // behind it discards that body before it is ever sent.
+    socket.setNoDelay(true);
     let head = Buffer.alloc(0);
     let answered = false;
     socket.on("data", (data: Buffer) => {
@@ -291,7 +296,14 @@ async function rawResetStub(firstBytes: string): Promise<RawStatusStub> {
       head = Buffer.concat([head, data]);
       if (head.indexOf("\r\n\r\n") === -1) return;
       answered = true;
-      socket.write(firstBytes, () => socket.resetAndDestroy());
+      if (afterwards === undefined) {
+        socket.write(firstBytes, () => socket.resetAndDestroy());
+        return;
+      }
+      // A split answer (MVP-7848): the head now, the body one event-loop turn
+      // later, the reset right behind it.
+      socket.write(firstBytes);
+      setImmediate(() => socket.write(afterwards, () => socket.resetAndDestroy()));
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
@@ -530,6 +542,71 @@ describe("upload relay in a real gateway process", () => {
     },
     60_000,
   );
+
+  it("an MCP server that answers 401 in two writes (head, then body) and resets without reading: 100 fast 20 MiB senders each get the exact answer", async () => {
+    // The MVP-7805 QA probe `split`: the answer head and the answer body reach
+    // the gateway in two segments, followed by a reset. Every sender must get the
+    // 401 with the byte-identical body, never a bare reset or a 502. The stub
+    // sets TCP_NODELAY: with Nagle on, the stub's own reset can discard the body
+    // segment before it is sent, and then no relay can deliver it (2 to 5 of 100
+    // attempts, with the relay as well as without the fix). Per-attempt counts
+    // are printed.
+    const refusal = JSON.stringify({ error: { code: "UPLOAD_UNAUTHENTICATED", message: "An Authorization header is required." } });
+    const upstream = await rawResetStub(
+      `HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(refusal)}\r\nConnection: close\r\n\r\n`,
+      refusal,
+    );
+    const gateway = await spawnGateway({ LOG_LEVEL: "info" });
+    await registerJira(gateway, upstream);
+
+    const attempts = 100;
+    const counts = new Map<string, number>();
+    const wrong: string[] = [];
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      let label: string;
+      try {
+        const result = await relay(gateway, { total: 20 * MiB, oneWrite: true });
+        label = `HTTP ${result.status}`;
+        if (result.status !== 401 || result.text !== refusal) wrong.push(`attempt ${attempt}: HTTP ${result.status} ${result.text}`);
+      } catch (error) {
+        label = "no answer (reset)";
+        wrong.push(`attempt ${attempt}: ${(error as Error).message}`);
+      }
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+    for (const line of wrong) report(line);
+    report(
+      `split answer then reset, 20 MiB x ${attempts}: ${[...counts].map(([label, count]) => `${label} x${count}`).join(", ")}; ` +
+        `failed attempts ${wrong.length}`,
+    );
+    expect(wrong).toEqual([]);
+
+    await waitUntilClosed(upstream);
+    expect(upstream.closed()).toBe(upstream.accepted());
+    expect(gateway.child.exitCode).toBeNull();
+    expect((await request(gateway.port, "GET", "/health")).status).toBe(200);
+  }, 300_000);
+
+  it("an MCP server that sends only an answer head (Content-Length: 100) and resets: the sender gets a clean 502 UPLOAD_UPSTREAM_FAILED within the wait bound", async () => {
+    const upstream = await rawResetStub("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n");
+    const gateway = await spawnGateway({ LOG_LEVEL: "info" });
+    await registerJira(gateway, upstream);
+
+    const result = await relay(gateway, { total: 5 * MiB, oneWrite: true });
+
+    expect(result.status).toBe(502);
+    expect(result.headers["content-length"]).toBe(String(Buffer.byteLength(result.text)));
+    const body = JSON.parse(result.text);
+    expect(body.error.code).toBe("UPLOAD_UPSTREAM_FAILED");
+    expect(body.error.message).toContain("dropped before its answer was complete; the outcome is unconfirmed");
+    expect(result.finishedAt - result.startedAt).toBeLessThan(ANSWER_AFTER_RESET_MS + 1500);
+
+    await waitUntilClosed(upstream);
+    expect(upstream.closed()).toBe(upstream.accepted());
+    expect(gateway.child.exitCode).toBeNull();
+    expect((await request(gateway.port, "GET", "/health")).status).toBe(200);
+    expect(gateway.output()).toMatch(/mcp\.upload\.relayed serverName=jira status=502 bytes=\d+ result=upstream_failed/);
+  }, 20_000);
 
   it.each(["101", "600", "000"])(
     "an upstream answer with status %s followed at once by a reset becomes 502 'cannot relay' and the gateway keeps serving",
