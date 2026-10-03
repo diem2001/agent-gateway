@@ -94,17 +94,20 @@ function launcherOf(gw: SpawnedGateway): number | null {
 }
 
 /**
- * A bwrap stand-in for R2. It runs the real bwrap in the background and starts a `sleep` helper that
+ * A bwrap stand-in for R2. In mode `pass` (the boot self-check) it runs the real bwrap; in mode `hold` it runs the real bwrap in the background and starts a `sleep` helper that
  * inherits the launcher's output, records the helper's pid, waits for the trigger file and then
  * SIGKILLs itself, so the launcher ends while the helper keeps the output pipe open.
  */
-function makeHoldWrapper(): { path: string; trigger: () => void; helperPid: () => number | null; endHelper: () => void } {
+function makeHoldWrapper(): { path: string; hold: () => void; trigger: () => void; helperPid: () => number | null; endHelper: () => void } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7964-launcher-"));
   const script = path.join(dir, "bwrap");
+  fs.writeFileSync(path.join(dir, "mode"), "pass");
   fs.writeFileSync(
     script,
     String.raw`#!/bin/bash
 DIR='${dir}'
+MODE=$(cat "$DIR/mode" 2>/dev/null || echo pass)
+if [ "$MODE" = pass ]; then exec /usr/bin/bwrap "$@"; fi
 exec 5<&0
 /usr/bin/bwrap "$@" <&5 &
 REAL=$!
@@ -143,6 +146,7 @@ kill -KILL $$
   });
   return {
     path: script,
+    hold: () => fs.writeFileSync(path.join(dir, "mode"), "hold"),
     trigger: () => fs.writeFileSync(path.join(dir, "trigger"), ""),
     helperPid: () => pidOf("helper.pid"),
     endHelper: () => endOwned("helper.pid", "sleep 600"),
@@ -258,6 +262,7 @@ describe("an outside signal ends the launcher: the request ends promptly with on
   it("R2: launcher SIGKILLed while a helper holds its output open: same outcome, and a late end of the output changes nothing", async () => {
     const wrapper = makeHoldWrapper();
     const { api, gw } = await rig({ wrapperPath: wrapper.path, deadlineMs: KILL_ROW_DEADLINE_MS });
+    wrapper.hold();
 
     const outcome = await disturbedQuery(gw, api, async () => {
       await waitFor("the wrapper's helper process", () => wrapper.helperPid() !== null);
