@@ -42,6 +42,10 @@ const MARKER_NAMES: Record<string, MarkerClass> = {
   oauthRefresh: "provider",
   registryHttpHeader: "mcp",
   legacyRegistryHeader: "mcp",
+  legacyHeader: "mcp",
+  urlUserInfo: "mcp",
+  urlQuery: "mcp",
+  urlFragment: "mcp",
   userOverrideHeader: "mcp",
   sseHeader: "mcp",
   stdioEnv: "mcp",
@@ -320,6 +324,8 @@ export const AC_ROWS: Record<string, string> = {
   "RG.write": "Registry write: the replies of an owner update and a new registration carry no headers or env property and no stored value",
   "RG.refused": "Registry refused write: another label's PUT and a PUT on an ownerless entry are 403, change no stored map and disclose nothing",
   "RG.preserve-run": "Registry preserve and run: a reqlift-style toggle keeps both stored maps and an authorized run still delivers the stored header and env value",
+  "RG.args-url": "Registry args and URL: no client sees stored stdio args; a compliant URL is returned verbatim; a legacy URL with user info, query or fragment is withheld with a migration flag; unsafe URL writes are refused without echo; a toggle keeps the args and the run still receives them",
+  "RG.failure-text": "Registry failure text: health, test and call answer a fixed category for an unsendable stored header, an unusable stored address and an unreachable upstream, with no stored value in any response or log line",
   "RT.config.subject": "The config route as the file detector's subject row (child run of the negative control)",
 };
 
@@ -916,7 +922,10 @@ export async function startFaultMcp(mode: "hang" | "reset"): Promise<FaultMcp> {
   };
 }
 
-/** An MCP server over stdio whose `echo` tool reports the length of its `SERVER_TOKEN` env value. The first argv names the tag. */
+/**
+ * An MCP server over stdio whose `echo` tool reports the length of its `SERVER_TOKEN` env value and whose `argv` tool
+ * reports the length of its first extra argument (the registry rows' stdio args marker). The first argv names the tag.
+ */
 export const STDIO_SOURCE = String.raw`// SECURITY-STDIO-SERVER
 const rl = require('node:readline').createInterface({ input: process.stdin });
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
@@ -924,8 +933,8 @@ rl.on('line', (line) => {
   let m; try { m = JSON.parse(line); } catch { return; }
   if (m.id === undefined) return;
   if (m.method === 'initialize') send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'security-stdio', version: '1' } } });
-  else if (m.method === 'tools/list') send({ jsonrpc: '2.0', id: m.id, result: { tools: [{ name: 'echo', description: 'echo', inputSchema: { type: 'object', properties: {} } }] } });
-  else if (m.method === 'tools/call') send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: 'STDIO-RESULT:' + (process.env.SERVER_TOKEN || '').length }] } });
+  else if (m.method === 'tools/list') send({ jsonrpc: '2.0', id: m.id, result: { tools: [{ name: 'echo', description: 'echo', inputSchema: { type: 'object', properties: {} } }, { name: 'argv', description: 'argv', inputSchema: { type: 'object', properties: {} } }] } });
+  else if (m.method === 'tools/call') send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: m.params && m.params.name === 'argv' ? 'STDIO-ARGV:' + (process.argv[1] || '').length : 'STDIO-RESULT:' + (process.env.SERVER_TOKEN || '').length }] } });
   else send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'Method not found' } });
 });
 `;

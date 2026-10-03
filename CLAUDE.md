@@ -16,6 +16,7 @@ npm test            # Unit tests (vitest, excludes E2E)
 npm run test:e2e    # E2E session tests (requires running Gateway + GATEWAY_API_KEY env var)
 npm run probe:docker-isolation  # Docker Outcome Probe: builds the image, runs task-owned containers under the compose security profile (needs sudo -n docker, uid 1000)
 npm run probe:docker-stop       # Docker Outcome Probe for the clean stop (same profile)
+npm run registry-url-inventory -- <mcp-servers.json>  # Rollout inventory (MVP-7957): names and categories of registry entries whose stored URL breaks the public-URL rule (never a URL; exit 0 none, 3 some, 2 unreadable); needs `npm run build`
 npm run probe:epic-integration   # Epic Integration Gate (MVP-7677): task-owned container on an --internal network, OAuth mode, representative reqlift and diemcrm callers, the eight secret routes before and after docker restart (needs sudo -n docker, uid 1000; writes an evidence JSON with the image digest)
 ```
 
@@ -133,6 +134,7 @@ src/
   tool-policy.ts     # enforcedTools: request validation, built-in/server selection, deny-only PreToolUse hook (per-run enforced tool set)
   tool-input-schema.ts # Webhook tool input_schema -> typed, described SDK shape; per-property "any value" fallback, per-tool untyped fallback
   mcp-registry.ts    # External MCP server registry CRUD + persistence (MCP_SERVERS_PERSIST_PATH); owner per entry (registering API-key label, never returned by a route), ownerless = registered before ownership
+  mcp-upstream-request.ts # Fixed failure texts of /health, /test, /call (header, address, unreachable) and the pre-fetch check of the merged headers and the address; `isSendableHeader`
   mcp-server-owners.ts # MCP_SERVER_OWNERS parser (fatal fixed lines) and startup applier (only ownerless entries, read-back lines)
   mcp-upload-relay.ts # Streaming upload relay: raw-path rule, parser skip, pre-auth guard, X-MCP-Credential-Headers, relay core
   mcp-credential-relay.ts # Loopback relay for every registered MCP server (http, SSE, stdio) and request servers with headers/env: per-run token and binding, grant check, message rules, buffered and validated answers, fixed TOOL_* failures (no OAuth login in the runtime)
@@ -152,7 +154,7 @@ src/
     workspace.ts     # CRUD for /v1/memory/*, /v1/agents/*, /v1/skills/*
     git.ts           # POST /v1/workspace/git/clone|pull, GET /v1/workspace/git/status
     tools.ts         # PUT/GET/DELETE /v1/tools (Tool Registry REST endpoints)
-    mcp.ts           # PUT/GET/DELETE /v1/mcp-servers (stored `headers`/`env` are write-only: never in a GET or PUT reply, per map omitted = keep, `{}` = clear, a transport-family change that strands a stored map = 400 `MCP_CREDENTIAL_MAP_INAPPLICABLE`; `MCP_FIELD_CLASS` in `mcp-registry.ts` classifies every stored field) + /restart + /health + /test + /call (MCP Server Registry; PUT/DELETE of an existing name only for its owner, else 403 MCP_SERVER_OWNER_MISMATCH before any validation, ownerless entries refused for every label and for credential-bearing /call, /test, /uploads/*; PUT refuses a NEW name outside ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ with 400 MCP_SERVER_NAME_INVALID, existing names stay editable/deletable; /call = direct LLM-free tools/call passthrough, gates on enabled unlike /test; /uploads/* = streaming upload relay)
+    mcp.ts           # PUT/GET/DELETE /v1/mcp-servers (stored `headers`/`env`/`args` are write-only: never in a GET or PUT reply, per field omitted = keep, `{}`/`[]` = clear, a transport-family change that strands a stored map or args list = 400 `MCP_CREDENTIAL_MAP_INAPPLICABLE`; `MCP_FIELD_CLASS` in `mcp-registry.ts` classifies every stored field; the `url` is public but a new or changed http/sse URL with user info, query or fragment is refused with 400 `MCP_SERVER_URL_INVALID` (`publicUrlProblem`), and a legacy stored URL that breaks that rule is withheld with `urlMigrationRequired: true`; `/health`, `/test`, `/call` answer fixed failure texts from `mcp-upstream-request.ts`, never a stored value) + /restart + /health + /test + /call (MCP Server Registry; PUT/DELETE of an existing name only for its owner, else 403 MCP_SERVER_OWNER_MISMATCH before any validation, ownerless entries refused for every label and for credential-bearing /call, /test, /uploads/*; PUT refuses a NEW name outside ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ with 400 MCP_SERVER_NAME_INVALID, existing names stay editable/deletable; /call = direct LLM-free tools/call passthrough, gates on enabled unlike /test; /uploads/* = streaming upload relay)
   tests/
     e2e-session.test.ts    # E2E session continuity tests
     routes.tools.test.ts   # Tool routes unit tests
@@ -194,7 +196,8 @@ src/
     helpers/security-routes.ts      # The eight route probes (in-sandbox Python) and their verdicts, shared with the Docker probe
     mcp-overrides.test.ts           # Override merge + requireUserCredentials header-key casing + ownerless left out of credential-bearing runs
     mcp-server-owner.test.ts / mcp-server-owners.test.ts # Registry ownership routes (two labels, real authMiddleware) and the MCP_SERVER_OWNERS parser/applier
-    mcp-registry-write-only.test.ts / security-registry-process.test.ts # Write-only stored headers/env: route rows (owner, other label, ownerless, update semantics, transport family) and the real-gateway rows RG.* (needs `npm run build` for the process suite)
+    mcp-registry-write-only.test.ts / security-registry-process.test.ts # Write-only stored headers/env: route rows (owner, other label, ownerless, update semantics, transport family) and the real-gateway rows RG.* incl. RG.args-url and RG.failure-text (needs `npm run build` for the process suite)
+    mcp-registry-public-fields.test.ts / mcp-registry-field-class.test.ts / mcp-failure-text.test.ts / registry-url-inventory.test.ts # MVP-7957: write-only args, the public-URL rule and legacy URL withholding; every `McpServerDefinition` field classified and response-path tested, `publicUrlProblem` table; fixed health/test/call failure texts; the rollout inventory script (`scripts/registry-url-inventory.mjs`, needs `npm run build`)
     mcp-server-owner-process.test.ts # Outcome Probe: another label cannot redirect a registered server; restart, deploy step, ownerless run (spawned gateway, needs `npm run build`)
     routes.mcp.test.ts              # Registry PUT schema validation + new-entry name rule
     require-user-credentials.test.ts # requireUserCredentials + header/env validation

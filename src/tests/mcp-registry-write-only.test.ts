@@ -137,7 +137,8 @@ describe("registry reads never disclose stored headers or env", () => {
         expect(detail.body.name).toBe(name);
       }
       const local = await request(app).get("/v1/mcp-servers/local").set(as(key));
-      expect(local.body).toMatchObject({ type: "stdio", command: "node", args: ["server.js"] });
+      expect(local.body).toMatchObject({ type: "stdio", command: "node" });
+      expect(local.body).not.toHaveProperty("args");
     });
   }
 
@@ -361,7 +362,7 @@ describe("a transport change does not silently lose or strand a stored map", () 
     expectNoSecrets(refused);
     expect(await stored("local")).toMatchObject({ type: "stdio", env: { API_TOKEN: ENV_MARKER } });
 
-    const resolved = await request(app).put("/v1/mcp-servers/local").set(as(KEY_OWNER)).send({ type: "http", url: HTTP_URL, env: {} });
+    const resolved = await request(app).put("/v1/mcp-servers/local").set(as(KEY_OWNER)).send({ type: "http", url: HTTP_URL, env: {}, args: [] });
     expect(resolved.status).toBe(200);
     expect(await stored("local")).not.toHaveProperty("env");
   });
