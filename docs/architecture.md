@@ -533,12 +533,17 @@ UploadRelay -------- node:http(s) request to <origin>/uploads/<target>?<query>
     |    (setImmediate; after drain when upstream is full) so an early answer
     |    is normally read before the next write
     |  a write that fails because the MCP server reset the connection first
-    |    (EPIPE/ECONNRESET, no answer yet): stop forwarding, keep reading for
-    |    at most ANSWER_AFTER_RESET_MS (1 s) for an answer that already arrived
+    |    (EPIPE/ECONNRESET, answer not yet complete): stop forwarding, keep
+    |    reading for at most ANSWER_AFTER_RESET_MS (1 s) for an answer (or the
+    |    rest of one) that already arrived
+    |  answer headers received != answer bytes sent to the caller: the status
+    |    line goes to the caller with the first answer byte (or the answer's end)
     |  every 2 MiB: minor GC (gc-budget.ts, needs --expose-gc)
     |  idle timer: reset by every request chunk and every answer chunk
     v
 MCP server answer -> status (200-599) + Content-Type + Content-Length + body, verbatim
+                     (a drop after the headers but before any answer byte was sent
+                      to the caller is a 502, a drop after that truncates the answer)
 ```
 
 **What is and is not held:** at any time only the chunks in flight (Node stream buffers and kernel socket buffers) are in memory; nothing is written to disk and nothing enters the session store, the transcript or the event cache. The request log line carries the URL, i.e. target and file name, never bytes or the credential. One audit line per relay: `mcp.upload.relayed serverName status bytes result`.
@@ -546,11 +551,13 @@ MCP server answer -> status (200-599) + Content-Type + Content-Length + body, ve
 **Exits:**
 
 - The MCP server answers after the whole body: its answer is streamed back and the relay ends (`ok` for 2xx, `upstream_answer` otherwise).
-- The MCP server answers early (while the body still streams): forwarding stops, the answer is passed through, and the sender connection is closed after a bounded drain (at most 1 MiB read, closed when the sender closes or 5 s after the answer). This also holds when the MCP server resets the connection right after its answer (mcp-jira closes with unread body data) and the reset reaches the gateway before the answer was read: the failed write does not destroy the socket at once. Forwarding stops, the socket keeps reading for at most `ANSWER_AFTER_RESET_MS`, and the answer is passed through. Node marks a socket's readable side errored when a write fails, so `keepReadingAfterWriteReset` wraps the socket's `destroy()` and clears `_readableState.errored`; if that is not possible, the socket is destroyed at once (502 unconfirmed).
+- The MCP server answers early (while the body still streams): forwarding stops, the answer is passed through, and the sender connection is closed after a bounded drain (at most 1 MiB read, closed when the sender closes or 5 s after the answer). This also holds when the MCP server resets the connection right after its answer (mcp-jira closes with unread body data) and the reset reaches the gateway before the answer was read: the failed write does not destroy the socket at once. Forwarding stops, the socket keeps reading for at most `ANSWER_AFTER_RESET_MS`, and the answer is passed through. The same holds for an answer that arrives split (its headers first, its body in a later segment) before the reset. Node marks a socket's readable side errored when a write fails, so `keepReadingAfterWriteReset` wraps the socket's `destroy()` and clears `_readableState.errored`; if that is not possible, the socket is destroyed at once (502 unconfirmed).
 - Connection refused, DNS failure, bad registration url or an invalid registered header value: `502 UPLOAD_UPSTREAM_FAILED`, nothing sent.
 - The MCP server answers with a status outside 200–599 (Node's client accepts any three digits; `writeHead` would throw below 100, which would end the process) or with headers `writeHead` refuses: the answer is discarded, the upstream request destroyed, and the sender gets `502 UPLOAD_UPSTREAM_FAILED`, outcome unconfirmed.
-- The upstream connection drops before an answer: `502 UPLOAD_UPSTREAM_FAILED`, outcome unconfirmed (after a failed write, as soon as the next read reports the reset, at the latest `ANSWER_AFTER_RESET_MS` later; a 1xx is not an answer). It drops after the answer's status line: the sender connection is destroyed (the status can no longer change).
-- No progress for `MCP_UPLOAD_IDLE_TIMEOUT_MS`: the upstream request is aborted and the sender gets `504 UPLOAD_TIMEOUT` (unconfirmed wording when the whole body was already sent), or the connection is destroyed if the answer had started.
+- The upstream connection drops before an answer: `502 UPLOAD_UPSTREAM_FAILED`, outcome unconfirmed (after a failed write, as soon as the next read reports the reset, at the latest `ANSWER_AFTER_RESET_MS` later; a 1xx is not an answer).
+- The upstream connection drops after the answer's headers were received from the MCP server but before any answer byte was sent to the caller: the relay has not committed a status yet, so the sender gets one complete `502 UPLOAD_UPSTREAM_FAILED` with its own `Content-Type` and `Content-Length` (never the MCP server's status line or headers), outcome unconfirmed (audit `status=502 result=upstream_failed`). The status line goes to the caller together with the first answer byte, or at the answer's end for an empty body.
+- The upstream connection drops after answer bytes were sent to the caller: the answer is truncated and the sender connection is destroyed, with no replacement status (the status can no longer change; audit carries the answer's status, `result=upstream_failed`).
+- No progress for `MCP_UPLOAD_IDLE_TIMEOUT_MS`: the upstream request is aborted and the sender gets `504 UPLOAD_TIMEOUT` (unconfirmed wording when the whole body was already sent), or the connection is destroyed if the answer headers had arrived (audit `status=-`, no 504).
 - The sender disconnects: the upstream request is destroyed at once, before the multipart trailer, so mcp-jira stores nothing.
 
 **Timers:** the relay's idle timer (default 60 s) is the only per-upload bound; Node's `requestTimeout` is raised to 3600 s on the listen handle so it does not cut a slow upload, while `nonUploadBodyDeadline` keeps a 300 s bound on every other request body until its response is sent (it clears with the response, so after an early answer the rest of that body is no longer bounded by it). mcp-jira's own no-progress timer (120 s) and `requestTimeout` (3600 s) sit behind it.
