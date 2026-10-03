@@ -368,7 +368,7 @@ router.post("/v1/mcp-servers/:name/test", async (req: Request, res: Response) =>
           : error.code === "MCP_TIMEOUT"
             ? "timeout"
             : "network_error";
-      log("audit", `mcp.test.called serverName=${name} result=${result}`);
+      log("audit", `mcp.test.called serverName=${name} result=${result}${error.reason ? ` reason=${error.reason}` : ""}`);
       const status = error.code === "MCP_AUTH_FAILED" ? 401 : error.code === "MCP_TIMEOUT" ? 504 : 502;
       res.status(status).json({ error: { code: error.code, message: error.message } });
       return;
@@ -472,7 +472,7 @@ router.post("/v1/mcp-servers/:name/call", async (req: Request, res: Response) =>
           : error.code === "MCP_TIMEOUT"
             ? "timeout"
             : "network_error";
-      log("audit", `mcp.call.called serverName=${name} tool=${body.tool} result=${result}`);
+      log("audit", `mcp.call.called serverName=${name} tool=${body.tool} result=${result}${error.reason ? ` reason=${error.reason}` : ""}`);
       const status = error.code === "MCP_AUTH_FAILED" ? 401 : error.code === "MCP_TIMEOUT" ? 504 : 502;
       res.status(status).json({ error: { code: error.code, message: error.message } });
       return;

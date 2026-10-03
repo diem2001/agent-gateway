@@ -1,5 +1,6 @@
 import { log } from "./logging.js";
 import { createPersistentStore, hasValidOwners } from "./persistence.js";
+import { MCP_FAILURE_TEXT, upstreamRequestProblem } from "./mcp-upstream-request.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */
@@ -387,6 +388,10 @@ export async function checkMcpServerHealth(
     return { status: "unknown", detail: "stdio servers cannot be health-checked remotely" };
   }
 
+  // Failures answer with fixed texts: the transport library's message quotes the stored header or address it refused.
+  const problem = upstreamRequestProblem(def.url, def.headers);
+  if (problem) return { status: "error", detail: MCP_FAILURE_TEXT[problem] };
+
   try {
     // Try the /health endpoint convention (same host, different path)
     const mcpUrl = new URL(def.url!);
@@ -409,7 +414,10 @@ export async function checkMcpServerHealth(
     }
     return { status: "error", detail: `HTTP ${res.status}` };
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return { status: "error", detail: msg };
+    const name = e instanceof Error ? e.name : "";
+    return {
+      status: "error",
+      detail: name === "AbortError" || name === "TimeoutError" ? "MCP server did not respond before timeout" : MCP_FAILURE_TEXT.unreachable,
+    };
   }
 }

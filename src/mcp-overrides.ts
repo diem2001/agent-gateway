@@ -1,6 +1,6 @@
-import { validateHeaderName, validateHeaderValue } from "node:http";
 import type { McpServerDefinition, SdkMcpServerConfig } from "./mcp-registry.js";
 import { getMcpServer } from "./mcp-registry.js";
+import { isSendableHeader } from "./mcp-upstream-request.js";
 
 export interface McpCredentialOverride {
   headers?: Record<string, string>;
@@ -131,16 +131,6 @@ function cloneMcpServerConfigs(
 function isStringRecord(value: unknown): value is Record<string, string> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   return Object.values(value).every((entry) => typeof entry === "string");
-}
-
-function isSendableHeader(name: string, value: string): boolean {
-  try {
-    validateHeaderName(name);
-    validateHeaderValue(name, value);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
