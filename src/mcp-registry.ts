@@ -100,6 +100,8 @@ export function loadMcpServers(): void {
   if (!data) return;
   for (const srv of data) {
     servers.set(srv.name, srv);
+    const problem = srv.url === undefined ? null : publicUrlProblem(srv.url);
+    if (problem) log("audit", `mcp.registry.url_migration_required serverName=${srv.name} reason=${problem}`);
   }
   log("mcp", `Loaded ${servers.size} MCP server(s) from disk`);
 }
@@ -126,9 +128,11 @@ export function isMcpServerOwner(def: McpServerDefinition, label: string | undef
 }
 
 /**
- * What an API response may do with each stored field (MVP-7936). `public` fields are returned as stored; `write-only`
- * fields (the credential maps) can be set and cleared through PUT but are never returned, to any caller; `internal`
- * fields never leave the gateway. A new field without a class here does not compile.
+ * What an API response may do with each stored field (MVP-7936, MVP-7957). `public` fields are returned as stored;
+ * `write-only` fields (the credential maps and the stdio args) can be set and cleared through PUT but are never
+ * returned, to any caller; `internal` fields never leave the gateway. A new field without a class here does not
+ * compile. The `url` is public configuration (reqlift compares it with its OAuth resource) only while it passes
+ * `publicUrlProblem`; a stored URL that does not is withheld on read.
  */
 const MCP_FIELD_CLASS: Record<keyof McpServerDefinition, "public" | "write-only" | "internal"> = {
   name: "public",
@@ -138,7 +142,7 @@ const MCP_FIELD_CLASS: Record<keyof McpServerDefinition, "public" | "write-only"
   url: "public",
   headers: "write-only",
   command: "public",
-  args: "public",
+  args: "write-only",
   env: "write-only",
   allowedToolsPattern: "public",
   userCredentialSchema: "public",
@@ -148,17 +152,55 @@ const MCP_FIELD_CLASS: Record<keyof McpServerDefinition, "public" | "write-only"
   updatedAt: "public",
 };
 
-export type PublicMcpServer = Omit<McpServerDefinition, "owner" | "headers" | "env">;
+/** The classification, for the test that every field has one and a response-path check. */
+export function mcpFieldClasses(): Record<keyof McpServerDefinition, "public" | "write-only" | "internal"> {
+  return { ...MCP_FIELD_CLASS };
+}
+
+export type UrlProblem = "invalid" | "user_info" | "query" | "fragment";
+
+/**
+ * Why `url` may not be a registered server address, or null when it may: an http(s) endpoint without user info,
+ * query or fragment (the path is public by contract). One predicate for both directions: a write is refused with it
+ * and a stored URL is returned exactly when it would be accepted. Everything is decided on the raw string, so an
+ * empty `?` or `#` and an empty user info count, and nothing the URL parser would normalize away slips through. The
+ * result names a category only, never a part of the value.
+ */
+export function publicUrlProblem(url: unknown): UrlProblem | null {
+  if (typeof url !== "string" || /[\s\\\x00-\x1f\x7f]/.test(url)) return "invalid";
+  const origin = /^https?:\/\/([^/?#]*)/i.exec(url);
+  if (!origin || origin[1] === "") return "invalid";
+  if (origin[1].includes("@")) return "user_info";
+  try {
+    new URL(url);
+  } catch {
+    return "invalid";
+  }
+  const query = url.indexOf("?");
+  const fragment = url.indexOf("#");
+  if (query >= 0 && (fragment < 0 || query < fragment)) return "query";
+  if (fragment >= 0) return "fragment";
+  return null;
+}
+
+export type PublicMcpServer = Omit<McpServerDefinition, "owner" | "headers" | "args" | "env"> & {
+  /** Present (true) only when the stored URL breaks the rule and was withheld; the entry needs migrating. */
+  urlMigrationRequired?: true;
+};
 
 /**
  * The entry as every API response shows it: an allowlist copy of the `public` fields. The owner label and the
- * stored `headers`/`env` are never revealed, and a key a legacy persisted file carries that no field names is not
- * copied either.
+ * stored `headers`/`args`/`env` are never revealed, and a key a legacy persisted file carries that no field names
+ * is not copied either. A stored URL that breaks `publicUrlProblem` is omitted and flagged instead.
  */
 export function publicMcpServer(def: McpServerDefinition): PublicMcpServer {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(def)) {
     if (MCP_FIELD_CLASS[key as keyof McpServerDefinition] === "public") out[key] = value;
+  }
+  if (def.url !== undefined && publicUrlProblem(def.url) !== null) {
+    delete out.url;
+    out.urlMigrationRequired = true;
   }
   return out as unknown as PublicMcpServer;
 }
@@ -166,6 +208,7 @@ export function publicMcpServer(def: McpServerDefinition): PublicMcpServer {
 export interface StoredCredentialMaps {
   headers?: Record<string, string>;
   env?: Record<string, string>;
+  args?: string[];
 }
 
 export type CredentialMapResolution =
@@ -175,15 +218,22 @@ export type CredentialMapResolution =
 const credentialFamily = (type: McpServerDefinition["type"]) => (type === "stdio" ? "stdio" : "http");
 
 /**
- * The credential maps an owner-authorized PUT stores. The maps are write-only, so a client that sends none must not
- * erase them: per map, omitted keeps the stored map, a non-empty map replaces it and `{}` clears it (no property
- * stored). Both maps are already validated as string maps. A change between the http/sse and stdio families with a
- * non-empty stored map whose property the body omits is refused, since the old map would silently stay behind on a
- * transport that does not use it or be dropped; the refusal names only the property and transport, never a value.
+ * The write-only fields an owner-authorized PUT stores. They cannot be read back, so a client that sends none must
+ * not erase them: per field, omitted keeps the stored value, a non-empty one replaces it and an empty one (`{}` for
+ * the headers/env maps, `[]` for the stdio args) clears it (no property stored). The values are already validated.
+ * A change between the http/sse and stdio families with a non-empty stored value that the body omits is refused,
+ * since the old value would silently stay behind on a transport that does not use it or be dropped: headers and env
+ * are checked on every family change, the args only when leaving stdio. The refusal names only the property and
+ * transport, never a value.
  */
 export function resolveStoredCredentialMaps(
   existing: McpServerDefinition | undefined,
-  body: { type: McpServerDefinition["type"]; headers?: Record<string, string>; env?: Record<string, string> },
+  body: {
+    type: McpServerDefinition["type"];
+    headers?: Record<string, string>;
+    env?: Record<string, string>;
+    args?: string[];
+  },
 ): CredentialMapResolution {
   const familyChanged = existing !== undefined && credentialFamily(existing.type) !== credentialFamily(body.type);
   const maps: StoredCredentialMaps = {};
@@ -203,6 +253,20 @@ export function resolveStoredCredentialMaps(
     } else if (Object.keys(sent).length > 0) {
       maps[property] = sent;
     }
+  }
+  if (body.args === undefined) {
+    const stored = existing?.args;
+    if (existing?.type === "stdio" && body.type !== "stdio" && stored !== undefined && stored.length > 0) {
+      return {
+        error: {
+          code: "MCP_CREDENTIAL_MAP_INAPPLICABLE",
+          message: `The stored args list does not apply to ${body.type} transport: send args: [] to clear it or switch back to stdio.`,
+        },
+      };
+    }
+    if (stored !== undefined) maps.args = stored;
+  } else if (body.args.length > 0) {
+    maps.args = body.args;
   }
   return { maps };
 }

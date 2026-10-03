@@ -374,7 +374,7 @@ describe("a legacy URL that breaks the rule is withheld and the entry is not rew
       const app = await createApp();
       await seed(name, { type: "http", url, owner: OWNER, headers: { Authorization: "HDR-LEGACY" }, env: { E: "ENV-LEGACY" } });
       const hashes = async () => {
-        const def = (await stored(name)) as Record<string, unknown>;
+        const def = (await stored(name)) as unknown as Record<string, unknown>;
         return ["url", "args", "headers", "env"].map((field) => sha(def[field]));
       };
       const before = await hashes();

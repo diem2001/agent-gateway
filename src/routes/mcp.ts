@@ -8,6 +8,7 @@ import {
   checkMcpServerHealth,
   isMcpServerOwner,
   publicMcpServer,
+  publicUrlProblem,
   resolveStoredCredentialMaps,
   type McpServerDefinition,
   type UserCredentialSchema,
@@ -68,6 +69,18 @@ function ownerMismatchBody(name: string): { error: { code: string; message: stri
 function logOwnerMismatch(name: string, method: string, label: string | undefined): void {
   log("audit", `mcp.registry.owner_mismatch serverName=${name} method=${method} caller=${label ?? ""}`);
 }
+
+/** Fixed refusals for the two write-only/public fields of MVP-7957; they never carry a part of the submitted value. */
+const URL_INVALID_BODY = {
+  error: {
+    code: "MCP_SERVER_URL_INVALID",
+    message:
+      "The server address must be an http(s) URL without a login, query or fragment. Put credentials in headers, env or per-user credentials.",
+  },
+};
+const ARGS_INVALID_BODY = {
+  error: { code: "MCP_SERVER_ARGS_INVALID", message: "args must be a list of text values without NUL characters." },
+};
 
 const FIELD_TYPES = new Set(["text", "password", "url", "email"]);
 const OUTPUT_TARGETS = new Set(["headers", "env"]);
@@ -188,8 +201,30 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     return;
   }
 
-  if ((body.type === "http" || body.type === "sse") && (!body.url || typeof body.url !== "string")) {
-    res.status(400).json({ error: "url is required for http/sse transport" });
+  // The address is public configuration, so it is checked on its way in (see publicUrlProblem). A same-family edit that
+  // omits it keeps the stored one, which also leaves a legacy address that was never returned untouched.
+  let url: string | undefined;
+  if (body.type === "http" || body.type === "sse") {
+    if (body.url === undefined) {
+      const keepable = existing !== undefined && existing.type !== "stdio" && typeof existing.url === "string";
+      if (!keepable) {
+        res.status(400).json({ error: "url is required for http/sse transport" });
+        return;
+      }
+      url = existing.url;
+    } else if (publicUrlProblem(body.url) !== null) {
+      res.status(400).json(URL_INVALID_BODY);
+      return;
+    } else {
+      url = body.url;
+    }
+  }
+
+  if (
+    body.args !== undefined &&
+    (!Array.isArray(body.args) || body.args.some((arg) => typeof arg !== "string" || arg.includes("\0")))
+  ) {
+    res.status(400).json(ARGS_INVALID_BODY);
     return;
   }
 
@@ -221,7 +256,7 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     return;
   }
 
-  // headers and env are write-only: a body that omits a map keeps the stored one (see resolveStoredCredentialMaps).
+  // headers, env and args are write-only: a body that omits one keeps the stored value (see resolveStoredCredentialMaps).
   const resolved = resolveStoredCredentialMaps(existing, body as { type: McpServerDefinition["type"] });
   if ("error" in resolved) {
     res.status(400).json({ error: resolved.error });
@@ -235,10 +270,10 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     description: body.description || "",
     enabled: body.enabled !== false,
     type: body.type,
-    url: body.url,
+    ...(url !== undefined ? { url } : {}),
     ...(resolved.maps.headers ? { headers: resolved.maps.headers } : {}),
     command: body.command,
-    args: body.args,
+    ...(resolved.maps.args ? { args: resolved.maps.args } : {}),
     ...(resolved.maps.env ? { env: resolved.maps.env } : {}),
     allowedToolsPattern: body.allowedToolsPattern,
     userCredentialSchema: body.userCredentialSchema,

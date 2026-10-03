@@ -362,7 +362,7 @@ describe("a transport change does not silently lose or strand a stored map", () 
     expectNoSecrets(refused);
     expect(await stored("local")).toMatchObject({ type: "stdio", env: { API_TOKEN: ENV_MARKER } });
 
-    const resolved = await request(app).put("/v1/mcp-servers/local").set(as(KEY_OWNER)).send({ type: "http", url: HTTP_URL, env: {} });
+    const resolved = await request(app).put("/v1/mcp-servers/local").set(as(KEY_OWNER)).send({ type: "http", url: HTTP_URL, env: {}, args: [] });
     expect(resolved.status).toBe(200);
     expect(await stored("local")).not.toHaveProperty("env");
   });
