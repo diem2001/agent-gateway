@@ -468,21 +468,51 @@ interface ProcInfo {
   ppid: number;
   comm: string;
   cmdline: string;
+  argv: string[];
+  startTicks: string;
 }
 
 function readProc(pid: number): ProcInfo | null {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
     const afterName = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const comm = fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+    const raw = fs.readFileSync(`/proc/${pid}/cmdline`).toString("latin1");
     return {
       pid,
       ppid: Number(afterName[1]),
-      comm: fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim(),
-      cmdline: fs.readFileSync(`/proc/${pid}/cmdline`).toString("latin1").replace(/\0/g, " "),
+      comm,
+      cmdline: raw.replace(/\0/g, " "),
+      argv: raw.split("\0").filter((_, index, all) => index < all.length - 1 || all[index] !== ""),
+      startTicks: afterName[19],
     };
   } catch {
     return null;
   }
+}
+
+/** One process the sampler classified as a runtime candidate: names, booleans and counts only (see `redactArgv`). */
+export interface ProcessRecord {
+  pid: number;
+  /** Field 22 of `/proc/<pid>/stat`: with the pid it identifies one process, never a reused pid. */
+  startTicks: string;
+  /** The distinct `comm` values seen in order (an exec changes it). */
+  comms: string[];
+  /** The command line with every element not on the allowlist replaced by its length. */
+  argvShape: string;
+  /** The executable's basename when on the allowlist, else `other`, or `unreadable`. */
+  exe: string;
+  /** The `comm` of each ancestor below the gateway, nearest first (`gateway` ends the chain). */
+  ancestors: string[];
+  /** Whether the pid, user and mount namespaces are the gateway's own; `unreadable` when a link could not be read. */
+  sameNamespaces: { pid: boolean | "unreadable"; user: boolean | "unreadable"; mnt: boolean | "unreadable" };
+  firstMs: number;
+  lastMs: number;
+  /** The rule of MVP-7677 counted it as a runtime, and flagged it as outside the sandbox. */
+  oldCounted: boolean;
+  oldUnsandboxed: boolean;
+  /** `running` when the same process still existed at `stop()`, else `exited`. */
+  fate: "running" | "exited";
 }
 
 export interface ProcessSample {
@@ -492,6 +522,62 @@ export interface ProcessSample {
   runtimesSeen: number;
   /** First and last epoch ms at which a process whose command line holds the tag existed (below the gateway). */
   windows: Record<string, { first: number; last: number } | undefined>;
+  /** One record per runtime candidate seen (any process whose command line names `cli.js`), for the problem texts. */
+  records: ProcessRecord[];
+}
+
+const ARGV_NAMES = new Set(["node", "cli.js", "sh", "dash", "bash", "bwrap", "unshare", "claude"]);
+
+/**
+ * The command line as it may be shown: a flag is printed by name (a `=value` part becomes `<len N>`), an element whose
+ * basename is one of the known executable names is printed as that name, everything else, URLs and JSON included,
+ * becomes `<len N>`. The relay URLs of a run carry a per-run token that no marker detector knows, so this is an
+ * allowlist and never a filter.
+ */
+export function redactArgv(argv: string[]): string {
+  return argv
+    .map((element) => {
+      const flag = /^(--?[A-Za-z][A-Za-z0-9-]*)(?:=([\s\S]*))?$/.exec(element);
+      if (flag) return flag[2] === undefined ? flag[1] : `${flag[1]}=<len ${flag[2].length}>`;
+      if (/^[\w./-]+$/.test(element) && ARGV_NAMES.has(path.basename(element))) return path.basename(element);
+      return `<len ${element.length}>`;
+    })
+    .join(" ");
+}
+
+function readlinkOrNull(link: string): string | null {
+  try {
+    return fs.readlinkSync(link);
+  } catch {
+    return null;
+  }
+}
+
+function exeName(pid: number): string {
+  const target = readlinkOrNull(`/proc/${pid}/exe`);
+  if (target === null) return "unreadable";
+  const name = path.basename(target.replace(/ \(deleted\)$/, ""));
+  return ARGV_NAMES.has(name) ? name : "other";
+}
+
+function sameNamespace(pid: number, root: number, kind: "pid" | "user" | "mnt"): boolean | "unreadable" {
+  const own = readlinkOrNull(`/proc/${pid}/ns/${kind}`);
+  const gateway = readlinkOrNull(`/proc/${root}/ns/${kind}`);
+  return own === null || gateway === null ? "unreadable" : own === gateway;
+}
+
+/**
+ * The text a problem line appends for the records, one entry per process. `redactArgv` already keeps every value out;
+ * the marker detector is a second check, and a hit withholds the text instead of printing it.
+ */
+export function describeRecords(records: ProcessRecord[], markers: Record<string, string> = {}): string {
+  const text = records
+    .map((record) => {
+      const ns = record.sameNamespaces;
+      return `pid ${record.pid} comm ${record.comms.join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
+    })
+    .join("; ");
+  return detect([{ name: "process-records", text }], markers).length > 0 ? "[process records withheld: a marker was detected]" : text;
 }
 
 /**
@@ -503,6 +589,7 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
   const unsandboxed = new Set<number>();
   const runtimes = new Set<number>();
   const windows: ProcessSample["windows"] = {};
+  const records = new Map<string, ProcessRecord>();
   const timer = setInterval(() => {
     const root = gatewayPid();
     const infos = new Map<number, ProcInfo>();
@@ -512,15 +599,39 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
     }
     const now = Date.now();
     for (const info of infos.values()) {
-      if (/(^|[ /])cli\.js( |$)/.test(info.cmdline) && info.comm !== "bwrap") {
-        runtimes.add(info.pid);
+      if (/(^|[ /])cli\.js( |$)/.test(info.cmdline)) {
         let ancestor = infos.get(info.ppid);
         let sandboxed = false;
+        const chain: string[] = [];
         while (ancestor) {
+          chain.push(ancestor.comm);
           if (ancestor.comm === "bwrap") sandboxed = true;
           ancestor = infos.get(ancestor.ppid);
         }
-        if (!sandboxed) unsandboxed.add(info.pid);
+        chain.push("gateway");
+        const counted = info.comm !== "bwrap";
+        if (counted) {
+          runtimes.add(info.pid);
+          if (!sandboxed) unsandboxed.add(info.pid);
+        }
+        const key = `${info.pid}:${info.startTicks}`;
+        const known = records.get(key);
+        const comms = known?.comms ?? [];
+        if (comms.at(-1) !== info.comm) comms.push(info.comm);
+        records.set(key, {
+          pid: info.pid,
+          startTicks: info.startTicks,
+          comms,
+          argvShape: redactArgv(info.argv),
+          exe: exeName(info.pid),
+          ancestors: chain,
+          sameNamespaces: { pid: sameNamespace(info.pid, root, "pid"), user: sameNamespace(info.pid, root, "user"), mnt: sameNamespace(info.pid, root, "mnt") },
+          firstMs: known?.firstMs ?? now,
+          lastMs: now,
+          oldCounted: (known?.oldCounted ?? false) || counted,
+          oldUnsandboxed: (known?.oldUnsandboxed ?? false) || (counted && !sandboxed),
+          fate: "running",
+        });
       }
       for (const tag of tags) {
         if (!info.cmdline.includes(tag)) continue;
@@ -529,7 +640,12 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
       }
     }
   }, intervalMs);
-  const snapshot = (): ProcessSample => ({ unsandboxedRuntimes: [...unsandboxed], runtimesSeen: runtimes.size, windows: { ...windows } });
+  const snapshot = (): ProcessSample => ({
+    unsandboxedRuntimes: [...unsandboxed],
+    runtimesSeen: runtimes.size,
+    windows: { ...windows },
+    records: [...records.values()].map((record) => ({ ...record, fate: readProc(record.pid)?.startTicks === record.startTicks ? ("running" as const) : ("exited" as const) })),
+  });
   return {
     peek: snapshot,
     stop: () => {
@@ -1230,6 +1346,9 @@ export interface TurnObservation {
   logFrom: number;
   unsandboxedRuntimes: number[];
   runtimesSeen: number;
+  processRecords: ProcessRecord[];
+  /** The run's synthetic markers: the last check before a process record is printed. */
+  markerValues: Record<string, string>;
   egress: string[];
   jiraBefore: number;
   reqHttpBefore: number;
@@ -1302,6 +1421,8 @@ export async function chatTurn(rig: SecurityRig, options: ChatTurnOptions): Prom
     logFrom,
     unsandboxedRuntimes: sample.unsandboxedRuntimes,
     runtimesSeen: sample.runtimesSeen,
+    processRecords: sample.records,
+    markerValues: rig.markers.values,
     egress: egress.stop(),
     jiraBefore,
     reqHttpBefore,
@@ -1331,7 +1452,7 @@ export function turnProblems(turn: TurnObservation, deadlineMs: number = TURN_DE
   const last = turn.outcome.events.at(-1)?.type ?? "no event";
   if (last !== "done") problems.push(`the stream did not end in done (${last})`);
   if (turn.outcome.ms > deadlineMs) problems.push("the turn missed its deadline");
-  if (turn.unsandboxedRuntimes.length > 0) problems.push(`${turn.unsandboxedRuntimes.length} agent runtime(s) ran without a sandbox ancestor`);
+  if (turn.unsandboxedRuntimes.length > 0) problems.push(`${turn.unsandboxedRuntimes.length} agent runtime(s) ran without a sandbox ancestor [${describeRecords(turn.processRecords.filter((record) => record.oldUnsandboxed), turn.markerValues)}]`);
   if (turn.runtimesSeen < 1) problems.push("the process sampler saw no runtime");
   if (turn.egress.length > 0) problems.push(`${turn.egress.length} non-loopback destination(s) held by the gateway's processes`);
   return problems;

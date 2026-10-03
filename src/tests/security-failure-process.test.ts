@@ -44,6 +44,7 @@ import {
   startEgressSampler,
   startFaultMcp,
   startProcessSampler,
+  describeRecords,
   surfacesOf,
   turnProblems,
   waitForIsolation,
@@ -183,8 +184,8 @@ type Window = ReturnType<typeof windowOf>;
 function fallbackProblems(rig: SecurityRig, window: Window, expectation: { runtimes: "none" | "some"; modelRequests: "none" | "some" }): string[] {
   const { sample, egress } = window.close();
   const problems: string[] = [];
-  if (sample.unsandboxedRuntimes.length > 0) problems.push(`${sample.unsandboxedRuntimes.length} agent runtime(s) ran without a sandbox ancestor`);
-  if (expectation.runtimes === "none" && sample.runtimesSeen > 0) problems.push(`${sample.runtimesSeen} runtime process(es) started in a window that must start none`);
+  if (sample.unsandboxedRuntimes.length > 0) problems.push(`${sample.unsandboxedRuntimes.length} agent runtime(s) ran without a sandbox ancestor [${describeRecords(sample.records.filter((record) => record.oldUnsandboxed), rig.markers.values)}]`);
+  if (expectation.runtimes === "none" && sample.runtimesSeen > 0) problems.push(`${sample.runtimesSeen} runtime process(es) started in a window that must start none [${describeRecords(sample.records.filter((record) => record.oldCounted), rig.markers.values)}]`);
   if (expectation.runtimes === "some" && sample.runtimesSeen === 0) problems.push("the process sampler saw no runtime in a window that ran one");
   const modelRequests = rig.api.requests.length - window.requestsBefore;
   if (expectation.modelRequests === "none" && modelRequests > 0) problems.push(`${modelRequests} model request(s) in a window that must make none`);
@@ -400,7 +401,7 @@ describe("cancellation and restart during a tool call with a child process", () 
     // No tagged process survives the gateway: the sandbox dies with its parent.
     await waitFor(() => !fs.readdirSync("/proc").some((entry) => /^\d+$/.test(entry) && (() => { try { return fs.readFileSync(`/proc/${entry}/cmdline`).toString("latin1").includes(held.tag); } catch { return false; } })()), 10_000, "the tagged child to end").then(() => controls.push("no_tagged_process_survived_the_gateway")).catch(() => problems.push("a tagged process survived the gateway"));
     const sample = held.window.close();
-    if (sample.sample.unsandboxedRuntimes.length > 0) problems.push("an agent runtime ran without a sandbox ancestor");
+    if (sample.sample.unsandboxedRuntimes.length > 0) problems.push(`an agent runtime ran without a sandbox ancestor [${describeRecords(sample.sample.records.filter((record) => record.oldUnsandboxed), rig.markers.values)}]`);
     const leftovers = runLeftoversText(rig.gateway).files;
     await rig.restart();
     expect(await waitForIsolation(rig), "/health isolation after the restart").toBe("ok");

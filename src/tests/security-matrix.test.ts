@@ -27,6 +27,9 @@ import {
   splitNeedle,
   splitNeedles,
   startProcessSampler,
+  redactArgv,
+  describeRecords,
+  type ProcessRecord,
   type MatrixRow,
   type Surface,
 } from "./helpers/security-matrix.js";
@@ -293,6 +296,40 @@ describe("host-side samplers", () => {
     expect(sample.windows["T1-WRAPPED-TAG"]).toBeDefined();
     expect(sample.windows["T1-ABSENT-TAG"]).toBeUndefined();
     expect(sample.windows["T1-BARE-TAG"]!.last).toBeGreaterThanOrEqual(sample.windows["T1-BARE-TAG"]!.first);
+  });
+
+  it("a process record shows names, booleans and lengths only: no relay token, flag value, MCP config or marker", () => {
+    const token = "tok-7950-per-run-relay-token";
+    const marker = "SYNTHETIC-7950-MARKER-value";
+    const argv = [
+      "/usr/local/bin/node",
+      `/opt/app/node_modules/sdk/cli.js`,
+      "--mcp-config",
+      JSON.stringify({ mcpServers: { jira: { type: "http", url: `http://127.0.0.1:41234/mcp/${token}`, headers: { Authorization: `Bearer ${marker}` } } } }),
+      `--x=${marker}`,
+      `http://127.0.0.1:41234/mcp/${token}`,
+      marker,
+      "/bin/sh",
+    ];
+    const shape = redactArgv(argv);
+    expect(shape).toMatch(/^node cli\.js --mcp-config <len \d+> --x=<len \d+> <len \d+> <len \d+> sh$/);
+    for (const forbidden of [token, marker, "127.0.0.1", "jira", "Bearer"]) expect(shape).not.toContain(forbidden);
+    const record: ProcessRecord = {
+      pid: 1,
+      startTicks: "9",
+      comms: ["sh"],
+      argvShape: shape,
+      exe: "sh",
+      ancestors: ["bwrap", "gateway"],
+      sameNamespaces: { pid: false, user: false, mnt: false },
+      firstMs: 10,
+      lastMs: 40,
+      oldCounted: true,
+      oldUnsandboxed: false,
+      fate: "exited",
+    };
+    expect(describeRecords([record], { marker })).toContain("pid 1 comm sh exe sh");
+    expect(describeRecords([{ ...record, argvShape: `leak ${marker}` }], { marker })).toBe("[process records withheld: a marker was detected]");
   });
 
   it("the offline mode gives a command a loopback-only network under the caller's own uid", async () => {
