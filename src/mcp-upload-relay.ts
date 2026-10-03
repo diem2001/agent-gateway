@@ -238,6 +238,8 @@ export const UPLOAD_MESSAGES = {
   notReached: (name: string) => `The MCP server ${name} could not be reached; nothing was sent`,
   unconfirmed: (name: string) =>
     `The connection to the MCP server ${name} dropped before it answered; the outcome is unconfirmed. Check the target's attachments before retrying`,
+  answerIncomplete: (name: string) =>
+    `The connection to the MCP server ${name} dropped before its answer was complete; the outcome is unconfirmed. Check the target's attachments before retrying`,
   invalidAnswer: (name: string) =>
     `The MCP server ${name} sent an answer the gateway cannot relay; the outcome is unconfirmed. Check the target's attachments before retrying`,
   idle: (ms: number) => `No upload progress for ${ms} ms; the relay was aborted`,
@@ -401,7 +403,10 @@ class UploadRelay {
   private timer: NodeJS.Timeout | null = null;
   private connected = false;
   private bodySent = false;
+  /** The MCP server's status line and headers were received and accepted. */
   private answered = false;
+  /** Answer bytes (the status line) were handed to the caller's response. */
+  private committed = false;
   private settled = false;
   private forwarding = true;
   private resetTimer: NodeJS.Timeout | null = null;
@@ -481,13 +486,16 @@ class UploadRelay {
    * socket's readable side errored and destroys it, which drops the answer
    * although it already arrived, and the sender would get a 502.
    *
-   * So a write that fails with EPIPE or ECONNRESET before any answer does not
-   * destroy the socket at once: forwarding stops, the readable side's error
-   * mark is cleared and the socket keeps reading for at most
-   * ANSWER_AFTER_RESET_MS. An answer that arrives is relayed as usual. Without
-   * one, the next read reports the reset (or the bound passes) and the socket
-   * is destroyed with the original write error, which ends as the usual 502
-   * "unconfirmed". The body is never sent again.
+   * So a write that fails with EPIPE or ECONNRESET while the answer is not
+   * yet complete does not destroy the socket at once: forwarding stops, the
+   * readable side's error mark is cleared and the socket keeps reading for at
+   * most ANSWER_AFTER_RESET_MS. That covers an answer whose head, or whose
+   * body, is still in the socket when the failure surfaces. An answer that
+   * arrives is relayed as usual. Without one, the next read reports the reset
+   * (or the bound passes) and the socket is destroyed with the original write
+   * error, which ends as a 502 "unconfirmed" while no answer byte was sent to
+   * the caller, and as a truncated answer after that. The body is never sent
+   * again.
    *
    * Node has no public API for reading after a failed write: this wraps the
    * socket's `destroy()` and clears `_readableState.errored`. If that field
@@ -498,7 +506,7 @@ class UploadRelay {
   private keepReadingAfterWriteReset(socket: Socket): void {
     const destroy = socket.destroy.bind(socket);
     socket.destroy = (error?: Error): Socket => {
-      if (this.resetTimer !== null || this.answered || this.settled || !isWriteReset(error)) return destroy(error);
+      if (this.resetTimer !== null || this.settled || !isWriteReset(error)) return destroy(error);
       if (!clearReadableError(socket)) return destroy(error);
       this.stopForwarding();
       this.resetTimer = setTimeout(() => destroy(error), ANSWER_AFTER_RESET_MS);
@@ -557,14 +565,10 @@ class UploadRelay {
     if (contentType !== undefined) headers["Content-Type"] = contentType;
     const contentLength = upstreamRes.headers["content-length"];
     if (contentLength !== undefined) headers["Content-Length"] = contentLength;
-    try {
-      res.writeHead(status, headers);
-    } catch {
-      // A throw here is uncaught in an event handler and would end the process.
-      this.failInvalidAnswer(upstreamRes);
-      return;
-    }
 
+    // The head is received, not yet sent: the caller's response is only
+    // committed with the first answer byte (or the answer's end), so an answer
+    // that breaks off before then can still become a clean 502.
     this.answered = true;
     this.touch();
     // An answer before the whole body was sent (an early refusal): stop sending.
@@ -572,21 +576,57 @@ class UploadRelay {
 
     upstreamRes.on("data", (chunk: Buffer) => {
       this.touch();
+      if (this.settled) return;
+      if (!this.commitHead(status, headers)) {
+        this.failInvalidAnswer(upstreamRes);
+        return;
+      }
       if (!res.write(chunk)) {
         upstreamRes.pause();
         res.once("drain", () => upstreamRes.resume());
       }
     });
     upstreamRes.on("end", () => {
+      if (this.settled) return;
+      // Before settling: an empty answer whose headers cannot be sent must not
+      // end as `ok` with nothing written.
+      if (!this.commitHead(status, headers)) {
+        this.failInvalidAnswer(upstreamRes);
+        return;
+      }
       if (!this.settle(status, status >= 200 && status < 300 ? "ok" : "upstream_answer")) return;
       this.upstream?.destroy();
       res.end();
     });
     upstreamRes.on("close", () => {
       if (upstreamRes.complete) return;
-      // The answer broke off after its status line: it can no longer change.
-      if (this.settle(status, "upstream_failed")) res.destroy();
+      if (this.committed || res.headersSent) {
+        // Answer bytes already reached the caller: the answer can no longer change.
+        if (this.settle(status, "upstream_failed")) res.destroy();
+        return;
+      }
+      // Headers were received but no answer byte was sent: the caller still gets
+      // one clean response, never the upstream's status line.
+      if (!this.settle(502, "upstream_failed")) return;
+      this.upstream?.destroy();
+      sendError(res, 502, "UPLOAD_UPSTREAM_FAILED", UPLOAD_MESSAGES.answerIncomplete(this.serverName));
     });
+  }
+
+  /**
+   * The one place the upstream status line and headers become the caller's
+   * response. Returns false when Node refuses them (nothing was sent then).
+   */
+  private commitHead(status: number, headers: Record<string, string>): boolean {
+    if (this.committed) return true;
+    this.committed = true;
+    try {
+      this.res.writeHead(status, headers);
+      return true;
+    } catch {
+      // A throw here is uncaught in an event handler and would end the process.
+      return false;
+    }
   }
 
   /** Upstream error or close before any answer arrived. */
@@ -622,10 +662,11 @@ class UploadRelay {
 
   private expire(): void {
     const bodySent = this.bodySent;
-    const headersSent = this.res.headersSent;
-    if (!this.settle(headersSent ? null : 504, "timeout")) return;
+    // Answer headers received (or already sent): the relay no longer answers 504.
+    const answerStarted = this.answered || this.res.headersSent;
+    if (!this.settle(answerStarted ? null : 504, "timeout")) return;
     this.upstream?.destroy();
-    if (headersSent) {
+    if (answerStarted) {
       this.res.destroy();
       return;
     }

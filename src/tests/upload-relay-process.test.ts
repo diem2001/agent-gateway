@@ -285,6 +285,10 @@ async function rawResetStub(firstBytes: string, afterwards?: string): Promise<Ra
       sockets.delete(socket);
     });
     socket.on("error", () => undefined);
+    // Without this, Nagle can hold the second write of a split answer in the
+    // stub's send queue behind the unacknowledged head, and the reset right
+    // behind it discards that body before it is ever sent.
+    socket.setNoDelay(true);
     let head = Buffer.alloc(0);
     let answered = false;
     socket.on("data", (data: Buffer) => {
@@ -540,11 +544,13 @@ describe("upload relay in a real gateway process", () => {
   );
 
   it("an MCP server that answers 401 in two writes (head, then body) and resets without reading: 100 fast 20 MiB senders each get the exact answer", async () => {
-    // The MVP-7805 QA probe `split`: the answer head reaches the gateway first,
-    // the relay's next body write fails, and the answer body is already in the
-    // socket. Every sender must still get the 401 with the byte-identical body,
-    // not a bare reset. The baseline failure is statistical (2 to 5 of 100 under
-    // scripts/cpu-load.mjs), so the per-attempt counts are printed.
+    // The MVP-7805 QA probe `split`: the answer head and the answer body reach
+    // the gateway in two segments, followed by a reset. Every sender must get the
+    // 401 with the byte-identical body, never a bare reset or a 502. The stub
+    // sets TCP_NODELAY: with Nagle on, the stub's own reset can discard the body
+    // segment before it is sent, and then no relay can deliver it (2 to 5 of 100
+    // attempts, with the relay as well as without the fix). Per-attempt counts
+    // are printed.
     const refusal = JSON.stringify({ error: { code: "UPLOAD_UNAUTHENTICATED", message: "An Authorization header is required." } });
     const upstream = await rawResetStub(
       `HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(refusal)}\r\nConnection: close\r\n\r\n`,
