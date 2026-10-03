@@ -330,6 +330,9 @@ describe("host-side samplers", () => {
       lastMs: 40,
       oldCounted: true,
       oldUnsandboxed: false,
+      verdict: "launcher",
+      unsandboxed: false,
+      inconsistentReads: 0,
       fate: "exited",
     };
     expect(describeRecords([record], { marker })).toContain("pid 1 comm sh exe sh");

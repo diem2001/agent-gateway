@@ -9,8 +9,9 @@
  * - Evidence lines: `SECURITY-EVIDENCE` (once per suite), `SECURITY-MATRIX` (one per row, with a stable AC row id
  *   and `expected= observed= result=`), `SECURITY-SUMMARY` (expected rows, observed rows, missing ids).
  * - Host prerequisites that fail with a fixed `host prerequisite missing: <name>` line instead of skipping.
- * - Host-side samplers: a process sampler (an agent runtime without a sandbox ancestor, overlap windows of
- *   concurrent roles) and an egress sampler (non-loopback destinations of the gateway's network namespace).
+ * - Host-side samplers: a process sampler (an agent runtime outside the sandbox, overlap windows of concurrent roles;
+ *   rule and blind spots at `startProcessSampler`) and an egress sampler (non-loopback destinations of the gateway's
+ *   network namespace).
  * - A rig: the compiled gateway, a scripted model, recording MCP/webhook/git doubles and every synthetic marker.
  *
  * Only case names, booleans and counts are ever printed. Needs `npm run build`, `bwrap` and user namespaces.
@@ -491,7 +492,7 @@ function readProc(pid: number): ProcInfo | null {
   }
 }
 
-/** One process the sampler classified as a runtime candidate: names, booleans and counts only (see `redactArgv`). */
+/** One process the sampler considered a runtime candidate: names, booleans and counts only (see `redactArgv`). */
 export interface ProcessRecord {
   pid: number;
   /** Field 22 of `/proc/<pid>/stat`: with the pid it identifies one process, never a reused pid. */
@@ -508,22 +509,50 @@ export interface ProcessRecord {
   sameNamespaces: { pid: boolean | "unreadable"; user: boolean | "unreadable"; mnt: boolean | "unreadable" };
   firstMs: number;
   lastMs: number;
-  /** The rule of MVP-7677 counted it as a runtime, and flagged it as outside the sandbox. */
+  /** What the rule of MVP-7677 made of it (any `cli.js` command line whose comm is not `bwrap`, no real ancestor check). */
   oldCounted: boolean;
   oldUnsandboxed: boolean;
+  /**
+   * The current rule at the last tick. `runtime`, `launcher` (a known non-runtime executable) and `other` (settled into a
+   * process that no longer names `cli.js` or `claude`, such as a shell that ended in `perl`) need one consistent read
+   * (executable, command line and start time agree before and after); `unresolved` never had one and counts as an
+   * unsandboxed runtime, except a `descendant`: a candidate that vanished or kept changing before a consistent read but
+   * whose ancestors include a process with the sandbox proof (a fork of the runtime or of the launch wrapper that is
+   * about to exec). A process that was read as a runtime stays one.
+   */
+  verdict: "runtime" | "launcher" | "other" | "descendant" | "unresolved";
+  /** A runtime without proof of the sandbox (a real bwrap ancestor and pid, user and mount namespaces of its own). */
+  unsandboxed: boolean;
+  /** What the first missing proof looked like: whether a real bwrap ancestor was found, and the three namespace comparisons. */
+  firstMissingProof?: string;
+  /** Reads that disagreed with themselves (a process in the middle of an exec, or one that vanished) before the verdict. */
+  inconsistentReads: number;
   /** `running` when the same process still existed at `stop()`, else `exited`. */
   fate: "running" | "exited";
 }
 
+/** A process the old rule counted or flagged that the current rule does not, and why that is acceptable (or not). */
+export interface ProcessClear {
+  record: ProcessRecord;
+  explanation:
+    | "known non-runtime executable at a consistent read"
+    | "settled into another process after an inconsistent read"
+    | "settled after an inconsistent read"
+    | "vanished before a consistent read below a process with the sandbox proof"
+    | "unexplained";
+}
+
 export interface ProcessSample {
-  /** Distinct pids of an agent runtime (`cli.js`) whose ancestors up to the gateway include no `bwrap`. */
+  /** Distinct pids of a runtime without proof of the sandbox (a runtime that was never read consistently counts here). */
   unsandboxedRuntimes: number[];
-  /** Distinct runtime pids seen (sandboxed or not). */
+  /** Distinct runtime pids seen (sandboxed or not; never a launcher). */
   runtimesSeen: number;
   /** First and last epoch ms at which a process whose command line holds the tag existed (below the gateway). */
   windows: Record<string, { first: number; last: number } | undefined>;
-  /** One record per runtime candidate seen (any process whose command line names `cli.js`), for the problem texts. */
+  /** One record per runtime candidate seen (a `cli.js` command line, or the `claude` process title), for the problem texts. */
   records: ProcessRecord[];
+  /** The old-versus-current audit: every process the old rule counted or flagged and the current rule clears. */
+  clears: ProcessClear[];
 }
 
 const ARGV_NAMES = new Set(["node", "cli.js", "sh", "dash", "bash", "bwrap", "unshare", "claude"]);
@@ -553,6 +582,16 @@ function readlinkOrNull(link: string): string | null {
   }
 }
 
+/** Device and inode of the file behind a path or a `/proc/<pid>/exe` link; null when it cannot be read. */
+function fileId(file: string): string | null {
+  try {
+    const stat = fs.statSync(file, { bigint: true });
+    return `${stat.dev}:${stat.ino}`;
+  } catch {
+    return null;
+  }
+}
+
 function exeName(pid: number): string {
   const target = readlinkOrNull(`/proc/${pid}/exe`);
   if (target === null) return "unreadable";
@@ -567,29 +606,126 @@ function sameNamespace(pid: number, root: number, kind: "pid" | "user" | "mnt"):
 }
 
 /**
- * The text a problem line appends for the records, one entry per process. `redactArgv` already keeps every value out;
- * the marker detector is a second check, and a hit withholds the text instead of printing it.
+ * The executables that are known not to be an agent runtime, by device and inode on this host: the shells and `unshare`
+ * of the launch wrapper, and the real bwrap. Nothing else is trusted: any other executable that runs `cli.js` (the
+ * gateway's Node, a copied Node, another install, a native binary) counts, and so does one that cannot be read.
  */
+function knownExecutables(): { launchers: Set<string>; bwraps: Set<string> } {
+  const ids = (paths: string[]) => new Set(paths.map(fileId).filter((id): id is string => id !== null));
+  return {
+    launchers: ids(["/bin/sh", "/usr/bin/sh", "/bin/dash", "/usr/bin/dash", "/bin/bash", "/usr/bin/bash", "/bin/unshare", "/usr/bin/unshare"]),
+    bwraps: ids(["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]),
+  };
+}
+
+const sticky = (now: boolean | "unreadable", before: boolean | "unreadable" | undefined): boolean | "unreadable" => (now === "unreadable" ? (before ?? now) : now);
+
+/** A runtime candidate: the command line names `cli.js`, or the process title is `claude`. */
+function namesRuntime(info: ProcInfo): boolean {
+  return /(^|[ /])cli\.js( |$)/.test(info.cmdline) || path.basename(info.argv[0] ?? "") === "claude" || info.comm === "claude";
+}
+
+interface Reading {
+  info: ProcInfo;
+  exeId: string;
+}
+
+/**
+ * One consistent read of a candidate: start time, command line and `comm`, then the executable, then start time,
+ * command line, `comm` and the executable again. A difference means the process is in the middle of an exec (the new
+ * command line is visible before the new `comm` or the new executable) or the pid was reused, so it is read again,
+ * up to three times, and otherwise left to the next tick. `vanished` is a process that ended between the reads.
+ */
+function readConsistent(first: ProcInfo): { reading: Reading } | { torn: number; vanished: boolean } {
+  let before: ProcInfo | null = first;
+  let torn = 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const exeBefore = fileId(`/proc/${before.pid}/exe`);
+    const after = readProc(before.pid);
+    if (after === null) return { torn: torn + 1, vanished: true };
+    const exeAfter = fileId(`/proc/${before.pid}/exe`);
+    if (exeBefore !== null && exeBefore === exeAfter && after.startTicks === before.startTicks && after.cmdline === before.cmdline && after.comm === before.comm) return { reading: { info: after, exeId: exeBefore } };
+    torn++;
+    before = after;
+  }
+  return { torn, vanished: false };
+}
+
+/**
+ * The sandbox proof for a runtime: an ancestor between it and the gateway is the real bwrap (by executable, not by
+ * `comm`), and its pid, user and mount namespaces all differ from the gateway's. A link that cannot be read is no proof.
+ */
+function sandboxProof(pid: number, root: number, bwraps: Set<string>): { proven: boolean; chain: string[]; detail: string } {
+  const chain: string[] = [];
+  let realBwrap = false;
+  let current = pid;
+  let broken = false;
+  for (let depth = 0; depth < 64; depth++) {
+    const info = readProc(current);
+    if (info === null) {
+      broken = true;
+      break;
+    }
+    if (info.ppid === root) {
+      chain.push("gateway");
+      break;
+    }
+    const parent = readProc(info.ppid);
+    if (parent === null || info.ppid <= 1) {
+      broken = true;
+      break;
+    }
+    chain.push(parent.comm);
+    if (bwraps.has(fileId(`/proc/${parent.pid}/exe`) ?? "")) realBwrap = true;
+    current = parent.pid;
+  }
+  const namespaces = { pid: sameNamespace(pid, root, "pid"), user: sameNamespace(pid, root, "user"), mnt: sameNamespace(pid, root, "mnt") };
+  const proven = !broken && realBwrap && namespaces.pid === false && namespaces.user === false && namespaces.mnt === false;
+  return { proven, chain, detail: `chain-${broken ? "broken" : "complete"} real-bwrap=${realBwrap} same-ns pid=${namespaces.pid} user=${namespaces.user} mnt=${namespaces.mnt}` };
+}
+
+/** The text a problem line appends for the records, one entry per process. `redactArgv` already keeps every value out;
+ * the marker detector is a second check, and a hit withholds the text instead of printing it. */
 export function describeRecords(records: ProcessRecord[], markers: Record<string, string> = {}): string {
   const text = records
     .map((record) => {
       const ns = record.sameNamespaces;
-      return `pid ${record.pid} comm ${record.comms.join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
+      return `pid ${record.pid} comm ${record.comms.join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
     })
     .join("; ");
   return detect([{ name: "process-records", text }], markers).length > 0 ? "[process records withheld: a marker was detected]" : text;
 }
 
+/** The records a problem line shows for a sample: runtimes without proof, plus clears the audit cannot explain. */
+export function sampleProblems(sample: ProcessSample, markers: Record<string, string>): string[] {
+  const problems: string[] = [];
+  const unsandboxed = sample.records.filter((record) => record.unsandboxed);
+  if (unsandboxed.length > 0) problems.push(`${unsandboxed.length} agent runtime(s) ran without a sandbox ancestor [${describeRecords(unsandboxed, markers)}]`);
+  const unexplained = sample.clears.filter((clear) => clear.explanation === "unexplained").map((clear) => clear.record);
+  if (unexplained.length > 0) problems.push(`${unexplained.length} process(es) the old rule counted were cleared without an explanation [${describeRecords(unexplained, markers)}]`);
+  return problems;
+}
+
 /**
- * Samples the processes below the gateway every `intervalMs` (20 ms by default): an agent runtime without a bwrap
- * ancestor is a run outside the sandbox (a model request would not prove it: it would not reach the double), and the
- * windows of command-line tags prove that concurrent roles overlapped a scan.
+ * Samples the processes below the gateway every `intervalMs` (20 ms by default). A runtime candidate is any process whose
+ * command line names `cli.js` or whose process title is `claude`. Each tick reads a candidate consistently (see
+ * `readConsistent`) and classifies it again every time, so a launcher that later execs Node is a runtime from then on:
+ * an executable that is a known non-runtime (`sh`, `bash`, `unshare`, the real bwrap) is a launcher and is not counted;
+ * any other executable is a runtime, and it is sandboxed only with `sandboxProof`. A candidate that never had a
+ * consistent read counts as an unsandboxed runtime. Windows of command-line tags prove that concurrent roles overlapped.
+ *
+ * The rule of MVP-7677 runs beside it: `clears` lists what that rule counted and this one does not, with the
+ * reason, so a sandbox failure can never be absorbed silently.
+ *
+ * Blind spots: a runtime that lives less than one tick; a runtime with neither `cli.js` in its command line nor the
+ * `claude` title; a process that left the gateway's process tree (`descendants` follows the children lists only).
  */
 export function startProcessSampler(gatewayPid: () => number, tags: string[] = [], intervalMs = 20): { stop: () => ProcessSample; peek: () => ProcessSample } {
-  const unsandboxed = new Set<number>();
-  const runtimes = new Set<number>();
+  const known = knownExecutables();
   const windows: ProcessSample["windows"] = {};
   const records = new Map<string, ProcessRecord>();
+  /** Candidates (launchers and runtimes) that had the sandbox proof at a consistent read, by pid and start time. */
+  const proven = new Set<string>();
   const timer = setInterval(() => {
     const root = gatewayPid();
     const infos = new Map<number, ProcInfo>();
@@ -599,37 +735,77 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
     }
     const now = Date.now();
     for (const info of infos.values()) {
-      if (/(^|[ /])cli\.js( |$)/.test(info.cmdline)) {
+      const oldCandidate = /(^|[ /])cli\.js( |$)/.test(info.cmdline);
+      if (namesRuntime(info)) {
         let ancestor = infos.get(info.ppid);
-        let sandboxed = false;
+        let oldSandboxed = false;
         const chain: string[] = [];
         while (ancestor) {
           chain.push(ancestor.comm);
-          if (ancestor.comm === "bwrap") sandboxed = true;
+          if (ancestor.comm === "bwrap") oldSandboxed = true;
           ancestor = infos.get(ancestor.ppid);
         }
-        chain.push("gateway");
-        const counted = info.comm !== "bwrap";
-        if (counted) {
-          runtimes.add(info.pid);
-          if (!sandboxed) unsandboxed.add(info.pid);
-        }
+        const oldCounted = oldCandidate && info.comm !== "bwrap";
         const key = `${info.pid}:${info.startTicks}`;
-        const known = records.get(key);
-        const comms = known?.comms ?? [];
-        if (comms.at(-1) !== info.comm) comms.push(info.comm);
+        const prior = records.get(key);
+        const read = readConsistent(info);
+        const ancestorPids: number[] = [];
+        for (let up = infos.get(info.ppid); up; up = infos.get(up.ppid)) ancestorPids.push(up.pid);
+        // A descendant inherits the namespaces of an ancestor that has the proof (it cannot leave them without capabilities).
+        const belowProven = ancestorPids.some((pid) => proven.has(`${pid}:${infos.get(pid)?.startTicks}`));
+        let verdict: ProcessRecord["verdict"] = prior && prior.verdict !== "unresolved" ? prior.verdict : "unresolved";
+        let unsandboxed = prior?.unsandboxed ?? false;
+        let firstMissingProof = prior?.firstMissingProof;
+        const comms = prior?.comms ?? [];
+        let seen = info;
+        let ancestors = chain.length > 0 ? [...chain, "gateway"] : ["gateway"];
+        if ("reading" in read) {
+          seen = read.reading.info;
+          if (!namesRuntime(seen)) {
+            if (verdict !== "runtime") verdict = "other";
+          } else if (known.launchers.has(read.reading.exeId) || known.bwraps.has(read.reading.exeId)) {
+            if (verdict !== "runtime") verdict = "launcher";
+            if (sandboxProof(info.pid, root, known.bwraps).proven) proven.add(key);
+          } else {
+            verdict = "runtime";
+            const proof = sandboxProof(info.pid, root, known.bwraps);
+            ancestors = proof.chain.length > 0 ? proof.chain : ancestors;
+            if (proof.proven) proven.add(key);
+            else if (!belowProven) firstMissingProof ??= proof.detail;
+            // A flag stays: one tick without proof is a run outside the sandbox, whatever the next tick shows.
+            unsandboxed = unsandboxed || !(proof.proven || belowProven);
+          }
+        } else if (verdict === "unresolved" && info.ppid === root && info.comm === "bwrap" && comms.every((comm) => comm === "bwrap")) {
+          // The gateway's own launch of bwrap (or of a recording wrapper named bwrap) ended before it could be read: the
+          // old rule never counted a process whose comm is bwrap either, and a runtime outside the sandbox does not run as one.
+          verdict = "launcher";
+        } else if (verdict === "unresolved" && belowProven) {
+          // A fork that has not exec'd yet (a copy of the runtime or of the launch wrapper) or one that already ended: it
+          // inherited the namespaces of an ancestor that has the proof, so it is not a runtime start of its own.
+          verdict = "descendant";
+        }
+        if (comms.at(-1) !== seen.comm) comms.push(seen.comm);
         records.set(key, {
           pid: info.pid,
           startTicks: info.startTicks,
           comms,
-          argvShape: redactArgv(info.argv),
-          exe: exeName(info.pid),
-          ancestors: chain,
-          sameNamespaces: { pid: sameNamespace(info.pid, root, "pid"), user: sameNamespace(info.pid, root, "user"), mnt: sameNamespace(info.pid, root, "mnt") },
-          firstMs: known?.firstMs ?? now,
+          argvShape: redactArgv(seen.argv),
+          // What could be read last is kept: a process that has exited cannot be read any more.
+          exe: exeName(info.pid) === "unreadable" ? (prior?.exe ?? "unreadable") : exeName(info.pid),
+          ancestors,
+          sameNamespaces: {
+            pid: sticky(sameNamespace(info.pid, root, "pid"), prior?.sameNamespaces.pid),
+            user: sticky(sameNamespace(info.pid, root, "user"), prior?.sameNamespaces.user),
+            mnt: sticky(sameNamespace(info.pid, root, "mnt"), prior?.sameNamespaces.mnt),
+          },
+          firstMs: prior?.firstMs ?? now,
           lastMs: now,
-          oldCounted: (known?.oldCounted ?? false) || counted,
-          oldUnsandboxed: (known?.oldUnsandboxed ?? false) || (counted && !sandboxed),
+          oldCounted: (prior?.oldCounted ?? false) || oldCounted,
+          oldUnsandboxed: (prior?.oldUnsandboxed ?? false) || (oldCounted && !oldSandboxed),
+          verdict,
+          unsandboxed,
+          firstMissingProof,
+          inconsistentReads: (prior?.inconsistentReads ?? 0) + ("reading" in read ? 0 : read.torn),
           fate: "running",
         });
       }
@@ -640,17 +816,35 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
       }
     }
   }, intervalMs);
-  const snapshot = (): ProcessSample => ({
-    unsandboxedRuntimes: [...unsandboxed],
-    runtimesSeen: runtimes.size,
-    windows: { ...windows },
-    records: [...records.values()].map((record) => ({ ...record, fate: readProc(record.pid)?.startTicks === record.startTicks ? ("running" as const) : ("exited" as const) })),
-  });
+  const snapshot = (): ProcessSample => {
+    const all = [...records.values()].map((record) => {
+      const alive = readProc(record.pid)?.startTicks === record.startTicks;
+      // A candidate that never had a consistent read is a runtime without proof: fail closed.
+      return { ...record, fate: alive ? ("running" as const) : ("exited" as const), unsandboxed: record.unsandboxed || record.verdict === "unresolved" };
+    });
+    const runtimes = all.filter((record) => record.verdict === "runtime" || record.verdict === "unresolved");
+    const clears: ProcessClear[] = [];
+    for (const record of all) {
+      if (record.oldCounted && record.verdict === "launcher") clears.push({ record, explanation: "known non-runtime executable at a consistent read" });
+      else if (record.oldCounted && record.verdict === "descendant") clears.push({ record, explanation: "vanished before a consistent read below a process with the sandbox proof" });
+      else if (record.oldCounted && record.verdict === "other") clears.push({ record, explanation: record.inconsistentReads > 0 || record.comms.length > 1 ? "settled into another process after an inconsistent read" : "unexplained" });
+      else if (record.oldUnsandboxed && record.verdict === "runtime" && !record.unsandboxed) clears.push({ record, explanation: record.inconsistentReads > 0 || record.comms.length > 1 ? "settled after an inconsistent read" : "unexplained" });
+    }
+    return {
+      unsandboxedRuntimes: runtimes.filter((record) => record.unsandboxed).map((record) => record.pid),
+      runtimesSeen: runtimes.length,
+      windows: { ...windows },
+      records: all,
+      clears,
+    };
+  };
   return {
     peek: snapshot,
     stop: () => {
       clearInterval(timer);
-      return snapshot();
+      const sample = snapshot();
+      for (const clear of sample.clears) emit(`SECURITY-PROCESS-AUDIT ${kv({ pid: clear.record.pid, explanation: clear.explanation, record: describeRecords([clear.record]) })}`);
+      return sample;
     },
   };
 }
@@ -1346,7 +1540,7 @@ export interface TurnObservation {
   logFrom: number;
   unsandboxedRuntimes: number[];
   runtimesSeen: number;
-  processRecords: ProcessRecord[];
+  sample: ProcessSample;
   /** The run's synthetic markers: the last check before a process record is printed. */
   markerValues: Record<string, string>;
   egress: string[];
@@ -1421,7 +1615,7 @@ export async function chatTurn(rig: SecurityRig, options: ChatTurnOptions): Prom
     logFrom,
     unsandboxedRuntimes: sample.unsandboxedRuntimes,
     runtimesSeen: sample.runtimesSeen,
-    processRecords: sample.records,
+    sample,
     markerValues: rig.markers.values,
     egress: egress.stop(),
     jiraBefore,
@@ -1452,7 +1646,7 @@ export function turnProblems(turn: TurnObservation, deadlineMs: number = TURN_DE
   const last = turn.outcome.events.at(-1)?.type ?? "no event";
   if (last !== "done") problems.push(`the stream did not end in done (${last})`);
   if (turn.outcome.ms > deadlineMs) problems.push("the turn missed its deadline");
-  if (turn.unsandboxedRuntimes.length > 0) problems.push(`${turn.unsandboxedRuntimes.length} agent runtime(s) ran without a sandbox ancestor [${describeRecords(turn.processRecords.filter((record) => record.oldUnsandboxed), turn.markerValues)}]`);
+  problems.push(...sampleProblems(turn.sample, turn.markerValues));
   if (turn.runtimesSeen < 1) problems.push("the process sampler saw no runtime");
   if (turn.egress.length > 0) problems.push(`${turn.egress.length} non-loopback destination(s) held by the gateway's processes`);
   return problems;
