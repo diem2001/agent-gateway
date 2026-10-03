@@ -5,6 +5,7 @@
  * label and an ownerless legacy entry; the real-gateway rows are in security-registry-process.test.ts.
  */
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import express from "express";
@@ -261,6 +262,44 @@ describe("an owner PUT keeps, replaces or clears each stored map on its own", ()
     await request(app).put("/v1/mcp-servers/local").set(as(KEY_OWNER)).send(stdioBody());
     await request(app).put("/v1/mcp-servers/local").set(as(KEY_OWNER)).send({ type: "stdio", command: "node", args: ["other.js"] });
     expect(await stored("local")).toMatchObject({ args: ["other.js"], env: { API_TOKEN: ENV_MARKER } });
+  });
+
+  it("a destination change that omits the maps keeps the stored credential and the next health check delivers it (accepted limit, MVP-7958)", async () => {
+    const hits: Array<{ path: string | undefined; authorization: string | undefined }> = [];
+    const stub = http.createServer((req, res) => {
+      hits.push({ path: req.url, authorization: req.headers.authorization });
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ status: "up" }));
+    });
+    await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", () => resolve()));
+    try {
+      const address = stub.address();
+      if (!address || typeof address === "string") throw new Error("stub did not bind a port");
+      const app = await seeded();
+      expect(hits).toEqual([]);
+
+      // The reqlift edit-form shape: the entry as read, only the address changed.
+      const detail = await request(app).get("/v1/mcp-servers/jira").set(as(KEY_OWNER));
+      const moved = await request(app)
+        .put("/v1/mcp-servers/jira")
+        .set(as(KEY_OWNER))
+        .send({ ...detail.body, url: `http://127.0.0.1:${address.port}/mcp` });
+      expect(moved.status).toBe(200);
+      expectNoMaps(moved.body);
+      expectNoSecrets(moved);
+      expect(await stored("jira")).toMatchObject({ headers: { Authorization: HEADER_MARKER }, env: { DORMANT_TOKEN: ENV_MARKER } });
+      const after = await request(app).get("/v1/mcp-servers/jira").set(as(KEY_OWNER));
+      expectNoMaps(after.body);
+      expectNoSecrets(after);
+      expect(hits).toEqual([]);
+
+      const health = await request(app).get("/v1/mcp-servers/jira/health").set(as(KEY_OTHER));
+      expect(health.status).toBe(200);
+      expectNoSecrets(health);
+      expect(hits).toEqual([{ path: "/health", authorization: HEADER_MARKER }]);
+    } finally {
+      await new Promise<void>((resolve) => stub.close(() => resolve()));
+    }
   });
 
   it("the reqlift admin bodies keep both maps: the toggle, the edit form and the schema editor", async () => {
