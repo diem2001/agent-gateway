@@ -6,8 +6,11 @@
  * Every value is synthetic. The assertions on printed text are boolean: no failure message of this file embeds a
  * marker value.
  */
-import { spawn } from "node:child_process";
-import { describe, expect, it, vi } from "vitest";
+import { spawn, type ChildProcess } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AC_ROWS,
   MatrixRecorder,
@@ -27,6 +30,7 @@ import {
   splitNeedle,
   splitNeedles,
   startProcessSampler,
+  type ProcessSample,
   redactArgv,
   describeRecords,
   type ProcessRecord,
@@ -341,5 +345,107 @@ describe("host-side samplers", () => {
     expect(Number(uid)).toBe(process.getuid?.());
     expect(Number(up)).toBeGreaterThanOrEqual(1);
     expect(Number(others)).toBe(0);
+  });
+});
+
+/**
+ * Stand-ins for what the sampler sees below a gateway (MVP-7950). Every stand-in is a real process tree below this
+ * test worker; the sampler runs until its own observation proves the stand-in was seen in the state under test, so a
+ * slow host delays a row but never makes it pass without having looked.
+ */
+describe("process sampler classification", () => {
+  const IDLE = "setInterval(() => {}, 1000)";
+  const BWRAP = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc"];
+  const children: ChildProcess[] = [];
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const child of children.splice(0)) child.kill("SIGKILL");
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function observe(start: () => ChildProcess, until: (sample: ProcessSample, pid: number) => boolean): Promise<{ sample: ProcessSample; pid: number }> {
+    const sampler = startProcessSampler(() => process.pid, []);
+    const child = start();
+    children.push(child);
+    const pid = child.pid!;
+    const deadline = Date.now() + 30_000;
+    while (!until(sampler.peek(), pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const sample = sampler.stop();
+    child.kill("SIGKILL");
+    return { sample, pid };
+  }
+
+  const recordFor = (sample: ProcessSample, predicate: (comms: string[]) => boolean) => sample.records.find((record) => predicate(record.comms));
+  const sawComm = (comm: string) => (sample: ProcessSample) => sample.records.some((record) => record.comms.includes(comm));
+
+  it("(c) the in-sandbox launch wrapper (sh, cli.js in its argv, below bwrap) is not counted as a runtime", async () => {
+    requireHost(["bwrap"]);
+    const { sample } = await observe(() => spawn(BWRAP[0], [...BWRAP.slice(1), "/bin/sh", "-c", "sleep 30", "sandbox", "node", "cli.js"], { stdio: "ignore" }), sawComm("sh"));
+    const wrapper = recordFor(sample, (comms) => comms[0] === "sh");
+    expect(wrapper, "the sampler saw the wrapper").toBeDefined();
+    expect(wrapper!.ancestors).toContain("bwrap");
+    expect(sample.runtimesSeen).toBe(0);
+    expect(sample.unsandboxedRuntimes).toEqual([]);
+  });
+
+  it("(d) a launcher (sh, cli.js in its argv) that is outside bwrap for a while and then execs bwrap is not flagged as an unsandboxed runtime", async () => {
+    requireHost(["bwrap"]);
+    const { sample } = await observe(
+      () => spawn("/bin/sh", ["-c", 'sleep 1; exec "$@"', "launcher", ...BWRAP, "/bin/sh", "-c", "sleep 30", "sandbox", "node", "cli.js"], { stdio: "ignore" }),
+      (seen) => seen.records.some((record) => record.comms[0] === "sh" && record.comms.includes("bwrap")),
+    );
+    const launcher = recordFor(sample, (comms) => comms[0] === "sh" && comms.includes("bwrap"));
+    expect(launcher, "the sampler saw the launcher before and after the exec").toBeDefined();
+    expect(sample.unsandboxedRuntimes).toEqual([]);
+    expect(sample.runtimesSeen).toBe(0);
+  });
+
+  it("(e) a Node runtime below bwrap that shares the gateway's pid namespace is flagged as unsandboxed", async () => {
+    requireHost(["bwrap"]);
+    const { sample } = await observe(
+      () => spawn("bwrap", ["--die-with-parent", "--ro-bind", "/", "/", "--unshare-user", "--dev", "/dev", "--proc", "/proc", "node", "-e", IDLE, "cli.js"], { stdio: "ignore" }),
+      (seen) => seen.runtimesSeen > 0,
+    );
+    expect(sample.unsandboxedRuntimes.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("(f) an unsandboxed runtime whose command line does not name cli.js but whose process title is claude is flagged", async () => {
+    const { sample } = await observe(() => spawn("bash", ["-c", `exec -a claude node -e ${JSON.stringify(IDLE)}`], { stdio: "ignore" }), (_, pid) => {
+      try {
+        return path.basename(fs.readlinkSync(`/proc/${pid}/exe`)) === "node";
+      } catch {
+        return false;
+      }
+    });
+    expect(sample.unsandboxedRuntimes.length).toBeGreaterThanOrEqual(1);
+    expect(sample.runtimesSeen).toBeGreaterThanOrEqual(1);
+  });
+
+  it("(g) a copied Node binary running cli.js outside any sandbox is flagged", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7950-copy-"));
+    dirs.push(dir);
+    const copy = path.join(dir, "not-node");
+    fs.copyFileSync(process.execPath, copy);
+    fs.chmodSync(copy, 0o755);
+    const { sample, pid } = await observe(() => spawn(copy, ["-e", IDLE, "cli.js"], { stdio: "ignore" }), (seen) => seen.runtimesSeen > 0);
+    expect(sample.unsandboxedRuntimes).toEqual([pid]);
+  });
+
+  it("(h) a launcher (sh, cli.js in its argv) outside bwrap that then execs node under the same pid is flagged unsandboxed", async () => {
+    const { sample, pid } = await observe(
+      () => spawn("/bin/sh", ["-c", 'sleep 0.5; exec "$@"', "sandbox", process.execPath, "-e", IDLE, "cli.js"], { stdio: "ignore" }),
+      (seen) => seen.records.some((record) => record.comms[0] === "sh" && record.comms.includes("node")),
+    );
+    expect(sample.unsandboxedRuntimes).toEqual([pid]);
+  });
+
+  it("(i) a runtime below a process whose comm is bwrap but which is not the real bwrap is flagged", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7950-fake-"));
+    dirs.push(dir);
+    const fake = path.join(dir, "bwrap");
+    fs.writeFileSync(fake, '#!/bin/sh\n"$@"\n', { mode: 0o755 });
+    const { sample } = await observe(() => spawn(fake, [process.execPath, "-e", IDLE, "cli.js"], { stdio: "ignore" }), (seen) => seen.runtimesSeen > 0);
+    expect(sample.unsandboxedRuntimes.length).toBeGreaterThanOrEqual(1);
   });
 });
