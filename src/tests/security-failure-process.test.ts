@@ -24,6 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { SANDBOX_CHECK_LINE } from "../sandbox.js";
 import { descendants, gatewayRequest, type Cleanup } from "./helpers/git-process-gateway.js";
 import {
   MatrixRecorder,
@@ -44,6 +45,8 @@ import {
   startEgressSampler,
   startFaultMcp,
   startProcessSampler,
+  describeRecords,
+  sampleProblems,
   surfacesOf,
   turnProblems,
   waitForIsolation,
@@ -66,6 +69,8 @@ const TOOL_TIMEOUT_MS = 3000;
 /** The runtime's exit wait (`RUNTIME_EXIT_WAIT_MS`) plus the plan's margin: nothing of a cancelled or stopped run may outlive it. */
 const NOTHING_LEFT_WITHIN_MS = 15_000;
 const SHUTDOWN_DRAIN_MS = 8000;
+/** How long a relay audit line that must exist may trail the answer that was already seen (the log arrives through a pipe). */
+const AUDIT_WAIT_MS = 5000;
 
 const cleanups: Cleanup[] = [];
 afterEach(async () => {
@@ -95,7 +100,13 @@ const LEGACY = "This conversation was started before a gateway security update a
 /*  The recording launcher                                              */
 /* ------------------------------------------------------------------ */
 
-type WrapperMode = "pass" | "startup-exit" | "startup-hang" | "no-userns";
+/**
+ * `bypass` and `bypass-ready` are the negative controls of the process sampler: the launcher drops the sandbox and runs
+ * the runtime command (`bypass`: a stand-in Node with the same executable and `cli.js` argument, so nothing real runs
+ * outside the sandbox; `bypass-ready`: after printing the sandbox check line, the real runtime in a scratch home) in the
+ * gateway's own namespaces.
+ */
+type WrapperMode = "pass" | "startup-exit" | "startup-hang" | "no-userns" | "bypass" | "bypass-ready";
 
 interface Wrapper {
   path: string;
@@ -119,6 +130,14 @@ case "$MODE" in
   startup-exit) exit 3 ;;
   startup-hang) exec sleep 120 ;;
   no-userns) exec /usr/bin/bwrap --args 4 "${"$"}{@:3}" 4< <(perl -0777 -pe 's/--disable-userns\0//' <&3) ;;
+  bypass)
+    for ((i = 1; i <= $#; i++)); do [ "${"$"}{!i}" = sandbox ] && break; done
+    exec "${"$"}{@:i+1:1}" -e 'setInterval(() => {}, 1000)' "${"$"}{@:i+2:1}" ;;
+  bypass-ready)
+    for ((i = 1; i <= $#; i++)); do [ "${"$"}{!i}" = sandbox ] && break; done
+    echo ${SANDBOX_CHECK_LINE} >&2
+    export HOME="$DIR/home"; mkdir -p "$HOME"; cd "$DIR"
+    exec "${"$"}{@:i+1}" ;;
   *) exec /usr/bin/bwrap "$@" ;;
 esac
 `,
@@ -151,9 +170,9 @@ async function newRig(env: Record<string, string> = {}): Promise<SecurityRig> {
   return rig;
 }
 
-async function wrapperRig(): Promise<{ rig: SecurityRig; wrapper: Wrapper }> {
+async function wrapperRig(startupTimeoutMs: number = STARTUP_TIMEOUT_MS): Promise<{ rig: SecurityRig; wrapper: Wrapper }> {
   const wrapper = makeWrapper();
-  const rig = await createRig(cleanups, { markers, env: { AGENT_SANDBOX_BWRAP: wrapper.path, ISOLATION_STARTUP_TIMEOUT_MS: String(STARTUP_TIMEOUT_MS), AGENT_MCP_TOOL_TIMEOUT_MS: String(TOOL_TIMEOUT_MS) } });
+  const rig = await createRig(cleanups, { markers, env: { AGENT_SANDBOX_BWRAP: wrapper.path, ISOLATION_STARTUP_TIMEOUT_MS: String(startupTimeoutMs), AGENT_MCP_TOOL_TIMEOUT_MS: String(TOOL_TIMEOUT_MS) } });
   expect(pinnedProblems(rig)).toEqual([]);
   expect(await waitForIsolation(rig), "the boot self-check passes through the wrapper").toBe("ok");
   await registerStandardServers(rig);
@@ -183,8 +202,8 @@ type Window = ReturnType<typeof windowOf>;
 function fallbackProblems(rig: SecurityRig, window: Window, expectation: { runtimes: "none" | "some"; modelRequests: "none" | "some" }): string[] {
   const { sample, egress } = window.close();
   const problems: string[] = [];
-  if (sample.unsandboxedRuntimes.length > 0) problems.push(`${sample.unsandboxedRuntimes.length} agent runtime(s) ran without a sandbox ancestor`);
-  if (expectation.runtimes === "none" && sample.runtimesSeen > 0) problems.push(`${sample.runtimesSeen} runtime process(es) started in a window that must start none`);
+  problems.push(...sampleProblems(sample, rig.markers.values));
+  if (expectation.runtimes === "none" && sample.runtimesSeen > 0) problems.push(`${sample.runtimesSeen} runtime process(es) started in a window that must start none [${describeRecords(sample.records.filter((record) => record.verdict === "runtime" || record.verdict === "unresolved"), rig.markers.values)}]`);
   if (expectation.runtimes === "some" && sample.runtimesSeen === 0) problems.push("the process sampler saw no runtime in a window that ran one");
   const modelRequests = rig.api.requests.length - window.requestsBefore;
   if (expectation.modelRequests === "none" && modelRequests > 0) problems.push(`${modelRequests} model request(s) in a window that must make none`);
@@ -400,7 +419,8 @@ describe("cancellation and restart during a tool call with a child process", () 
     // No tagged process survives the gateway: the sandbox dies with its parent.
     await waitFor(() => !fs.readdirSync("/proc").some((entry) => /^\d+$/.test(entry) && (() => { try { return fs.readFileSync(`/proc/${entry}/cmdline`).toString("latin1").includes(held.tag); } catch { return false; } })()), 10_000, "the tagged child to end").then(() => controls.push("no_tagged_process_survived_the_gateway")).catch(() => problems.push("a tagged process survived the gateway"));
     const sample = held.window.close();
-    if (sample.sample.unsandboxedRuntimes.length > 0) problems.push("an agent runtime ran without a sandbox ancestor");
+    if (sample.sample.unsandboxedRuntimes.length > 0) problems.push(`an agent runtime ran without a sandbox ancestor [${describeRecords(sample.sample.records.filter((record) => record.unsandboxed), rig.markers.values)}]`);
+    problems.push(...sampleProblems(sample.sample, rig.markers.values).filter((problem) => problem.includes("cleared")));
     const leftovers = runLeftoversText(rig.gateway).files;
     await rig.restart();
     expect(await waitForIsolation(rig), "/health isolation after the restart").toBe("ok");
@@ -437,16 +457,81 @@ const PER_USER_SCHEMA = {
   outputs: [{ outputKey: "Authorization", target: "headers", template: "Bearer {token}" }],
 };
 
-describe("trusted mediation failures", () => {
-  /** One model call of `mcp__<server>__get_page`, returning the model-bound result, the NDJSON tool_result event and the relay's audit lines. */
-  async function mediated(rig: SecurityRig, server: string, prompt: string, session: string, body: Record<string, unknown> = {}) {
-    const window = windowOf(rig);
-    const turn = await chatTurn(rig, { prompt, sessionId: session, steps: [{ name: `mcp__${server}__get_page`, input: { id: "P-1" } }], withCredentials: false, body: { allowedTools: [`mcp__${server}__*`], ...body } });
-    const toolResult = turn.outcome.events.find((event) => event.type === "tool_result") as { output?: string; success?: boolean } | undefined;
-    const audit = rig.log().slice(window.logFrom).split("\n").filter((line) => line.includes("mcp.relay.refused") && line.includes(`serverName=${server}`));
-    return { turn, result: turn.results[0], toolResult, audit, window };
-  }
+/**
+ * One model call of `mcp__<server>__get_page`, returning the model-bound result, the NDJSON tool_result event and the
+ * relay's audit lines. The runtime's answer can reach this process before the gateway's log line does, so a line that
+ * must exist (`audit`) is waited for, bounded; checks that something did NOT happen run after that wait, never before.
+ */
+async function mediated(rig: SecurityRig, server: string, prompt: string, session: string, body: Record<string, unknown> = {}, audit: string | null = null) {
+  const window = windowOf(rig);
+  const turn = await chatTurn(rig, { prompt, sessionId: session, steps: [{ name: `mcp__${server}__get_page`, input: { id: "P-1" } }], withCredentials: false, body: { allowedTools: [`mcp__${server}__*`], ...body } });
+  const toolResult = turn.outcome.events.find((event) => event.type === "tool_result") as { output?: string; success?: boolean } | undefined;
+  const auditLines = (): string[] => rig.log().slice(window.logFrom).split("\n").filter((line) => line.includes("mcp.relay.refused") && line.includes(`serverName=${server}`));
+  if (audit !== null) await waitFor(() => auditLines().some((line) => line.includes(audit)), AUDIT_WAIT_MS, "the relay audit line").catch(() => undefined);
+  return { turn, result: turn.results[0], toolResult, audit: auditLines(), window };
+}
 
+type Mediated = Awaited<ReturnType<typeof mediated>>;
+
+/* ------------------------------------------------------------------ */
+/*  The refused-credential check, shared by the row and its control    */
+/* ------------------------------------------------------------------ */
+
+type OAuthStub = Awaited<ReturnType<typeof startOAuthMcpStub>>;
+
+interface RefusalObservation {
+  user: OAuthStub;
+  shared: OAuthStub;
+  countersBefore: string[];
+  withUser: Mediated;
+  withShared: Mediated;
+}
+
+const oauthCounters = (stub: OAuthStub): string => JSON.stringify([stub.counters.registration, stub.counters.authorize, stub.counters.token, stub.counters.metadata]);
+
+/** Two registered servers, one per credential kind, whose upstreams `refuse` (401 to tools/call) or `accept` it, and one model call through each. */
+async function refusalObservation(rig: SecurityRig, upstream: "refuse" | "accept"): Promise<RefusalObservation> {
+  const v = rig.markers.values;
+  const user = await startOAuthMcpStub({ toolNames: ["get_page"], ...(upstream === "refuse" ? { refuse: "tools-call" as const } : {}) });
+  cleanups.push(() => user.close());
+  const shared = await startOAuthMcpStub({ toolNames: ["get_page"], ...(upstream === "refuse" ? { refuse: "tools-call" as const } : {}) });
+  cleanups.push(() => shared.close());
+  await rig.register("reqlift", "refuseduser", { type: "http", url: user.url, userCredentialSchema: PER_USER_SCHEMA });
+  await rig.register("reqlift", "refusedshared", { type: "http", url: shared.url, headers: { Authorization: `Basic ${v.registryHttpHeader}` } });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const countersBefore = [oauthCounters(user), oauthCounters(shared)];
+  const withUser = await mediated(rig, "refuseduser", "IF-CRED-REFUSED-USER", "conv-cred-refused-user", { mcpCredentialOverrides: { refuseduser: { headers: { Authorization: `Bearer ${v.userOverrideHeader}` } } } }, "status=401");
+  const withShared = await mediated(rig, "refusedshared", "IF-CRED-REFUSED-SHARED", "conv-cred-refused-shared", {}, "status=401");
+  return { user, shared, countersBefore, withUser, withShared };
+}
+
+/** What the IF.cred-refused row requires of an observation; the negative control feeds it an upstream that accepts the credential. */
+function refusalProblems(rig: SecurityRig, observed: RefusalObservation): { problems: string[]; controls: string[]; withUser: Mediated; withShared: Mediated } {
+  const v = rig.markers.values;
+  const { user, shared, countersBefore, withUser, withShared } = observed;
+  const toolCallRequests = (stub: OAuthStub) => stub.requests.filter((request) => request.rpcMethods.includes("tools/call"));
+  const problems = [...turnProblems(withUser.turn), ...turnProblems(withShared.turn), ...fallbackProblems(rig, withUser.window, { runtimes: "some", modelRequests: "some" })];
+  const controls: string[] = [];
+  const userText = `TOOL_AUTH_UNAVAILABLE: "refuseduser" did not accept the user's credential. Ask the user to reconnect their account; retrying will not help.`;
+  const sharedText = `TOOL_AUTH_UNAVAILABLE: "refusedshared" did not accept the gateway's credential. Ask your gateway administrator to check this tool's credential; retrying will not help.`;
+  if (withUser.result?.isError && withUser.result.text === userText && withUser.toolResult?.success === false) controls.push("exact_user_credential_refused_text_with_success_false");
+  else problems.push("the user-credential refusal was not the exact fixed failure");
+  if (withShared.result?.isError && withShared.result.text === sharedText && withShared.toolResult?.success === false) controls.push("exact_gateway_credential_refused_text_with_success_false");
+  else problems.push("the gateway-credential refusal was not the exact fixed failure");
+  if (toolCallRequests(user).length === 1 && toolCallRequests(user).every((request) => request.headers.authorization === `Bearer ${v.userOverrideHeader}`) && user.authorizations().every((value) => value === `Bearer ${v.userOverrideHeader}`)) controls.push("one_tools_call_with_the_user_credential_only");
+  else problems.push("the user-credential upstream did not receive exactly one call with exactly the user's credential");
+  if (toolCallRequests(shared).length === 1 && shared.authorizations().every((value) => value === `Basic ${v.registryHttpHeader}`)) controls.push("one_tools_call_with_the_registry_credential_only");
+  else problems.push("the registry-credential upstream did not receive exactly one call with exactly its credential");
+  if (withUser.audit.some((line) => line.includes("status=401")) && withShared.audit.some((line) => line.includes("status=401"))) controls.push("relay_audit_lines_show_the_refusals");
+  else problems.push("the relay's audit lines for the refusals are missing");
+  if (oauthCounters(user) !== countersBefore[0] || oauthCounters(shared) !== countersBefore[1]) problems.push("an OAuth discovery, registration or token request reached an upstream");
+  else controls.push("no_oauth_login_attempted");
+  const credentialsFile = path.join(rig.gateway.dirs.workspace, ".credentials.json");
+  if (/mcpOAuth/.test(fs.readFileSync(credentialsFile, "utf8"))) problems.push("an mcpOAuth record was written");
+  return { problems, controls, withUser, withShared };
+}
+
+describe("trusted mediation failures", () => {
   it("IF.cred-missing: a run without the user's credential gets the fixed no-credential text at the relay, success:false, no upstream tools/call, no shared fallback and no login", async () => {
     const rig = await newRig();
     const started = Date.now();
@@ -458,7 +543,7 @@ describe("trusted mediation failures", () => {
     const authBefore = upstream.authorizations().length;
     const oauth = (counters: typeof upstream.counters): string => JSON.stringify([counters.registration, counters.authorize, counters.token, counters.metadata]);
     const countersBefore = oauth(upstream.counters);
-    const { turn, result, toolResult, audit, window } = await mediated(rig, "peruser", "IF-CRED-MISSING", "conv-cred-missing");
+    const { turn, result, toolResult, audit, window } = await mediated(rig, "peruser", "IF-CRED-MISSING", "conv-cred-missing", {}, "reason=no_credential");
     const problems = [...turnProblems(turn), ...fallbackProblems(rig, window, { runtimes: "some", modelRequests: "some" })];
     const controls: string[] = [];
     const text = `TOOL_AUTH_UNAVAILABLE: No credential for "peruser" was provided with this request. Ask the user to connect their account; retrying will not help.`;
@@ -485,38 +570,9 @@ describe("trusted mediation failures", () => {
 
   it("IF.cred-refused: an upstream that answers 401 to the user's credential, and to the gateway's own, gets the fixed refusal text, success:false, one call with that credential only, no shared fallback and no login", async () => {
     const rig = await newRig();
-    const v = rig.markers.values;
     const started = Date.now();
-    const user = await startOAuthMcpStub({ toolNames: ["get_page"], refuse: "tools-call" });
-    cleanups.push(() => user.close());
-    const shared = await startOAuthMcpStub({ toolNames: ["get_page"], refuse: "tools-call" });
-    cleanups.push(() => shared.close());
-    await rig.register("reqlift", "refuseduser", { type: "http", url: user.url, userCredentialSchema: PER_USER_SCHEMA });
-    await rig.register("reqlift", "refusedshared", { type: "http", url: shared.url, headers: { Authorization: `Basic ${v.registryHttpHeader}` } });
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    const oauth = (counters: typeof user.counters): string => JSON.stringify([counters.registration, counters.authorize, counters.token, counters.metadata]);
-    const countersBefore = [oauth(user.counters), oauth(shared.counters)];
-    const toolCallRequests = (stub: typeof user) => stub.requests.filter((request) => request.rpcMethods.includes("tools/call"));
-    const withUser = await mediated(rig, "refuseduser", "IF-CRED-REFUSED-USER", "conv-cred-refused-user", { mcpCredentialOverrides: { refuseduser: { headers: { Authorization: `Bearer ${v.userOverrideHeader}` } } } });
-    const withShared = await mediated(rig, "refusedshared", "IF-CRED-REFUSED-SHARED", "conv-cred-refused-shared");
-    const problems = [...turnProblems(withUser.turn), ...turnProblems(withShared.turn), ...fallbackProblems(rig, withUser.window, { runtimes: "some", modelRequests: "some" })];
-    const controls: string[] = [];
-    const userText = `TOOL_AUTH_UNAVAILABLE: "refuseduser" did not accept the user's credential. Ask the user to reconnect their account; retrying will not help.`;
-    const sharedText = `TOOL_AUTH_UNAVAILABLE: "refusedshared" did not accept the gateway's credential. Ask your gateway administrator to check this tool's credential; retrying will not help.`;
-    if (withUser.result?.isError && withUser.result.text === userText && withUser.toolResult?.success === false) controls.push("exact_user_credential_refused_text_with_success_false");
-    else problems.push("the user-credential refusal was not the exact fixed failure");
-    if (withShared.result?.isError && withShared.result.text === sharedText && withShared.toolResult?.success === false) controls.push("exact_gateway_credential_refused_text_with_success_false");
-    else problems.push("the gateway-credential refusal was not the exact fixed failure");
-    if (toolCallRequests(user).length === 1 && toolCallRequests(user).every((request) => request.headers.authorization === `Bearer ${v.userOverrideHeader}`) && user.authorizations().every((value) => value === `Bearer ${v.userOverrideHeader}`)) controls.push("one_tools_call_with_the_user_credential_only");
-    else problems.push("the user-credential upstream did not receive exactly one call with exactly the user's credential");
-    if (toolCallRequests(shared).length === 1 && shared.authorizations().every((value) => value === `Basic ${v.registryHttpHeader}`)) controls.push("one_tools_call_with_the_registry_credential_only");
-    else problems.push("the registry-credential upstream did not receive exactly one call with exactly its credential");
-    if (withUser.audit.some((line) => line.includes("status=401")) && withShared.audit.some((line) => line.includes("status=401"))) controls.push("relay_audit_lines_show_the_refusals");
-    else problems.push("the relay's audit lines for the refusals are missing");
-    if (oauth(user.counters) !== countersBefore[0] || oauth(shared.counters) !== countersBefore[1]) problems.push("an OAuth discovery, registration or token request reached an upstream");
-    else controls.push("no_oauth_login_attempted");
-    const credentialsFile = path.join(rig.gateway.dirs.workspace, ".credentials.json");
-    if (/mcpOAuth/.test(fs.readFileSync(credentialsFile, "utf8"))) problems.push("an mcpOAuth record was written");
+    const observed = await refusalObservation(rig, "refuse");
+    const { problems, controls, withUser, withShared } = refusalProblems(rig, observed);
     finishRow(recorder, rig, { id: "IF.cred-refused", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS * 2, surfaces: surfacesOf(rig, [withUser.turn, withShared.turn]), controls, problems, floors: { "tool-results": 50 } });
   });
 
@@ -575,6 +631,66 @@ describe("legacy session admission", () => {
     if (fs.existsSync(transcript) && fs.readFileSync(transcript, "utf8").includes(rig.markers.values.legacyTranscript)) controls.push("the_legacy_transcript_exists_and_holds_its_marker_on_the_host");
     else problems.push("the legacy transcript fixture was not on the host");
     finishRow(recorder, rig, { id: "IF.legacy", durationMs: Date.now() - started, deadlineMs: 2000, surfaces: noRunSurfaces(rig, window, outcome), controls, problems });
+  });
+});
+
+
+/* ------------------------------------------------------------------ */
+/*  Negative controls: a genuine violation still fails                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The sampler's rule may only ever get stricter about a real runtime. These controls run the same windows as the rows
+ * (`windowOf`, `fallbackProblems`, `chatTurn`, `turnProblems`) with real processes against a launcher that breaks the
+ * sandbox, and against an upstream that accepts the credential the row says is refused. They are not matrix rows.
+ */
+describe("sampler and refusal-check controls", () => {
+  it("control: a runtime outside the sandbox in a window that must start none is reported by both problems, with its pid and a Node executable", async () => {
+    const { rig, wrapper } = await wrapperRig(30_000);
+    const prompt = "IF-CONTROL-BYPASS-NONE";
+    rig.scripts.push(scriptOf(prompt, [bashStep("echo CONTROL")]));
+    wrapper.setMode("bypass");
+    const window = windowOf(rig);
+    const asked = rig.ask("reqlift", { queryId: "q-control-bypass-none", sessionId: "conv-control-bypass-none", prompt, user_id: "user-1", useSession: true, allowedTools: ["Bash"] }, 60_000).catch(() => undefined);
+    await waitFor(() => window.peek().unsandboxedRuntimes.length > 0, 30_000, "the runtime started outside the sandbox");
+    const seen = window.peek();
+    const problems = fallbackProblems(rig, window, { runtimes: "none", modelRequests: "none" });
+    expect(problems.filter((problem) => problem.includes("agent runtime(s) ran without a sandbox ancestor")).length).toBe(1);
+    expect(problems.filter((problem) => problem.includes("runtime process(es) started in a window that must start none")).length).toBe(1);
+    const flagged = seen.records.filter((record) => record.unsandboxed);
+    expect(flagged.map((record) => record.pid)).toEqual(expect.arrayContaining(seen.unsandboxedRuntimes));
+    expect(flagged.some((record) => record.exe === "node" && record.verdict === "runtime")).toBe(true);
+    expect(problems.join(" ")).not.toContain(rig.markers.values.providerApiKey);
+    void asked;
+  });
+
+  it("control: a turn that completes with the runtime outside the sandbox is reported as a runtime without a sandbox ancestor", async () => {
+    const { rig, wrapper } = await wrapperRig();
+    wrapper.setMode("bypass-ready");
+    const turn = await chatTurn(rig, { prompt: "IF-CONTROL-BYPASS-READY", sessionId: "conv-control-bypass-ready", steps: [bashStep("echo CONTROL")], withCredentials: false });
+    const problems = turnProblems(turn);
+    expect(problems.filter((problem) => problem.includes("agent runtime(s) ran without a sandbox ancestor")).length).toBe(1);
+    expect(turn.sample.records.some((record) => record.unsandboxed && record.exe === "node" && record.verdict === "runtime")).toBe(true);
+  });
+
+  it("control: a sandboxed runtime in a window that must start none is reported as a started runtime, and not as one outside the sandbox", async () => {
+    const { rig } = await wrapperRig();
+    const window = windowOf(rig);
+    const turn = await chatTurn(rig, { prompt: "IF-CONTROL-PASS-NONE", sessionId: "conv-control-pass-none", steps: [bashStep("echo CONTROL")], withCredentials: false });
+    const problems = fallbackProblems(rig, window, { runtimes: "none", modelRequests: "none" });
+    expect(problems.some((problem) => problem.includes("runtime process(es) started in a window that must start none"))).toBe(true);
+    expect(problems.some((problem) => problem.includes("ran without a sandbox ancestor"))).toBe(false);
+    expect(turnProblems(turn)).toEqual([]);
+  });
+
+  it("control: an upstream that accepts the credential fails both refusal texts and the missing audit lines after the bounded wait", async () => {
+    const rig = await newRig();
+    const started = Date.now();
+    const observed = await refusalObservation(rig, "accept");
+    const { problems } = refusalProblems(rig, observed);
+    expect(problems).toEqual(expect.arrayContaining(["the user-credential refusal was not the exact fixed failure", "the gateway-credential refusal was not the exact fixed failure", "the relay's audit lines for the refusals are missing"]));
+    // Two calls each waited the bound for a line that never came, so the poll ended and the absence was reported.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(AUDIT_WAIT_MS);
   });
 });
 
