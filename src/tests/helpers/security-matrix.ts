@@ -1887,7 +1887,7 @@ export function detachedProof(tag: string): DetachedProof {
   };
 }
 
-type PresenceKey = Pick<DetachedRecord, "tag" | "pidNs" | "outer" | "init">;
+export type PresenceKey = Pick<DetachedRecord, "tag" | "pidNs" | "outer" | "init">;
 
 export interface RunPresence {
   gone: boolean;
@@ -1922,6 +1922,24 @@ export function runPresence(record: PresenceKey): RunPresence {
     if (reasons.length > 0) survivors.push(`pid=${facts.pid} comm=${facts.comm} state=${facts.state} sid=${facts.session} nspid=${facts.nspid.join("/")} why=${reasons.join("+")}`);
   }
   return { gone: survivors.length === 0, survivors };
+}
+
+/**
+ * Host-side record of a sandboxed Node fixture started through `bwrap --unshare-pid`: the running Node process that carries
+ * the tag, its PID namespace, the namespace init and the launcher above it, as the key `waitRunGone` and `killRun` compare
+ * against. Null while any fact is missing, so a caller fails as "precondition not reached" and never passes unobserved.
+ */
+export function sandboxFixtureRecord(tag: string): PresenceKey | null {
+  const all = allProcFacts();
+  const byPid = new Map(all.map((facts) => [facts.pid, facts]));
+  const own = readProcFacts(process.pid);
+  const child = all.find((facts) => facts.comm === "node" && facts.cmdline.includes(tag) && facts.state !== "Z");
+  if (!child || !child.pidNs || child.pidNs === own?.pidNs || child.nspid.length < 2) return null;
+  const init = all.find((facts) => facts.pidNs === child.pidNs && facts.nspid.at(-1) === 1);
+  if (!init || init.comm !== "bwrap") return null;
+  const outer = byPid.get(init.ppid);
+  if (!outer || outer.comm !== "bwrap") return null;
+  return { tag, pidNs: child.pidNs, outer: { pid: outer.pid, startTicks: outer.startTicks }, init: { pid: init.pid, startTicks: init.startTicks } };
 }
 
 /** The tag-only absence check of a run whose namespace was never recorded (the startup-timing rows). */

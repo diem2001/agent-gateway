@@ -7,6 +7,7 @@
  * marker value.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,16 +21,21 @@ import {
   createMarkers,
   destinationsFromTable,
   detect,
+  emit,
   evidenceLine,
+  killRun,
   matrixLine,
   offlineAvailable,
   offlinePrefix,
   requireHost,
   runChild,
+  sandboxFixtureRecord,
   scrub,
   splitNeedle,
   splitNeedles,
   startProcessSampler,
+  waitRunGone,
+  type PresenceKey,
   type ProcessSample,
   redactArgv,
   describeRecords,
@@ -284,22 +290,37 @@ describe("host-side samplers", () => {
     expect(destinationsFromTable("tcp", header + external + foreign)).toEqual(["192.168.0.1", "192.168.0.2"]);
   });
 
+  // Each run tags its fixtures uniquely: the absence check and the cleanup then see only this run's processes, never an older
+  // leftover or another session's fixture, and no kill path ever matches a shared literal tag.
+  const fixtureTags: string[] = [];
+  afterEach(() => {
+    for (const tag of fixtureTags.splice(0)) killRun({ tag });
+  });
+
   it("the process sampler flags an agent runtime without a bwrap ancestor, and not one inside bwrap, and times a tag", async () => {
     requireHost(["bwrap"]);
     const idle = "setInterval(() => {}, 1000)";
-    const bare = spawn("node", ["-e", idle, "cli.js", "T1-BARE-TAG"], { stdio: "ignore" });
-    const wrapped = spawn("bwrap", ["--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc", "node", "-e", idle, "cli.js", "T1-WRAPPED-TAG"], { stdio: "ignore" });
-    const sampler = startProcessSampler(() => process.pid, ["T1-BARE-TAG", "T1-WRAPPED-TAG", "T1-ABSENT-TAG"]);
+    const suffix = randomBytes(6).toString("hex");
+    const [bareTag, wrappedTag, absentTag] = [`T1-BARE-${suffix}`, `T1-WRAPPED-${suffix}`, `T1-ABSENT-${suffix}`];
+    fixtureTags.push(bareTag, wrappedTag);
+    const bare = spawn("node", ["-e", idle, "cli.js", bareTag], { stdio: "ignore" });
+    const wrapped = spawn("bwrap", ["--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc", "node", "-e", idle, "cli.js", wrappedTag], { stdio: "ignore" });
+    const sampler = startProcessSampler(() => process.pid, [bareTag, wrappedTag, absentTag]);
     await new Promise((resolve) => setTimeout(resolve, 600));
     const sample = sampler.stop();
+    const record: PresenceKey | null = sandboxFixtureRecord(wrappedTag);
     bare.kill("SIGKILL");
     wrapped.kill("SIGKILL");
+    expect(record, "precondition not reached: the sandboxed fixture was not recorded while it ran").not.toBeNull();
     expect(sample.unsandboxedRuntimes).toEqual([bare.pid]);
     expect(sample.runtimesSeen).toBeGreaterThanOrEqual(2);
-    expect(sample.windows["T1-BARE-TAG"]).toBeDefined();
-    expect(sample.windows["T1-WRAPPED-TAG"]).toBeDefined();
-    expect(sample.windows["T1-ABSENT-TAG"]).toBeUndefined();
-    expect(sample.windows["T1-BARE-TAG"]!.last).toBeGreaterThanOrEqual(sample.windows["T1-BARE-TAG"]!.first);
+    expect(sample.windows[bareTag]).toBeDefined();
+    expect(sample.windows[wrappedTag]).toBeDefined();
+    expect(sample.windows[absentTag]).toBeUndefined();
+    expect(sample.windows[bareTag]!.last).toBeGreaterThanOrEqual(sample.windows[bareTag]!.first);
+    const gone = await waitRunGone(record!, 5000);
+    emit(`SECURITY-FIXTURE-CLEANUP row=T1 gone=${gone.gone} elapsedMs=${gone.elapsedMs} survivors=${gone.survivors.length}`);
+    expect(gone.survivors, "the sandboxed fixture left a process behind after its launcher ended").toEqual([]);
   });
 
   it("a process record shows names, booleans and lengths only: no relay token, flag value, MCP config or marker", () => {
