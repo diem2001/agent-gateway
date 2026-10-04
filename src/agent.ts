@@ -212,6 +212,45 @@ async function* buildContentMessageStream(
   };
 }
 
+/** How long messages that are already on their way are still processed after the launcher ended by an outside signal. */
+export const LAUNCHER_EXIT_GRACE_MS = 1000;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Yields what the SDK yields until `gone` settles first, then throws `ended()`. The SDK's own next message always
+ * wins when it is ready. After `gone` the SDK iterator is abandoned: its pending promise and its `return()` get a
+ * no-op rejection handler, because a late SDK error must not become an unhandled rejection of the gateway process.
+ */
+export async function* untilLauncherGone<T>(source: AsyncIterator<T>, gone: Promise<unknown>, ended: () => Error): AsyncGenerator<T, void, undefined> {
+  let finished = false;
+  try {
+    for (;;) {
+      const next = source.next().then((result) => ({ result }));
+      next.catch(() => {});
+      let step: { result: IteratorResult<T> } | null;
+      try {
+        step = await Promise.race([next, gone.then(() => null)]);
+      } catch (error) {
+        finished = true;
+        throw error;
+      }
+      if (step === null) {
+        finished = true;
+        Promise.resolve(source.return?.()).catch(() => {});
+        throw ended();
+      }
+      if (step.result.done) {
+        finished = true;
+        return;
+      }
+      yield step.result.value;
+    }
+  } finally {
+    if (!finished) await source.return?.();
+  }
+}
+
 /**
  * One attempt. A failed attempt throws a `RunFailure` (run-failure.ts) with a
  * safe public message: a result with `is_error: true`, or any error the SDK
@@ -504,7 +543,14 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
 
   try {
   const conversation = query({ prompt: promptArg, options });
-  for await (const message of conversation) {
+  // A launcher that ended by a signal the gateway did not send ends this run after a short grace, even when the
+  // SDK never notices (MVP-7964). Messages that arrive inside the grace are still processed.
+  const launcherGone = sandbox.unownedExit().then(() => sleep(LAUNCHER_EXIT_GRACE_MS));
+  const launcherEnded = (): RunFailure => {
+    sandbox.releaseOutput();
+    return classifyRunFailure({ installedVersion, result: resultData, assistantErrors, runtimeExit: sandbox.runtimeExit }, queryId);
+  };
+  for await (const message of untilLauncherGone(conversation[Symbol.asyncIterator](), launcherGone, launcherEnded)) {
     if (abortController.signal.aborted) break;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const msg = message as any;
