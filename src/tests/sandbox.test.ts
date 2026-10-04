@@ -3,7 +3,7 @@
  * parsing with fatal invalid values, the exact bwrap argument list, the sandbox environment
  * allowlist, the fixed public failure texts and their kinds, and the run deadline.
  */
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   IsolationConfigError,
@@ -13,6 +13,7 @@ import {
   buildSandboxEnv,
   loadIsolationConfig,
   runtimeEnvFrom,
+  sdkProcessOf,
   SandboxRun,
   type BwrapSpec,
 } from "../sandbox.js";
@@ -359,5 +360,127 @@ describe("runtime exit metadata (MVP-7852)", () => {
     await run.dispose(50);
     expect(child.signalCode).toBe("SIGKILL");
     expect(run.runtimeExit).toBeNull();
+  });
+});
+
+describe("a launcher that ends by an outside signal (MVP-7964)", () => {
+  const HOLD = "setTimeout(() => {}, 60000)";
+  const reaped: ChildProcess[] = [];
+
+  afterEach(() => {
+    for (const child of reaped.splice(0)) {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+  });
+
+  /** A SandboxRun that watches a real launcher process; the test owns and always reaps it. */
+  function watched(script: string, spawnSignal?: AbortSignal) {
+    const run = new SandboxRun({ runLogDir: "/nonexistent/run-log", runLogEnv: {} });
+    const child = spawn(process.execPath, ["-e", script], { stdio: "ignore" });
+    reaped.push(child);
+    const launch = { child, failure: () => null, ready: Promise.resolve() };
+    (run as unknown as { launch: unknown }).launch = launch;
+    run.watchLaunch(launch, spawnSignal);
+    return { run, child };
+  }
+
+  const exited = (child: ChildProcess): Promise<void> => new Promise((resolve) => child.once("exit", () => resolve()));
+  const settled = (promise: Promise<unknown>, waitMs = 200): Promise<"resolved" | "pending"> =>
+    Promise.race([promise.then(() => "resolved" as const), new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), waitMs))]);
+
+  it("unownedExit resolves with the signal when the launcher is signaled from outside", async () => {
+    const { run, child } = watched(HOLD);
+    process.kill(child.pid!, "SIGKILL");
+    await expect(run.unownedExit()).resolves.toEqual({ exitCode: null, signalCode: "SIGKILL" });
+  });
+
+  it.each([
+    ["exit code 0", "process.exit(0)"],
+    ["exit code 1", "process.exit(1)"],
+  ])("unownedExit stays pending for a launcher that ends with %s", async (_name, script) => {
+    const { run, child } = watched(script);
+    await exited(child);
+    expect(await settled(run.unownedExit())).toBe("pending");
+  });
+
+  it("unownedExit stays pending for a launcher the gateway process itself killed (SDK close, abort, start failure)", async () => {
+    const { run, child } = watched(HOLD);
+    const gone = exited(child);
+    child.kill("SIGTERM");
+    await gone;
+    expect(child.killed).toBe(true);
+    expect(await settled(run.unownedExit())).toBe("pending");
+  });
+
+  it("unownedExit stays pending for the launcher dispose() killed after its wait", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const { run, child } = watched(HOLD);
+    await run.dispose(50);
+    expect(child.signalCode).toBe("SIGKILL");
+    expect(await settled(run.unownedExit())).toBe("pending");
+  });
+
+  it("unownedExit stays pending when the run was already aborted", async () => {
+    const aborted = new AbortController();
+    const { run, child } = watched(HOLD, aborted.signal);
+    aborted.abort();
+    const gone = exited(child);
+    process.kill(child.pid!, "SIGKILL");
+    await gone;
+    expect(await settled(run.unownedExit())).toBe("pending");
+  });
+
+  it("unownedExit stays pending without a launch", async () => {
+    expect(await settled(new SandboxRun({ runLogDir: "/nonexistent/run-log", runLogEnv: {} }).unownedExit())).toBe("pending");
+  });
+
+  describe("the process object the SDK gets", () => {
+    it("calls an exit listener registered after the end once, with the recorded code and signal", async () => {
+      const child = spawn(process.execPath, ["-e", HOLD], { stdio: "ignore" });
+      reaped.push(child);
+      const process_ = sdkProcessOf(child);
+      const gone = exited(child);
+      process.kill(child.pid!, "SIGKILL");
+      await gone;
+      expect(process_.exitCode).toBeNull();
+      expect(process_.killed).toBe(false);
+
+      const calls: unknown[][] = [];
+      process_.once("exit", (code, signal) => calls.push([code, signal]));
+      expect(calls).toEqual([]);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(calls).toEqual([[null, "SIGKILL"]]);
+    });
+
+    it("does not replay a listener registered before the end, and does not replay one that was removed", async () => {
+      const child = spawn(process.execPath, ["-e", HOLD], { stdio: "ignore" });
+      reaped.push(child);
+      const process_ = sdkProcessOf(child);
+      const live: unknown[][] = [];
+      process_.on("exit", (code, signal) => live.push([code, signal]));
+      const gone = exited(child);
+      process.kill(child.pid!, "SIGKILL");
+      await gone;
+
+      const removed = vi.fn();
+      process_.once("exit", removed);
+      process_.off("exit", removed);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(live).toEqual([[null, "SIGKILL"]]);
+      expect(removed).not.toHaveBeenCalled();
+    });
+
+    it("passes streams, kill and the live state through to the launcher", async () => {
+      const child = spawn(process.execPath, ["-e", HOLD], { stdio: ["pipe", "pipe", "ignore"] });
+      reaped.push(child);
+      const process_ = sdkProcessOf(child);
+      expect(process_.stdin).toBe(child.stdin);
+      expect(process_.stdout).toBe(child.stdout);
+      expect(process_.killed).toBe(false);
+      const gone = exited(child);
+      expect(process_.kill("SIGTERM")).toBe(true);
+      await gone;
+      expect(process_.killed).toBe(true);
+    });
   });
 });

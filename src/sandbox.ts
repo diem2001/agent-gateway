@@ -546,6 +546,81 @@ export function launchBwrap(
 }
 
 /* ------------------------------------------------------------------ */
+/*  The launcher's end as the SDK and the gateway see it (MVP-7964)     */
+/* ------------------------------------------------------------------ */
+
+/** How the launcher ended: Node's own exit code and signal, never decoded. */
+export interface LauncherExit {
+  exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
+}
+
+/**
+ * Resolves when the launcher ended by a signal nobody on the gateway side sent, and never otherwise (a normal
+ * end, an exit code, any `kill()` from this process, the gateway's own cleanup, an abort). `child.killed` is true
+ * after every `kill()` this process issued, including the abort signal of `spawn`, so it separates the gateway's
+ * own endings from an outside one. `owned` names the endings `killed` cannot see (the cleanup kill, an abort).
+ */
+export function watchUnownedExit(child: ChildProcess, owned: () => boolean): Promise<LauncherExit> {
+  return new Promise<LauncherExit>((resolve) => {
+    child.once("exit", (exitCode, signalCode) => {
+      if (signalCode !== null && !child.killed && !owned()) resolve({ exitCode, signalCode });
+    });
+  });
+}
+
+type ExitListener = (code: number | null, signal: NodeJS.Signals | null) => void;
+
+/**
+ * The process object the SDK gets. SDK 0.1.77 looks at `exitCode`/`killed` when it starts waiting for the end of
+ * the runtime and otherwise registers a one-time `exit` listener; a launcher ended by an outside signal has
+ * `exitCode` null and `killed` false, so that listener arrives after the event and is never called. This object
+ * calls an `exit` listener that is registered after the end once, with the recorded code and signal, so the
+ * SDK's wait ends with its own error instead of hanging. Everything else is the launcher itself.
+ */
+export function sdkProcessOf(child: ChildProcess): SpawnedProcess {
+  const replays = new Map<ExitListener, NodeJS.Immediate>();
+  const ended = (): boolean => child.exitCode !== null || child.signalCode !== null;
+  const add = (once: boolean) => (event: "exit" | "error", listener: ExitListener | ((error: Error) => void)): void => {
+    if (event === "exit" && ended()) {
+      const exitListener = listener as ExitListener;
+      replays.set(
+        exitListener,
+        setImmediate(() => {
+          replays.delete(exitListener);
+          exitListener(child.exitCode, child.signalCode);
+        }),
+      );
+      return;
+    }
+    if (once) child.once(event, listener as (...args: unknown[]) => void);
+    else child.on(event, listener as (...args: unknown[]) => void);
+  };
+  return {
+    stdin: child.stdin,
+    stdout: child.stdout,
+    get killed(): boolean {
+      return child.killed;
+    },
+    get exitCode(): number | null {
+      return child.exitCode;
+    },
+    kill: (signal: NodeJS.Signals): boolean => child.kill(signal),
+    on: add(false),
+    once: add(true),
+    off: (event: "exit" | "error", listener: ExitListener | ((error: Error) => void)): void => {
+      const pending = event === "exit" ? replays.get(listener as ExitListener) : undefined;
+      if (pending !== undefined) {
+        clearImmediate(pending);
+        replays.delete(listener as ExitListener);
+      } else {
+        child.off(event, listener as (...args: unknown[]) => void);
+      }
+    },
+  } as unknown as SpawnedProcess;
+}
+
+/* ------------------------------------------------------------------ */
 /*  One active request per conversation                                 */
 /* ------------------------------------------------------------------ */
 
@@ -629,11 +704,36 @@ export class SandboxRun {
   private prepFailure: IsolationFailure | null = null;
   /** Set when `dispose` itself killed the launcher: that end is the gateway's own cleanup, not a cause to report. */
   private killedByGateway = false;
+  private readonly unowned: Promise<LauncherExit>;
+  private resolveUnowned: (exit: LauncherExit) => void = () => {};
   readonly spawnHook: (spawnOptions: SpawnOptions) => SpawnedProcess;
 
   constructor(options: SandboxRunOptions) {
     this.options = options;
     this.spawnHook = (spawnOptions) => this.start(spawnOptions);
+    this.unowned = new Promise<LauncherExit>((resolve) => {
+      this.resolveUnowned = resolve;
+    });
+  }
+
+  /**
+   * Resolves when the launcher ended by a signal the gateway did not send (MVP-7964), and never otherwise: not
+   * for a normal end, an exit code, the SDK's or the gateway's own kill, an abort or a start failure.
+   */
+  unownedExit(): Promise<LauncherExit> {
+    return this.unowned;
+  }
+
+  /** Watches a started launcher for an outside signal; `start` calls it for every launch. */
+  watchLaunch(launch: Launch, spawnSignal?: AbortSignal): void {
+    void watchUnownedExit(launch.child, () => this.killedByGateway || spawnSignal?.aborted === true || this.options.signal?.aborted === true).then((exit) =>
+      this.resolveUnowned(exit),
+    );
+  }
+
+  /** Closes the launcher's output stream so an SDK reader blocked on it stops; stdin stays, so a late SDK write cannot throw. */
+  releaseOutput(): void {
+    this.launch?.child.stdout?.destroy();
   }
 
   /** The runtime's process group leader (the bwrap process), once started. */
@@ -673,7 +773,8 @@ export class SandboxRun {
       const launch = this.prepareAndLaunch(config, spawnOptions);
       this.launch = launch;
       launch.ready.catch(() => {});
-      return launch.child as unknown as SpawnedProcess;
+      this.watchLaunch(launch, spawnOptions.signal);
+      return sdkProcessOf(launch.child);
     } catch (error) {
       if (error instanceof IsolationFailure) throw error;
       if (error instanceof SandboxPrepError) return this.refuse(error.problem);
