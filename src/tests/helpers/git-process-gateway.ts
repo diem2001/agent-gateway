@@ -102,6 +102,13 @@ export async function spawnGateway(
     seed?: (dirs: SpawnedGateway["dirs"]) => void;
     /** A restart: the directories of an earlier gateway (its cleanup removes them), with a new process and port. */
     reuse?: SpawnedGateway;
+    /**
+     * Descriptors of this process the gateway inherits WITHOUT close-on-exec, as its descriptors 20, 21, ... (MVP-7991).
+     * They start at 20 because libuv's `uv_disable_stdio_inheritance` marks the first 16 descriptors and every contiguous
+     * one after them close-on-exec when a Node process starts, so only a descriptor behind a gap survives in the gateway.
+     * Absent: stdio unchanged.
+     */
+    inheritedFds?: number[];
   } = {},
 ): Promise<SpawnedGateway> {
   assertFreshBuild();
@@ -137,7 +144,7 @@ export async function spawnGateway(
   const child = spawn(process.execPath, ["--expose-gc", options.distServer ?? DIST_SERVER], {
     cwd: dirs.cwd,
     env: childEnv,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: options.inheritedFds ? ["ignore", "pipe", "pipe", ...Array<"ignore">(17).fill("ignore"), ...options.inheritedFds] : ["ignore", "pipe", "pipe"],
   });
   let output = "";
   child.stdout!.on("data", (data: Buffer) => (output += data.toString("utf8")));

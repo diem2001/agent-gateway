@@ -41,7 +41,8 @@ function shim(options: { silent?: boolean } = {}): string {
       "#!/bin/sh",
       `cat <&3 > ${JSON.stringify(path.join(dir, "bwrap-options"))}`,
       `printf '%s\\n' "$@" > ${JSON.stringify(path.join(dir, "bwrap-argv"))}`,
-      "while [ \"$1\" != \"--\" ]; do shift; done; shift; shift; shift; shift; shift",
+      // Everything up to and including the launch wrapper's argv0 ("sandbox") is the launcher's own.
+      "while [ \"$1\" != \"sandbox\" ]; do shift; done; shift",
       options.silent ? "sleep 30" : "echo SANDBOX-CHECK-OK >&2",
       'exec "$@"',
     ].join("\n"),
