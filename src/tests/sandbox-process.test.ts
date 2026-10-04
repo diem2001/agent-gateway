@@ -29,6 +29,7 @@ import {
 } from "../sandbox.js";
 import { FINAL_ANSWER, startFakeAnthropicApi, type FakeAnthropicApi, type FakeApiMode } from "./helpers/fake-anthropic-api.js";
 import { assertFreshBuild, descendants, gatewayRequest, getHealth, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
+import { checkDescriptors, crossReference, emitEvidence, evidenceLines, inheritedAtExec, parseFdRecords, readFdTable, readRecorderFile, summaryLine, writeRecorderWrapper, type FdTable, type RedactContext } from "./helpers/fd-evidence.js";
 import { DETACHED_MAX_AGE_S, detachedAgeS, detachedCommand, detachedEvidence, detachedProof, detachedTag, killRun, runPresence, tagPresence, waitRunGone, type DetachedRecord } from "./helpers/security-matrix.js";
 
 // Real processes on a shared, loaded host: every row gets a generous deadline.
@@ -57,6 +58,9 @@ const ENV_SECRETS: Record<string, string> = {
   MCP_TIMEOUT: "77777",
 };
 const ALL_MARKERS = [PROVIDER_KEY, GATEWAY_KEY, OAUTH_ACCESS, OAUTH_REFRESH, SSH_KEY, CLONE_TOKEN, STATE_MARKER, LEGACY_MARKER, OTHER_SESSION_MARKER, ...Object.values(ENV_SECRETS).filter((v) => v.startsWith("SYNTH"))];
+
+/** An identifiable descriptor target (MVP-7991); kept out of ALL_MARKERS, which the other rows assert absent. */
+const FD_MARKER = "SYNTH-FD-MARKER-7991";
 
 let tmp: string;
 let home: string;
@@ -144,6 +148,7 @@ afterAll(() => {
     else process.env[key] = value;
   }
   fs.rmSync(tmp, { recursive: true, force: true });
+  for (const dir of evidenceDirs) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 beforeEach(async () => {
@@ -174,6 +179,8 @@ interface ProbeResult {
   run: SandboxRun;
   lines: Map<string, string>;
   token: string | null;
+  /** O1, when requested. */
+  o1?: FdTable;
 }
 
 interface ProbeOptions {
@@ -183,6 +190,8 @@ interface ProbeOptions {
   signal?: AbortSignal;
   /** Do not wait for the probe to exit (the caller ends it). */
   detach?: boolean;
+  /** Read the test process's own descriptor table right after `spawnHook()` returned (observation point O1). */
+  observe?: boolean;
 }
 
 /** Starts a real sandbox that runs `script` with /bin/sh, exactly as the launcher starts the runtime. */
@@ -207,12 +216,14 @@ async function probe(script: string, options: ProbeOptions = {}): Promise<ProbeR
     fs.rmSync(runLogs.dir, { recursive: true, force: true });
     throw error;
   }
+  // The call chain from `spawnHook()` to `spawn()` is synchronous: the child has exec'd when it returns.
+  const o1 = options.observe ? readFdTable("O1") : undefined;
   let stdout = "";
   child.stdout.on("data", (d: Buffer) => (stdout += d.toString("utf8")));
   child.stdin.end();
   const token = /ANTHROPIC_API_KEY=(mpt_[A-Za-z0-9_-]+)/.exec(script)?.[1] ?? null;
   if (options.detach) {
-    return { stdout: "", exitCode: null, run, lines: new Map(), token };
+    return { stdout: "", exitCode: null, run, lines: new Map(), token, o1 };
   }
   const exitCode = await new Promise<number | null>((resolve) => {
     const timer = setTimeout(() => {
@@ -230,7 +241,7 @@ async function probe(script: string, options: ProbeOptions = {}): Promise<ProbeR
     const eq = line.indexOf("=");
     if (eq > 0 && /^[A-Z0-9_]+$/.test(line.slice(0, eq))) lines.set(line.slice(0, eq), line.slice(eq + 1));
   }
-  return { stdout, exitCode, run, lines, token };
+  return { stdout, exitCode, run, lines, token, o1 };
 }
 
 /** A launcher that drops --disable-userns from the arguments it is given on descriptor 3, then runs the real bwrap. */
@@ -244,6 +255,66 @@ function dirId(label: string): string {
 function markersIn(text: string): string[] {
   return ALL_MARKERS.filter((m) => text.includes(m));
 }
+
+const evidenceDirs: string[] = [];
+
+/**
+ * A directory for a recorder wrapper's files. It lives next to the fixture, not inside it: the recorder's bind
+ * mount puts its host path on the sandbox init's command line, and the `/proc` rows scan that for the fixture root.
+ */
+function evidenceDir(): string {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fd-ev-")));
+  evidenceDirs.push(dir);
+  return dir;
+}
+
+/** What the descriptor evidence may print as a path: the fixture's own roots, with every identifiable value redacted. */
+function fdContext(): RedactContext {
+  return { tmpRoots: [tmp, ...evidenceDirs, os.tmpdir()], homes: [home], markers: [...ALL_MARKERS, FD_MARKER] };
+}
+
+/**
+ * The probe shell's own descriptor table (observation point O3), printed by one external process that reads
+ * `/proc/<shell pid>/fd` as the shell's first statement: no command substitution (its pipe and the shell's own
+ * glob directory descriptor would show up in the table) and no `/proc/self` (it would name the reader).
+ */
+const O3_SNIPPET = `python3 -c "
+import os, sys
+pid = sys.argv[1]
+for n in sorted(os.listdir('/proc/%s/fd' % pid), key=int):
+    try:
+        target = os.readlink('/proc/%s/fd/%s' % (pid, n))
+    except OSError:
+        continue
+    flags = '-'
+    try:
+        for line in open('/proc/%s/fdinfo/%s' % (pid, n)).read().split(chr(10)):
+            if line.startswith('flags:'):
+                flags = line.split()[1]
+    except OSError:
+        pass
+    print('FDREC O3 %s %s %s' % (n, flags, target))
+" $$`;
+
+/** In-sandbox Python listing (observation point O4): the `FDS=` line, then one FDREC line per descriptor with target and flags. */
+const O4_LISTING = `python3 -c "
+import os
+names = sorted(n for n in os.listdir('/proc/self/fd') if os.path.exists('/proc/self/fd/' + n))
+print('FDS=' + ' '.join(names))
+for n in names:
+    try:
+        target = os.readlink('/proc/self/fd/' + n)
+    except OSError:
+        continue
+    flags = '-'
+    try:
+        for line in open('/proc/self/fdinfo/' + n).read().split(chr(10)):
+            if line.startswith('flags:'):
+                flags = line.split()[1]
+    except OSError:
+        pass
+    print('FDREC O4 %s %s %s' % (n, flags, target))
+"`;
 
 describe("environment and processes", () => {
   it("the sandbox environment is the allowlist: no gateway secret in it or in any child interpreter, only the run token as credential", async () => {
@@ -299,7 +370,11 @@ describe("environment and processes", () => {
   });
 
   it("/proc shows no other process, no environment or command line of the gateway, no inherited descriptor, and the masked entries stay masked", async () => {
+    // FD_EVIDENCE_O2=1 inserts the sandbox-entry recorder (O2) in front of the launch wrapper; the loaded
+    // reproduction of MVP-7991 alternates it so the recorder cannot hide the original timing.
+    const recorder = process.env.FD_EVIDENCE_O2 === "1" ? writeRecorderWrapper({ dir: evidenceDir(), entry: true }) : null;
     const r = await probe(`
+      ${O3_SNIPPET}
       echo PID1=$(cat /proc/1/comm)
       echo PIDS=$(ls -d /proc/[0-9]* | wc -l)
       echo SELF_ENV_HAS_HOME=$(cat /proc/self/environ | tr '\\0' '\\n' | grep -c '^HOME=/home/node$')
@@ -320,7 +395,7 @@ def hits(pattern):
 print("ALL_ENV_MARKERS=%d" % hits("/proc/[0-9]*/environ"))
 print("ALL_CMDLINE_MARKERS=%d" % hits("/proc/[0-9]*/cmdline"))
 PYEOF
-      echo FDS=$(python3 -c "import os; print(' '.join(sorted(n for n in os.listdir('/proc/self/fd') if os.path.exists('/proc/self/fd/' + n))))")
+      echo "$(${O4_LISTING})"
       echo KCORE=$(cat /proc/kcore 2>&1 | wc -c)
       echo TIMER_LIST=$(cat /proc/timer_list 2>&1 | wc -c)
       echo SYSRQ=$(echo b > /proc/sysrq-trigger 2>&1; echo $?)
@@ -332,9 +407,23 @@ PYEOF
       echo UNSHARE_USER=$(unshare -U true >/dev/null 2>&1; echo $?)
       echo UNSHARE_ROOT=$(unshare -r true >/dev/null 2>&1; echo $?)
       echo UNSHARE_NET=$(unshare -n true >/dev/null 2>&1; echo $?)
-    `);
+    `, { observe: true, config: recorder ? config({ bwrapPath: recorder.bwrapPath }) : undefined });
     expect(r.exitCode, r.stdout).toBe(0);
     const v = (key: string) => r.lines.get(key);
+    // The descriptor table at the observation points, each marked valid or missing; a failure names every
+    // descriptor beyond 0 1 2 with its redacted target and flags (MVP-7991).
+    const fdCtx = fdContext();
+    const o1 = r.o1 ?? null;
+    const o2 = recorder ? readRecorderFile("O2", recorder.entryFile).table : null;
+    const o3 = parseFdRecords(r.stdout, "O3");
+    const o4 = parseFdRecords(r.stdout, "O4");
+    const fdChecks = [checkDescriptors(o3, fdCtx), checkDescriptors(o4, fdCtx)];
+    emitEvidence([summaryLine([o1, o2, o3, o4], { recorder: recorder ? "on" : "off" })]);
+    if (fdChecks.some((c) => !c.ok)) {
+      const extra = fdChecks.flatMap((c) => c.extra);
+      emitEvidence([...[o1, o2, o3, o4].flatMap((t) => (t ? evidenceLines(t, fdCtx) : [])), ...crossReference(extra, o1, process.pid)]);
+    }
+    expect(fdChecks.filter((c) => !c.ok).map((c) => c.message), "descriptor tables of the probe").toEqual([]);
     // The sandbox's own init is process 1; the gateway, its parent and every sibling are not visible.
     expect(v("PID1")).toBe("bwrap");
     expect(Number(v("PIDS"))).toBeLessThanOrEqual(6);
@@ -356,6 +445,39 @@ PYEOF
     // A nested user namespace cannot be created (and the launcher already checked it before starting).
     expect(v("UNSHARE_USER")).not.toBe("0");
     expect(v("UNSHARE_ROOT")).not.toBe("0");
+  });
+});
+
+describe("descriptor diagnostics (MVP-7991)", () => {
+  it("control: the sandbox-entry recorder sees a descriptor the launcher holds open, holds none of its own at exec and changes nothing the probe sees", async () => {
+    const dir = evidenceDir();
+    const markerFile = path.join(dir, FD_MARKER);
+    fs.writeFileSync(markerFile, "marker");
+    const wrapper = writeRecorderWrapper({ dir, name: "control", entry: true, markers: [{ fd: 45, file: markerFile }] });
+    const keys = (stdout: string) =>
+      stdout
+        .split("\n")
+        .filter((l) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(l))
+        .filter((l) => !/^(ANTHROPIC_API_KEY|ANTHROPIC_BASE_URL|CLAUDE_CODE_DEBUG_LOGS_DIR|XDG_CACHE_HOME|_|SHLVL|PWD|OLDPWD)=/.test(l))
+        .sort();
+    const recorded = await probe("env", { config: config({ bwrapPath: wrapper.bwrapPath }) });
+    const plain = await probe("env");
+    expect(recorded.exitCode, recorded.stdout).toBe(0);
+    expect(keys(recorded.stdout).length).toBeGreaterThan(10);
+    // Exec-transparent: the environment the first command sees is the one the launcher built.
+    expect(keys(recorded.stdout)).toEqual(keys(plain.stdout));
+    const { table, survivors } = readRecorderFile("O2", wrapper.entryFile);
+    const fdCtx = fdContext();
+    emitEvidence(evidenceLines(table, fdCtx));
+    expect(table.valid, "O2 capture").toBe(true);
+    // The marker crossed the launcher boundary into the sandbox's first process: later clean tables are not vacuous.
+    expect(inheritedAtExec(table).entries.map((e) => e.fd)).toEqual([0, 1, 2, 45]);
+    const marker = table.entries.find((e) => e.fd === 45);
+    expect(marker?.target).toBe(markerFile);
+    expect(markersIn(evidenceLines(table, fdCtx).join("\n"))).toEqual([]);
+    expect(evidenceLines(table, fdCtx).join("\n")).not.toContain(FD_MARKER);
+    // The recorder holds no descriptor of its own at exec: what survives its exec is what it inherited.
+    expect(survivors).toEqual([0, 1, 2, 45]);
   });
 });
 
