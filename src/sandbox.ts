@@ -177,15 +177,30 @@ function noteStartFailure(failure: IsolationFailure): void {
 
 /** Exit code the launch wrapper uses when a nested user namespace can still be created. */
 export const EXIT_USERNS_NOT_BLOCKED = 97;
+/** Exit code the launch wrapper uses when it cannot list its own descriptors (no `/proc`), so it cannot prove it closed them. */
+export const EXIT_FDS_NOT_LISTABLE = 96;
 /** The line the launch wrapper writes to stderr once the sandbox has passed its start check. */
 export const SANDBOX_CHECK_LINE = "SANDBOX-CHECK-OK";
 /**
- * Launch wrapper, first process inside the sandbox: refuse to start unless a nested user
- * namespace fails, close the launcher's argument descriptor (the runtime inherits nothing but
- * stdin, stdout and stderr), report the passed check on stderr (which belongs to the launcher
- * until that line arrives) and exec the runtime.
+ * The interpreter of the launch wrapper: bash, because dash cannot close descriptors above 9. `-p` (privileged mode)
+ * ignores `BASH_ENV`, exported functions and `SHELLOPTS`; `--norc` is needed on top of it: the launcher's stdio are
+ * sockets, and bash then behaves as if started by sshd and sources `/etc/bash.bashrc` and `$HOME/.bashrc` even under
+ * `-p` (observed, Debian build).
  */
-export const LAUNCH_WRAPPER = `if unshare -U true >/dev/null 2>&1; then exit ${EXIT_USERNS_NOT_BLOCKED}; fi; exec 3>&-; echo ${SANDBOX_CHECK_LINE} >&2; exec "$@"`;
+export const LAUNCH_INTERPRETER = ["/bin/bash", "--norc", "-p", "-c"] as const;
+/**
+ * Launch wrapper, first process inside the sandbox: close every descriptor above 2 (bwrap passes on whatever its
+ * parent left open without close-on-exec, and the runtime inherits nothing but stdin, stdout and stderr), refuse to
+ * start unless a nested user namespace fails, report the passed check on stderr (which belongs to the launcher until
+ * that line arrives) and exec the runtime.
+ *
+ * It runs under `bash --norc -p` so neither the caller-controlled environment of a stdio tool server (`BASH_ENV`,
+ * `BASH_FUNC_*`, `SHELLOPTS`) nor a start file can change it; the close loop uses builtins only and does not look at
+ * `PATH`; `unshare` and the program it runs are called by absolute path (`unshare -U true` would look `true` up in
+ * `PATH`, fail under a poisoned `PATH` and read as "blocked"); and it refuses (its own exit code) when it cannot list
+ * its descriptors, because an unmatched glob would otherwise close nothing.
+ */
+export const LAUNCH_WRAPPER = `[ -e /proc/self/fd/0 ] || exit ${EXIT_FDS_NOT_LISTABLE}; for f in /proc/self/fd/*; do n=\${f##*/}; if [ "$n" -gt 2 ]; then eval "exec $n>&-"; fi; done; if /usr/bin/unshare -U /usr/bin/true >/dev/null 2>&1; then exit ${EXIT_USERNS_NOT_BLOCKED}; fi; echo ${SANDBOX_CHECK_LINE} >&2; exec "$@"`;
 
 export interface RootLayout {
   /** `--symlink <target> <link>` entries (merged-usr layouts). */
@@ -251,7 +266,7 @@ export function buildBwrapArgv(spec: BwrapSpec): string[] {
   for (const dest of spec.hidden) argv.push("--ro-bind", spec.emptyFile, dest);
   for (const p of spec.roBinds) argv.push("--ro-bind", p, p);
   for (const p of spec.rwBinds) argv.push("--bind", p, p);
-  argv.push("--chdir", spec.workDir ? SANDBOX_WORK : SANDBOX_HOME, "--", "/bin/sh", "-c", LAUNCH_WRAPPER, "sandbox", spec.command, ...spec.args);
+  argv.push("--chdir", spec.workDir ? SANDBOX_WORK : SANDBOX_HOME, "--", ...LAUNCH_INTERPRETER, LAUNCH_WRAPPER, "sandbox", spec.command, ...spec.args);
   return argv;
 }
 
@@ -462,6 +477,9 @@ export interface Launch {
 
 function classifyEarlyExit(code: number | null, stderr: string): IsolationProblem {
   if (code === EXIT_USERNS_NOT_BLOCKED) return "userns_not_blocked";
+  if (code === EXIT_FDS_NOT_LISTABLE) return "proc_denied";
+  // The interpreter of the launch wrapper is missing in the sandbox's root: the isolation runtime's own exec failure.
+  if (/execvp \/bin\/bash: No such file or directory/.test(stderr)) return "binary_missing";
   if (/No permissions to create new namespace|Creating new namespace failed/.test(stderr)) return "namespace_denied";
   if (/Can't mount proc|mount proc/.test(stderr)) return "proc_denied";
   if (/Can't (mount|bind|make|create|mkdir|find source|open)|Failed to make|pivot_root|No such file or directory/.test(stderr)) return "mount_failed";

@@ -18,8 +18,14 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { ModelProxy, ProviderCredentials } from "../model-proxy.js";
 import { createRunLogDir } from "../sdk-run-logs.js";
 import {
+  EXIT_FDS_NOT_LISTABLE,
   IsolationFailure,
+  LAUNCH_WRAPPER,
   SandboxRun,
+  buildBwrapArgv,
+  detectProcMasks,
+  detectRootLayout,
+  launchBwrap,
   isolationStatus,
   loadIsolationConfig,
   resetIsolationStatusForTests,
@@ -29,7 +35,8 @@ import {
 } from "../sandbox.js";
 import { FINAL_ANSWER, startFakeAnthropicApi, type FakeAnthropicApi, type FakeApiMode } from "./helpers/fake-anthropic-api.js";
 import { assertFreshBuild, descendants, gatewayRequest, getHealth, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
-import { checkDescriptors, crossReference, emitEvidence, evidenceLines, inheritedAtExec, parseFdRecords, readFdTable, readRecorderFile, summaryLine, writeRecorderWrapper, type FdTable, type RedactContext } from "./helpers/fd-evidence.js";
+import { checkDescriptors, crossReference, emitEvidence, evidenceLines, inheritedAtExec, isCloseOnExec, parseFdRecords, readFdTable, summaryLine, writeRecorderWrapper, type FdTable, type RecorderWrapperOptions, type RedactContext } from "./helpers/fd-evidence.js";
+import { buildToolSandboxEnv } from "../mcp-stdio-sandbox.js";
 import { DETACHED_MAX_AGE_S, detachedAgeS, detachedCommand, detachedEvidence, detachedProof, detachedTag, killRun, runPresence, tagPresence, waitRunGone, type DetachedRecord } from "./helpers/security-matrix.js";
 
 // Real processes on a shared, loaded host: every row gets a generous deadline.
@@ -414,7 +421,7 @@ PYEOF
     // descriptor beyond 0 1 2 with its redacted target and flags (MVP-7991).
     const fdCtx = fdContext();
     const o1 = r.o1 ?? null;
-    const o2 = recorder ? readRecorderFile("O2", recorder.entryFile).table : null;
+    const o2 = recorder ? (recorder.captures("O2").at(-1)?.table ?? ({ point: "O2", valid: false, entries: [], reason: "no recorder file" } as FdTable)) : null;
     const o3 = parseFdRecords(r.stdout, "O3");
     const o4 = parseFdRecords(r.stdout, "O4");
     const fdChecks = [checkDescriptors(o3, fdCtx), checkDescriptors(o4, fdCtx)];
@@ -449,6 +456,21 @@ PYEOF
 });
 
 describe("descriptor diagnostics (MVP-7991)", () => {
+  it("a Node process marks a descriptor it inherited close-on-exec at startup: the gateway cannot hand an inherited descriptor to bwrap, only the process that execs bwrap can", () => {
+    const { dir, file } = fdMarkerFile();
+    const fd = fs.openSync(file, "r");
+    try {
+      const code = `const fs=require("fs");console.log(fs.readFileSync("/proc/self/fdinfo/5","utf8").split("\\n").find((l)=>l.startsWith("flags")))`;
+      const flagsOf = (command: string, args: string[]) => /flags:\s+(\d+)/.exec(execFileSync(command, args, { stdio: ["ignore", "pipe", "ignore", "ignore", "ignore", fd], encoding: "utf8" }))?.[1] ?? null;
+      // Control: a non-Node child sees the same descriptor without the flag, so the inheritance itself works.
+      expect(isCloseOnExec(flagsOf("python3", ["-c", 'print(open("/proc/self/fdinfo/5").read().split(chr(10))[1])'])), "python child").toBe(false);
+      expect(isCloseOnExec(flagsOf(process.execPath, ["-e", code])), "node child").toBe(true);
+    } finally {
+      fs.closeSync(fd);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("control: the sandbox-entry recorder sees a descriptor the launcher holds open, holds none of its own at exec and changes nothing the probe sees", async () => {
     const dir = evidenceDir();
     const markerFile = path.join(dir, FD_MARKER);
@@ -466,7 +488,9 @@ describe("descriptor diagnostics (MVP-7991)", () => {
     expect(keys(recorded.stdout).length).toBeGreaterThan(10);
     // Exec-transparent: the environment the first command sees is the one the launcher built.
     expect(keys(recorded.stdout)).toEqual(keys(plain.stdout));
-    const { table, survivors } = readRecorderFile("O2", wrapper.entryFile);
+    const captures = wrapper.captures("O2");
+    expect(captures.length, "one launch, one O2 capture").toBe(1);
+    const { table, survivors } = captures[0];
     const fdCtx = fdContext();
     emitEvidence(evidenceLines(table, fdCtx));
     expect(table.valid, "O2 capture").toBe(true);
@@ -478,6 +502,250 @@ describe("descriptor diagnostics (MVP-7991)", () => {
     expect(evidenceLines(table, fdCtx).join("\n")).not.toContain(FD_MARKER);
     // The recorder holds no descriptor of its own at exec: what survives its exec is what it inherited.
     expect(survivors).toEqual([0, 1, 2, 45]);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  The launcher boundary: nothing above descriptor 2 crosses (MVP-7991) */
+/* ------------------------------------------------------------------ */
+
+/** The launch wrapper as it was before MVP-7991 (it closed only descriptor 3), for the negative controls. */
+const PRE_FIX_LAUNCH_WRAPPER = `if unshare -U true >/dev/null 2>&1; then exit 97; fi; exec 3>&-; echo SANDBOX-CHECK-OK >&2; exec "$@"`;
+
+/** What the sandbox's init (process 1) holds: readable entries and how many point at the marker. */
+const PID1_PROBE = `python3 -c "
+import os
+rows = []
+for n in sorted(os.listdir('/proc/1/fd'), key=int):
+    try:
+        rows.append((n, os.readlink('/proc/1/fd/' + n)))
+    except OSError:
+        pass
+print('PID1_READABLE=%d' % len(rows))
+print('PID1_MARKER_FDS=%d' % sum(1 for n, t in rows if 'SYNTH-FD-MARKER' in t))
+"`;
+
+/** A marker file the launching side holds open, in a directory of its own. */
+function fdMarkerFile(): { dir: string; file: string } {
+  const dir = evidenceDir();
+  const file = path.join(dir, FD_MARKER);
+  fs.writeFileSync(file, "marker");
+  return { dir, file };
+}
+
+/** A probe through a test-owned bwrap wrapper that holds a marker on descriptor 45 and records the sandbox entry. */
+async function boundaryProbe(extra: Partial<RecorderWrapperOptions> = {}) {
+  const { dir, file } = fdMarkerFile();
+  const wrapper = writeRecorderWrapper({ dir, entry: true, markers: [{ fd: 45, file }], ...extra });
+  const r = await probe(`${O3_SNIPPET}\necho "$(${O4_LISTING})"\n${PID1_PROBE}`, { observe: true, config: config({ bwrapPath: wrapper.bwrapPath }) });
+  const ctx = fdContext();
+  const o2 = wrapper.captures("O2").at(-1)?.table ?? ({ point: "O2", valid: false, entries: [], reason: "no recorder file" } as FdTable);
+  const o3 = parseFdRecords(r.stdout, "O3");
+  const o4 = parseFdRecords(r.stdout, "O4");
+  emitEvidence([summaryLine([r.o1 ?? null, o2, o3, o4], { row: "probe-marker" })]);
+  return { r, file, ctx, o2, o3, o4, checks: { o3: checkDescriptors(o3, ctx), o4: checkDescriptors(o4, ctx) } };
+}
+
+/**
+ * The real runtime through the gateway, launched by the production `launchBwrap`, while the process that execs bwrap
+ * (the test-owned `AGENT_SANDBOX_BWRAP` wrapper) holds a marker descriptor without close-on-exec. The gateway process
+ * itself cannot hold one: Node marks every inherited descriptor above 2 close-on-exec at startup (see the row about it).
+ */
+async function runtimeBoundary(replace?: RecorderWrapperOptions["replace"]) {
+  const { dir, file } = fdMarkerFile();
+  const wrapper = writeRecorderWrapper({ dir, entry: true, start: true, markers: [{ fd: 45, file }], replace });
+  const c = await chain({ env: { AGENT_SANDBOX_BWRAP: wrapper.bwrapPath } });
+  const ctx = fdContext();
+  const answer = await ask(c);
+  const entry = wrapper.captures("O2").filter((x) => x.runtime).at(-1);
+  const start = wrapper.captures("O5").filter((x) => x.runtime).at(-1);
+  const o2 = entry?.table ?? ({ point: "O2", valid: false, entries: [], reason: "no recorder file" } as FdTable);
+  const o5 = start ? { ...inheritedAtExec(start.table), point: "O5" } : ({ point: "O5", valid: false, entries: [], reason: "no recorder file" } as FdTable);
+  emitEvidence([summaryLine([o2, o5], { row: "real-runtime-marker", observed: "sandbox entry before the launch wrapper (O2), runtime start after it (O5)" })]);
+  return { file, ctx, answer, entry, start, o2, o5, check: checkDescriptors(o5, ctx) };
+}
+
+describe("the launcher boundary closes every inherited descriptor (MVP-7991)", () => {
+  it("probe path: a descriptor the launcher holds open reaches the sandbox entry, never the probe, and the sandbox init does not hold it", async () => {
+    const b = await boundaryProbe();
+    expect(b.r.exitCode, b.r.stdout).toBe(0);
+    // Not vacuous: the marker was in the table of the sandbox's first process, before the launch wrapper ran.
+    expect(b.o2.valid, "O2 capture").toBe(true);
+    const entry = inheritedAtExec(b.o2).entries.find((e) => e.fd === 45);
+    expect(entry?.target).toBe(b.file);
+    // After the launch wrapper: the probe shell and the Python listing see exactly 0 1 2.
+    expect(b.checks.o3.ok, b.checks.o3.message).toBe(true);
+    expect(b.checks.o4.ok, b.checks.o4.message).toBe(true);
+    expect(Number(b.r.lines.get("PID1_READABLE")), "process 1 listing readable").toBeGreaterThan(0);
+    expect(b.r.lines.get("PID1_MARKER_FDS")).toBe("0");
+  });
+
+  it("negative control (probe path): with the pre-fix wrapper the same marker reaches the probe and the checker names it with its redacted target", async () => {
+    const b = await boundaryProbe({ replace: [{ from: LAUNCH_WRAPPER, to: PRE_FIX_LAUNCH_WRAPPER }] });
+    expect(b.r.exitCode, b.r.stdout).toBe(0);
+    expect(inheritedAtExec(b.o2).entries.some((e) => e.fd === 45)).toBe(true);
+    for (const check of [b.checks.o3, b.checks.o4]) {
+      expect(check.ok).toBe(false);
+      expect(check.message).toContain("45 -> <tmp>/<redacted>");
+      expect(check.message).not.toContain(FD_MARKER);
+    }
+  });
+
+  // A pass proves only that the launcher passes nothing across the boundary, not that the runtime never opens descriptors later.
+  it("real runtime: a descriptor held by the process that execs bwrap reaches the sandbox entry of the real launch, and the runtime's start table is exactly 0 1 2", async () => {
+    const x = await runtimeBoundary();
+    expect(x.answer.events.at(-1)?.type, JSON.stringify(x.answer.events.at(-1))).toBe("done");
+    // Not vacuous: the marker was present at sandbox entry.
+    expect(x.o2.valid, "O2 capture of the runtime launch").toBe(true);
+    expect(inheritedAtExec(x.o2).entries.find((e) => e.fd === 45)?.target).toBe(x.file);
+    // The runtime's start table, read right after the launch wrapper and before node starts.
+    expect(x.check.ok, x.check.message).toBe(true);
+    expect(x.start?.survivors, "the recorder holds no descriptor of its own at exec").toEqual([0, 1, 2]);
+    expect(x.start?.pid1?.length ?? 0, "process 1 listing readable").toBeGreaterThan(0);
+    expect(x.start?.pid1?.includes(x.file), "the marker is not held by the sandbox init").toBe(false);
+  }, 120_000);
+
+  it("negative control (real runtime): with the pre-fix wrapper the marker reaches the runtime's start table and the checker names it", async () => {
+    const x = await runtimeBoundary([{ from: LAUNCH_WRAPPER, to: PRE_FIX_LAUNCH_WRAPPER }]);
+    expect(x.answer.events.at(-1)?.type).toBe("done");
+    expect(inheritedAtExec(x.o2).entries.some((e) => e.fd === 45)).toBe(true);
+    expect(x.check.ok).toBe(false);
+    expect(x.check.message).toContain("45 -> <tmp>/<redacted>");
+    expect(x.check.message).not.toContain(FD_MARKER);
+  }, 120_000);
+
+  it("a start that cannot list its descriptors is refused as proc_denied before the runtime starts", async () => {
+    // A launcher that drops `--proc /proc`: the sandbox has no /proc/self/fd, the wrapper cannot prove it closed anything.
+    const noProc = path.join(tmp, "bwrap-without-proc");
+    fs.writeFileSync(noProc, `#!/bin/bash\nexec /usr/bin/bwrap --args 4 "\${@:3}" 4< <(perl -0777 -pe 's/--proc\\0\\/proc\\0//' <&3)\n`, { mode: 0o755 });
+    const runLogs = createRunLogDir();
+    const run = new SandboxRun({ queryId: "q-probe", runLogDir: runLogs.dir, runLogEnv: runLogs.env, sessionDirId: dirId("conv-noproc"), workspaceRoot: ws, config: config({ bwrapPath: noProc }), proxy });
+    const child = run.spawnHook({ command: "/bin/sh", args: ["-c", "echo started > /home/node/started", SDK_CLI], env: {}, signal: new AbortController().signal });
+    child.stdin.end();
+    const exitCode = await new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
+    expect(exitCode).toBe(EXIT_FDS_NOT_LISTABLE);
+    expect(run.startFailure?.problem).toBe("proc_denied");
+    expect(fs.existsSync(path.join(sandboxRoot, "sessions", dirId("conv-noproc"), "home", "started"))).toBe(false);
+    await run.dispose();
+    fs.rmSync(runLogs.dir, { recursive: true, force: true });
+  });
+
+  it("a missing /bin/bash fails closed as binary_missing", async () => {
+    const { dir } = fdMarkerFile();
+    // A tmpfs over /usr/bin: the merged-usr /bin/bash no longer exists inside the sandbox.
+    const wrapper = writeRecorderWrapper({ dir, name: "nobash", extraArgs: ["--tmpfs", "/usr/bin"] });
+    const runLogs = createRunLogDir();
+    const run = new SandboxRun({ queryId: "q-probe", runLogDir: runLogs.dir, runLogEnv: runLogs.env, sessionDirId: dirId("conv-nobash"), workspaceRoot: ws, config: config({ bwrapPath: wrapper.bwrapPath }), proxy });
+    const child = run.spawnHook({ command: "/bin/sh", args: ["-c", "echo started > /home/node/started", SDK_CLI], env: {}, signal: new AbortController().signal });
+    child.stdin.end();
+    await new Promise<void>((resolve) => child.on("exit", () => resolve()));
+    expect(run.startFailure?.problem).toBe("binary_missing");
+    expect(fs.existsSync(path.join(sandboxRoot, "sessions", dirId("conv-nobash"), "home", "started"))).toBe(false);
+    await run.dispose();
+    fs.rmSync(runLogs.dir, { recursive: true, force: true });
+  });
+});
+
+describe("the launch wrapper against a hostile tool-server environment (MVP-7991)", () => {
+  /** A stdio tool server's `env` (merged verbatim into the sandbox environment) that targets a bash launch wrapper. */
+  const ATTACK_ENV: Record<string, string> = {
+    BASH_ENV: "$(/usr/bin/touch /tmp/pwn-bash-env)",
+    "BASH_FUNC_exec%%": '() { /usr/bin/touch /tmp/pwn-exec-fn; builtin exec "$@"; }',
+    "BASH_FUNC_unshare%%": "() { /usr/bin/touch /tmp/pwn-unshare-fn; return 1; }",
+    SHELLOPTS: "xtrace",
+    PATH: "/nonexistent",
+  };
+  const O3_ABSOLUTE = O3_SNIPPET.replace("python3 -c", "/usr/bin/python3 -c");
+  const SCRIPT = `${O3_ABSOLUTE}\n/usr/bin/python3 -c "import os; print('PWN=' + ','.join(sorted(n for n in os.listdir('/tmp') if n.startswith('pwn-'))))"`;
+
+  /**
+   * A test-owned bwrap wrapper in Python (a bash wrapper would drop BASH_ENV and SHELLOPTS from the environment it
+   * passes on): holds the marker on descriptor 45 without close-on-exec, optionally rewrites elements of the command
+   * after `--`, and execs the real bwrap with the environment untouched.
+   */
+  function pythonHolder(dir: string, markerPath: string, replace: { from: string; to: string }[]): string {
+    const script = path.join(dir, "holder-bwrap.py");
+    fs.writeFileSync(
+      script,
+      [
+        "#!/usr/bin/python3 -I",
+        "import json, os, sys",
+        `fd = os.open(${JSON.stringify(markerPath)}, os.O_RDONLY)`,
+        "os.dup2(fd, 45, inheritable=True)",
+        "os.close(fd)",
+        "args = sys.argv[1:]",
+        "split = args.index('--')",
+        `replace = json.loads(${JSON.stringify(JSON.stringify(replace))})`,
+        "args = args[:split] + [next((r['to'] for r in replace if r['from'] == a), a) for a in args[split:]]",
+        "os.execv('/usr/bin/bwrap', ['/usr/bin/bwrap'] + args)",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    return script;
+  }
+
+  /** The launch the stdio tool sandbox uses: `buildBwrapArgv` + `launchBwrap` with `buildToolSandboxEnv`. */
+  async function stdioLaunch(serverEnv: Record<string, string>, options: { bwrapPath?: string; plantBashrc?: boolean; replace?: { from: string; to: string }[] } = {}) {
+    const { dir, file } = fdMarkerFile();
+    const { bwrapPath, plantBashrc, replace } = options;
+    const holder = bwrapPath ?? pythonHolder(dir, file, replace ?? []);
+    const home = fs.mkdtempSync(path.join(tmp, "stdio-home-"));
+    fs.chmodSync(home, 0o700);
+    // A start file in the server's home: the launcher's stdio are sockets, and bash then sources it even in privileged mode.
+    if (plantBashrc) fs.writeFileSync(path.join(home, ".bashrc"), "/usr/bin/touch /tmp/pwn-bashrc\n");
+    const argv = buildBwrapArgv({ layout: detectRootLayout(), procMasks: detectProcMasks(), homeDir: home, mounts: [], hidden: [], emptyFile: "/dev/null", roBinds: [], rwBinds: [], command: "/bin/sh", args: ["-c", SCRIPT] });
+    const launch = launchBwrap(config({ bwrapPath: holder }), argv, buildToolSandboxEnv(process.env, serverEnv), { markOk: false });
+    let stdout = "";
+    let stderr = "";
+    launch.child.stdout?.on("data", (d: Buffer) => (stdout += d.toString("utf8")));
+    launch.child.stderr?.on("data", (d: Buffer) => (stderr += d.toString("utf8")));
+    const outcome = await launch.ready.then(
+      () => "ready" as const,
+      (f: IsolationFailure) => f,
+    );
+    await new Promise<void>((resolve) => (launch.child.exitCode !== null || launch.child.signalCode !== null ? resolve() : launch.child.once("exit", () => resolve())));
+    fs.rmSync(home, { recursive: true, force: true });
+    return { outcome, stdout, stderr, ctx: fdContext() };
+  }
+
+  it("BASH_ENV, exported functions, SHELLOPTS, a start file in the home and a poisoned PATH change nothing: the server still sees exactly 0 1 2; controls show each attack is live", async () => {
+    const hardened = await stdioLaunch(ATTACK_ENV, { plantBashrc: true });
+    expect(hardened.outcome).toBe("ready");
+    const table = parseFdRecords(hardened.stdout, "O3");
+    const check = checkDescriptors(table, hardened.ctx);
+    emitEvidence([summaryLine([table], { row: "stdio-env-attack", wrapper: "bash --norc -p" })]);
+    expect(check.ok, check.message).toBe(true);
+    expect(hardened.stdout.split("\n"), "nothing of the attack ran").toContain("PWN=");
+    expect(hardened.stderr.split("\n").filter((l) => l.startsWith("+")), "no xtrace output").toEqual([]);
+
+    // Control 1: without privileged mode BASH_ENV, the exported function and SHELLOPTS take effect.
+    const noPrivileged = await stdioLaunch(ATTACK_ENV, { replace: [{ from: "-p", to: "+p" }] });
+    expect(noPrivileged.outcome).toBe("ready");
+    const pwnedEnv = noPrivileged.stdout.split("\n").find((l) => l.startsWith("PWN=")) ?? "";
+    expect(pwnedEnv).toContain("pwn-bash-env");
+    expect(pwnedEnv).toContain("pwn-exec-fn");
+    expect(noPrivileged.stderr.split("\n").some((l) => l.startsWith("+"))).toBe(true);
+    // The marker crossed the boundary in this run (the exported `exec` replaced the close step), so the clean table above is not vacuous.
+    const leaked = checkDescriptors(parseFdRecords(noPrivileged.stdout, "O3"), noPrivileged.ctx);
+    expect(leaked.ok).toBe(false);
+    expect(leaked.message).toContain("45 -> <tmp>/<redacted>");
+
+    // Control 2: without `--norc` the start file of the server's home runs, even in privileged mode.
+    const withRc = await stdioLaunch({ PATH: "/nonexistent" }, { plantBashrc: true, replace: [{ from: "--norc", to: "--noprofile" }] });
+    expect(withRc.outcome).toBe("ready");
+    expect(withRc.stdout.split("\n").find((l) => l.startsWith("PWN=")) ?? "").toContain("pwn-bashrc");
+  });
+
+  it("with a poisoned PATH the nested user namespace check still runs and refuses a sandbox that allows one", async () => {
+    const dir = evidenceDir();
+    // The helper bwrap itself runs with the poisoned environment, so it names its tools by absolute path.
+    const fake = path.join(dir, "bwrap-without-disable-userns");
+    fs.writeFileSync(fake, NO_DISABLE_USERNS_BWRAP.replace("#!/bin/bash", "#!/bin/bash -p").replace("perl", "/usr/bin/perl"), { mode: 0o755 });
+    for (const env of [{}, ATTACK_ENV]) {
+      const refused = await stdioLaunch(env, { bwrapPath: fake });
+      expect(refused, JSON.stringify(Object.keys(env))).toMatchObject({ outcome: { name: "IsolationFailure", problem: "userns_not_blocked" } });
+    }
   });
 });
 

@@ -240,7 +240,7 @@ export function emitEvidence(lines: string[]): void {
  * Python opens is close-on-exec), and execs the rest of its command line with its original environment (read from
  * `/proc/self/environ`, so Python's locale coercion cannot leak into the next program).
  */
-export const RECORDER_PY = String.raw`import json, os, shutil, sys
+export const RECORDER_PY = String.raw`import json, os, shutil, sys, time
 
 out_path, point, command = sys.argv[1], sys.argv[2], sys.argv[3:]
 
@@ -272,8 +272,21 @@ def survivors(rows):
     return sorted(r["fd"] for r in rows if r["flags"] is not None and not (int(r["flags"], 8) & 0o2000000))
 
 rows = snapshot()
+# What the sandbox's init (process 1) holds: link targets only.
+pid1 = []
+try:
+    for n in os.listdir("/proc/1/fd"):
+        try:
+            pid1.append(os.readlink("/proc/1/fd/" + n))
+        except OSError:
+            pass
+except OSError:
+    pid1 = None
+# One file per launch (a gateway also starts a boot self-check through the same wrapper); "runtime" marks the start of the agent runtime.
+out_path = "%s.%d.json" % (out_path, time.time_ns())
+runtime = any(arg.endswith("cli.js") for arg in command)
 with open(out_path, "w") as handle:
-    json.dump({"point": point, "entries": rows}, handle)
+    json.dump({"point": point, "runtime": runtime, "entries": rows, "pid1": pid1}, handle)
 after = survivors(snapshot())
 with open(out_path + ".exec", "w") as handle:
     json.dump({"survivors": after}, handle)
@@ -300,8 +313,10 @@ export interface RecorderWrapperOptions {
   start?: boolean;
   /** Descriptors the wrapper holds open (non-close-on-exec) while it execs bwrap, one per entry. */
   markers?: { fd: number; file: string }[];
-  /** Replace the launch wrapper text in the argument vector (the negative control substitutes the pre-fix wrapper). */
-  replaceWrapper?: { from: string; to: string };
+  /** Replace whole elements of the post-`--` argument vector (the negative control substitutes the pre-fix wrapper text, another row a missing interpreter). */
+  replace?: { from: string; to: string }[];
+  /** Extra bwrap options, appended after the launcher's (e.g. a tmpfs over a directory the sandbox needs to be missing). */
+  extraArgs?: string[];
   /** Prefix of the evidence file names. */
   name?: string;
 }
@@ -309,8 +324,18 @@ export interface RecorderWrapperOptions {
 export interface RecorderWrapper {
   /** The executable to use as `config.bwrapPath`. */
   bwrapPath: string;
-  entryFile: string;
-  startFile: string;
+  /** Every capture of one observation point so far, oldest first (a gateway also starts a boot self-check through the wrapper). */
+  captures: (point: "O2" | "O5") => RecorderCapture[];
+}
+
+export interface RecorderCapture {
+  table: FdTable;
+  /** Descriptors that survive the recorder's exec (no close-on-exec flag), read after it closed its evidence file; null when unreadable. */
+  survivors: number[] | null;
+  /** The command that follows names the agent runtime (`cli.js`). */
+  runtime: boolean;
+  /** Link targets of the sandbox init's descriptors (`/proc/1/fd`), null when unreadable. */
+  pid1: string[] | null;
 }
 
 const SANDBOX_EVIDENCE_DIR = "/fd-evidence";
@@ -328,40 +353,48 @@ export function writeRecorderWrapper(options: RecorderWrapperOptions): RecorderW
   fs.mkdirSync(options.dir, { recursive: true });
   const recorder = path.join(options.dir, "fd-recorder.py");
   fs.writeFileSync(recorder, RECORDER_PY);
-  const entryFile = path.join(options.dir, `${name}-O2.json`);
-  const startFile = path.join(options.dir, `${name}-O5.json`);
   const markerOpens = (options.markers ?? []).map((m) => `exec ${m.fd}<${shQuote(m.file)}`).join("\n");
-  const replace = options.replaceWrapper;
+  const replacements = (options.replace ?? []).map(
+    (r) => `for i in "\${!post[@]}"; do if [ "\${post[$i]}" = ${shQuote(r.from)} ]; then post[$i]=${shQuote(r.to)}; fi; done`,
+  );
+  const python = `/usr/bin/python3 -I -S ${SANDBOX_EVIDENCE_DIR}/fd-recorder.py`;
   const lines = [
-    "#!/bin/bash",
+    // Privileged mode: a hostile server environment (BASH_ENV, exported functions, SHELLOPTS) must not change this helper either.
+    "#!/bin/bash -p",
     markerOpens,
     "pre=()",
     'while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do pre+=("$1"); shift; done',
     "shift",
     'post=("$@")',
-    replace
-      ? `for i in "\${!post[@]}"; do if [ "\${post[$i]}" = ${shQuote(replace.from)} ]; then post[$i]=${shQuote(replace.to)}; fi; done`
-      : "",
-    `mounts=(--ro-bind ${shQuote(recorder)} ${SANDBOX_EVIDENCE_DIR}/fd-recorder.py --bind ${shQuote(options.dir)} ${SANDBOX_EVIDENCE_DIR}/out)`,
+    ...replacements,
+    `mounts=(--ro-bind ${shQuote(recorder)} ${SANDBOX_EVIDENCE_DIR}/fd-recorder.py --bind ${shQuote(options.dir)} ${SANDBOX_EVIDENCE_DIR}/out${(options.extraArgs ?? []).map((a) => ` ${shQuote(a)}`).join("")})`,
     'idx=-1; for i in "${!post[@]}"; do if [ "${post[$i]}" = sandbox ]; then idx=$i; break; fi; done',
-    options.start
-      ? `if [ "$idx" -ge 0 ]; then post=("\${post[@]:0:$((idx+1))}" /usr/bin/python3 -I -S ${SANDBOX_EVIDENCE_DIR}/fd-recorder.py ${SANDBOX_EVIDENCE_DIR}/out/${name}-O5.json O5 "\${post[@]:$((idx+1))}"); fi`
-      : "",
+    options.start ? `if [ "$idx" -ge 0 ]; then post=("\${post[@]:0:$((idx+1))}" ${python} ${SANDBOX_EVIDENCE_DIR}/out/${name}-O5 O5 "\${post[@]:$((idx+1))}"); fi` : "",
     options.entry
-      ? `exec /usr/bin/bwrap "\${pre[@]}" "\${mounts[@]}" -- /usr/bin/python3 -I -S ${SANDBOX_EVIDENCE_DIR}/fd-recorder.py ${SANDBOX_EVIDENCE_DIR}/out/${name}-O2.json O2 "\${post[@]}"`
+      ? `exec /usr/bin/bwrap "\${pre[@]}" "\${mounts[@]}" -- ${python} ${SANDBOX_EVIDENCE_DIR}/out/${name}-O2 O2 "\${post[@]}"`
       : `exec /usr/bin/bwrap "\${pre[@]}" "\${mounts[@]}" -- "\${post[@]}"`,
     "",
   ];
   const script = path.join(options.dir, `${name}-bwrap.sh`);
   fs.writeFileSync(script, lines.filter((l) => l !== "").join("\n") + "\n", { mode: 0o755 });
-  return { bwrapPath: script, entryFile, startFile };
+  const captures = (point: "O2" | "O5"): RecorderCapture[] =>
+    fs
+      .readdirSync(options.dir)
+      .filter((f) => new RegExp(`^${name}-${point}\\.\\d+\\.json$`).test(f))
+      .sort((x, y) => Number(x.split(".")[1]) - Number(y.split(".")[1]))
+      .map((f) => readRecorderFile(point, path.join(options.dir, f)));
+  return { bwrapPath: script, captures };
 }
 
-/** A recorder capture file as a table; missing or empty means not valid. Also returns the descriptors that would survive its exec. */
-export function readRecorderFile(point: string, file: string): { table: FdTable; survivors: number[] | null } {
+/** One recorder capture file; missing or empty means not valid. */
+export function readRecorderFile(point: string, file: string): RecorderCapture {
   let table: FdTable;
+  let runtime = false;
+  let pid1: string[] | null = null;
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { entries: FdEntry[] };
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { entries: FdEntry[]; runtime?: boolean; pid1?: string[] | null };
+    runtime = parsed.runtime === true;
+    pid1 = parsed.pid1 ?? null;
     table = parsed.entries.length === 0 ? { point, valid: false, entries: [], reason: "empty" } : { point, valid: true, entries: parsed.entries };
   } catch {
     table = { point, valid: false, entries: [], reason: "no recorder file" };
@@ -372,7 +405,7 @@ export function readRecorderFile(point: string, file: string): { table: FdTable;
   } catch {
     survivors = null;
   }
-  return { table, survivors };
+  return { table, survivors, runtime, pid1 };
 }
 
 /** The table a program would inherit across exec from the recorder's capture: the descriptors without the close-on-exec flag, minus the recorder's own listing directory. */

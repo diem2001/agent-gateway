@@ -8,6 +8,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   IsolationConfigError,
   IsolationFailure,
+  EXIT_FDS_NOT_LISTABLE,
+  EXIT_USERNS_NOT_BLOCKED,
+  LAUNCH_INTERPRETER,
   LAUNCH_WRAPPER,
   buildBwrapArgv,
   buildSandboxEnv,
@@ -158,7 +161,9 @@ describe("bwrap argument list", () => {
       "--chdir",
       "/work",
       "--",
-      "/bin/sh",
+      "/bin/bash",
+      "--norc",
+      "-p",
       "-c",
       LAUNCH_WRAPPER,
       "sandbox",
@@ -180,12 +185,29 @@ describe("bwrap argument list", () => {
     expect(argv.join(" ")).not.toContain("/srv/sb/sessions ");
   });
 
-  it("the launch wrapper refuses to run unless a nested user namespace fails, reports the check and starts the runtime last", () => {
-    expect(LAUNCH_WRAPPER).toContain("unshare -U true");
-    expect(LAUNCH_WRAPPER).toContain("exit 97");
-    expect(LAUNCH_WRAPPER.indexOf("exit 97")).toBeLessThan(LAUNCH_WRAPPER.indexOf("exec 3>&-"));
-    expect(LAUNCH_WRAPPER.indexOf("exec 3>&-")).toBeLessThan(LAUNCH_WRAPPER.indexOf("SANDBOX-CHECK-OK"));
+  it("the launch wrapper closes every descriptor above 2 first, refuses without a descriptor listing, then checks the nested user namespace, reports it and starts the runtime last", () => {
+    // bash, because dash cannot close descriptors above 9: `-p` ignores BASH_ENV, exported functions and SHELLOPTS,
+    // `--norc` keeps the sshd-style start files out (the launcher's stdio are sockets).
+    expect(LAUNCH_INTERPRETER).toEqual(["/bin/bash", "--norc", "-p", "-c"]);
+    const steps = [
+      "[ -e /proc/self/fd/0 ] || exit 96",
+      "for f in /proc/self/fd/*",
+      'eval "exec $n>&-"',
+      "/usr/bin/unshare -U /usr/bin/true",
+      "exit 97",
+      "SANDBOX-CHECK-OK",
+      'exec "$@"',
+    ];
+    const positions = steps.map((step) => LAUNCH_WRAPPER.indexOf(step));
+    expect(positions.every((p) => p >= 0), JSON.stringify(positions)).toBe(true);
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions);
     expect(LAUNCH_WRAPPER.endsWith('exec "$@"')).toBe(true);
+    expect(EXIT_FDS_NOT_LISTABLE).toBe(96);
+    expect(EXIT_USERNS_NOT_BLOCKED).toBe(97);
+    // Builtins and absolute paths only: no PATH lookup (a poisoned PATH skipped the namespace check before), no substitution (it would open a descriptor of its own).
+    expect(LAUNCH_WRAPPER).not.toMatch(/\$\(|`|<\(/);
+    expect(LAUNCH_WRAPPER).not.toMatch(/(^|[;&| ])unshare /);
+    expect(LAUNCH_WRAPPER).not.toContain("exec 3>&-");
   });
 });
 
