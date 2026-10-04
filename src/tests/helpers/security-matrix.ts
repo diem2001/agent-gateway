@@ -297,6 +297,9 @@ export const AC_ROWS: Record<string, string> = {
   "IF.cancel": "Failure: cancellation during a tool call with a child process",
   "IF.restart-term": "Failure: gateway restart (SIGTERM) during that tool call",
   "IF.restart-kill": "Failure: gateway restart (SIGKILL) during that tool call",
+  "IF.detached-complete": "Failure: a detached (setsid nohup) tool child at the run's normal completion",
+  "IF.detached-cancel": "Failure: a detached (setsid nohup) tool child at caller cancellation",
+  "IF.detached-kill": "Failure: a detached (setsid nohup) tool child at gateway SIGKILL",
   "IF.cred-missing": "Failure: missing upstream credential",
   "IF.cred-refused": "Failure: refused upstream credential",
   "IF.timeout": "Failure: upstream timeout",
@@ -1726,4 +1729,250 @@ export async function waitForIsolation(rig: SecurityRig, timeoutMs = 20_000): Pr
     if (state === "ok" || Date.now() > end) return state;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Detached tool children (MVP-7977)                                   */
+/* ------------------------------------------------------------------ */
+
+export const DETACHED_LIFETIME_S = 120;
+/** A child older than this at the moment of absence could have expired on its own: the row cannot prove anything then. */
+export const DETACHED_MAX_AGE_S = DETACHED_LIFETIME_S - 10;
+
+/**
+ * A unique, finite-lived tag: the fractional argument of a `sleep` that lives about two minutes. The lifetime outlasts every
+ * row's path to its deadline, and still bounds a leak.
+ */
+export function detachedTag(): string {
+  const digits = Array.from(randomBytes(12), (byte) => byte % 10).join("");
+  return `${DETACHED_LIFETIME_S}.${digits}`;
+}
+
+/** A tool command that leaves the tool's session and process group: `setsid nohup sleep <tag>` in the background. */
+export const detachedCommand = (tag: string): string => `setsid nohup sleep ${tag} >/dev/null 2>&1 </dev/null &`;
+
+interface ProcFacts {
+  pid: number;
+  ppid: number;
+  pgrp: number;
+  session: number;
+  startTicks: number;
+  state: string;
+  uid: number;
+  sigIgn: bigint;
+  /** The pid inside every PID namespace the process is in (outermost first); more than one entry means a nested namespace. */
+  nspid: number[];
+  comm: string;
+  cmdline: string;
+  /** The PID namespace link text, null when it cannot be read. */
+  pidNs: string | null;
+  /** Why `pidNs` is null: the process vanished (`ENOENT`) or the link is unreadable. */
+  pidNsError: string | null;
+}
+
+/** One process's `/proc` entry, or null when it ended while being read. */
+function readProcFacts(pid: number): ProcFacts | null {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "latin1");
+    const close = stat.lastIndexOf(")");
+    const comm = stat.slice(stat.indexOf("(") + 1, close);
+    // After the command: state(0) ppid(1) pgrp(2) session(3) ... starttime(19).
+    const rest = stat.slice(close + 2).split(" ");
+    const status = fs.readFileSync(`/proc/${pid}/status`, "latin1");
+    const field = (name: string): string => new RegExp(`^${name}:\\s*(.*)$`, "m").exec(status)?.[1] ?? "";
+    let cmdline = "";
+    try {
+      cmdline = fs.readFileSync(`/proc/${pid}/cmdline`).toString("latin1");
+    } catch {
+      // Ended, or a zombie.
+    }
+    let pidNs: string | null = null;
+    let pidNsError: string | null = null;
+    try {
+      pidNs = fs.readlinkSync(`/proc/${pid}/ns/pid`);
+    } catch (error) {
+      pidNsError = (error as NodeJS.ErrnoException).code ?? "unknown";
+    }
+    return {
+      pid,
+      ppid: Number(rest[1]),
+      pgrp: Number(rest[2]),
+      session: Number(rest[3]),
+      startTicks: Number(rest[19]),
+      state: rest[0],
+      uid: Number(field("Uid").split(/\s+/)[0]),
+      sigIgn: BigInt(`0x${field("SigIgn") || "0"}`),
+      nspid: field("NSpid").split(/\s+/).filter(Boolean).map(Number),
+      comm,
+      cmdline,
+      pidNs,
+      pidNsError,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function allProcFacts(): ProcFacts[] {
+  const result: ProcFacts[] = [];
+  for (const entry of fs.readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    const facts = readProcFacts(Number(entry));
+    if (facts) result.push(facts);
+  }
+  return result;
+}
+
+const clockTicksPerSecond = (): number => Number(execFileSync("getconf", ["CLK_TCK"], { encoding: "utf8" }).trim());
+const uptimeSeconds = (): number => Number(fs.readFileSync("/proc/uptime", "utf8").split(" ")[0]);
+
+/** What the host recorded of a run before it ended: the facts the absence check compares against. */
+export interface DetachedRecord {
+  tag: string;
+  /** The sandbox's PID namespace (link text). */
+  pidNs: string;
+  /** The outer `bwrap` (the launcher) and the sandbox's init (a copy of `bwrap`, pid 1 inside): pid and start time, so a reused pid is never mistaken. */
+  outer: { pid: number; startTicks: number };
+  init: { pid: number; startTicks: number };
+  child: { pid: number; startTicks: number };
+  /** Seconds since boot at the child's start. */
+  childStartedAtS: number;
+}
+
+export interface DetachedProof {
+  record: DetachedRecord | null;
+  /** The facts that held, and the ones that did not. */
+  held: string[];
+  missing: string[];
+}
+
+const SIGHUP_BIT = 1n;
+
+/**
+ * Host-side proof, before any termination, that the tagged child is a detached process inside the run's sandbox: it leads its
+ * own session and process group (left the tool's), ignores SIGHUP (`nohup`), is in a nested PID namespace (the sandbox's,
+ * different from this process's), and has a `bwrap` init and a `bwrap` launcher above it. A proof with a missing fact never
+ * passes: the caller fails the row as "precondition not reached".
+ */
+export function detachedProof(tag: string): DetachedProof {
+  const held: string[] = [];
+  const missing: string[] = [];
+  const all = allProcFacts();
+  const byPid = new Map(all.map((facts) => [facts.pid, facts]));
+  const own = readProcFacts(process.pid);
+  const child = all.find((facts) => facts.comm === "sleep" && facts.cmdline.includes(tag) && facts.state !== "Z" && facts.session === facts.pid);
+  if (!child) return { record: null, held, missing: ["a_tagged_sleep_that_leads_its_own_session_is_running"] };
+  held.push("a_tagged_sleep_leads_its_own_session");
+  (child.pgrp === child.pid ? held : missing).push("it_leads_its_own_process_group");
+  ((child.sigIgn & SIGHUP_BIT) === SIGHUP_BIT ? held : missing).push("it_ignores_SIGHUP_like_nohup");
+  (child.nspid.length > 1 ? held : missing).push("it_is_in_a_nested_PID_namespace");
+  (child.pidNs !== null && child.pidNs !== own?.pidNs ? held : missing).push("its_PID_namespace_differs_from_the_test_process");
+  // The init: the process of this namespace that is pid 1 inside it (a copy of bwrap); its parent is the launcher.
+  const init = child.pidNs === null ? undefined : all.find((facts) => facts.pidNs === child.pidNs && facts.nspid.at(-1) === 1);
+  (init && init.comm === "bwrap" ? held : missing).push("the_sandbox_init_is_a_bwrap");
+  const outer = init ? byPid.get(init.ppid) : undefined;
+  (outer && outer.comm === "bwrap" ? held : missing).push("the_launcher_above_it_is_a_bwrap");
+  if (missing.length > 0 || !child.pidNs || !init || !outer) return { record: null, held, missing };
+  return {
+    held,
+    missing,
+    record: {
+      tag,
+      pidNs: child.pidNs,
+      outer: { pid: outer.pid, startTicks: outer.startTicks },
+      init: { pid: init.pid, startTicks: init.startTicks },
+      child: { pid: child.pid, startTicks: child.startTicks },
+      childStartedAtS: child.startTicks / clockTicksPerSecond(),
+    },
+  };
+}
+
+type PresenceKey = Pick<DetachedRecord, "tag" | "pidNs" | "outer" | "init">;
+
+export interface RunPresence {
+  gone: boolean;
+  /** One line per survivor: pid, command name, state, session, pids per namespace and why it counts. Never a command line, never an environment. */
+  survivors: string[];
+}
+
+/**
+ * The whole-run absence check, host-wide and fail-closed. A run is gone only when (a) no process is in its recorded PID
+ * namespace, (b) its recorded launcher and init are gone (a pid with another start time is a reused pid, not the run), and
+ * (c) no process in `/proc` carries the tag. An entry whose PID namespace cannot be read counts as a survivor when it carries
+ * the tag or descends from the recorded launcher; it is never skipped. Zombies hold nothing and are not survivors.
+ */
+export function runPresence(record: PresenceKey): RunPresence {
+  const survivors: string[] = [];
+  const all = allProcFacts();
+  const byPid = new Map(all.map((facts) => [facts.pid, facts]));
+  const underOuter = (facts: ProcFacts): boolean => {
+    for (let up = byPid.get(facts.ppid), hops = 0; up && hops < 64; up = byPid.get(up.ppid), hops++) {
+      if (up.pid === record.outer.pid && up.startTicks === record.outer.startTicks) return true;
+    }
+    return false;
+  };
+  for (const facts of all) {
+    if (facts.state === "Z" || facts.pid === process.pid) continue;
+    const reasons: string[] = [];
+    if (facts.pidNs !== null && facts.pidNs === record.pidNs) reasons.push("in_the_run_PID_namespace");
+    if (facts.pid === record.outer.pid && facts.startTicks === record.outer.startTicks) reasons.push("is_the_recorded_launcher");
+    if (facts.pid === record.init.pid && facts.startTicks === record.init.startTicks) reasons.push("is_the_recorded_init");
+    if (facts.cmdline.includes(record.tag)) reasons.push("carries_the_tag");
+    if (facts.pidNs === null && facts.pidNsError !== "ENOENT" && underOuter(facts)) reasons.push("namespace_unreadable_below_the_launcher");
+    if (reasons.length > 0) survivors.push(`pid=${facts.pid} comm=${facts.comm} state=${facts.state} sid=${facts.session} nspid=${facts.nspid.join("/")} why=${reasons.join("+")}`);
+  }
+  return { gone: survivors.length === 0, survivors };
+}
+
+/** The tag-only absence check of a run whose namespace was never recorded (the startup-timing rows). */
+export const tagPresence = (tag: string): RunPresence => runPresence({ tag, pidNs: "none", outer: { pid: -1, startTicks: -1 }, init: { pid: -1, startTicks: -1 } });
+
+/** Polls until the run is gone or `ms` elapsed; returns the last observation and the time it took. */
+export async function waitRunGone(record: PresenceKey, ms: number): Promise<RunPresence & { elapsedMs: number }> {
+  const started = Date.now();
+  let presence = runPresence(record);
+  while (!presence.gone && Date.now() - started < ms) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    presence = runPresence(record);
+  }
+  return { ...presence, elapsedMs: Date.now() - started };
+}
+
+/** How old the child is now, in seconds (from its recorded start); more than `DETACHED_MAX_AGE_S` means it could have expired by itself. */
+export const detachedAgeS = (record: DetachedRecord): number => uptimeSeconds() - record.childStartedAtS;
+
+/**
+ * Task-owned cleanup: SIGKILLs the recorded init and launcher (ending the namespace) and every process of this uid that
+ * carries the tag, re-reading start time and uid first so a reused pid is never hit, and never this process or one above it.
+ * Returns what it killed.
+ */
+export function killRun(record: { tag: string; outer?: PresenceKey["outer"]; init?: PresenceKey["init"] }): number[] {
+  const killed: number[] = [];
+  const myUid = process.getuid?.() ?? -1;
+  const protectedPids = new Set<number>();
+  for (let pid = process.pid, hops = 0; pid > 1 && hops < 64; hops++) {
+    protectedPids.add(pid);
+    pid = readProcFacts(pid)?.ppid ?? 0;
+  }
+  const kill = (pid: number): void => {
+    if (protectedPids.has(pid)) return;
+    try {
+      process.kill(pid, "SIGKILL");
+      killed.push(pid);
+    } catch {
+      // Already gone.
+    }
+  };
+  for (const target of [record.init, record.outer]) {
+    if (!target) continue;
+    const facts = readProcFacts(target.pid);
+    if (facts && facts.startTicks === target.startTicks && facts.uid === myUid) kill(target.pid);
+  }
+  for (const facts of allProcFacts()) if (facts.uid === myUid && facts.state !== "Z" && facts.cmdline.includes(record.tag)) kill(facts.pid);
+  return killed;
+}
+
+/** The evidence line of one detached row (stderr): booleans, counts and times only. */
+export function detachedEvidence(row: string, fields: Record<string, string | number | boolean>): void {
+  emit(`DETACHED-EVIDENCE row=${row} ${Object.entries(fields).map(([key, value]) => `${key}=${value}`).join(" ")}`);
 }
