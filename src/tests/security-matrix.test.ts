@@ -304,7 +304,7 @@ describe("host-side samplers", () => {
     const [bareTag, wrappedTag, absentTag] = [`T1-BARE-${suffix}`, `T1-WRAPPED-${suffix}`, `T1-ABSENT-${suffix}`];
     fixtureTags.push(bareTag, wrappedTag);
     const bare = spawn("node", ["-e", idle, "cli.js", bareTag], { stdio: "ignore" });
-    const wrapped = spawn("bwrap", ["--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc", "node", "-e", idle, "cli.js", wrappedTag], { stdio: "ignore" });
+    const wrapped = spawn("bwrap", ["--die-with-parent", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc", "node", "-e", idle, "cli.js", wrappedTag], { stdio: "ignore" });
     const sampler = startProcessSampler(() => process.pid, [bareTag, wrappedTag, absentTag]);
     await new Promise((resolve) => setTimeout(resolve, 600));
     const sample = sampler.stop();
