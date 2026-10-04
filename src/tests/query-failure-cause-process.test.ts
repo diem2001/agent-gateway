@@ -8,9 +8,8 @@
  * - exit 3: a test-owned `AGENT_SANDBOX_BWRAP` wrapper runs the real bwrap, then ends it and exits 3.
  * - SIGKILL: the same wrapper ends the real bwrap, closes its own output so the runtime's output stream
  *   ends first, and then SIGKILLs itself: the gateway's launcher process is terminated by SIGKILL.
- *   (Observed limit: an external SIGKILL of the launcher while its output is still open leaves the
- *   SDK waiting for an exit event it has already missed, so the request ends only at the run
- *   deadline and no failure line is written. This row does not cover that ordering.)
+ *   (An external SIGKILL of the launcher while its output is still open is not this row: the SDK
+ *   never learns of it, and the gateway ends the run itself; see launcher-external-kill-process.test.ts.)
  * - Documented behavior, not an acceptance row: a runtime killed INSIDE the sandbox makes the launcher
  *   exit 137, so the line shows `exit=137 signal=none`, never `signal=SIGKILL`.
  *
