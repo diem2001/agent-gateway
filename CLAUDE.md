@@ -166,7 +166,7 @@ src/
     session-ownership.test.ts / session-isolation-process.test.ts # Owner rule, legacy refusal, list/delete scoping, persistence, query refusals (mocked run); real runtime: legacy transcripts, concurrent owners, restart resume, one active request per conversation (needs `npm run build`)
     sandbox.test.ts / sandbox-content.test.ts # Isolation config, exact argv, env allowlist, failure texts; no-follow validation, git config allowlist, known-value scan (chunked, any size up to 64 MiB, SSH key lines, webhook URL parts), mount plan
     scan-residuals-process.test.ts # Outcome Probe (MVP-7919): spawned gateway, real bwrap; planted known credential, SSH key and webhook URL values of every size in a global directory, a repository and a 2 MiB CLAUDE.md stay unreadable on every surface, clean small and 2 MiB files stay available, per-surface negative control; `SCAN_RESIDUALS_DIST` points it at another compiled server for the red run (needs `npm run build`)
-    sandbox-process.test.ts # Real bwrap: env, /proc, trusted files, planted links, git masks, read-only content, fail-closed rows, cancel and SIGKILL, plus the real runtime through the gateway (needs `npm run build`)
+    sandbox-process.test.ts # Real bwrap: env, /proc, trusted files, planted links, git masks, read-only content, fail-closed rows, cancel and SIGKILL, detached `setsid nohup` child rows D1-D4 with negative controls NC1/NC2 (MVP-7977), plus the real runtime through the gateway (needs `npm run build`)
     model-proxy.test.ts / model-proxy-process.test.ts # Trusted model proxy: token, path, header and refresh rules; real runtime through it
     sdk-login-guard-process.test.ts # Real-runtime probe: spawned gateway, OAuth-capable MCP stub, scripted Anthropic API (needs `npm run build`)
     run-failure.test.ts             # Failure classifier table: kinds, exact messages, version bounds, hostile inputs
@@ -191,7 +191,7 @@ src/
     security-matrix.test.ts         # T1 for the security harness: detector, evidence lines, route probes, samplers, offline mode
     security-regression-process.test.ts # Real-process regression: normal chat, eight secret routes x fresh/resumed/restarted, leftovers, negative controls (child runs against vulnerable dist copies); rows RP.*, RT.*, NC.*, X.* (need `npm run build`)
     security-entrypoints-process.test.ts # Entry points (ordinary chat, agent, skill, sub-agent, direct MCP call, upload relay), denied-tool and grant-enlargement rows EP.* (need `npm run build`)
-    security-failure-process.test.ts # The seven injected isolation failures with boundary confirmation, rows IF.* (need `npm run build`)
+    security-failure-process.test.ts # The seven injected isolation failures with boundary confirmation, plus detached-child rows IF.detached-complete/cancel/kill (MVP-7977), rows IF.* (need `npm run build`)
     helpers/security-matrix.ts      # Harness: markers, surfaces, detector, evidence lines, samplers, offline mode, rig with recording doubles (no vitest import)
     helpers/security-routes.ts      # The eight route probes (in-sandbox Python) and their verdicts, shared with the Docker probe
     mcp-overrides.test.ts           # Override merge + requireUserCredentials header-key casing + ownerless left out of credential-bearing runs
