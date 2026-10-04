@@ -10,6 +10,11 @@
  *   query id is not visible to it): that line is the boundary proof.
  * - `IF.cancel`, `IF.restart-term`, `IF.restart-kill`: a Bash tool with a tagged child; the host sees the child below the
  *   gateway and the model double recorded the call before the caller closes the connection, or the gateway is stopped.
+ * - `IF.detached-complete`, `IF.detached-cancel`, `IF.detached-kill` (MVP-7977): the same, with a tool child that left its session
+ *   (`setsid nohup`). Host-side proof that it is detached inside the run's sandbox before the termination; afterwards the whole run is
+ *   absent from the host (no process in its PID namespace, launcher and init gone, no process carrying the tag). A completed or
+ *   cancelled run's relay URL and run token, saved from inside the sandbox, are refused. Only these three terminations are probed
+ *   for detached children here; the startup timings are probed at `SandboxRun` level (`sandbox-process.test.ts`).
  * - `IF.cred-missing`, `IF.cred-refused`, `IF.timeout`, `IF.unavailable`: registered MCP server doubles behind the relay; the
  *   relay's own audit line shows the trusted mediation step was reached.
  * - `IF.legacy`: resume of a stored conversation with a credential-bearing legacy transcript.
@@ -45,17 +50,27 @@ import {
   startEgressSampler,
   startFaultMcp,
   startProcessSampler,
+  DETACHED_MAX_AGE_S,
   describeRecords,
+  detachedAgeS,
+  detachedCommand,
+  detachedEvidence,
+  detachedProof,
+  detachedTag,
+  killRun,
   sampleProblems,
   surfacesOf,
   turnProblems,
   waitForIsolation,
+  waitRunGone,
+  type DetachedRecord,
   type Ndjson,
   type QueryOutcome,
   type SecurityMarkers,
   type SecurityRig,
   type Surface,
   type ToolStep,
+  type TurnObservation,
 } from "./helpers/security-matrix.js";
 import { failureRowIds } from "./helpers/security-routes.js";
 import { startOAuthMcpStub } from "./helpers/oauth-mcp-stub.js";
@@ -445,6 +460,220 @@ describe("cancellation and restart during a tool call with a child process", () 
       controls,
       problems,
     });
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  A detached tool child (setsid nohup) at the three terminations       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Runs inside the sandbox as part of the tool command: saves the run's relay URL(s), model proxy base URL and run token to
+ * `/work/replay.json` (never to the tool output), so the host can replay them after the run ended. Prints nothing.
+ */
+const SAVE_RUN_FACTS = String.raw`python3 - <<'PY'
+import json, os, re
+pattern = re.compile(rb'http://127\.0\.0\.1:\d+/mcp/[A-Za-z0-9_-]+')
+urls, token, base = [], None, None
+me = str(os.getpid())
+def add(data):
+    for m in pattern.finditer(data):
+        u = m.group(0).decode()
+        if u not in urls:
+            urls.append(u)
+for pid in os.listdir('/proc'):
+    if not pid.isdigit() or pid == me:
+        continue
+    for name in ('cmdline', 'environ'):
+        try:
+            data = open('/proc/%s/%s' % (pid, name), 'rb').read()
+        except Exception:
+            continue
+        add(data)
+        if name == 'environ':
+            for item in data.split(b'\0'):
+                if item.startswith(b'ANTHROPIC_API_KEY=mpt_'):
+                    token = item.split(b'=', 1)[1].decode()
+                if item.startswith(b'ANTHROPIC_BASE_URL='):
+                    base = item.split(b'=', 1)[1].decode()
+for root in ('/tmp', '/home/node'):
+    for dirpath, dirs, files in os.walk(root):
+        for f in files:
+            try:
+                p = os.path.join(dirpath, f)
+                if os.path.getsize(p) > 5000000:
+                    continue
+                add(open(p, 'rb').read())
+            except Exception:
+                continue
+json.dump({'relay': urls, 'token': token, 'base': base}, open('/work/replay.json', 'w'))
+PY`;
+
+interface DetachedHeld {
+  rig: SecurityRig;
+  session: string;
+  queryId: string;
+  prompt: string;
+  heldTag: string;
+  window: Window;
+  outcome: Promise<QueryOutcome>;
+  control: { abort?: () => void };
+  record: DetachedRecord;
+  /** The conversation's work area on the host (`/work` inside the sandbox). */
+  workDir: string;
+}
+
+/**
+ * Starts a run whose Bash tool leaves a `setsid nohup` child, saves the run's relay URL and run token, then holds; waits until the
+ * host proves the child is detached inside the run's sandbox and the model double recorded the call. A missing proof fails the row.
+ */
+async function startDetachedRun(rig: SecurityRig, id: string): Promise<DetachedHeld> {
+  const heldTag = `HELD-${id}-${randomBytes(3).toString("hex")}`;
+  const tag = detachedTag();
+  const prompt = `IF-${id}`;
+  const session = `conv-${id}`;
+  const queryId = `q-${id}-${randomBytes(2).toString("hex")}`;
+  const owned: { tag: string; outer?: DetachedRecord["outer"]; init?: DetachedRecord["init"] } = { tag };
+  cleanups.push(async () => {
+    killRun(owned);
+    killRun({ tag: heldTag });
+  });
+  rig.scripts.push(scriptOf(prompt, [bashStep([detachedCommand(tag), SAVE_RUN_FACTS, heldCommand(heldTag), "echo DETACHED-TOOL-DONE"].join("\n"))]));
+  const window = windowOf(rig, [heldTag, tag]);
+  const control: { abort?: () => void } = {};
+  const outcome = rig.ask("reqlift", { queryId, sessionId: session, prompt, user_id: "user-1", useSession: true, allowedTools: ["Bash", "mcp__jira__*"] }, 90_000, control);
+  await waitFor(() => window.peek().windows[heldTag] !== undefined && rig.api.requests.some((request) => request.userTexts.some((text) => text.includes(prompt)) && !request.warmup), 60_000, "the held child below the gateway and the model's tool call");
+  let proof = detachedProof(tag);
+  await waitFor(() => (proof = detachedProof(tag)).record !== null, 30_000, "the proof of the detached child").catch(() => {
+    throw new Error(`precondition not reached: held=[${proof.held.join(",")}] missing=[${proof.missing.join(",")}]`);
+  });
+  const record = proof.record!;
+  owned.outer = record.outer;
+  owned.init = record.init;
+  const workDir = path.join(conversationDirs(rig.gateway, [session])[0], "work");
+  return { rig, session, queryId, prompt, heldTag, window, outcome, control, record, workDir };
+}
+
+interface SavedRunFacts {
+  relay: string[];
+  token: string | null;
+  base: string | null;
+}
+
+const savedFacts = (held: DetachedHeld): SavedRunFacts | null => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(held.workDir, "replay.json"), "utf8")) as SavedRunFacts;
+  } catch {
+    return null;
+  }
+};
+
+const relayListCall = (url: string): Promise<Response> =>
+  fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }), signal: AbortSignal.timeout(10_000) });
+
+/** While the run lives, the saved relay URL answers (a permitted control: the replay after the run proves something only if it could have worked). */
+async function relayLiveControl(held: DetachedHeld): Promise<string | null> {
+  const facts = savedFacts(held);
+  if (!facts || facts.relay.length === 0 || !facts.token || !facts.base) return "the run's relay URL and run token could not be saved from inside the sandbox";
+  const status = (await relayListCall(facts.relay[0])).status;
+  return status === 200 ? null : `the saved relay URL answered ${status} while the run was alive (the replay control is not live)`;
+}
+
+/** After the run ended: the saved relay URL and run token are refused and nothing reaches the MCP or model doubles. */
+async function replayRefusals(held: DetachedHeld): Promise<{ problems: string[]; controls: string[] }> {
+  const { rig } = held;
+  const facts = savedFacts(held);
+  const problems: string[] = [];
+  const controls: string[] = [];
+  if (!facts || facts.relay.length === 0 || !facts.token || !facts.base) return { problems: ["the run's relay URL and run token could not be saved from inside the sandbox"], controls };
+  const jiraBefore = rig.jira.requests.length;
+  const apiBefore = rig.api.requests.length;
+  for (const url of facts.relay) {
+    const status = (await relayListCall(url)).status;
+    if (status !== 404) problems.push(`a saved relay URL answered ${status} after the run ended`);
+  }
+  const model = await fetch(`${facts.base}/v1/messages`, { method: "POST", headers: { "x-api-key": facts.token, "content-type": "application/json", "anthropic-version": "2023-06-01" }, body: "{}", signal: AbortSignal.timeout(10_000) });
+  if (model.status !== 401) problems.push(`the saved run token answered ${model.status} after the run ended`);
+  if (rig.jira.requests.length !== jiraBefore || rig.api.requests.length !== apiBefore) problems.push("a replay reached an upstream double");
+  if (problems.length === 0) controls.push("saved_relay_url_refused_404_and_saved_run_token_refused_401_nothing_reached_a_double");
+  return { problems, controls };
+}
+
+/** The checks every detached row makes of the end of the run: nothing of it is left on the host, and the child did not simply expire. */
+async function detachedEndProblems(id: string, held: DetachedHeld, bound: number): Promise<{ problems: string[]; controls: string[]; elapsedMs: number }> {
+  const presence = await waitRunGone(held.record, bound);
+  const age = detachedAgeS(held.record);
+  detachedEvidence(id, { absent_after_ms: presence.elapsedMs, child_age_s: Math.round(age), survivors: presence.survivors.length, proof: true });
+  const problems: string[] = [];
+  const controls = ["detached_child_proven_inside_the_sandbox_before_the_end"];
+  if (!presence.gone) problems.push(`the run was not gone within ${bound} ms: ${presence.survivors.join(" | ")}`);
+  else if (age >= DETACHED_MAX_AGE_S) problems.push(`the detached child could have expired by itself (age ${Math.round(age)} s)`);
+  else controls.push("no_process_in_the_sandbox_namespace_no_launcher_no_tagged_process_before_the_child_could_expire");
+  return { problems, controls, elapsedMs: presence.elapsedMs };
+}
+
+const turnOf = (held: DetachedHeld, outcome: QueryOutcome): TurnObservation => ({ outcome, prompt: held.prompt, extraPrompts: [], sessionId: held.session, queryId: held.queryId, logFrom: held.window.logFrom }) as unknown as TurnObservation;
+
+describe("a detached tool child (setsid nohup) at completion, cancellation and gateway SIGKILL", () => {
+  it("IF.detached-complete: the run's normal end leaves no process of the sandbox, and the run's relay URL and token are refused afterwards", async () => {
+    const rig = await newRig();
+    const held = await startDetachedRun(rig, "dcomplete");
+    const live = await relayLiveControl(held);
+    const problems: string[] = live ? [live] : [];
+    fs.writeFileSync(path.join(held.workDir, "stop"), "");
+    const outcome = await held.outcome;
+    if (outcome.events.at(-1)?.type !== "done") problems.push(`the stream did not end in done (${outcome.events.at(-1)?.type ?? "none"})`);
+    const end = await detachedEndProblems("IF.detached-complete", held, NOTHING_LEFT_WITHIN_MS);
+    problems.push(...end.problems);
+    await waitFor(() => descendants(rig.gateway.child.pid!).length === 0 && runLeftoversText(rig.gateway).files === 0, NOTHING_LEFT_WITHIN_MS, "the runtime and the run directory to go").catch(() => problems.push("a runtime process or a run directory survived the normal end"));
+    const replayed = await replayRefusals(held);
+    problems.push(...replayed.problems, ...fallbackProblems(rig, held.window, { runtimes: "some", modelRequests: "some" }));
+    finishRow(recorder, rig, { id: "IF.detached-complete", durationMs: end.elapsedMs, deadlineMs: NOTHING_LEFT_WITHIN_MS, surfaces: surfacesOf(rig, [turnOf(held, outcome)]), controls: [...end.controls, ...(live ? [] : ["saved_relay_url_answered_while_the_run_was_alive"]), ...replayed.controls], problems, floors: { "tool-results": 5 } });
+  });
+
+  it("IF.detached-cancel: closing the caller's connection leaves no process of the sandbox, and the run's relay URL and token are refused afterwards", async () => {
+    const rig = await newRig();
+    const held = await startDetachedRun(rig, "dcancel");
+    const live = await relayLiveControl(held);
+    const problems: string[] = live ? [live] : [];
+    held.control.abort!();
+    const outcome = await held.outcome;
+    if (outcome.events.some((event) => event.type === "done")) problems.push("the cancelled stream reported done");
+    const end = await detachedEndProblems("IF.detached-cancel", held, NOTHING_LEFT_WITHIN_MS);
+    problems.push(...end.problems);
+    await waitFor(() => descendants(rig.gateway.child.pid!).length === 0 && runLeftoversText(rig.gateway).files === 0, NOTHING_LEFT_WITHIN_MS, "the runtime and the run directory to go").catch(() => problems.push("a runtime process or a run directory survived the cancellation"));
+    const replayed = await replayRefusals(held);
+    problems.push(...replayed.problems, ...fallbackProblems(rig, held.window, { runtimes: "some", modelRequests: "some" }));
+    finishRow(recorder, rig, { id: "IF.detached-cancel", durationMs: end.elapsedMs, deadlineMs: NOTHING_LEFT_WITHIN_MS, surfaces: surfacesOf(rig, [turnOf(held, outcome)]), controls: [...end.controls, ...(live ? [] : ["saved_relay_url_answered_while_the_run_was_alive"]), ...replayed.controls], problems, floors: { "tool-results": 0 } });
+  });
+
+  it("IF.detached-kill: SIGKILL of the gateway leaves no process of the sandbox, the stream ends without done, and the restart sweeps the run files (the in-memory relay and proxy grants end with the process: no replay claim)", async () => {
+    const rig = await newRig();
+    const held = await startDetachedRun(rig, "dkill");
+    const problems: string[] = [];
+    const stoppedAt = Date.now();
+    const old = rig.gateway.child;
+    old.kill("SIGKILL");
+    await new Promise<void>((resolve) => (old.exitCode !== null || old.signalCode !== null ? resolve() : old.once("exit", () => resolve())));
+    const exitMs = Date.now() - stoppedAt;
+    const outcome = await held.outcome;
+    const streamEndMs = Date.now() - stoppedAt;
+    if (exitMs > 5000) problems.push(`the gateway took ${exitMs} ms to exit`);
+    if (streamEndMs > 5000) problems.push(`the caller's stream ended ${streamEndMs} ms after the stop`);
+    if (outcome.events.some((event) => event.type === "done")) problems.push("the stream ended with done");
+    const end = await detachedEndProblems("IF.detached-kill", held, 10_000);
+    problems.push(...end.problems);
+    const sample = held.window.close();
+    if (sample.sample.unsandboxedRuntimes.length > 0) problems.push(`an agent runtime ran without a sandbox ancestor [${describeRecords(sample.sample.records.filter((record) => record.unsandboxed), rig.markers.values)}]`);
+    problems.push(...sampleProblems(sample.sample, rig.markers.values).filter((problem) => problem.includes("cleared")));
+    const controls = [...end.controls, ...(outcome.aborted ? ["stream_ended_abnormally_without_done"] : [])];
+    if (!outcome.aborted) problems.push("the stream was not cut (it ended normally)");
+    await rig.restart();
+    expect(await waitForIsolation(rig), "/health isolation after the restart").toBe("ok");
+    const afterSweep = runLeftoversText(rig.gateway).files;
+    if (afterSweep !== 0) problems.push(`${afterSweep} run file(s) survived the restart`);
+    else controls.push("no_run_files_after_the_restart");
+    finishRow(recorder, rig, { id: "IF.detached-kill", durationMs: streamEndMs, deadlineMs: 5000, surfaces: surfacesOf(rig, [turnOf(held, outcome)]), controls, problems, floors: { "tool-results": 0 } });
   });
 });
 

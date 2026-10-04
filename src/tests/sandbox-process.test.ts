@@ -29,6 +29,7 @@ import {
 } from "../sandbox.js";
 import { FINAL_ANSWER, startFakeAnthropicApi, type FakeAnthropicApi, type FakeApiMode } from "./helpers/fake-anthropic-api.js";
 import { assertFreshBuild, descendants, gatewayRequest, getHealth, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
+import { DETACHED_MAX_AGE_S, detachedAgeS, detachedCommand, detachedEvidence, detachedProof, detachedTag, killRun, runPresence, tagPresence, waitRunGone, type DetachedRecord } from "./helpers/security-matrix.js";
 
 // Real processes on a shared, loaded host: every row gets a generous deadline.
 vi.setConfig({ testTimeout: 60_000 });
@@ -938,6 +939,206 @@ describe("ending a run ends every sandbox process", () => {
       expect(await waitUntil(() => sleepers(tag).length === 0), `survivors: ${sleepers(tag).join(",")}`).toBe(true);
     } finally {
       gateway.kill("SIGKILL");
+    }
+  }, 60_000);
+});
+
+/* ------------------------------------------------------------------ */
+/*  A tool child that left its session ends with its run (MVP-7977)     */
+/* ------------------------------------------------------------------ */
+
+/** A launcher that drops --die-with-parent from the arguments it is given on descriptor 3, then runs the real bwrap (negative control of the gateway-SIGKILL row). */
+const NO_DIE_WITH_PARENT_BWRAP = `#!/bin/bash\nexec /usr/bin/bwrap --args 4 "\${@:3}" 4< <(perl -0777 -pe 's/--die-with-parent\\0//' <&3)\n`;
+
+describe("a detached tool child (setsid nohup) ends with its run", () => {
+  /** Every run a row recorded, for the task-owned cleanup (a failing row must not leave a two-minute process behind). */
+  const started: { tag: string; outer?: DetachedRecord["outer"]; init?: DetachedRecord["init"] }[] = [];
+  const DEADLINE_MS = 10_000;
+
+  afterEach(async () => {
+    for (const run of started.splice(0)) {
+      const killed = killRun(run);
+      if (killed.length > 0) detachedEvidence("cleanup", { killed: killed.length, note: "processes that were still there when the row ended" });
+      expect((await waitRunGone({ pidNs: "none", outer: { pid: -1, startTicks: -1 }, init: { pid: -1, startTicks: -1 }, ...run }, 5000)).survivors, "cleanup left a process of the row").toEqual([]);
+    }
+  }, 120_000);
+
+  async function until(check: () => boolean, ms: number): Promise<boolean> {
+    for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 50))) if (check()) return true;
+    return check();
+  }
+
+  /** Waits for the host-side proof that the tagged child is detached inside the run's sandbox; a missing fact is a failure ("precondition not reached"), never a pass. */
+  async function proven(tag: string, label: string): Promise<DetachedRecord> {
+    const entry: (typeof started)[number] = { tag };
+    started.push(entry);
+    let last = detachedProof(tag);
+    await until(() => (last = detachedProof(tag)).record !== null, 20_000);
+    if (!last.record) throw new Error(`${label}: precondition not reached; held=[${last.held.join(",")}] missing=[${last.missing.join(",")}]`);
+    entry.outer = last.record.outer;
+    entry.init = last.record.init;
+    return last.record;
+  }
+
+  const workDirOf = (id: string): string => path.join(sandboxRoot, "sessions", id, "work");
+
+  /** A mini-gateway: a Node process that starts a run with the production launch code, and dies the way the row says. */
+  function miniGateway(options: { script: string; bwrap?: string; early?: "e0" | "e1"; sessionId?: string }) {
+    const script = `
+      import { ModelProxy, ProviderCredentials } from ${JSON.stringify(path.join(REPO_ROOT, "dist", "model-proxy.js"))};
+      import { SandboxRun, SANDBOX_CHECK_LINE } from ${JSON.stringify(path.join(REPO_ROOT, "dist", "sandbox.js"))};
+      import { createRunLogDir } from ${JSON.stringify(path.join(REPO_ROOT, "dist", "sdk-run-logs.js"))};
+      const proxy = new ModelProxy({ upstreamBaseUrl: "http://127.0.0.1:1", credentials: new ProviderCredentials({ home: process.env.HOME, env: {} }) });
+      await proxy.start();
+      const logs = createRunLogDir();
+      const run = new SandboxRun({ runLogDir: logs.dir, runLogEnv: logs.env, workspaceRoot: process.env.WS, proxy, sessionDirId: process.env.SESSION || undefined,
+        config: { startupTimeoutMs: 10000, runTimeoutMs: 100000, sandboxRoot: process.env.SBROOT, bwrapPath: process.env.BWRAP } });
+      const child = run.spawnHook({ command: "/bin/sh", args: ["-c", process.env.SCRIPT, ${JSON.stringify(SDK_CLI)}], env: {}, signal: new AbortController().signal });
+      if (process.env.EARLY === "e0") process.kill(process.pid, "SIGKILL");
+      // The hook returns the SDK's process object (stdout only); the launcher's stderr is on the run's own child.
+      child.stdout.on("data", () => {});
+      run.child.stderr.on("data", (chunk) => { if (process.env.EARLY === "e1" && String(chunk).includes(SANDBOX_CHECK_LINE)) process.kill(process.pid, "SIGKILL"); });
+      console.log("STARTED");
+      setInterval(() => {}, 1000);
+    `;
+    const gateway = spawn(process.execPath, ["--input-type=module", "-e", script], {
+      env: { PATH: process.env.PATH ?? "", HOME: home, WS: ws, SBROOT: sandboxRoot, SCRIPT: options.script, BWRAP: options.bwrap ?? "/usr/bin/bwrap", EARLY: options.early ?? "", SESSION: options.sessionId ?? "" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    gateway.stdout.on("data", (d: Buffer) => (out += d.toString("utf8")));
+    gateway.stderr.on("data", (d: Buffer) => (out += d.toString("utf8")));
+    const exited = new Promise<void>((resolve) => gateway.once("exit", () => resolve()));
+    return { gateway, exited, output: () => out, kill: () => gateway.kill("SIGKILL") };
+  }
+
+  function assertGone(row: string, record: DetachedRecord, presence: Awaited<ReturnType<typeof waitRunGone>>, extra: Record<string, string | number | boolean> = {}): void {
+    const age = detachedAgeS(record);
+    detachedEvidence(row, { ...extra, absent_after_ms: presence.elapsedMs, child_age_s: Math.round(age), survivors: presence.survivors.length, proof: true });
+    expect(presence.survivors, `${row}: survivors after ${presence.elapsedMs} ms (${presence.survivors.length})`).toEqual([]);
+    // A child older than its lifetime margin could have ended by itself: the row proves nothing then.
+    expect(age, `${row}: the child could have expired by itself (age ${Math.round(age)} s)`).toBeLessThan(DETACHED_MAX_AGE_S);
+  }
+
+  it("D1 normal completion: the run's script ends, the detached child is gone within the deadline, the run token is refused", async () => {
+    const tag = detachedTag();
+    const id = dirId("detached-D1");
+    const script = `${detachedCommand(tag)} i=0; while [ ! -e /work/go ] && [ $i -lt 100 ]; do sleep 0.2; i=$((i+1)); done`;
+    const r = await probe(script, { detach: true, sessionDirId: id });
+    try {
+      const record = await proven(tag, "D1");
+      fs.writeFileSync(path.join(workDirOf(id), "go"), "");
+      expect(await until(() => r.run.child?.exitCode !== null || r.run.child?.signalCode !== null, DEADLINE_MS), "the launcher did not exit after the script ended").toBe(true);
+      expect(r.run.child?.exitCode, "the launcher's exit code").toBe(0);
+      await r.run.dispose();
+      assertGone("D1", record, await waitRunGone(record, DEADLINE_MS));
+      expect(proxy.activeTokenCount(), "the run token is revoked").toBe(0);
+    } finally {
+      await r.run.dispose();
+    }
+  });
+
+  it("D2 caller cancellation: the SDK's abort ends the run and the detached child within the deadline, the run token is refused", async () => {
+    const tag = detachedTag();
+    const controller = new AbortController();
+    const r = await probe(`${detachedCommand(tag)} sleep ${tag} & wait`, { detach: true, signal: controller.signal });
+    try {
+      const record = await proven(tag, "D2");
+      controller.abort();
+      expect(await until(() => r.run.child?.exitCode !== null || r.run.child?.signalCode !== null, DEADLINE_MS), "the launcher did not end after the abort").toBe(true);
+      await r.run.dispose();
+      assertGone("D2", record, await waitRunGone(record, DEADLINE_MS));
+      expect(proxy.activeTokenCount(), "the run token is revoked").toBe(0);
+    } finally {
+      await r.run.dispose();
+    }
+  });
+
+  it("D3 gateway SIGKILL during the run: the detached child and the whole sandbox are gone within the deadline", async () => {
+    assertFreshBuild();
+    const tag = detachedTag();
+    const mini = miniGateway({ script: `${detachedCommand(tag)} sleep ${tag} & wait` });
+    try {
+      expect(await until(() => mini.output().includes("STARTED"), 15_000), mini.output()).toBe(true);
+      const record = await proven(tag, "D3");
+      mini.kill();
+      await mini.exited;
+      assertGone("D3", record, await waitRunGone(record, DEADLINE_MS));
+    } finally {
+      mini.kill();
+    }
+  }, 60_000);
+
+  describe("D4 gateway SIGKILL immediately after the sandbox starts", () => {
+    const ITERATIONS = 10;
+    const MAX_ITERATIONS = 40;
+    const SCRIPT = (tag: string): string => `setsid nohup sh -c 'echo x > /work/detached-started; exec sleep ${tag}' >/dev/null 2>&1 </dev/null & sleep ${tag} & wait`;
+
+    // E0: the gateway SIGKILLs itself synchronously right after the launcher was spawned; E1: on the sandbox's own start check line.
+    it.each([
+      ["E0", "e0"],
+      ["E1", "e1"],
+    ] as const)("%s (%s): at least ten iterations leave no process carrying the tag", async (label, early) => {
+      assertFreshBuild();
+      let childStarted = 0;
+      let lateKilled = 0;
+      const failures: string[] = [];
+      // E1 acts after the sandbox passed its check, but the script may not have started its child yet: more iterations (at most MAX_ITERATIONS) only until one did.
+      let iterations = 0;
+      for (let i = 0; i < ITERATIONS || (label === "E1" && childStarted === 0 && i < MAX_ITERATIONS); i++) {
+        iterations++;
+        const tag = detachedTag();
+        const id = dirId(`detached-D4-${label}-${i}`);
+        started.push({ tag });
+        const mini = miniGateway({ script: SCRIPT(tag), early, sessionId: id });
+        try {
+          await Promise.race([mini.exited, new Promise<void>((resolve) => setTimeout(resolve, 30_000))]);
+          const presence = await waitRunGone({ tag, pidNs: "none", outer: { pid: -1, startTicks: -1 }, init: { pid: -1, startTicks: -1 } }, DEADLINE_MS);
+          // A late starter: look again after a further 2 s.
+          await new Promise((r) => setTimeout(r, 2000));
+          const late = tagPresence(tag);
+          if (fs.existsSync(path.join(workDirOf(id), "detached-started"))) childStarted++;
+          if (!presence.gone || !late.gone) failures.push(`${label} iteration ${i}: ${[...presence.survivors, ...late.survivors].join(" | ")}`);
+        } finally {
+          mini.kill();
+          const killed = killRun({ tag });
+          if (killed.length > 0) lateKilled += killed.length;
+        }
+      }
+      detachedEvidence(`D4.${label}`, { iterations, detached_child_started: childStarted, not_started: iterations - childStarted, survivor_iterations: failures.length, killed_after_the_check: lateKilled, deadline_ms: DEADLINE_MS });
+      expect(failures, "iterations with a surviving process").toEqual([]);
+      // E1 acts after the sandbox passed its check, so at least one detached child must have started: otherwise the row never probed the case.
+      if (label === "E1") expect(childStarted, "E1: no iteration started the detached child").toBeGreaterThan(0);
+    }, 300_000);
+  });
+
+  it("NC1 scanner: a detached process that is not below any gateway is reported by the absence check", async () => {
+    const tag = detachedTag();
+    started.push({ tag });
+    spawn("/bin/sh", ["-c", detachedCommand(tag)], { stdio: "ignore" }).unref();
+    expect(await until(() => !tagPresence(tag).gone, 10_000), "the scanner did not see the host-side detached process").toBe(true);
+    expect(tagPresence(tag).survivors.some((line) => line.includes("comm=sleep") && line.includes("carries_the_tag"))).toBe(true);
+  });
+
+  it("NC2 launcher: without --die-with-parent the gateway's SIGKILL leaves the detached child and the held sandbox, and D3's check reports them", async () => {
+    assertFreshBuild();
+    const tag = detachedTag();
+    const wrapper = path.join(tmp, "bwrap-no-die-with-parent");
+    fs.writeFileSync(wrapper, NO_DIE_WITH_PARENT_BWRAP, { mode: 0o755 });
+    const mini = miniGateway({ script: `${detachedCommand(tag)} sleep ${tag} & wait`, bwrap: wrapper });
+    try {
+      expect(await until(() => mini.output().includes("STARTED"), 15_000), mini.output()).toBe(true);
+      const record = await proven(tag, "NC2");
+      mini.kill();
+      await mini.exited;
+      await new Promise((r) => setTimeout(r, 3000));
+      const presence = runPresence(record);
+      detachedEvidence("NC2", { observed_survivors: presence.survivors.length, expected: "survivors" });
+      expect(presence.gone, "the control must observe the survivors").toBe(false);
+      expect(presence.survivors.some((line) => line.includes("comm=sleep"))).toBe(true);
+      expect(presence.survivors.some((line) => line.includes("is_the_recorded_init"))).toBe(true);
+    } finally {
+      mini.kill();
     }
   }, 60_000);
 });

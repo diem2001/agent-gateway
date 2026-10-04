@@ -626,5 +626,5 @@ export function registryRowIds(): string[] {
 
 /** The row ids of the failure suite (`security-failure-process.test.ts`). */
 export function failureRowIds(): string[] {
-  return ["IF.startup-exit", "IF.startup-hang", "IF.policy", "IF.cancel", "IF.restart-term", "IF.restart-kill", "IF.cred-missing", "IF.cred-refused", "IF.timeout", "IF.unavailable", "IF.legacy"];
+  return ["IF.startup-exit", "IF.startup-hang", "IF.policy", "IF.cancel", "IF.restart-term", "IF.restart-kill", "IF.detached-complete", "IF.detached-cancel", "IF.detached-kill", "IF.cred-missing", "IF.cred-refused", "IF.timeout", "IF.unavailable", "IF.legacy"];
 }
