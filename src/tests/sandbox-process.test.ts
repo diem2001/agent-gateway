@@ -456,15 +456,27 @@ PYEOF
 });
 
 describe("descriptor diagnostics (MVP-7991)", () => {
-  it("a Node process marks a descriptor it inherited close-on-exec at startup: the gateway cannot hand an inherited descriptor to bwrap, only the process that execs bwrap can", () => {
+  it("a Node process keeps an inherited descriptor behind a gap in the descriptor numbers: that is how a descriptor of a parent reaches bwrap through the gateway", () => {
+    // libuv's uv_disable_stdio_inheritance marks the first 16 descriptors, and every contiguous one after them,
+    // close-on-exec when a Node process starts. A descriptor with a gap below it (the descriptors of the original
+    // failures were 38 to 45) is left alone and goes on to every child.
     const { dir, file } = fdMarkerFile();
     const fd = fs.openSync(file, "r");
     try {
-      const code = `const fs=require("fs");console.log(fs.readFileSync("/proc/self/fdinfo/5","utf8").split("\\n").find((l)=>l.startsWith("flags")))`;
-      const flagsOf = (command: string, args: string[]) => /flags:\s+(\d+)/.exec(execFileSync(command, args, { stdio: ["ignore", "pipe", "ignore", "ignore", "ignore", fd], encoding: "utf8" }))?.[1] ?? null;
-      // Control: a non-Node child sees the same descriptor without the flag, so the inheritance itself works.
-      expect(isCloseOnExec(flagsOf("python3", ["-c", 'print(open("/proc/self/fdinfo/5").read().split(chr(10))[1])'])), "python child").toBe(false);
-      expect(isCloseOnExec(flagsOf(process.execPath, ["-e", code])), "node child").toBe(true);
+      const stdio = ["ignore", "pipe", "ignore", ...Array<"ignore">(2).fill("ignore"), fd, ...Array<"ignore">(14).fill("ignore"), fd];
+      const probe = (which: "node" | "python") =>
+        execFileSync(
+          which === "node" ? process.execPath : "python3",
+          which === "node"
+            ? ["-e", `const fs=require("fs");const f=(n)=>fs.readFileSync("/proc/self/fdinfo/"+n,"utf8").split("\\n").find((l)=>l.startsWith("flags")).split(/\\s+/)[1];console.log(f(5),f(20))`]
+            : ["-c", 'f=lambda n: open("/proc/self/fdinfo/%d" % n).read().split(chr(10))[1].split()[1]\nprint(f(5), f(20))'],
+          { stdio: stdio as never, encoding: "utf8" },
+        )
+          .trim()
+          .split(" ");
+      // Control: a non-Node child holds both descriptors without the flag, so the inheritance itself works.
+      expect(probe("python").map((f) => isCloseOnExec(f)), "python child, descriptors 5 and 20").toEqual([false, false]);
+      expect(probe("node").map((f) => isCloseOnExec(f)), "node child, descriptors 5 and 20").toEqual([true, false]);
     } finally {
       fs.closeSync(fd);
       fs.rmSync(dir, { recursive: true, force: true });
@@ -495,13 +507,16 @@ describe("descriptor diagnostics (MVP-7991)", () => {
     emitEvidence(evidenceLines(table, fdCtx));
     expect(table.valid, "O2 capture").toBe(true);
     // The marker crossed the launcher boundary into the sandbox's first process: later clean tables are not vacuous.
-    expect(inheritedAtExec(table).entries.map((e) => e.fd)).toEqual([0, 1, 2, 45]);
+    // (Anything else the host chain leaks to this process, for example a descriptor of the load generator, is also listed.)
+    const crossed = inheritedAtExec(table).entries.map((e) => e.fd);
+    expect(crossed.slice(0, 3)).toEqual([0, 1, 2]);
+    expect(crossed).toContain(45);
     const marker = table.entries.find((e) => e.fd === 45);
     expect(marker?.target).toBe(markerFile);
     expect(markersIn(evidenceLines(table, fdCtx).join("\n"))).toEqual([]);
     expect(evidenceLines(table, fdCtx).join("\n")).not.toContain(FD_MARKER);
     // The recorder holds no descriptor of its own at exec: what survives its exec is what it inherited.
-    expect(survivors).toEqual([0, 1, 2, 45]);
+    expect(survivors).toEqual(crossed);
   });
 });
 
@@ -547,22 +562,30 @@ async function boundaryProbe(extra: Partial<RecorderWrapperOptions> = {}) {
 }
 
 /**
- * The real runtime through the gateway, launched by the production `launchBwrap`, while the process that execs bwrap
- * (the test-owned `AGENT_SANDBOX_BWRAP` wrapper) holds a marker descriptor without close-on-exec. The gateway process
- * itself cannot hold one: Node marks every inherited descriptor above 2 close-on-exec at startup (see the row about it).
+ * The real runtime through the gateway, launched by the production `launchBwrap`, while the gateway process itself holds
+ * a marker descriptor without close-on-exec (descriptor 20: see `inheritedFds` of `spawnGateway`). The test-owned
+ * `AGENT_SANDBOX_BWRAP` wrapper only records, at sandbox entry (O2) and right after the launch wrapper (O5).
  */
 async function runtimeBoundary(replace?: RecorderWrapperOptions["replace"]) {
   const { dir, file } = fdMarkerFile();
-  const wrapper = writeRecorderWrapper({ dir, entry: true, start: true, markers: [{ fd: 45, file }], replace });
-  const c = await chain({ env: { AGENT_SANDBOX_BWRAP: wrapper.bwrapPath } });
+  const wrapper = writeRecorderWrapper({ dir, entry: true, start: true, replace });
+  const markerFd = fs.openSync(file, "r");
+  let c: Chain;
+  try {
+    c = await chain({ env: { AGENT_SANDBOX_BWRAP: wrapper.bwrapPath }, inheritedFds: [markerFd] });
+  } finally {
+    fs.closeSync(markerFd);
+  }
   const ctx = fdContext();
+  // Proven in the gateway itself, before the run: the marker is its descriptor 20 and has no close-on-exec flag.
+  const gateway = readFdTable("gateway", c.gateway.child.pid!);
   const answer = await ask(c);
   const entry = wrapper.captures("O2").filter((x) => x.runtime).at(-1);
   const start = wrapper.captures("O5").filter((x) => x.runtime).at(-1);
   const o2 = entry?.table ?? ({ point: "O2", valid: false, entries: [], reason: "no recorder file" } as FdTable);
   const o5 = start ? { ...inheritedAtExec(start.table), point: "O5" } : ({ point: "O5", valid: false, entries: [], reason: "no recorder file" } as FdTable);
-  emitEvidence([summaryLine([o2, o5], { row: "real-runtime-marker", observed: "sandbox entry before the launch wrapper (O2), runtime start after it (O5)" })]);
-  return { file, ctx, answer, entry, start, o2, o5, check: checkDescriptors(o5, ctx) };
+  emitEvidence([summaryLine([gateway, o2, o5], { row: "real-runtime-marker", observed: "gateway table, sandbox entry before the launch wrapper (O2), runtime start after it (O5)" })]);
+  return { file, ctx, gateway, answer, entry, start, o2, o5, check: checkDescriptors(o5, ctx) };
 }
 
 describe("the launcher boundary closes every inherited descriptor (MVP-7991)", () => {
@@ -592,12 +615,15 @@ describe("the launcher boundary closes every inherited descriptor (MVP-7991)", (
   });
 
   // A pass proves only that the launcher passes nothing across the boundary, not that the runtime never opens descriptors later.
-  it("real runtime: a descriptor held by the process that execs bwrap reaches the sandbox entry of the real launch, and the runtime's start table is exactly 0 1 2", async () => {
+  it("real runtime: a descriptor the gateway process holds reaches the sandbox entry of the real launch, and the runtime's start table is exactly 0 1 2", async () => {
     const x = await runtimeBoundary();
+    const held = x.gateway.entries.find((e) => e.fd === 20);
+    expect(held?.target, "marker in the gateway").toBe(x.file);
+    expect(isCloseOnExec(held?.flags ?? null), "marker has no close-on-exec flag in the gateway").toBe(false);
     expect(x.answer.events.at(-1)?.type, JSON.stringify(x.answer.events.at(-1))).toBe("done");
     // Not vacuous: the marker was present at sandbox entry.
     expect(x.o2.valid, "O2 capture of the runtime launch").toBe(true);
-    expect(inheritedAtExec(x.o2).entries.find((e) => e.fd === 45)?.target).toBe(x.file);
+    expect(inheritedAtExec(x.o2).entries.find((e) => e.fd === 20)?.target).toBe(x.file);
     // The runtime's start table, read right after the launch wrapper and before node starts.
     expect(x.check.ok, x.check.message).toBe(true);
     expect(x.start?.survivors, "the recorder holds no descriptor of its own at exec").toEqual([0, 1, 2]);
@@ -605,12 +631,12 @@ describe("the launcher boundary closes every inherited descriptor (MVP-7991)", (
     expect(x.start?.pid1?.includes(x.file), "the marker is not held by the sandbox init").toBe(false);
   }, 120_000);
 
-  it("negative control (real runtime): with the pre-fix wrapper the marker reaches the runtime's start table and the checker names it", async () => {
+  it("negative control (real runtime): with the pre-fix wrapper the gateway's marker reaches the runtime's start table and the checker names it", async () => {
     const x = await runtimeBoundary([{ from: LAUNCH_WRAPPER, to: PRE_FIX_LAUNCH_WRAPPER }]);
     expect(x.answer.events.at(-1)?.type).toBe("done");
-    expect(inheritedAtExec(x.o2).entries.some((e) => e.fd === 45)).toBe(true);
+    expect(inheritedAtExec(x.o2).entries.some((e) => e.fd === 20)).toBe(true);
     expect(x.check.ok).toBe(false);
-    expect(x.check.message).toContain("45 -> <tmp>/<redacted>");
+    expect(x.check.message).toContain("20 -> <tmp>/<redacted>");
     expect(x.check.message).not.toContain(FD_MARKER);
   }, 120_000);
 
@@ -1550,13 +1576,14 @@ interface Chain {
 }
 
 /** A gateway with the real runtime, secrets planted in its environment and home, and a scripted model that makes one exact tool call. */
-async function chain(options: { tool?: { name: string; input: Record<string, unknown> }; toolFor?: (gateway: SpawnedGateway) => { name: string; input: Record<string, unknown> }; mode?: FakeApiMode; env?: Record<string, string>; plantedHome?: (gateway: SpawnedGateway) => void } = {}): Promise<Chain> {
+async function chain(options: { tool?: { name: string; input: Record<string, unknown> }; toolFor?: (gateway: SpawnedGateway) => { name: string; input: Record<string, unknown> }; mode?: FakeApiMode; env?: Record<string, string>; plantedHome?: (gateway: SpawnedGateway) => void; inheritedFds?: number[] } = {}): Promise<Chain> {
   // The scripted call may name paths of the gateway that is started after the model stand-in: it is filled in then.
   const scripted = options.tool ? { name: options.tool.name, input: { ...options.tool.input }, prompt: GW_PROMPT } : options.toolFor ? { name: "", input: {} as Record<string, unknown>, prompt: GW_PROMPT } : undefined;
   const api = await startFakeAnthropicApi({ toolName: "unused-7678", mode: options.mode, exactTool: scripted });
   gatewayCleanups.push(() => api.close());
   const gateway = await spawnGateway(gatewayCleanups, {
     rootPrefix: "mvp7678-chain-",
+    inheritedFds: options.inheritedFds,
     env: {
       ANTHROPIC_BASE_URL: api.baseUrl,
       ANTHROPIC_API_KEY: PROVIDER_KEY,
