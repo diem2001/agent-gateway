@@ -995,8 +995,9 @@ describe("a detached tool child (setsid nohup) ends with its run", () => {
         config: { startupTimeoutMs: 10000, runTimeoutMs: 100000, sandboxRoot: process.env.SBROOT, bwrapPath: process.env.BWRAP } });
       const child = run.spawnHook({ command: "/bin/sh", args: ["-c", process.env.SCRIPT, ${JSON.stringify(SDK_CLI)}], env: {}, signal: new AbortController().signal });
       if (process.env.EARLY === "e0") process.kill(process.pid, "SIGKILL");
+      // The hook returns the SDK's process object (stdout only); the launcher's stderr is on the run's own child.
       child.stdout.on("data", () => {});
-      child.stderr.on("data", (chunk) => { if (process.env.EARLY === "e1" && String(chunk).includes(SANDBOX_CHECK_LINE)) process.kill(process.pid, "SIGKILL"); });
+      run.child.stderr.on("data", (chunk) => { if (process.env.EARLY === "e1" && String(chunk).includes(SANDBOX_CHECK_LINE)) process.kill(process.pid, "SIGKILL"); });
       console.log("STARTED");
       setInterval(() => {}, 1000);
     `;
