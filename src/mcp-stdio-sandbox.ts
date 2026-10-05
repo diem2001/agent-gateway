@@ -26,7 +26,7 @@ import type { ToolFailure } from "./tool-mediation.js";
 
 const BASE_ENV_KEYS = ["LANG"] as const;
 
-/** The environment of a tool sandbox: a base allowlist built from nothing, then the server's own `env`. */
+/** The environment of a tool sandbox: a base allowlist built from nothing, then the server's own `env` without loader settings. */
 export function buildToolSandboxEnv(gatewayEnv: NodeJS.ProcessEnv, serverEnv: Record<string, string>): Record<string, string> {
   const env: Record<string, string> = {
     HOME: SANDBOX_HOME,
@@ -39,7 +39,18 @@ export function buildToolSandboxEnv(gatewayEnv: NodeJS.ProcessEnv, serverEnv: Re
   for (const [key, value] of Object.entries(gatewayEnv)) {
     if ((BASE_ENV_KEYS.includes(key as (typeof BASE_ENV_KEYS)[number]) || /^LC_[A-Z_]+$/.test(key)) && typeof value === "string" && /^[A-Za-z0-9_.@-]{1,64}$/.test(value)) env[key] = value;
   }
-  return Object.assign(env, serverEnv);
+  Object.assign(env, serverEnv);
+  // A loader setting (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, any other `LD_*`, `GLIBC_TUNABLES`) would load a library into the
+  // launch wrapper and into the launcher process before the wrapper closes the inherited descriptors (MVP-8020): never delivered.
+  let removed = 0;
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("LD_") || key === "GLIBC_TUNABLES") {
+      delete env[key];
+      removed++;
+    }
+  }
+  if (removed > 0) log("mcp", `mcp.stdio.loader_settings_removed count=${removed}`);
+  return env;
 }
 
 export interface StdioBridgeOptions {

@@ -716,7 +716,7 @@ describe("the launch wrapper refuses a start whose preconditions fail (MVP-8020)
   it.each([
     ["/usr/bin/unshare", "an empty non-executable file"],
     ["/usr/bin/true", "an empty non-executable file"],
-  ] as const)("%s masked by %s is refused as binary_missing before the runtime starts; the pre-fix wrapper starts with the same mask", async (tool) => {
+  ] as const)("%s masked by %s is refused as binary_missing before the runtime starts; the pre-fix wrapper starts with the same mask", async (tool, _what) => {
     const mask = masks().file;
     const name = `mask-${path.basename(tool)}`;
     const refused = await startThrough(name, { extraArgs: ["--ro-bind", mask, tool] });
@@ -884,7 +884,10 @@ describe("the launch wrapper against a hostile tool-server environment (MVP-7991
     expect(hardened.stderr.split("\n").filter((l) => l.startsWith("+")), "no xtrace output").toEqual([]);
 
     // Control 1: without privileged mode BASH_ENV, the exported function and SHELLOPTS take effect.
-    const noPrivileged = await stdioLaunch(ATTACK_ENV, { replace: [{ from: "-p", to: "+p" }] });
+    // The exported `exec` replaces the close step, so the verification step now refuses that start (MVP-8020); the leak itself is shown with the verification removed.
+    const refusedWithoutP = await stdioLaunch(ATTACK_ENV, { replace: [{ from: "-p", to: "+p" }] });
+    expect(refusedWithoutP.outcome).toMatchObject({ name: "IsolationFailure", problem: "start_failed" });
+    const noPrivileged = await stdioLaunch(ATTACK_ENV, { replace: [{ from: "-p", to: "+p" }, { from: LAUNCH_WRAPPER, to: patched(LAUNCH_WRAPPER, RELIST_STEP, "") }] });
     expect(noPrivileged.outcome).toBe("ready");
     const pwnedEnv = noPrivileged.stdout.split("\n").find((l) => l.startsWith("PWN=")) ?? "";
     expect(pwnedEnv).toContain("pwn-bash-env");
