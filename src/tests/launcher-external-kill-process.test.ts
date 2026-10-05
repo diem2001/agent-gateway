@@ -389,7 +389,8 @@ function proxyStatus(proxy: { token: string; baseUrl: URL }): Promise<number> {
 
 describe("the run deadline ends the request although the SDK ignores the abort (MVP-8000, real runtime, real bwrap)", () => {
   it("R5: ends within limit + 2 s with one deadline error, kills the sandbox, revokes the proxy token, frees the conversation", async () => {
-    const LIMIT_MS = 3_000;
+    // Long enough for the runtime to start and send its request first (a new conversation's start takes several seconds).
+    const LIMIT_MS = 10_000;
     const { api, gw } = await rig({ deadlineMs: LIMIT_MS, distServer: ignoresAbortDist() });
     const queryId = `q8000-${randomBytes(4).toString("hex")}`;
     const conversation = `conv8000-${randomBytes(4).toString("hex")}`;
