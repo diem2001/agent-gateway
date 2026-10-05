@@ -609,8 +609,10 @@ export function regressionRowIds(): string[] {
     "X.leftovers",
     "X.extension-writes",
     "X.run-leftovers",
+    "X.loader-env",
     "RP.negative-control",
     "RP.negative-control.file-detector",
+    "RP.negative-control.loader-env",
   ];
 }
 
@@ -626,5 +628,5 @@ export function registryRowIds(): string[] {
 
 /** The row ids of the failure suite (`security-failure-process.test.ts`). */
 export function failureRowIds(): string[] {
-  return ["IF.startup-exit", "IF.startup-hang", "IF.policy", "IF.cancel", "IF.restart-term", "IF.restart-kill", "IF.detached-complete", "IF.detached-cancel", "IF.detached-kill", "IF.cred-missing", "IF.cred-refused", "IF.timeout", "IF.unavailable", "IF.legacy"];
+  return ["IF.startup-exit", "IF.startup-hang", "IF.policy", "IF.check-tool-unshare", "IF.check-tool-true", "IF.cancel", "IF.restart-term", "IF.restart-kill", "IF.detached-complete", "IF.detached-cancel", "IF.detached-kill", "IF.cred-missing", "IF.cred-refused", "IF.timeout", "IF.unavailable", "IF.legacy"];
 }

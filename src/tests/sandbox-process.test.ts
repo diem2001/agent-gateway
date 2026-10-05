@@ -7,7 +7,7 @@
  * Needs `bwrap` and user namespaces (the Docker probe of Gate E covers the container profile) and
  * `npm run build` (the SIGKILL row starts the compiled launcher). Linux only.
  */
-import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, execFileSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,6 +20,7 @@ import { createRunLogDir } from "../sdk-run-logs.js";
 import {
   EXIT_FDS_NOT_LISTABLE,
   IsolationFailure,
+  LAUNCH_INTERPRETER,
   LAUNCH_WRAPPER,
   SandboxRun,
   buildBwrapArgv,
@@ -68,6 +69,8 @@ const ALL_MARKERS = [PROVIDER_KEY, GATEWAY_KEY, OAUTH_ACCESS, OAUTH_REFRESH, SSH
 
 /** An identifiable descriptor target (MVP-7991); kept out of ALL_MARKERS, which the other rows assert absent. */
 const FD_MARKER = "SYNTH-FD-MARKER-7991";
+/** The file a planted library creates in the sandbox home when it runs (MVP-8020). */
+const LOADER_MARKER = "loader-ran-marker";
 
 let tmp: string;
 let home: string;
@@ -672,6 +675,134 @@ describe("the launcher boundary closes every inherited descriptor (MVP-7991)", (
   });
 });
 
+/** The launch wrapper as it was before MVP-8020 (it did not check its tools and did not verify its close), for the negative controls. */
+const WRAPPER_BEFORE_8020 = `[ -e /proc/self/fd/0 ] || exit 96; for f in /proc/self/fd/*; do n=\${f##*/}; if [ "$n" -gt 2 ]; then eval "exec $n>&-"; fi; done; if /usr/bin/unshare -U /usr/bin/true >/dev/null 2>&1; then exit 97; fi; echo SANDBOX-CHECK-OK >&2; exec "$@"`;
+const CLOSE_STEP = 'if [ "$n" -gt 2 ]; then eval "exec $n>&-"; fi';
+const RELIST_STEP = 'for f in /proc/self/fd/*; do n=${f##*/}; if [ "$n" -gt 2 ] && [ -L "$f" ]; then exit 94; fi; done; ';
+
+/** `base` with `from` replaced by `to`; the patch must match exactly once, or the row would test nothing. */
+function patched(base: string, from: string, to: string): string {
+  expect(base.split(from).length - 1, `the patch target occurs exactly once: ${from}`).toBe(1);
+  return base.replace(from, () => to);
+}
+
+describe("the launch wrapper refuses a start whose preconditions fail (MVP-8020)", () => {
+  /** Starts a run through a recorder wrapper (the runtime command writes a marker into the home); reports how the start ended. */
+  async function startThrough(name: string, options: Partial<RecorderWrapperOptions>) {
+    const { dir } = fdMarkerFile();
+    const wrapper = writeRecorderWrapper({ dir, name, ...options });
+    const runLogs = createRunLogDir();
+    const id = dirId(`conv-${name}`);
+    const run = new SandboxRun({ queryId: "q-probe", runLogDir: runLogs.dir, runLogEnv: runLogs.env, sessionDirId: id, workspaceRoot: ws, config: config({ bwrapPath: wrapper.bwrapPath }), proxy });
+    const child = run.spawnHook({ command: "/bin/sh", args: ["-c", "echo started > /home/node/started", SDK_CLI], env: {}, signal: new AbortController().signal });
+    child.stdin.end();
+    const exitCode = await new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
+    const result = { exitCode, problem: run.startFailure?.problem ?? null, started: fs.existsSync(path.join(sandboxRoot, "sessions", id, "home", "started")) };
+    await run.dispose();
+    fs.rmSync(runLogs.dir, { recursive: true, force: true });
+    return result;
+  }
+
+  /** A trusted empty, non-executable regular file and an empty directory, in a directory the test owns. */
+  function masks(): { file: string; dir: string } {
+    const { dir } = fdMarkerFile();
+    const file = path.join(dir, "empty-file");
+    fs.writeFileSync(file, "", { mode: 0o644 });
+    const emptyDir = path.join(dir, "empty-dir");
+    fs.mkdirSync(emptyDir);
+    return { file, dir: emptyDir };
+  }
+
+  it.each([
+    ["/usr/bin/unshare", "an empty non-executable file"],
+    ["/usr/bin/true", "an empty non-executable file"],
+  ] as const)("%s masked by %s is refused as binary_missing before the runtime starts; the pre-fix wrapper starts with the same mask", async (tool, _what) => {
+    const mask = masks().file;
+    const name = `mask-${path.basename(tool)}`;
+    const refused = await startThrough(name, { extraArgs: ["--ro-bind", mask, tool] });
+    expect(refused.problem).toBe("binary_missing");
+    expect(refused.exitCode).toBe(95);
+    expect(refused.started, "the runtime command never ran").toBe(false);
+    // Control: the mask is live, the wrapper before the fix starts the runtime anyway.
+    const control = await startThrough(`${name}-control`, { extraArgs: ["--ro-bind", mask, tool], replace: [{ from: LAUNCH_WRAPPER, to: WRAPPER_BEFORE_8020 }] });
+    expect(control.problem).toBeNull();
+    expect(control.started).toBe(true);
+  });
+
+  // bwrap cannot bind a directory over a file, so the directory case runs the wrapper itself under bash with the tool paths pointed at stand-ins.
+  describe("a start-check tool that is a directory", () => {
+    const STAND_IN_UNSHARE = "#!/bin/sh\nexit 1\n";
+    const STAND_IN_TRUE = "#!/bin/sh\nexit 0\n";
+
+    function wrapperOutcome(unshare: "stand-in" | "directory", trueTool: "stand-in" | "directory") {
+      const dir = evidenceDir();
+      const unshareStandIn = path.join(dir, "unshare");
+      const trueStandIn = path.join(dir, "true");
+      const folder = path.join(dir, "a-directory");
+      fs.mkdirSync(folder);
+      fs.writeFileSync(unshareStandIn, STAND_IN_UNSHARE, { mode: 0o755 });
+      fs.writeFileSync(trueStandIn, STAND_IN_TRUE, { mode: 0o755 });
+      const wrapper = LAUNCH_WRAPPER.split("/usr/bin/unshare").join(unshare === "directory" ? folder : unshareStandIn).split("/usr/bin/true").join(trueTool === "directory" ? folder : trueStandIn);
+      const result = spawnSync(LAUNCH_INTERPRETER[0], [...LAUNCH_INTERPRETER.slice(1), wrapper, "sh", "/bin/true"], { env: { PATH: "/usr/bin:/bin" }, encoding: "utf8" });
+      return { status: result.status, stderr: result.stderr };
+    }
+
+    it("control: with two executable stand-ins the wrapper reports the passed check and runs the command", () => {
+      const ok = wrapperOutcome("stand-in", "stand-in");
+      expect(ok.status).toBe(0);
+      expect(ok.stderr.split("\n")).toContain("SANDBOX-CHECK-OK");
+    });
+
+    it.each([
+      ["unshare", "directory", "stand-in"],
+      ["true", "stand-in", "directory"],
+    ] as const)("%s as a directory is refused with exit 95 before the check line", (_tool, unshare, trueTool) => {
+      const refused = wrapperOutcome(unshare, trueTool);
+      expect(refused.status).toBe(95);
+      expect(refused.stderr).not.toContain("SANDBOX-CHECK-OK");
+    });
+  });
+
+  it("a descriptor that survives the close is refused as start_failed (exit 94, not proc_denied) before the runtime starts; without the re-list the same start succeeds and leaks it", async () => {
+    const skipClose = patched(LAUNCH_WRAPPER, CLOSE_STEP, 'if [ "$n" -gt 2 ] && [ "$n" -ne 45 ]; then eval "exec $n>&-"; fi');
+    const { dir, file } = fdMarkerFile();
+    const refused = await startThrough("close-failure", { dir, markers: [{ fd: 45, file }], replace: [{ from: LAUNCH_WRAPPER, to: skipClose }] });
+    expect(refused.problem).toBe("start_failed");
+    expect(refused.exitCode).toBe(94);
+    expect(refused.started, "the runtime command never ran").toBe(false);
+    // Control: without the verification step the same failed close goes unnoticed and the marker reaches the probe.
+    const unverified = patched(skipClose, RELIST_STEP, "");
+    const b = await boundaryProbe({ replace: [{ from: LAUNCH_WRAPPER, to: unverified }] });
+    expect(b.r.exitCode, b.r.stdout).toBe(0);
+    expect(b.checks.o3.ok).toBe(false);
+    expect(b.checks.o3.message).toContain("45 -> <tmp>/<redacted>");
+  });
+
+  it("an interpreter that is not executable (Permission denied) fails closed as binary_missing", async () => {
+    const mask = masks().file;
+    const refused = await startThrough("bash-not-executable", { extraArgs: ["--ro-bind", mask, "/bin/bash"] });
+    expect(refused.problem).toBe("binary_missing");
+    expect(refused.started).toBe(false);
+  });
+
+  it("the boot self-check of a masked start-check tool sets isolation unavailable with exactly one log line naming binary_missing", async () => {
+    const { file } = masks();
+    const { dir } = fdMarkerFile();
+    const wrapper = writeRecorderWrapper({ dir, name: "selfcheck-mask", extraArgs: ["--ro-bind", file, "/usr/bin/unshare"] });
+    await runIsolationSelfCheck(config({ bwrapPath: wrapper.bwrapPath }));
+    expect(isolationStatus()).toBe("unavailable");
+    expect(logs.filter((l) => l.includes("ERROR isolation problem="))).toEqual(["[isolation] ERROR isolation problem=binary_missing reason=the isolation runtime is not installed or not executable (see /health)"]);
+  });
+
+  it("the boot self-check of a start that times out sets isolation unavailable with exactly one log line naming start_failed", async () => {
+    const hang = path.join(tmp, "bwrap-selfcheck-hang-once");
+    fs.writeFileSync(hang, "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
+    await runIsolationSelfCheck(config({ bwrapPath: hang, startupTimeoutMs: 300 }));
+    expect(isolationStatus()).toBe("unavailable");
+    expect(logs.filter((l) => l.includes("ERROR isolation problem="))).toEqual(["[isolation] ERROR isolation problem=start_failed reason=the sandbox did not start (see /health)"]);
+  });
+});
+
 describe("the launch wrapper against a hostile tool-server environment (MVP-7991)", () => {
   /** A stdio tool server's `env` (merged verbatim into the sandbox environment) that targets a bash launch wrapper. */
   const ATTACK_ENV: Record<string, string> = {
@@ -712,7 +843,10 @@ describe("the launch wrapper against a hostile tool-server environment (MVP-7991
   }
 
   /** The launch the stdio tool sandbox uses: `buildBwrapArgv` + `launchBwrap` with `buildToolSandboxEnv`. */
-  async function stdioLaunch(serverEnv: Record<string, string>, options: { bwrapPath?: string; plantBashrc?: boolean; replace?: { from: string; to: string }[] } = {}) {
+  async function stdioLaunch(
+    serverEnv: Record<string, string>,
+    options: { bwrapPath?: string; plantBashrc?: boolean; replace?: { from: string; to: string }[]; plant?: (home: string) => void; unstripped?: boolean } = {},
+  ) {
     const { dir, file } = fdMarkerFile();
     const { bwrapPath, plantBashrc, replace } = options;
     const holder = bwrapPath ?? pythonHolder(dir, file, replace ?? []);
@@ -720,8 +854,11 @@ describe("the launch wrapper against a hostile tool-server environment (MVP-7991
     fs.chmodSync(home, 0o700);
     // A start file in the server's home: the launcher's stdio are sockets, and bash then sources it even in privileged mode.
     if (plantBashrc) fs.writeFileSync(path.join(home, ".bashrc"), "/usr/bin/touch /tmp/pwn-bashrc\n");
+    options.plant?.(home);
     const argv = buildBwrapArgv({ layout: detectRootLayout(), procMasks: detectProcMasks(), homeDir: home, mounts: [], hidden: [], emptyFile: "/dev/null", roBinds: [], rwBinds: [], command: "/bin/sh", args: ["-c", SCRIPT] });
-    const launch = launchBwrap(config({ bwrapPath: holder }), argv, buildToolSandboxEnv(process.env, serverEnv), { markOk: false });
+    // `unstripped`: the merge of the base allowlist and the server env as it was before the loader settings were removed (control rows only).
+    const env = options.unstripped ? Object.assign(buildToolSandboxEnv(process.env, {}), serverEnv) : buildToolSandboxEnv(process.env, serverEnv);
+    const launch = launchBwrap(config({ bwrapPath: holder }), argv, env, { markOk: false });
     let stdout = "";
     let stderr = "";
     launch.child.stdout?.on("data", (d: Buffer) => (stdout += d.toString("utf8")));
@@ -731,8 +868,9 @@ describe("the launch wrapper against a hostile tool-server environment (MVP-7991
       (f: IsolationFailure) => f,
     );
     await new Promise<void>((resolve) => (launch.child.exitCode !== null || launch.child.signalCode !== null ? resolve() : launch.child.once("exit", () => resolve())));
+    const loaderMarker = fs.existsSync(path.join(home, LOADER_MARKER));
     fs.rmSync(home, { recursive: true, force: true });
-    return { outcome, stdout, stderr, ctx: fdContext() };
+    return { outcome, stdout, stderr, ctx: fdContext(), loaderMarker };
   }
 
   it("BASH_ENV, exported functions, SHELLOPTS, a start file in the home and a poisoned PATH change nothing: the server still sees exactly 0 1 2; controls show each attack is live", async () => {
@@ -746,7 +884,10 @@ describe("the launch wrapper against a hostile tool-server environment (MVP-7991
     expect(hardened.stderr.split("\n").filter((l) => l.startsWith("+")), "no xtrace output").toEqual([]);
 
     // Control 1: without privileged mode BASH_ENV, the exported function and SHELLOPTS take effect.
-    const noPrivileged = await stdioLaunch(ATTACK_ENV, { replace: [{ from: "-p", to: "+p" }] });
+    // The exported `exec` replaces the close step, so the verification step now refuses that start (MVP-8020); the leak itself is shown with the verification removed.
+    const refusedWithoutP = await stdioLaunch(ATTACK_ENV, { replace: [{ from: "-p", to: "+p" }] });
+    expect(refusedWithoutP.outcome).toMatchObject({ name: "IsolationFailure", problem: "start_failed" });
+    const noPrivileged = await stdioLaunch(ATTACK_ENV, { replace: [{ from: "-p", to: "+p" }, { from: LAUNCH_WRAPPER, to: patched(LAUNCH_WRAPPER, RELIST_STEP, "") }] });
     expect(noPrivileged.outcome).toBe("ready");
     const pwnedEnv = noPrivileged.stdout.split("\n").find((l) => l.startsWith("PWN=")) ?? "";
     expect(pwnedEnv).toContain("pwn-bash-env");
@@ -772,6 +913,35 @@ describe("the launch wrapper against a hostile tool-server environment (MVP-7991
       const refused = await stdioLaunch(env, { bwrapPath: fake });
       expect(refused, JSON.stringify(Object.keys(env))).toMatchObject({ outcome: { name: "IsolationFailure", problem: "userns_not_blocked" } });
     }
+  });
+
+  describe("a loader setting of a tool server never loads a library (MVP-8020)", () => {
+    /** A library that records its own execution: its constructor creates a marker file in the sandbox home. */
+    function plantLibrary(home: string): void {
+      try {
+        execFileSync("gcc", ["--version"], { stdio: "ignore" });
+      } catch {
+        throw new Error("host prerequisite missing: gcc");
+      }
+      const source = path.join(home, "ld-marker.c");
+      fs.writeFileSync(source, `#include <fcntl.h>\n#include <unistd.h>\n__attribute__((constructor)) static void run(void) { int fd = open("/home/node/${LOADER_MARKER}", O_WRONLY | O_CREAT, 0600); if (fd >= 0) close(fd); }\n`);
+      execFileSync("gcc", ["-shared", "-fPIC", "-o", path.join(home, "ld-marker.so"), source]);
+    }
+    const SERVER_ENV = { LD_PRELOAD: "/home/node/ld-marker.so", LD_DEBUG: "files", GLIBC_TUNABLES: "glibc.malloc.check=3" };
+
+    it("a library planted in the server's home and named by LD_PRELOAD never runs; the server still sees exactly 0 1 2", async () => {
+      const hardened = await stdioLaunch(SERVER_ENV, { plant: plantLibrary });
+      expect(hardened.outcome).toBe("ready");
+      expect(hardened.loaderMarker, "the planted library ran").toBe(false);
+      const check = checkDescriptors(parseFdRecords(hardened.stdout, "O3"), hardened.ctx);
+      expect(check.ok, check.message).toBe(true);
+    });
+
+    it("negative control: with the merge as it was before, the same planted library runs", async () => {
+      const control = await stdioLaunch(SERVER_ENV, { plant: plantLibrary, unstripped: true });
+      expect(control.outcome).toBe("ready");
+      expect(control.loaderMarker, "the planted library did not run: the probe is not live").toBe(true);
+    });
   });
 });
 

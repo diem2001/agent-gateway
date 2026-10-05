@@ -179,6 +179,10 @@ function noteStartFailure(failure: IsolationFailure): void {
 export const EXIT_USERNS_NOT_BLOCKED = 97;
 /** Exit code the launch wrapper uses when it cannot list its own descriptors (no `/proc`), so it cannot prove it closed them. */
 export const EXIT_FDS_NOT_LISTABLE = 96;
+/** Exit code the launch wrapper uses when a descriptor above 2 is still open after the close step. */
+export const EXIT_FDS_NOT_CLOSED = 94;
+/** Exit code the launch wrapper uses when a tool of its own start check (`unshare`, `true`) is not a regular executable file, or `unshare` could not run. */
+export const EXIT_CHECK_TOOL_MISSING = 95;
 /** The line the launch wrapper writes to stderr once the sandbox has passed its start check. */
 export const SANDBOX_CHECK_LINE = "SANDBOX-CHECK-OK";
 /**
@@ -190,17 +194,23 @@ export const SANDBOX_CHECK_LINE = "SANDBOX-CHECK-OK";
 export const LAUNCH_INTERPRETER = ["/bin/bash", "--norc", "-p", "-c"] as const;
 /**
  * Launch wrapper, first process inside the sandbox: close every descriptor above 2 (bwrap passes on whatever its
- * parent left open without close-on-exec, and the runtime inherits nothing but stdin, stdout and stderr), refuse to
- * start unless a nested user namespace fails, report the passed check on stderr (which belongs to the launcher until
- * that line arrives) and exec the runtime.
+ * parent left open without close-on-exec, and the runtime inherits nothing but stdin, stdout and stderr), list the
+ * descriptors again and refuse if one survived, refuse unless the tools of its own start check are regular executable
+ * files, refuse to start unless a nested user namespace fails, report the passed check on stderr (which belongs to the
+ * launcher until that line arrives) and exec the runtime.
  *
  * It runs under `bash --norc -p` so neither the caller-controlled environment of a stdio tool server (`BASH_ENV`,
  * `BASH_FUNC_*`, `SHELLOPTS`) nor a start file can change it; the close loop uses builtins only and does not look at
  * `PATH`; `unshare` and the program it runs are called by absolute path (`unshare -U true` would look `true` up in
  * `PATH`, fail under a poisoned `PATH` and read as "blocked"); and it refuses (its own exit code) when it cannot list
  * its descriptors, because an unmatched glob would otherwise close nothing.
+ *
+ * A start check that cannot run is never a passed check: `[ -f ] && [ -x ]` rejects a missing tool, a directory and a
+ * file that is not executable (95), and only exit status 1 of `unshare` counts as "blocked" (126 or 127 mean it could
+ * not run, 95). The re-listed glob's own directory descriptor is closed again when the test runs, so it needs no
+ * exception.
  */
-export const LAUNCH_WRAPPER = `[ -e /proc/self/fd/0 ] || exit ${EXIT_FDS_NOT_LISTABLE}; for f in /proc/self/fd/*; do n=\${f##*/}; if [ "$n" -gt 2 ]; then eval "exec $n>&-"; fi; done; if /usr/bin/unshare -U /usr/bin/true >/dev/null 2>&1; then exit ${EXIT_USERNS_NOT_BLOCKED}; fi; echo ${SANDBOX_CHECK_LINE} >&2; exec "$@"`;
+export const LAUNCH_WRAPPER = `[ -e /proc/self/fd/0 ] || exit ${EXIT_FDS_NOT_LISTABLE}; for f in /proc/self/fd/*; do n=\${f##*/}; if [ "$n" -gt 2 ]; then eval "exec $n>&-"; fi; done; for f in /proc/self/fd/*; do n=\${f##*/}; if [ "$n" -gt 2 ] && [ -L "$f" ]; then exit ${EXIT_FDS_NOT_CLOSED}; fi; done; [ -f /usr/bin/unshare ] && [ -x /usr/bin/unshare ] && [ -f /usr/bin/true ] && [ -x /usr/bin/true ] || exit ${EXIT_CHECK_TOOL_MISSING}; /usr/bin/unshare -U /usr/bin/true >/dev/null 2>&1; r=$?; [ $r -eq 0 ] && exit ${EXIT_USERNS_NOT_BLOCKED}; [ $r -eq 1 ] || exit ${EXIT_CHECK_TOOL_MISSING}; echo ${SANDBOX_CHECK_LINE} >&2; exec "$@"`;
 
 export interface RootLayout {
   /** `--symlink <target> <link>` entries (merged-usr layouts). */
@@ -475,11 +485,15 @@ export interface Launch {
   failure: () => IsolationFailure | null;
 }
 
+/** The isolation runtime's own exec failure for the launch wrapper's interpreter: missing, or not executable. */
+const INTERPRETER_EXEC_FAILURE = new RegExp(`execvp ${LAUNCH_INTERPRETER[0].replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}: (No such file or directory|Permission denied)`);
+
 function classifyEarlyExit(code: number | null, stderr: string): IsolationProblem {
   if (code === EXIT_USERNS_NOT_BLOCKED) return "userns_not_blocked";
   if (code === EXIT_FDS_NOT_LISTABLE) return "proc_denied";
-  // The interpreter of the launch wrapper is missing in the sandbox's root: the isolation runtime's own exec failure.
-  if (/execvp \/bin\/bash: No such file or directory/.test(stderr)) return "binary_missing";
+  if (code === EXIT_CHECK_TOOL_MISSING) return "binary_missing";
+  if (code === EXIT_FDS_NOT_CLOSED) return "start_failed";
+  if (INTERPRETER_EXEC_FAILURE.test(stderr)) return "binary_missing";
   if (/No permissions to create new namespace|Creating new namespace failed/.test(stderr)) return "namespace_denied";
   if (/Can't mount proc|mount proc/.test(stderr)) return "proc_denied";
   if (/Can't (mount|bind|make|create|mkdir|find source|open)|Failed to make|pivot_root|No such file or directory/.test(stderr)) return "mount_failed";
@@ -1031,9 +1045,11 @@ export async function runIsolationSelfCheck(configOverride?: IsolationConfig): P
       markIsolationUnavailable(outcome.problem === "timeout" ? "start_failed" : outcome.problem);
       return;
     }
+    // The launcher ended before its check line: `launchBwrap` already classified the exit, logged it and marked the state once.
+    if (launch.failure()) return;
     if (outcome === 98) markIsolationUnavailable("canary_visible");
     else if (outcome === 99) markIsolationUnavailable("pid_namespace_shared");
-    else markIsolationUnavailable(outcome === EXIT_USERNS_NOT_BLOCKED ? "userns_not_blocked" : "start_failed");
+    else markIsolationUnavailable("start_failed");
   } catch (error) {
     markIsolationUnavailable(error instanceof SandboxPrepError ? error.problem : "start_failed");
   } finally {

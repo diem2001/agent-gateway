@@ -12,13 +12,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   IsolationConfigError,
   IsolationFailure,
+  EXIT_CHECK_TOOL_MISSING,
+  EXIT_FDS_NOT_CLOSED,
   EXIT_FDS_NOT_LISTABLE,
   EXIT_USERNS_NOT_BLOCKED,
   LAUNCH_INTERPRETER,
   LAUNCH_WRAPPER,
   buildBwrapArgv,
   buildSandboxEnv,
+  launchBwrap,
   loadIsolationConfig,
+  resetIsolationStatusForTests,
   runtimeEnvFrom,
   sdkProcessOf,
   SandboxRun,
@@ -190,7 +194,7 @@ describe("bwrap argument list", () => {
     expect(argv.join(" ")).not.toContain("/srv/sb/sessions ");
   });
 
-  it("the launch wrapper closes every descriptor above 2 first, refuses without a descriptor listing, then checks the nested user namespace, reports it and starts the runtime last", () => {
+  it("the launch wrapper closes every descriptor above 2 first, verifies it, refuses without a descriptor listing or a start-check tool, then checks the nested user namespace, reports it and starts the runtime last", () => {
     // bash, because dash cannot close descriptors above 9: `-p` ignores BASH_ENV, exported functions and SHELLOPTS,
     // `--norc` keeps the sshd-style start files out (the launcher's stdio are sockets).
     expect(LAUNCH_INTERPRETER).toEqual(["/bin/bash", "--norc", "-p", "-c"]);
@@ -198,8 +202,11 @@ describe("bwrap argument list", () => {
       "[ -e /proc/self/fd/0 ] || exit 96",
       "for f in /proc/self/fd/*",
       'eval "exec $n>&-"',
+      'if [ "$n" -gt 2 ] && [ -L "$f" ]; then exit 94; fi',
+      "[ -f /usr/bin/unshare ] && [ -x /usr/bin/unshare ] && [ -f /usr/bin/true ] && [ -x /usr/bin/true ] || exit 95",
       "/usr/bin/unshare -U /usr/bin/true",
-      "exit 97",
+      "[ $r -eq 0 ] && exit 97",
+      "[ $r -eq 1 ] || exit 95",
       "SANDBOX-CHECK-OK",
       'exec "$@"',
     ];
@@ -207,12 +214,52 @@ describe("bwrap argument list", () => {
     expect(positions.every((p) => p >= 0), JSON.stringify(positions)).toBe(true);
     expect([...positions].sort((a, b) => a - b)).toEqual(positions);
     expect(LAUNCH_WRAPPER.endsWith('exec "$@"')).toBe(true);
+    expect(EXIT_FDS_NOT_CLOSED).toBe(94);
+    expect(EXIT_CHECK_TOOL_MISSING).toBe(95);
     expect(EXIT_FDS_NOT_LISTABLE).toBe(96);
     expect(EXIT_USERNS_NOT_BLOCKED).toBe(97);
     // Builtins and absolute paths only: no PATH lookup (a poisoned PATH skipped the namespace check before), no substitution (it would open a descriptor of its own).
     expect(LAUNCH_WRAPPER).not.toMatch(/\$\(|`|<\(/);
     expect(LAUNCH_WRAPPER).not.toMatch(/(^|[;&| ])unshare /);
     expect(LAUNCH_WRAPPER).not.toContain("exec 3>&-");
+  });
+});
+
+describe("an early exit of the launcher is classified (MVP-8020)", () => {
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+    resetIsolationStatusForTests();
+  });
+
+  /** A launcher that writes `stderr`, waits until the data is surely read and exits with `code`; returns the start problem. */
+  async function problemOf(stderr: string, code: number): Promise<string | null> {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-class-"));
+    dirs.push(dir);
+    const launcher = path.join(dir, "bwrap");
+    fs.writeFileSync(launcher, `#!/bin/sh\ncat >&2 <<'STDERR-END'\n${stderr}\nSTDERR-END\nsleep 0.3\nexit ${code}\n`, { mode: 0o755 });
+    const config = { ...loadIsolationConfig({ HOME: dir, AGENT_SANDBOX_ROOT: path.join(dir, "root") }), bwrapPath: launcher };
+    const launch = launchBwrap(config, ["--", "/bin/true"], { PATH: "/usr/bin:/bin" }, { markOk: false });
+    const failure = await launch.ready.then(
+      () => null,
+      (f: IsolationFailure) => f,
+    );
+    return failure?.problem ?? null;
+  }
+
+  it.each([
+    ["exit 95 (a start-check tool is missing)", "", 95, "binary_missing"],
+    ["exit 94 (a descriptor survived the close)", "", 94, "start_failed"],
+    ["exit 96 (no descriptor listing)", "", 96, "proc_denied"],
+    ["exit 97 (nested user namespaces still work)", "", 97, "userns_not_blocked"],
+    ["an interpreter that is not executable", "bwrap: execvp /bin/bash: Permission denied", 1, "binary_missing"],
+    ["an interpreter that is missing", "bwrap: execvp /bin/bash: No such file or directory", 1, "binary_missing"],
+    ["a mount that is denied (not the interpreter)", "bwrap: Can't bind mount /oldroot/x on /newroot/x: Permission denied", 1, "mount_failed"],
+  ])("%s is classified as its problem word", async (_label, stderr, code, expected) => {
+    expect(await problemOf(stderr, code)).toBe(expected);
   });
 });
 

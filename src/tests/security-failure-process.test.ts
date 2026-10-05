@@ -8,6 +8,9 @@
  *   self-check (isolation `ok`), then a mode file makes it exit, hang or drop `--disable-userns` for the next launch. The
  *   wrapper logs every launch with the run's unique log path from its environment (the arguments travel on fd 3, so the
  *   query id is not visible to it): that line is the boundary proof.
+ * - `IF.check-tool-unshare`, `IF.check-tool-true` (MVP-8020): the same wrapper binds an empty non-executable file over one tool of the
+ *   launch wrapper's own start check; the gateway log names `binary_missing`, the caller gets the permanent text, nothing ran and the next
+ *   start with the tool back returns `/health` to `ok`.
  * - `IF.cancel`, `IF.restart-term`, `IF.restart-kill`: a Bash tool with a tagged child; the host sees the child below the
  *   gateway and the model double recorded the call before the caller closes the connection, or the gateway is stopped.
  * - `IF.detached-complete`, `IF.detached-cancel`, `IF.detached-kill` (MVP-7977): the same, with a tool child that left its session
@@ -120,13 +123,14 @@ const LEGACY = "This conversation was started before a gateway security update a
  * `bypass` and `bypass-ready` are the negative controls of the process sampler: the launcher drops the sandbox and runs
  * the runtime command (`bypass`: a stand-in Node with the same executable and `cli.js` argument, so nothing real runs
  * outside the sandbox; `bypass-ready`: after printing the sandbox check line, the real runtime in a scratch home) in the
- * gateway's own namespaces. A mode that must start no runtime (`pass`, `startup-exit`, `startup-hang`, `no-userns`) forks
+ * gateway's own namespaces. A mode that must start no runtime (`pass`, `startup-exit`, `startup-hang`, `no-userns`,
+ * `mask-unshare`, `mask-true`) forks
  * nothing before it execs or exits: the sampler cannot tell a fork of this script, whose command line carries `cli.js`, from
  * a runtime, so the mode file, the time stamp and the `--disable-userns` strip use shell builtins only. `startup-exit` holds
  * 0.4 s on a FIFO (`read -t` on a builtin, no fork) before it exits: a process that ends before the sampler can read its
  * executable cannot be classified by it (a stated blind spot), so the double stays alive for several sampler ticks.
  */
-type WrapperMode = "pass" | "startup-exit" | "startup-hang" | "no-userns" | "bypass" | "bypass-ready";
+type WrapperMode = "pass" | "startup-exit" | "startup-hang" | "no-userns" | "mask-unshare" | "mask-true" | "bypass" | "bypass-ready";
 
 interface Wrapper {
   path: string;
@@ -140,6 +144,8 @@ function makeWrapper(): Wrapper {
   cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   const script = path.join(dir, "bwrap");
   fs.writeFileSync(path.join(dir, "mode"), "pass\n");
+  // The stand-in of a missing start-check tool: an empty regular file that is not executable (`mask-*` binds it over the tool).
+  fs.writeFileSync(path.join(dir, "empty"), "", { mode: 0o644 });
   execFileSync("mkfifo", [path.join(dir, "hold")]);
   fs.writeFileSync(
     script,
@@ -155,6 +161,11 @@ case "$MODE" in
   no-userns)
     ARGS="$DIR/args.$$"
     while IFS= read -r -d '' ARG; do [ "$ARG" = --disable-userns ] || printf '%s\0' "$ARG"; done <&3 > "$ARGS"
+    exec /usr/bin/bwrap --args 4 "${"$"}{@:3}" 4< "$ARGS" ;;
+  mask-unshare|mask-true)
+    ARGS="$DIR/args.$$"
+    while IFS= read -r -d '' ARG; do printf '%s\0' "$ARG"; done <&3 > "$ARGS"
+    printf '%s\0%s\0%s\0' --ro-bind "$DIR/empty" "/usr/bin/${"$"}{MODE#mask-}" >> "$ARGS"
     exec /usr/bin/bwrap --args 4 "${"$"}{@:3}" 4< "$ARGS" ;;
   bypass)
     for ((i = 1; i <= $#; i++)); do [ "${"$"}{!i}" = sandbox ] && break; done
@@ -343,6 +354,34 @@ describe("sandbox startup and policy-check failures", () => {
     const dir = conversationDirs(rig.gateway, ["conv-policy"])[0];
     if (dir && fs.existsSync(path.join(dir, "work", "m-policy"))) problems.push("the scripted tool's marker exists");
     finishRow(recorder, rig, { id: "IF.policy", durationMs: outcome.ms, deadlineMs: STARTUP_TIMEOUT_MS + 2000, surfaces: noRunSurfaces(rig, window, outcome), controls, problems });
+  });
+
+  it.each([
+    ["IF.check-tool-unshare", "mask-unshare"],
+    ["IF.check-tool-true", "mask-true"],
+  ] as const)("%s: a sandbox whose start-check tool is not executable is refused as binary_missing before the first tool; nothing ran; the next start works", async (id, mode) => {
+    const { rig, wrapper } = await wrapperRig();
+    const slug = id.slice(3).toLowerCase();
+    const { outcome, launches, window, queryId } = await injected(rig, wrapper, mode, slug, [bashStep(`touch /work/m-${slug}; echo RAN`)]);
+    const problems = fallbackProblems(rig, window, { runtimes: "none", modelRequests: "none" });
+    const controls: string[] = [];
+    if (launches.some((launch) => launch.mode === mode && launch.run !== "none")) controls.push("sandbox_started_with_the_tool_masked");
+    else problems.push("the launcher did not see a launch of this run");
+    if (/problem=binary_missing/.test(rig.log().slice(window.logFrom))) controls.push("gateway_log_names_binary_missing");
+    else problems.push("the gateway log did not name binary_missing");
+    if (exactError(outcome, UNAVAILABLE(queryId))) controls.push("exact_permanent_text_without_done");
+    else problems.push("the caller did not receive exactly the permanent isolation text");
+    if (outcome.ms > STARTUP_TIMEOUT_MS + 2000) problems.push("the failure took longer than the startup bound plus 2 s");
+    expect((await gatewayRequest(rig.gateway.port, "GET", "/health")).json?.isolation, "/health isolation").toBe("unavailable");
+    const dir = conversationDirs(rig.gateway, [`conv-${slug}`])[0];
+    if (dir && fs.existsSync(path.join(dir, "work", `m-${slug}`))) problems.push("the scripted tool's marker exists");
+    // Recovery: with the tool back the next start works and the state returns to ok.
+    wrapper.setMode("pass");
+    const recovered = await chatTurn(rig, { prompt: `IF-${slug}-recover`, sessionId: `conv-${slug}`, steps: [bashStep("echo RECOVERED")], withCredentials: false });
+    problems.push(...turnProblems(recovered));
+    if ((await waitForIsolation(rig)) === "ok") controls.push("next_start_recovered_and_health_returned_to_ok");
+    else problems.push("/health isolation did not return to ok");
+    finishRow(recorder, rig, { id, durationMs: outcome.ms, deadlineMs: STARTUP_TIMEOUT_MS + 2000, surfaces: noRunSurfaces(rig, window, outcome), controls, problems });
   });
 });
 

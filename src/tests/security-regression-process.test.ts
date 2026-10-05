@@ -16,16 +16,21 @@
  *   allowed workspace command, an alternate interpreter environment read and a built-in Read of a credential file.
  * - `X.*`: rows for leftovers of an earlier version in a conversation home, writes into the read-only extension
  *   directories and the trusted git configuration.
+ * - `X.loader-env` (MVP-8020): a registered stdio server whose env sets `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `LD_DEBUG` and
+ *   `GLIBC_TUNABLES`. Those settings are removed before launch, so a gcc-built library at a test-owned host path, whose constructor
+ *   records its own execution, never runs on the gateway side (the launcher process); the server's tool still works and reports none
+ *   of the five keys. The in-sandbox load point is covered by `sandbox-process.test.ts` (a library planted in the server's home).
  * - The negative controls prove the detector end to end: a child vitest run of the same row against a deliberately
  *   vulnerable copy of `dist/` (offline, in a loopback-only namespace) must exit nonzero, name the row and report
  *   hits, and print no marker value.
  *
  * The child run selects rows with `-t`, so a row's test name carries its selector: `regression row` for the regression
- * scenario, `route config probe` for the file detector. No other test name may contain either phrase.
+ * scenario, `route config probe` for the file detector, `loader env probe` for the loader-setting row. No other test name may contain either phrase.
  *
  * Needs `npm run build`, `bwrap`, user namespaces, `unshare`, `git` and `python3`; a missing prerequisite fails with
  * `host prerequisite missing: <name>`. Linux only.
  */
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -91,7 +96,7 @@ afterEach(async () => {
 });
 
 beforeAll(() => {
-  requireHost(["bwrap", "userns", "unshare", "git", "python3", "build"]);
+  requireHost(["bwrap", "plain-bwrap", "userns", "unshare", "git", "python3", "gcc", "build"]);
   emit(
     evidenceLine({
       suite: "security-regression-process",
@@ -782,6 +787,72 @@ describe("route probes", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/*  Loader settings of a tool server (MVP-8020)                         */
+/* ------------------------------------------------------------------ */
+
+/** A stdio server whose tool reports how many loader settings its own environment holds. */
+const LOADER_STDIO_SOURCE = String.raw`// SECURITY-LOADER-SERVER
+const rl = require('node:readline').createInterface({ input: process.stdin });
+const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
+rl.on('line', (line) => {
+  let m; try { m = JSON.parse(line); } catch { return; }
+  if (m.id === undefined) return;
+  if (m.method === 'initialize') send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'security-loader', version: '1' } } });
+  else if (m.method === 'tools/list') send({ jsonrpc: '2.0', id: m.id, result: { tools: [{ name: 'echo', description: 'echo', inputSchema: { type: 'object', properties: {} } }] } });
+  else if (m.method === 'tools/call') send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: 'LOADER-KEYS:' + Object.keys(process.env).filter((k) => k.startsWith('LD_') || k === 'GLIBC_TUNABLES').length + ' TOKEN:' + (process.env.SERVER_TOKEN || '').length }] } });
+  else send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'Method not found' } });
+});
+`;
+
+/** A gcc-built library whose constructor appends one byte to a marker file (the number of executions), in a directory the test owns. */
+function plantedLibrary(): { library: string; dir: string; executions: () => number } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp8020-loader-"));
+  cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const marker = path.join(dir, "executions");
+  const source = path.join(dir, "planted.c");
+  fs.writeFileSync(source, `#include <fcntl.h>\n#include <unistd.h>\n__attribute__((constructor)) static void run(void) { int fd = open(${JSON.stringify(marker)}, O_WRONLY | O_CREAT | O_APPEND, 0600); if (fd >= 0) { (void)!write(fd, "x", 1); close(fd); } }\n`);
+  const library = path.join(dir, "planted.so");
+  execFileSync("gcc", ["-shared", "-fPIC", "-o", library, source]);
+  return { library, dir, executions: () => (fs.existsSync(marker) ? fs.statSync(marker).size : 0) };
+}
+
+const LOADER_PROBLEM = "a library named by a loader setting ran on the gateway side";
+
+describe("loader settings of a tool server", () => {
+  it("X.loader-env: LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, LD_DEBUG and GLIBC_TUNABLES of a registered stdio server are removed before launch; the planted library never runs and the tool works (loader env probe)", async () => {
+    const started = Date.now();
+    const planted = plantedLibrary();
+    const rig = await newRig();
+    await rig.register("reqlift", "loaderenv", {
+      type: "stdio",
+      command: "node",
+      args: ["-e", LOADER_STDIO_SOURCE],
+      env: { LD_PRELOAD: planted.library, LD_AUDIT: path.join(planted.dir, "no-audit.so"), LD_LIBRARY_PATH: planted.dir, LD_DEBUG: "files", GLIBC_TUNABLES: "glibc.malloc.perturb=0", SERVER_TOKEN: "x".repeat(7) },
+    });
+    expect(planted.executions(), "the library must not have run before the row").toBe(0);
+    const turn = await chatTurn(rig, {
+      prompt: "LOADER-ENV probe the loader server",
+      sessionId: "conv-loader-env",
+      steps: [{ name: "mcp__loaderenv__echo", input: {} }],
+      withCredentials: false,
+      body: { allowedTools: ["mcp__loaderenv__*"] },
+    });
+    const problems = turnProblems(turn);
+    const controls: string[] = [];
+    const answer = turn.results.at(-1);
+    if (answer && !answer.isError && /LOADER-KEYS:0 TOKEN:7/.test(answer.text)) controls.push("tool_answered_with_no_loader_key_in_its_environment_and_its_other_env_intact");
+    else problems.push("the server's tool did not answer with zero loader keys and its other env value");
+    if (/mcp\.stdio\.loader_settings_removed count=5/.test(rig.log())) controls.push("gateway_logged_the_removal_count");
+    else problems.push("the gateway did not log the count of removed loader settings");
+    const executions = planted.executions();
+    if (executions > 0) problems.push(`${LOADER_PROBLEM} (${executions} execution(s))`);
+    else controls.push("planted_library_recorded_no_execution");
+    // The server's answer is one short line; the other surfaces keep their floors.
+    finishRow(recorder, rig, { id: "X.loader-env", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS, surfaces: surfacesOf(rig, [turn]), controls, problems, floors: { "tool-results": 10 } });
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /*  Negative controls                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -806,6 +877,8 @@ interface ChildResult {
   hits: number;
   printsAMarkerValue: boolean;
   reportsExpectedFailure: boolean;
+  /** The child's output contains `problemText` (rows whose failure is a named problem, not a marker hit). */
+  namesProblem: boolean;
   timedOut: boolean;
 }
 
@@ -813,7 +886,7 @@ interface ChildResult {
  * Runs `-t <selector>` of this file in a child vitest against `dist`, offline, with the parent's marker seed. The child's
  * output is never printed or asserted as text: only these booleans and the hit count leave this function.
  */
-async function runChildRow(selector: string, rowId: string, dist: string, childSeed: string): Promise<ChildResult> {
+async function runChildRow(selector: string, rowId: string, dist: string, childSeed: string, problemText = ""): Promise<ChildResult> {
   const childMarkers = createMarkers(childSeed);
   const { code, output, timedOut } = await runChild(
     [...offlinePrefix(), process.execPath, path.join(REPO_ROOT, "node_modules", "vitest", "vitest.mjs"), "run", "src/tests/security-regression-process.test.ts", "-t", selector],
@@ -837,6 +910,7 @@ async function runChildRow(selector: string, rowId: string, dist: string, childS
     hits: Number(/ hits=(\d+)/.exec(line)?.[1] ?? 0),
     printsAMarkerValue: Object.values(childMarkers.values).some((value) => output.includes(value)),
     reportsExpectedFailure: output.includes(`security row ${rowId}: hits=`),
+    namesProblem: problemText.length > 0 && output.includes(problemText),
     timedOut,
   };
 }
@@ -871,6 +945,20 @@ describe("negative control", () => {
     expect(result.hits).toBeGreaterThan(0);
     expect(result.printsAMarkerValue).toBe(false);
     recorder.record({ id: "RP.negative-control.file-detector", expected: "fail", observed: result.failed && result.namesTheRow && result.hits > 0 ? "fail" : "pass", hits: result.hits, durationMs: Date.now() - started, deadlineMs: 240_000, surfaces: [], controls: ["child_exited_nonzero", "row_named", "no_marker_value_printed"] });
+  });
+
+  it("negative control: a gateway that keeps loader settings in a tool-server environment lets the planted library run on the gateway side in a child run", async () => {
+    expect(offlineAvailable()).toBe(true);
+    const dist = vulnerableDist("mcp-stdio-sandbox.js", 'if (key.startsWith("LD_") || key === "GLIBC_TUNABLES") {', "if (false) {");
+    const started = Date.now();
+    const result = await runChildRow("loader env probe", "X.loader-env", dist, randomBytes(4).toString("hex"), LOADER_PROBLEM);
+    expect(result.timedOut).toBe(false);
+    expect(result.failed, "the row must exit nonzero when loader settings are kept").toBe(true);
+    expect(result.namesTheRow).toBe(true);
+    expect(result.reportsExpectedFailure).toBe(true);
+    expect(result.namesProblem, "the child must name the gateway-side library execution").toBe(true);
+    expect(result.printsAMarkerValue).toBe(false);
+    recorder.record({ id: "RP.negative-control.loader-env", expected: "fail", observed: result.failed && result.namesTheRow && result.namesProblem ? "fail" : "pass", hits: result.namesProblem ? 1 : 0, durationMs: Date.now() - started, deadlineMs: 240_000, surfaces: [], controls: ["child_exited_nonzero", "row_named", "library_execution_named", "no_marker_value_printed"] });
   });
 });
 

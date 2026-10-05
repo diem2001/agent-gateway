@@ -272,6 +272,7 @@ export const AC_ROWS: Record<string, string> = {
   "RP.regression": "Real-process regression: an ordinary chat shows its environment, nothing leaks, the authorized operation works",
   "RP.negative-control": "Real-process regression: the suite fails on a deliberately exposed credential",
   "RP.negative-control.file-detector": "Negative control: a credential file bound into the sandbox is found by the config route",
+  "RP.negative-control.loader-env": "Negative control: a gateway that keeps loader settings in a tool-server environment runs a planted library",
   "RT.env": "Route: inherited environment of the agent and its subprocesses",
   "RT.proc": "Route: gateway, parent, sibling and trusted-worker process information",
   "RT.config": "Route: gateway key files, provider OAuth state and MCP configuration",
@@ -294,6 +295,8 @@ export const AC_ROWS: Record<string, string> = {
   "IF.startup-exit": "Failure: sandbox startup failure (exit)",
   "IF.startup-hang": "Failure: sandbox startup failure (hang)",
   "IF.policy": "Failure: policy enforcement failure before the first tool",
+  "IF.check-tool-unshare": "Failure: a start-check tool (unshare) is missing, the start is refused as binary_missing",
+  "IF.check-tool-true": "Failure: a start-check tool (true) is missing, the start is refused as binary_missing",
   "IF.cancel": "Failure: cancellation during a tool call with a child process",
   "IF.restart-term": "Failure: gateway restart (SIGTERM) during that tool call",
   "IF.restart-kill": "Failure: gateway restart (SIGKILL) during that tool call",
@@ -308,6 +311,7 @@ export const AC_ROWS: Record<string, string> = {
   "X.gitconfig": "The trusted git configuration reaches the runtime's own git and the agent's git; the start-time git runs nothing planted",
   "X.leftovers": "Leftovers of an earlier version planted in a conversation home start nothing and are gone at the next start",
   "X.extension-writes": "Writes into the read-only extension directories fail",
+  "X.loader-env": "Tool-server loader settings (LD_*, GLIBC_TUNABLES) are removed before launch; a planted library never runs",
   "X.run-leftovers": "Per-run runtime and sandbox directories hold no marker during a held run and after SIGKILL; the next start sweeps them",
   "EI.profile": "Epic integration: the container runs under the committed security profile and reports isolation ok",
   "EI.registration": "Epic integration: both callers register their tools; the deploy read-back shows zero ownerless tools and servers",
@@ -337,7 +341,7 @@ export const AC_ROWS: Record<string, string> = {
 /*  Host prerequisites                                                  */
 /* ------------------------------------------------------------------ */
 
-export type Prerequisite = "bwrap" | "userns" | "unshare" | "git" | "python3" | "docker" | "uid1000" | "build";
+export type Prerequisite = "bwrap" | "plain-bwrap" | "userns" | "unshare" | "git" | "python3" | "gcc" | "docker" | "uid1000" | "build";
 
 /** Throws `host prerequisite missing: <name>` for the first missing prerequisite. A suite never skips. */
 export function requireHost(needs: Prerequisite[]): void {
@@ -345,6 +349,15 @@ export function requireHost(needs: Prerequisite[]): void {
     switch (name) {
       case "bwrap":
         return tryExec("bwrap", ["--version"]) === "unknown";
+      case "plain-bwrap":
+        // A setuid `bwrap` runs with a scrubbed environment (the loader drops `LD_*`), so a loader-setting row would prove nothing.
+        try {
+          return (fs.statSync("/usr/bin/bwrap").mode & 0o4000) !== 0;
+        } catch {
+          return true;
+        }
+      case "gcc":
+        return tryExec("gcc", ["--version"]) === "unknown";
       case "userns":
         return tryExec("bwrap", ["--ro-bind", "/", "/", "--unshare-user", "true"]) === "unknown" && !fs.existsSync("/proc/self/ns/user");
       case "unshare":
