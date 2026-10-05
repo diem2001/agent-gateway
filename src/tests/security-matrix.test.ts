@@ -39,10 +39,12 @@ import {
   type ProcessSample,
   redactArgv,
   describeRecords,
+  sampleProblems,
   type ProcessRecord,
   type MatrixRow,
   type Surface,
 } from "./helpers/security-matrix.js";
+import { descendants } from "./helpers/git-process-gateway.js";
 import { ROUTE_IDS, credentialSteps, entrypointRowIds, failureRowIds, registryRowIds, regressionRowIds, parseReport, routeSource, routeSteps, verifyRoute, type RouteContext, type RouteReport } from "./helpers/security-routes.js";
 
 vi.setConfig({ testTimeout: 60_000 });
@@ -332,7 +334,7 @@ describe("host-side samplers", () => {
     wrappedFixture.children.push(wrapped);
     const sampler = startProcessSampler(() => process.pid, [bareTag, wrappedTag, absentTag]);
     await new Promise((resolve) => setTimeout(resolve, 600));
-    const sample = sampler.stop();
+    const sample = sampler.stop({});
     const record = (wrappedFixture.record = sandboxFixtureRecord(wrappedTag));
     bare.kill("SIGKILL");
     wrapped.kill("SIGKILL");
@@ -381,8 +383,10 @@ describe("host-side samplers", () => {
       "/bin/sh",
     ];
     const shape = redactArgv(argv);
-    expect(shape).toMatch(/^node cli\.js --mcp-config <len \d+> --x=<len \d+> <len \d+> <len \d+> sh$/);
+    expect(shape).toMatch(/^node cli\.js --mcp-config <len \d+> <flag len 3>=<len \d+> <len \d+> <len \d+> sh$/);
     for (const forbidden of [token, marker, "127.0.0.1", "jira", "Bearer"]) expect(shape).not.toContain(forbidden);
+    // A flag name that is not on the allowlist can itself be a secret (`--<marker>`): it is printed as its length.
+    expect(redactArgv(["/usr/bin/node", "cli.js", `--${marker}`, "--verbose"])).toMatch(/^node cli\.js <flag len \d+> --verbose$/);
     const record: ProcessRecord = {
       pid: 1,
       startTicks: "9",
@@ -402,6 +406,11 @@ describe("host-side samplers", () => {
     };
     expect(describeRecords([record], { marker })).toContain("pid 1 comm sh exe sh");
     expect(describeRecords([{ ...record, argvShape: `leak ${marker}` }], { marker })).toBe("[process records withheld: a marker was detected]");
+    // A process name that is not on the allowlist (a comm or an ancestor) is printed as `other`, with or without markers.
+    const named = describeRecords([{ ...record, comms: [marker.slice(0, 15)], ancestors: [marker.slice(0, 15), "gateway"] }], {});
+    expect(named.includes(marker.slice(0, 15))).toBe(false);
+    expect(named).toContain("comm other exe sh");
+    expect(named).toContain("ancestors [other,gateway]");
   });
 
   it("the offline mode gives a command a loopback-only network under the caller's own uid", async () => {
@@ -439,7 +448,7 @@ describe("process sampler classification", () => {
     const deadline = Date.now() + 30_000;
     while (!until(sampler.peek(), pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
     await new Promise((resolve) => setTimeout(resolve, 150));
-    const sample = sampler.stop();
+    const sample = sampler.stop({});
     child.kill("SIGKILL");
     return { sample, pid };
   }
@@ -515,5 +524,248 @@ describe("process sampler classification", () => {
     fs.writeFileSync(fake, '#!/bin/sh\n"$@"\n', { mode: 0o755 });
     const { sample } = await observe(() => spawn(fake, [process.execPath, "-e", IDLE, "cli.js"], { stdio: "ignore" }), (seen) => seen.runtimesSeen > 0);
     expect(sample.unsandboxedRuntimes.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+/**
+ * The launcher exemption of the process sampler (MVP-7992). Every control is a real process tree below this test worker,
+ * and every row first asserts that the sampler recorded the candidate in the state under test (a process that ends
+ * between two ticks can never decide a row). Rows that need an executable the sampler cannot read use an
+ * execute-only copy of the shell: the kernel makes such a process non-dumpable, so `/proc/<pid>/exe` and `ns/*` fail with
+ * EACCES for the same user while it lives (needs a non-root euid and `fs.suid_dumpable` 0 or 2; a host without that
+ * fails the row, never skips it).
+ */
+describe("process sampler launcher exemption", () => {
+  const IDLE = "setInterval(() => {}, 1000)";
+  const SHELL = fs.realpathSync("/bin/sh");
+  const BWRAP = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc"];
+  const children: ChildProcess[] = [];
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const child of children.splice(0)) {
+      for (const pid of [...descendants(child.pid!), child.pid!]) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    }
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const quote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+
+  /** Links named `bwrap` to the real shell, to an execute-only copy of it and to this Node, plus a `bwrap` script that runs a fixed command. */
+  function standIns(): { dir: string; executeOnly: string; shell: string; node: string; script: (command: string) => string } {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7992-"));
+    dirs.push(dir);
+    const copy = path.join(dir, "execute-only");
+    fs.copyFileSync(SHELL, copy);
+    fs.chmodSync(copy, 0o111);
+    const link = (sub: string, target: string): string => {
+      fs.mkdirSync(path.join(dir, sub));
+      const named = path.join(dir, sub, "bwrap");
+      fs.symlinkSync(target, named);
+      return named;
+    };
+    return {
+      dir,
+      executeOnly: link("x", copy),
+      shell: link("s", SHELL),
+      node: link("n", process.execPath),
+      script: (command) => {
+        fs.mkdirSync(path.join(dir, "w"));
+        const file = path.join(dir, "w", "bwrap");
+        fs.writeFileSync(file, `#!/bin/sh\n${command}\n:\n`, { mode: 0o755 });
+        return file;
+      },
+    };
+  }
+
+  type Stage = { name: string; until: (sample: ProcessSample) => boolean; settleMs?: number };
+
+  /** Runs the sampler beside `start()`, takes a snapshot when each stage is reached (undefined when it never was), and returns the final sample and the audit lines `stop(markers)` printed. */
+  async function stages(start: () => ChildProcess, steps: Stage[], markers: Record<string, string> = {}): Promise<{ snapshots: (ProcessSample | undefined)[]; final: ProcessSample; audit: string[]; summary: string[] }> {
+    const sampler = startProcessSampler(() => process.pid, []);
+    const child = start();
+    children.push(child);
+    const snapshots: (ProcessSample | undefined)[] = [];
+    for (const step of steps) {
+      const deadline = Date.now() + 20_000;
+      while (!step.until(sampler.peek()) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+      if (!step.until(sampler.peek())) break;
+      await new Promise((resolve) => setTimeout(resolve, step.settleMs ?? 150));
+      snapshots.push(sampler.peek());
+    }
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    let final: ProcessSample;
+    try {
+      final = sampler.stop(markers);
+    } finally {
+      spy.mockRestore();
+    }
+    const printed = lines.join("").split("\n");
+    return { snapshots, final, audit: printed.filter((line) => line.startsWith("SECURITY-PROCESS-AUDIT")), summary: printed.filter((line) => line.startsWith("SECURITY-PROCESS-SUMMARY")) };
+  }
+
+  const exeUnreadable = (pid: number): boolean => {
+    try {
+      fs.readlinkSync(`/proc/${pid}/exe`);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EACCES";
+    }
+  };
+  const hostFacts = (): string => `euid ${process.geteuid?.()}, fs.suid_dumpable ${fs.readFileSync("/proc/sys/fs/suid_dumpable", "utf8").trim()}`;
+  const unreadable = (record: ProcessRecord): void => expect(record.exe, `the execute-only executable was readable (${hostFacts()}): the technique needs a non-root user and fs.suid_dumpable 0 or 2`).toBe("unreadable");
+  const recorded = (sample: ProcessSample | undefined, what: string): ProcessRecord => {
+    expect(sample, `precondition not reached: ${what}`).toBeDefined();
+    expect(sample!.records.length, `precondition not reached: ${what}`).toBeGreaterThan(0);
+    return sample!.records[0];
+  };
+
+  it("J: a runtime started through a link named bwrap below a script named bwrap, outside any sandbox, is flagged by the window", async () => {
+    const s = standIns();
+    const script = s.script(`${quote(s.node)} -e ${quote(IDLE)} cli.js`);
+    const { snapshots, final } = await stages(() => spawn(script, [], { stdio: "ignore" }), [{ name: "runtime recorded", until: (seen) => seen.runtimesSeen > 0 }]);
+    const record = recorded(snapshots[0], "the renamed runtime was not recorded");
+    expect(record.comms).toEqual(["bwrap"]);
+    expect(record.ancestors).toEqual(["bwrap", "gateway"]);
+    expect(record.verdict).toBe("runtime");
+    expect(final.unsandboxedRuntimes).toContain(record.pid);
+    expect(sampleProblems(final, {}).join("\n")).toContain(`pid ${record.pid}`);
+  });
+
+  it("K: an executable that cannot be read is never excused by the name bwrap alone (first tick)", async () => {
+    const s = standIns();
+    const script = s.script(`${quote(s.executeOnly)} -c 'sleep 3; :' sh cli.js`);
+    const { snapshots, final } = await stages(() => spawn(script, [], { stdio: "ignore" }), [{ name: "candidate recorded", until: (seen) => seen.records.length > 0 }]);
+    const record = recorded(snapshots[0], "the unreadable candidate was not recorded");
+    unreadable(record);
+    expect(record.comms).toEqual(["bwrap"]);
+    expect(record.ancestors).toEqual(["bwrap", "gateway"]);
+    expect(record.verdict).toBe("unresolved");
+    expect(final.unsandboxedRuntimes).toContain(record.pid);
+    expect(sampleProblems(final, {}).join("\n")).toContain(`pid ${record.pid}`);
+  });
+
+  it("L1: an unreadable candidate that execs a readable runtime is re-checked on the next tick and flagged as a runtime", async () => {
+    const s = standIns();
+    const script = s.script(`${quote(s.executeOnly)} -c 'sleep 2; exec "$1" -e "$2" "$3"' sh ${quote(s.node)} ${quote(IDLE)} cli.js`);
+    let pid = 0;
+    const { snapshots, final } = await stages(
+      () => spawn(script, [], { stdio: "ignore" }),
+      [
+        { name: "unreadable phase", until: (seen) => seen.records.length > 0 },
+        { name: "readable runtime phase", until: (seen) => seen.records.some((record) => record.exe === "node") },
+      ],
+    );
+    const first = recorded(snapshots[0], "the unreadable phase was not recorded");
+    pid = first.pid;
+    unreadable(first);
+    expect(first.verdict).toBe("unresolved");
+    expect(snapshots[1], "precondition not reached: the exec into the readable runtime was not recorded").toBeDefined();
+    const later = final.records.find((record) => record.pid === pid)!;
+    expect(later.verdict).toBe("runtime");
+    expect(final.unsandboxedRuntimes).toContain(pid);
+  });
+
+  it("L2: an unreadable candidate that execs a readable launcher is reclassified by that executable and stays counted", async () => {
+    const s = standIns();
+    const script = s.script(`${quote(s.executeOnly)} -c 'sleep 2; exec "$1" -c "$2" sh "$3"' sh ${quote(s.shell)} 'sleep 3; :' cli.js`);
+    const { snapshots, final } = await stages(
+      () => spawn(script, [], { stdio: "ignore" }),
+      [
+        { name: "unreadable phase", until: (seen) => seen.records.length > 0 },
+        { name: "readable launcher phase", until: (seen) => seen.records.some((record) => record.exe === "dash") },
+      ],
+    );
+    const first = recorded(snapshots[0], "the unreadable phase was not recorded");
+    unreadable(first);
+    expect(first.verdict).toBe("unresolved");
+    expect(snapshots[1], "precondition not reached: the exec into the readable launcher was not recorded").toBeDefined();
+    const later = final.records.find((record) => record.pid === first.pid)!;
+    expect(later.verdict).toBe("launcher");
+    expect(final.unsandboxedRuntimes, "the process was unreadable while it lived: it stays counted").toContain(first.pid);
+  });
+
+  it("M: the real bwrap and a link named bwrap to the real shell are launchers: not counted, also when they end during the window", async () => {
+    requireHost(["bwrap"]);
+    const real = await stages(
+      () => spawn(BWRAP[0], [...BWRAP.slice(1), "/bin/sh", "-c", "sleep 0.5", "sandbox", "node", "cli.js"], { stdio: "ignore" }),
+      [
+        { name: "launcher recorded", until: (seen) => seen.records.some((record) => record.exe === "bwrap") },
+        { name: "launcher ended", until: (seen) => seen.records.some((record) => record.exe === "bwrap" && record.fate === "exited") },
+      ],
+    );
+    const launcher = recorded(real.snapshots[0], "the real launcher was not recorded");
+    expect(real.snapshots[1], "precondition not reached: the real launcher did not end during the window").toBeDefined();
+    const ended = real.final.records.find((record) => record.pid === launcher.pid)!;
+    expect(ended.verdict).toBe("launcher");
+    expect(ended.unsandboxed).toBe(false);
+    expect(real.final.unsandboxedRuntimes).toEqual([]);
+    expect(real.final.runtimesSeen).toBe(0);
+
+    const s = standIns();
+    const script = s.script(`${quote(s.shell)} -c 'sleep 2; :' sh cli.js`);
+    const renamed = await stages(() => spawn(script, [], { stdio: "ignore" }), [{ name: "candidate recorded", until: (seen) => seen.records.length > 0 }]);
+    const record = recorded(renamed.snapshots[0], "the renamed shell was not recorded");
+    expect(record.comms).toEqual(["bwrap"]);
+    expect(record.exe).toBe("dash");
+    expect(record.verdict).toBe("launcher");
+    expect(renamed.final.unsandboxedRuntimes).toEqual([]);
+  });
+
+  it("N: a launcher that execs an executable that cannot be read loses its launcher verdict and is counted", async () => {
+    const s = standIns();
+    const script = s.script(`${quote(s.shell)} -c 'sleep 2; exec "$1" -c "sleep 3; :" sh "$2"' sh ${quote(s.executeOnly)} cli.js`);
+    let pid = 0;
+    const { snapshots, final } = await stages(
+      () => spawn(script, [], { stdio: "ignore" }),
+      [
+        { name: "launcher phase", until: (seen) => seen.records.some((record) => record.verdict === "launcher") },
+        {
+          name: "unreadable phase",
+          until: (seen) => {
+            pid = seen.records[0]?.pid ?? 0;
+            return pid > 0 && exeUnreadable(pid);
+          },
+          settleMs: 400,
+        },
+      ],
+    );
+    const first = recorded(snapshots[0], "the launcher phase was not recorded");
+    expect(first.verdict).toBe("launcher");
+    expect(snapshots[1], "precondition not reached: the exec into the unreadable executable was not seen").toBeDefined();
+    const during = snapshots[1]!.records.find((record) => record.pid === first.pid)!;
+    unreadable(during);
+    expect(during.verdict, "the launcher verdict must be withdrawn while the process is alive and unreadable").toBe("unresolved");
+    expect(final.unsandboxedRuntimes).toContain(first.pid);
+  });
+
+  it("O: the audit lines hold no unsafe process name, flag or marker, and keep the detail of allowlisted processes", async () => {
+    for (const withMarkers of [true, false]) {
+      const marker = `SY7992${randomBytes(3).toString("hex")}`;
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7992-"));
+      dirs.push(dir);
+      const named = path.join(dir, marker);
+      fs.symlinkSync(SHELL, named);
+      const { snapshots, audit, summary } = await stages(
+        () => spawn(named, ["-c", `/bin/sh -c 'sleep 3; :' sh cli.js --${marker}; :`, "sh", "cli.js", `--${marker}`], { stdio: "ignore" }),
+        [{ name: "both candidates recorded", until: (seen) => seen.records.length >= 2 }],
+        withMarkers ? { synthetic: marker } : {},
+      );
+      expect(snapshots[0], "precondition not reached: the marker-named launcher and its child were not both recorded").toBeDefined();
+      expect(audit.length, "precondition not reached: no audit line was printed").toBeGreaterThanOrEqual(2);
+      for (const line of audit) expect(line.includes(marker), "an audit line carried the synthetic name").toBe(false);
+      expect(audit.some((line) => line.includes("comm sh exe") && line.includes("verdict=launcher")), "the allowlisted process lost its detail").toBe(true);
+      expect(summary, "one summary line of counts per window").toHaveLength(1);
+      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+$/);
+    }
   });
 });

@@ -10,7 +10,7 @@
  *   and `expected= observed= result=`), `SECURITY-SUMMARY` (expected rows, observed rows, missing ids).
  * - Host prerequisites that fail with a fixed `host prerequisite missing: <name>` line instead of skipping.
  * - Host-side samplers: a process sampler (an agent runtime outside the sandbox, overlap windows of concurrent roles;
- *   rule and blind spots at `startProcessSampler`) and an egress sampler (non-loopback destinations of the gateway's
+ *   rule and blind spots at `startProcessSampler`; a launcher is excused by its executable, never by a name) and an egress sampler (non-loopback destinations of the gateway's
  *   network namespace).
  * - A rig: the compiled gateway, a scripted model, recording MCP/webhook/git doubles and every synthetic marker.
  *
@@ -474,6 +474,8 @@ interface ProcInfo {
   cmdline: string;
   argv: string[];
   startTicks: string;
+  /** Field 3 of `/proc/<pid>/stat` (`R`, `S`, `Z`, `X`, ...). */
+  state: string;
 }
 
 function readProc(pid: number): ProcInfo | null {
@@ -489,6 +491,7 @@ function readProc(pid: number): ProcInfo | null {
       cmdline: raw.replace(/\0/g, " "),
       argv: raw.split("\0").filter((_, index, all) => index < all.length - 1 || all[index] !== ""),
       startTicks: afterName[19],
+      state: afterName[0],
     };
   } catch {
     return null;
@@ -516,15 +519,21 @@ export interface ProcessRecord {
   oldCounted: boolean;
   oldUnsandboxed: boolean;
   /**
-   * The current rule at the last tick. `runtime`, `launcher` (a known non-runtime executable) and `other` (settled into a
-   * process that no longer names `cli.js` or `claude`, such as a shell that ended in `perl`) need one consistent read
-   * (executable, command line and start time agree before and after); `unresolved` never had one and counts as an
-   * unsandboxed runtime, except a `descendant`: a candidate that vanished or kept changing before a consistent read but
+   * The current rule at the last tick, decided by the executable and never by a name. `runtime`, `launcher` (a known
+   * non-runtime executable, by device and inode) and `other` (settled into a process that no longer names `cli.js` or
+   * `claude`, such as a shell that ended in `perl`) need one stable reading on that tick (executable, command line and
+   * start time agree before and after); a launcher or other verdict is re-checked on every tick and withdrawn to
+   * `unresolved` when the process is alive and cannot be read. `unresolved` never had a stable reading and counts as an
+   * unsandboxed runtime, except a `descendant`: a candidate that vanished or kept changing before a stable reading but
    * whose ancestors include a process with the sandbox proof (a fork of the runtime or of the launch wrapper that is
    * about to exec). A process that was read as a runtime stays one.
    */
   verdict: "runtime" | "launcher" | "other" | "descendant" | "unresolved";
-  /** A runtime without proof of the sandbox (a real bwrap ancestor and pid, user and mount namespaces of its own). */
+  /**
+   * A runtime without proof of the sandbox (a real bwrap ancestor and pid, user and mount namespaces of its own), or a
+   * process whose executable could not be read on a tick while it was alive and not below a proven process: that flag stays
+   * whatever the verdict says later (an execute-only executable cannot become a launcher by exec'ing a readable one).
+   */
   unsandboxed: boolean;
   /** What the first missing proof looked like: whether a real bwrap ancestor was found, and the three namespace comparisons. */
   firstMissingProof?: string;
@@ -538,10 +547,10 @@ export interface ProcessRecord {
 export interface ProcessClear {
   record: ProcessRecord;
   explanation:
-    | "known non-runtime executable at a consistent read"
+    | "known non-runtime executable at a stable reading"
     | "settled into another process after an inconsistent read" // the old rule read the new `comm` with the old command line, mid-exec
     | "settled after an inconsistent read"
-    | "vanished before a consistent read below a process with the sandbox proof"
+    | "vanished before a stable reading below a process with the sandbox proof"
     | "unexplained";
 }
 
@@ -560,8 +569,20 @@ export interface ProcessSample {
 
 const ARGV_NAMES = new Set(["node", "cli.js", "sh", "dash", "bash", "bwrap", "unshare", "claude"]);
 
+/** The flags a runtime or launcher command line may show by name; any other flag name is printed as its length. */
+const FLAG_NAMES = new Set([
+  "-c", "-e", "-p", "--print", "--verbose", "--debug", "--output-format", "--input-format", "--include-partial-messages", "--mcp-config",
+  "--strict-mcp-config", "--permission-prompt-tool", "--permission-mode", "--allowedTools", "--disallowedTools", "--max-turns", "--model",
+  "--system-prompt", "--append-system-prompt", "--setting-sources", "--settings", "--resume", "--add-dir", "--args", "--die-with-parent",
+  "--ro-bind", "--bind", "--unshare-user", "--unshare-pid", "--dev", "--proc", "--tmpfs", "--chdir", "--disable-userns",
+]);
+
+/** The names a printed record or audit line may carry: the known executables and the gateway; anything else is `other`. */
+const printableName = (name: string): string => (ARGV_NAMES.has(name) || name === "gateway" ? name : "other");
+
 /**
- * The command line as it may be shown: a flag is printed by name (a `=value` part becomes `<len N>`), an element whose
+ * The command line as it may be shown: a flag on the allowlist is printed by name (a `=value` part becomes `<len N>`), any
+ * other flag name becomes `<flag len N>` (its `=value` part `=<len N>`), an element whose
  * basename is one of the known executable names is printed as that name, everything else, URLs and JSON included,
  * becomes `<len N>`. The relay URLs of a run carry a per-run token that no marker detector knows, so this is an
  * allowlist and never a filter.
@@ -570,7 +591,10 @@ export function redactArgv(argv: string[]): string {
   return argv
     .map((element) => {
       const flag = /^(--?[A-Za-z][A-Za-z0-9-]*)(?:=([\s\S]*))?$/.exec(element);
-      if (flag) return flag[2] === undefined ? flag[1] : `${flag[1]}=<len ${flag[2].length}>`;
+      if (flag) {
+        const name = FLAG_NAMES.has(flag[1]) ? flag[1] : `<flag len ${flag[1].length}>`;
+        return flag[2] === undefined ? name : `${name}=<len ${flag[2].length}>`;
+      }
       if (/^[\w./-]+$/.test(element) && ARGV_NAMES.has(path.basename(element))) return path.basename(element);
       return `<len ${element.length}>`;
     })
@@ -633,25 +657,54 @@ interface Reading {
   exeId: string;
 }
 
+type ExeRead = { id: string } | { denied: true } | { gone: true };
+
+/** The executable behind `/proc/<pid>/exe`: its device and inode, `denied` (EACCES: the process is alive but not dumpable for us) or `gone`. */
+function readExe(pid: number): ExeRead {
+  try {
+    fs.readlinkSync(`/proc/${pid}/exe`);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EACCES" ? { denied: true } : { gone: true };
+  }
+  const id = fileId(`/proc/${pid}/exe`);
+  return id === null ? { gone: true } : { id };
+}
+
+/** A process that is ending runs no code: its state is `Z` or `X`, its command line is already empty, or its executable link is gone. */
+const exiting = (info: ProcInfo, exe: ExeRead): boolean => info.state === "Z" || info.state === "X" || info.cmdline === "" || "gone" in exe;
+
+type TickRead =
+  /** The executable (read twice), command line and start time agreed. */
+  | { kind: "stable"; reading: Reading }
+  /** No stable reading but the process is running; `denied` when an executable read failed with EACCES, `torn` counts the disagreeing reads. */
+  | { kind: "alive"; denied: boolean; torn: number }
+  /** The process ended between the reads, or is exiting. */
+  | { kind: "gone"; torn: number };
+
 /**
- * One consistent read of a candidate: start time, command line and `comm`, then the executable, then start time,
- * command line, `comm` and the executable again. A difference means the process is in the middle of an exec (the new
- * command line is visible before the new `comm` or the new executable) or the pid was reused, so it is read again,
- * up to three times, and otherwise left to the next tick. `vanished` is a process that ended between the reads.
+ * One reading of a candidate on one tick: the executable (`firstExe`, read right after discovery to narrow the window),
+ * then the process again, then the executable again. Start time, command line and executable must agree, and the start time
+ * must equal the record's (`first.startTicks`) on every read, so a reused pid is never filed under the old record. A difference
+ * means the process is in the middle of an exec (the new command line is visible before the new executable), so it is read
+ * again, up to three times, and otherwise left to the next tick. `comm` does not take part: the kernel changes it after the
+ * command line and the executable at an exec. A process that has vanished or is exiting is `gone`.
  */
-function readConsistent(first: ProcInfo): { reading: Reading } | { torn: number; vanished: boolean } {
-  let before: ProcInfo | null = first;
+function readTick(first: ProcInfo, firstExe: ExeRead): TickRead {
+  let before = first;
+  let exeBefore = firstExe;
   let torn = 0;
+  let denied = false;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const exeBefore = fileId(`/proc/${before.pid}/exe`);
-    const after = readProc(before.pid);
-    if (after === null) return { torn: torn + 1, vanished: true };
-    const exeAfter = fileId(`/proc/${before.pid}/exe`);
-    if (exeBefore !== null && exeBefore === exeAfter && after.startTicks === before.startTicks && after.cmdline === before.cmdline && after.comm === before.comm) return { reading: { info: after, exeId: exeBefore } };
+    const after = readProc(first.pid);
+    const exeAfter = readExe(first.pid);
+    if (after === null || after.startTicks !== first.startTicks || exiting(after, exeAfter)) return { kind: "gone", torn: torn + 1 };
+    if ("denied" in exeBefore || "denied" in exeAfter) denied = true;
+    if ("id" in exeBefore && "id" in exeAfter && exeBefore.id === exeAfter.id && after.cmdline === before.cmdline) return { kind: "stable", reading: { info: after, exeId: exeAfter.id } };
     torn++;
     before = after;
+    exeBefore = exeAfter;
   }
-  return { torn, vanished: false };
+  return { kind: "alive", denied, torn };
 }
 
 /**
@@ -687,13 +740,13 @@ function sandboxProof(pid: number, root: number, bwraps: Set<string>): { proven:
   return { proven, chain, detail: `chain-${broken ? "broken" : "complete"} real-bwrap=${realBwrap} same-ns pid=${namespaces.pid} user=${namespaces.user} mnt=${namespaces.mnt}` };
 }
 
-/** The text a problem line appends for the records, one entry per process. `redactArgv` already keeps every value out;
- * the marker detector is a second check, and a hit withholds the text instead of printing it. */
+/** The text a problem line appends for the records, one entry per process. `redactArgv` and the name allowlist already keep
+ * every value out; the marker detector is a second check, and a hit withholds the text instead of printing it. */
 export function describeRecords(records: ProcessRecord[], markers: Record<string, string> = {}): string {
   const text = records
     .map((record) => {
       const ns = record.sameNamespaces;
-      return `pid ${record.pid} comm ${record.comms.join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
+      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
     })
     .join("; ");
   return detect([{ name: "process-records", text }], markers).length > 0 ? "[process records withheld: a marker was detected]" : text;
@@ -711,31 +764,39 @@ export function sampleProblems(sample: ProcessSample, markers: Record<string, st
 
 /**
  * Samples the processes below the gateway every `intervalMs` (20 ms by default). A runtime candidate is any process whose
- * command line names `cli.js` or whose process title is `claude`. Each tick reads a candidate consistently (see
- * `readConsistent`) and classifies it again every time, so a launcher that later execs Node is a runtime from then on:
- * an executable that is a known non-runtime (`sh`, `bash`, `unshare`, the real bwrap) is a launcher and is not counted;
- * any other executable is a runtime, and it is sandboxed only with `sandboxProof` (or below a process that has it: a
- * descendant inherits the namespaces). A candidate that never had a consistent read counts as an unsandboxed runtime,
- * except one that vanished below a process with the proof and the gateway's own `bwrap` launch. Windows of command-line tags prove that concurrent roles overlapped.
+ * command line names `cli.js` or whose process title is `claude`. Each tick reads a candidate (see `readTick`) and
+ * classifies it again, by its executable and never by a name: an executable that is a known non-runtime (`sh`, `bash`,
+ * `unshare`, the real bwrap) is a launcher and is not counted; any other executable is a runtime, and it is sandboxed only
+ * with `sandboxProof` (or below a process that has it: a descendant inherits the namespaces). A launcher or other verdict is
+ * withdrawn to `unresolved` on a tick where the process is alive and its executable cannot be read, and such a tick outside a
+ * proven process flags the record as unsandboxed for good (a process that is unreadable while it lives cannot be shown to be
+ * a launcher). A process that has vanished or is exiting keeps its last verdict. A candidate that never had a stable reading
+ * counts as an unsandboxed runtime, except one that vanished below a process with the proof. Windows of command-line tags
+ * prove that concurrent roles overlapped.
  *
  * The rule of MVP-7677 runs beside it: `clears` lists what that rule counted and this one does not, with the
- * reason, so a sandbox failure can never be absorbed silently.
+ * reason, so a sandbox failure can never be absorbed silently. `stop(markers)` prints those clears as
+ * `SECURITY-PROCESS-AUDIT` lines with the run's markers checked and every name on an allowlist.
  *
- * Blind spots: a runtime that lives less than one tick; a runtime with neither `cli.js` in its command line nor the
+ * Blind spots: a runtime that lives less than one tick; a launcher that execs a runtime which ends before the next tick
+ * (a process that vanished keeps its last stable verdict); a runtime with neither `cli.js` in its command line nor the
  * `claude` title; a process that left the gateway's process tree (`descendants` follows the children lists only).
  */
-export function startProcessSampler(gatewayPid: () => number, tags: string[] = [], intervalMs = 20): { stop: () => ProcessSample; peek: () => ProcessSample } {
+export function startProcessSampler(gatewayPid: () => number, tags: string[] = [], intervalMs = 20): { stop: (markers: Record<string, string>) => ProcessSample; peek: () => ProcessSample } {
   const known = knownExecutables();
   const windows: ProcessSample["windows"] = {};
   const records = new Map<string, ProcessRecord>();
-  /** Candidates (launchers and runtimes) that had the sandbox proof at a consistent read, by pid and start time. */
+  /** Candidates (launchers and runtimes) that had the sandbox proof at a stable reading, by pid and start time. */
   const proven = new Set<string>();
   const timer = setInterval(() => {
     const root = gatewayPid();
     const infos = new Map<number, ProcInfo>();
+    const firstExes = new Map<number, ExeRead>();
     for (const pid of descendants(root)) {
       const info = readProc(pid);
-      if (info) infos.set(pid, info);
+      if (!info) continue;
+      infos.set(pid, info);
+      if (namesRuntime(info)) firstExes.set(pid, readExe(pid));
     }
     const now = Date.now();
     for (const info of infos.values()) {
@@ -752,18 +813,18 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
         const oldCounted = oldCandidate && info.comm !== "bwrap";
         const key = `${info.pid}:${info.startTicks}`;
         const prior = records.get(key);
-        const read = readConsistent(info);
+        const read = readTick(info, firstExes.get(info.pid)!);
         const ancestorPids: number[] = [];
         for (let up = infos.get(info.ppid); up; up = infos.get(up.ppid)) ancestorPids.push(up.pid);
         // A descendant inherits the namespaces of an ancestor that has the proof (it cannot leave them without capabilities).
         const belowProven = ancestorPids.some((pid) => proven.has(`${pid}:${infos.get(pid)?.startTicks}`));
-        let verdict: ProcessRecord["verdict"] = prior && prior.verdict !== "unresolved" ? prior.verdict : "unresolved";
+        let verdict: ProcessRecord["verdict"] = prior?.verdict ?? "unresolved";
         let unsandboxed = prior?.unsandboxed ?? false;
         let firstMissingProof = prior?.firstMissingProof;
         const comms = prior?.comms ?? [];
         let seen = info;
         let ancestors = chain.length > 0 ? [...chain, "gateway"] : ["gateway"];
-        if ("reading" in read) {
+        if (read.kind === "stable") {
           seen = read.reading.info;
           if (!namesRuntime(seen)) {
             if (verdict !== "runtime") verdict = "other";
@@ -779,24 +840,31 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
             // A flag stays: one tick without proof is a run outside the sandbox, whatever the next tick shows.
             unsandboxed = unsandboxed || !(proof.proven || belowProven);
           }
-        } else if (verdict === "unresolved" && info.comm === "bwrap" && comms.every((comm) => comm === "bwrap") && ancestorPids.every((pid) => infos.get(pid)?.comm === "bwrap") && (infos.get(ancestorPids.at(-1) ?? -1)?.ppid ?? info.ppid) === root) {
-          // The gateway's own launch of bwrap (or of a recording wrapper named bwrap, and the subshells that script forks)
-          // ended before it could be read: the old rule never counted a process whose comm is bwrap either, and a runtime
-          // outside the sandbox does not run as one below nothing but bwrap-named processes.
-          verdict = "launcher";
-        } else if (verdict === "unresolved" && belowProven) {
-          // A fork that has not exec'd yet (a copy of the runtime or of the launch wrapper) or one that already ended: it
-          // inherited the namespaces of an ancestor that has the proof, so it is not a runtime start of its own.
-          verdict = "descendant";
+        } else {
+          if (read.kind === "alive") {
+            // Alive but not readable (or changing): a launcher or other verdict no longer stands on a reading of this tick.
+            if (verdict === "launcher" || verdict === "other") verdict = "unresolved";
+            if (read.denied && !belowProven) {
+              unsandboxed = true;
+              firstMissingProof ??= "executable unreadable while the process was alive";
+            }
+          }
+          if (verdict === "unresolved" && belowProven) {
+            // A fork that has not exec'd yet (a copy of the runtime or of the launch wrapper) or one that already ended: it
+            // inherited the namespaces of an ancestor that has the proof, so it is not a runtime start of its own.
+            verdict = "descendant";
+          }
         }
         if (comms.at(-1) !== seen.comm) comms.push(seen.comm);
+        const exeNow = exeName(info.pid);
         records.set(key, {
           pid: info.pid,
           startTicks: info.startTicks,
           comms,
           argvShape: redactArgv(seen.argv),
-          // What could be read last is kept: a process that has exited cannot be read any more.
-          exe: exeName(info.pid) === "unreadable" ? (prior?.exe ?? "unreadable") : exeName(info.pid),
+          // An executable that cannot be read while the process lives is shown as such; what could be read last is kept
+          // once the process is ending, because an exiting process cannot be read any more.
+          exe: exeNow !== "unreadable" ? exeNow : read.kind === "alive" && read.denied ? "unreadable" : (prior?.exe ?? "unreadable"),
           ancestors,
           sameNamespaces: {
             pid: sticky(sameNamespace(info.pid, root, "pid"), prior?.sameNamespaces.pid),
@@ -810,7 +878,7 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
           verdict,
           unsandboxed,
           firstMissingProof,
-          inconsistentReads: (prior?.inconsistentReads ?? 0) + ("reading" in read ? 0 : read.torn),
+          inconsistentReads: (prior?.inconsistentReads ?? 0) + (read.kind === "stable" ? 0 : read.torn),
           fate: "running",
         });
       }
@@ -824,16 +892,18 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
   const snapshot = (): ProcessSample => {
     const all = [...records.values()].map((record) => {
       const alive = readProc(record.pid)?.startTicks === record.startTicks;
-      // A candidate that never had a consistent read is a runtime without proof: fail closed.
+      // A candidate that never had a stable reading is a runtime without proof: fail closed.
       return { ...record, fate: alive ? ("running" as const) : ("exited" as const), unsandboxed: record.unsandboxed || record.verdict === "unresolved" };
     });
-    const runtimes = all.filter((record) => record.verdict === "runtime" || record.verdict === "unresolved");
+    // A record flagged unreadable counts as a runtime whatever its last verdict is.
+    const runtimes = all.filter((record) => record.verdict === "runtime" || record.verdict === "unresolved" || record.unsandboxed);
     const clears: ProcessClear[] = [];
     for (const record of all) {
-      if (record.oldCounted && record.verdict === "launcher") clears.push({ record, explanation: "known non-runtime executable at a consistent read" });
-      else if (record.oldCounted && record.verdict === "descendant") clears.push({ record, explanation: "vanished before a consistent read below a process with the sandbox proof" });
+      if (record.unsandboxed) continue;
+      if (record.oldCounted && record.verdict === "launcher") clears.push({ record, explanation: "known non-runtime executable at a stable reading" });
+      else if (record.oldCounted && record.verdict === "descendant") clears.push({ record, explanation: "vanished before a stable reading below a process with the sandbox proof" });
       else if (record.oldCounted && record.verdict === "other") clears.push({ record, explanation: "settled into another process after an inconsistent read" });
-      else if (record.oldUnsandboxed && record.verdict === "runtime" && !record.unsandboxed) clears.push({ record, explanation: record.inconsistentReads > 0 || record.comms.length > 1 ? "settled after an inconsistent read" : "unexplained" });
+      else if (record.oldUnsandboxed && record.verdict === "runtime") clears.push({ record, explanation: record.inconsistentReads > 0 || record.comms.length > 1 ? "settled after an inconsistent read" : "unexplained" });
     }
     return {
       unsandboxedRuntimes: runtimes.filter((record) => record.unsandboxed).map((record) => record.pid),
@@ -845,10 +915,28 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
   };
   return {
     peek: snapshot,
-    stop: () => {
+    stop: (markers) => {
       clearInterval(timer);
       const sample = snapshot();
-      for (const clear of sample.clears) emit(`SECURITY-PROCESS-AUDIT ${kv({ pid: clear.record.pid, explanation: clear.explanation, record: describeRecords([clear.record]) })}`);
+      for (const clear of sample.clears) emit(`SECURITY-PROCESS-AUDIT ${kv({ pid: clear.record.pid, explanation: clear.explanation, record: describeRecords([clear.record], markers) })}`);
+      if (sample.records.length > 0) {
+        const count = (match: (record: ProcessRecord) => boolean): number => sample.records.filter(match).length;
+        // Counts only: how the candidates of this window ended up, and why the unresolved ones are unresolved.
+        emit(
+          `SECURITY-PROCESS-SUMMARY ${kv({
+            records: sample.records.length,
+            runtime: count((record) => record.verdict === "runtime"),
+            launcher: count((record) => record.verdict === "launcher"),
+            other: count((record) => record.verdict === "other"),
+            descendant: count((record) => record.verdict === "descendant"),
+            unresolved: count((record) => record.verdict === "unresolved"),
+            unresolved_unreadable: count((record) => record.verdict === "unresolved" && record.firstMissingProof?.startsWith("executable unreadable") === true),
+            unresolved_torn: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads > 0),
+            unresolved_unread: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads === 0),
+            flagged_unreadable: count((record) => record.firstMissingProof?.startsWith("executable unreadable") === true),
+          })}`,
+        );
+      }
       return sample;
     },
   };
@@ -1609,7 +1697,7 @@ export async function chatTurn(rig: SecurityRig, options: ChatTurnOptions): Prom
     },
     options.deadlineMs ?? TURN_DEADLINE_MS,
   );
-  const sample = processes.stop();
+  const sample = processes.stop(rig.markers.values);
   return {
     outcome,
     results: options.steps.length > 0 ? resultsFor(rig.api, options.prompt).slice(-options.steps.length) : [],
