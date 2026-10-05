@@ -396,7 +396,9 @@ describe("the run deadline ends the request although the SDK ignores the abort (
     const started = Date.now();
     const response = gatewayRequest(gw.port, "POST", "/v1/query", { queryId, sessionId: conversation, prompt: "hi", model: "claude-opus-5-5", useSession: true });
     const settled = response.then((res) => res);
-    await waitFor("the runtime's request at the fake API", () => api.mainRequests().length > 0);
+    await waitFor("the runtime's request at the fake API", () => api.mainRequests().length > 0).catch((error: unknown) => {
+      throw new Error(`${String(error)}; gateway output: ${gw.output().slice(-1500)}`);
+    });
     const proxy = runtimeProxyOf(gw);
     expect(proxy.token.startsWith("mpt_"), "the run's model proxy token").toBe(true);
     // Control: while the run is live its token is accepted by the proxy, so a refusal later is the revocation.
