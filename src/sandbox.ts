@@ -651,8 +651,9 @@ export interface ConversationLock {
 /**
  * The trusted-side lock of one conversation home: a second request for a conversation that is still
  * answering gets null (and is refused with 0 runtime starts). Held for the whole request, retries
- * included; `SandboxRun.dispose` has waited for the sandbox process to exit before it is released, so
- * two sandboxes never share one home at the same time.
+ * included; `SandboxRun.dispose` has waited for the sandbox process to exit before it is released (after a
+ * deadline stop whose exit was not observed in time, query.ts keeps the lock until that exit), so two sandboxes
+ * never share one home at the same time.
  */
 export function tryLockConversation(dirId: string): ConversationLock | null {
   if (lockedConversations.has(dirId)) return null;
@@ -692,6 +693,9 @@ export interface SandboxRunOptions {
 }
 
 const RUNTIME_EXIT_WAIT_MS = 10_000;
+
+/** How long a deadline stop waits to observe the launcher's exit after it sent SIGKILL (MVP-8000). */
+export const DEADLINE_KILL_CONFIRM_MS = 500;
 
 function runtimeSdkDir(cliPath: string): string {
   const sdkEntry = createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk");
@@ -896,10 +900,7 @@ export class SandboxRun {
 
   /** Revokes the run token now; removes the run's directories once the process has exited (killed after a bounded wait). */
   async dispose(waitMs: number = RUNTIME_EXIT_WAIT_MS): Promise<void> {
-    if (this.proxyToken) {
-      this.proxy().revoke(this.proxyToken);
-      this.proxyToken = null;
-    }
+    this.revokeProxyToken();
     const child = this.child;
     if (child && child.exitCode === null && child.signalCode === null) {
       await new Promise<void>((resolve) => {
@@ -914,14 +915,55 @@ export class SandboxRun {
         });
       });
     }
-    if (this.runDir) {
-      try {
-        fs.rmSync(this.runDir, { recursive: true, force: true });
-      } catch (e: unknown) {
-        log("query", `sandbox run directory cleanup failed: ${e instanceof Error ? e.name : "error"}`);
+    this.removeRunDir();
+  }
+
+  /**
+   * The stop of a run whose deadline expired (MVP-8000): the run token is revoked and the launcher is killed at once
+   * (`--unshare-pid` and `--die-with-parent` take the sandbox tree with it), and its exit is awaited at most
+   * `confirmMs`. Resolves null when the exit was observed (the run directory is then removed, as `dispose` does).
+   * Otherwise it logs one line and resolves with the launcher's exit promise (wrapped, so awaiting this call does not await the exit) without blocking the request; the run
+   * directory is removed when that exit is eventually observed, and the caller keeps the conversation locked until then.
+   */
+  async disposeAfterDeadline(confirmMs: number = DEADLINE_KILL_CONFIRM_MS): Promise<{ exited: Promise<void> } | null> {
+    this.revokeProxyToken();
+    const child = this.child;
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      this.killedByGateway = true;
+      child.kill("SIGKILL");
+      const startedAt = Date.now();
+      let timer: NodeJS.Timeout | undefined;
+      const confirmed = await Promise.race([
+        exited.then(() => true),
+        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), confirmMs); }),
+      ]);
+      clearTimeout(timer);
+      if (!confirmed) {
+        log("query", `sandbox exit not confirmed after deadline stop queryId=${this.options.queryId ?? "none"} waitedMs=${Date.now() - startedAt}`);
+        void exited.then(() => this.removeRunDir());
+        return { exited };
       }
-      this.runDir = null;
     }
+    this.removeRunDir();
+    return null;
+  }
+
+  private revokeProxyToken(): void {
+    if (this.proxyToken) {
+      this.proxy().revoke(this.proxyToken);
+      this.proxyToken = null;
+    }
+  }
+
+  private removeRunDir(): void {
+    if (!this.runDir) return;
+    try {
+      fs.rmSync(this.runDir, { recursive: true, force: true });
+    } catch (e: unknown) {
+      log("query", `sandbox run directory cleanup failed: ${e instanceof Error ? e.name : "error"}`);
+    }
+    this.runDir = null;
   }
 }
 

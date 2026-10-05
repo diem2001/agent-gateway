@@ -267,7 +267,7 @@ describe("a run whose SDK ignores the abort and never settles", () => {
 
   it("U5: a runtime whose exit cannot be confirmed does not hold the request, but keeps its conversation busy until it exits", async () => {
     const { SandboxRun } = await import("../sandbox.js");
-    const stub = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, pid: 2_147_483_000, kill: vi.fn(() => true) });
+    const stub = Object.assign(new EventEmitter(), { exitCode: null as number | null, signalCode: null as string | null, pid: 2_147_483_000, kill: vi.fn(() => true) });
     vi.spyOn(SandboxRun.prototype, "child", "get").mockImplementation(() => stub as never);
     const app = await createApp();
     const body = { sessionId: "conv-u5", prompt: "hi", useSession: true };
@@ -285,6 +285,8 @@ describe("a run whose SDK ignores the abort and never settles", () => {
     expect(second.events.map((e) => ({ type: e.type, content: e.content }))).toEqual([{ type: "error", content: BUSY_TEXT }]);
     expect(sdkQueryCalls).toBe(callsBefore);
 
+    // The seam serves every later run too: from here on the stub is an exited process.
+    stub.signalCode = "SIGKILL";
     stub.emit("exit", null, "SIGKILL");
     await sleep(100);
     afterInit = async function* () {
