@@ -162,7 +162,13 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   const label = req.clientLabel ?? "";
   const cacheEntry = createCacheEntry(label, queryId);
 
+  // `done` and `error` end the stream: nothing is written, cached or sent to a listener after either of them,
+  // so output of a run that was stopped from outside (the run deadline, MVP-8000) cannot appear late.
+  let terminal = false;
+
   function emit(event: Omit<StreamEvent, "seq">): void {
+    if (terminal) return;
+    if (event.type === "done" || event.type === "error") terminal = true;
     const line = { seq: seq++, ...event } as StreamEvent;
     cacheEntry.events.push(line);
     if (!res.writableEnded) { const json = JSON.stringify(line) + "\n"; res.write(json); logDebug("out", json.trimEnd()); }
@@ -205,6 +211,17 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
     if (!res.writableEnded) res.end();
   };
   let conversationLock: ConversationLock | null = null;
+  // Set when a deadline stop could not confirm the sandbox process's exit: the conversation then stays locked until
+  // that exit is observed, so two runtimes never share one home. The request itself still ends within its bound.
+  let lockHeldUntil: Promise<unknown> | null = null;
+  let lockReleased = false;
+  const releaseConversation = (): void => {
+    if (lockReleased) return;
+    lockReleased = true;
+    const lock = conversationLock;
+    if (lockHeldUntil) void lockHeldUntil.then(() => lock?.release(), () => lock?.release());
+    else lock?.release();
+  };
   if (conversationId) {
     const admission = admitSession(conversationId, caller);
     if (admission.kind === "refused") {
@@ -266,11 +283,13 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
         enforcedTools,
         label: caller.label,
         grant,
+        holdConversation: (until) => { lockHeldUntil = until; },
       });
     } finally {
       // Every sandbox process of this request has exited (agent.ts waits for it): the conversation is free
       // again before its `done` or `error` reaches the client, so a prompt follow-up is never refused as busy.
-      conversationLock?.release();
+      // The one exception is a deadline stop whose process exit was not observed in time (see lockHeldUntil).
+      releaseConversation();
     }
     const { response: _response, resultData } = runResult;
 
@@ -312,7 +331,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
 
     log("query", `Completed queryId=${queryId} tokens=${inputTokens}+${outputTokens} cost=$${costUsd} duration=${Date.now() - startTime}ms`);
   } catch (err) {
-    conversationLock?.release();
+    releaseConversation();
     emitError(err);
   }
 

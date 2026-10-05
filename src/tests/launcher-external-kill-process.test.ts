@@ -11,6 +11,11 @@
  *   stays open after the launcher exit, and a late end of the output must change nothing.
  * - R3: the client goes away: the gateway's own cleanup ends the launcher and is not an outside kill.
  * - R4: the run deadline ends the launcher, again the gateway's own cleanup.
+ * - R5 (MVP-8000, the Outcome Probe of the run deadline): the SDK ignores the abort (a patched copy of `dist/` hands the
+ *   SDK a private abort controller that never fires), so the runtime stays alive and the SDK iterator never settles;
+ *   the run deadline must still end the request within limit + 2 s, kill the sandbox, revoke the run's model proxy
+ *   token, free the conversation and leave the gateway alive. `MVP8000_DIST_ROOT` names a tree whose `dist/` the
+ *   patched copy is made from (the red run on the baseline); default is this worktree.
  *
  * The kill rows bound the end of the request at 10 s after the kill with the run deadline at 120 s
  * (`MVP7964_KILL_ROW_TIMEOUT_MS` overrides the deadline for the red run on the baseline). Expected texts
@@ -23,7 +28,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { startFakeAnthropicApi, type FakeAnthropicApi } from "./helpers/fake-anthropic-api.js";
-import { GATEWAY_API_KEY, descendants, gatewayRequest, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
+import { GATEWAY_API_KEY, REPO_ROOT, descendants, gatewayRequest, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
 
 const KILL_ROW_DEADLINE_MS = Number(process.env.MVP7964_KILL_ROW_TIMEOUT_MS ?? "120000");
 /** The end of the request must follow the kill within this bound, far below the run deadline. */
@@ -153,11 +158,12 @@ kill -KILL $$
   };
 }
 
-async function rig(options: { wrapperPath?: string; deadlineMs: number }): Promise<{ api: FakeAnthropicApi; gw: SpawnedGateway }> {
+async function rig(options: { wrapperPath?: string; deadlineMs: number; distServer?: string }): Promise<{ api: FakeAnthropicApi; gw: SpawnedGateway }> {
   const api = await startFakeAnthropicApi({ toolName: "no-such-tool-7964", mode: "hang" });
   cleanups.push(() => api.close());
   const gw = await spawnGateway(cleanups, {
     rootPrefix: "mvp7964-gw-",
+    distServer: options.distServer,
     env: {
       ANTHROPIC_BASE_URL: api.baseUrl,
       ANTHROPIC_API_KEY: "sk-ant-fake-launcher-kill-7964",
@@ -331,3 +337,108 @@ describe("an outside signal ends the launcher: the request ends promptly with on
     await expectHealthy(gw);
   }, 180_000);
 });
+
+/**
+ * A copy of `dist/` whose SDK call gets a private abort controller that never fires: the SDK then ignores the run's
+ * abort, the runtime stays alive and the SDK's iterator never settles (the case MVP-8000 closes). The patch is checked
+ * to apply, so a changed call site fails loudly instead of testing nothing.
+ */
+function ignoresAbortDist(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mvp8000-dist-"));
+  cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.cpSync(path.join(process.env.MVP8000_DIST_ROOT ?? REPO_ROOT, "dist"), path.join(root, "dist"), { recursive: true });
+  fs.copyFileSync(path.join(REPO_ROOT, "package.json"), path.join(root, "package.json"));
+  fs.symlinkSync(path.join(REPO_ROOT, "node_modules"), path.join(root, "node_modules"));
+  const file = path.join(root, "dist", "agent.js");
+  const source = fs.readFileSync(file, "utf8");
+  const call = "query({ prompt: promptArg, options })";
+  expect(source, "the SDK call site in dist/agent.js").toContain(call);
+  fs.writeFileSync(file, source.replace(call, "query({ prompt: promptArg, options: { ...options, abortController: new AbortController() } })"));
+  return path.join(root, "dist", "server.js");
+}
+
+/** The run token and the model proxy URL the runtime of the running sandbox was given (its launcher's own environment). */
+function runtimeProxyOf(gw: SpawnedGateway): { token: string; baseUrl: URL } {
+  const launcher = launcherOf(gw);
+  expect(launcher, "the gateway's sandbox launcher process").not.toBeNull();
+  const env = new Map(
+    fs
+      .readFileSync(`/proc/${launcher}/environ`, "utf8")
+      .split("\0")
+      .filter((entry) => entry.includes("="))
+      .map((entry) => [entry.slice(0, entry.indexOf("=")), entry.slice(entry.indexOf("=") + 1)] as const),
+  );
+  return { token: env.get("ANTHROPIC_API_KEY") ?? "", baseUrl: new URL(env.get("ANTHROPIC_BASE_URL") ?? "http://invalid") };
+}
+
+/** One POST to the model proxy with the given run token; resolves with the HTTP status. */
+function proxyStatus(proxy: { token: string; baseUrl: URL }): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const payload = Buffer.from(JSON.stringify({ model: "claude-opus-5-5", max_tokens: 8, messages: [{ role: "user", content: "token control" }] }), "utf8");
+    const req = http.request(
+      { host: proxy.baseUrl.hostname, port: Number(proxy.baseUrl.port), method: "POST", path: "/v1/messages", agent: false, headers: { "x-api-key": proxy.token, "anthropic-version": "2023-06-01", "Content-Type": "application/json", "Content-Length": payload.length } },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode ?? 0));
+      },
+    );
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
+describe("the run deadline ends the request although the SDK ignores the abort (MVP-8000, real runtime, real bwrap)", () => {
+  it("R5: ends within limit + 2 s with one deadline error, kills the sandbox, revokes the proxy token, frees the conversation", async () => {
+    // Long enough for the runtime to start and send its request first (a new conversation's start takes several seconds).
+    const LIMIT_MS = 10_000;
+    const { api, gw } = await rig({ deadlineMs: LIMIT_MS, distServer: ignoresAbortDist() });
+    const queryId = `q8000-${randomBytes(4).toString("hex")}`;
+    const conversation = `conv8000-${randomBytes(4).toString("hex")}`;
+    const started = Date.now();
+    const response = gatewayRequest(gw.port, "POST", "/v1/query", { queryId, sessionId: conversation, prompt: "hi", model: "claude-opus-5-5", useSession: true });
+    const settled = response.then((res) => res);
+    await waitFor("the runtime's request at the fake API", () => api.mainRequests().length > 0).catch((error: unknown) => {
+      throw new Error(`${String(error)}; gateway output: ${gw.output().slice(-1500)}`);
+    });
+    const proxy = runtimeProxyOf(gw);
+    expect(proxy.token.startsWith("mpt_"), "the run's model proxy token").toBe(true);
+    // Control: while the run is live its token is accepted by the proxy, so a refusal later is the revocation.
+    expect(await proxyStatus(proxy)).toBe(200);
+
+    const res = await Promise.race([settled, sleep(LIMIT_MS + 2_000).then(() => null)]);
+    const endedAfterMs = Date.now() - started;
+    process.stderr.write(`DEADLINE-UNCOOPERATIVE-EVIDENCE R5 endedAfterMs=${endedAfterMs} limitMs=${LIMIT_MS} open=${res === null}\n`);
+    expect(res, `the request was still open ${endedAfterMs} ms after it started (limit ${LIMIT_MS} ms)`).not.toBeNull();
+    expect(res!.status).toBe(200);
+    expect(endedAfterMs).toBeGreaterThanOrEqual(LIMIT_MS);
+    expect(endedAfterMs).toBeLessThan(LIMIT_MS + 2_000);
+
+    const events = parseNdjson(res!.text);
+    const outcome: Outcome = { queryId, events, text: res!.text, replayText: (await gatewayRequest(gw.port, "GET", `/v1/query/${queryId}/events`)).text, endedAfterMs };
+    expectOneError(outcome, gw, deadlineFailure(queryId));
+    const lines = linesOf(gw, queryId);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("kind=run_deadline");
+    expect(gw.output()).not.toContain("signal=SIGKILL");
+    expect(gw.output()).not.toContain("kind=unknown");
+
+    // The sandbox was killed by the stop itself: nothing of it is left within a second of the answer.
+    await waitFor("no runtime process left", () => descendants(gw.child.pid!).length === 0, 1_000);
+    // The run's model proxy token no longer works.
+    expect(await proxyStatus(proxy)).toBe(401);
+
+    // The conversation is free again: a follow-up is admitted and completes (a run with no tool at all is answered by the fake API).
+    const followUp = await gatewayRequest(gw.port, "POST", "/v1/query", { queryId: `${queryId}-next`, sessionId: conversation, prompt: "hi again", model: "claude-opus-5-5", useSession: true, enforcedTools: [] });
+    const followEvents = parseNdjson(followUp.text);
+    expect(followEvents.some((e) => e.type === "done"), followUp.text).toBe(true);
+    expect(followEvents.some((e) => e.type === "error")).toBe(false);
+
+    await sleep(1_000);
+    const output = gw.output();
+    for (const text of ["Unhandled", "unhandled", "Uncaught", "uncaught"]) expect(output, `the gateway output contains ${text}`).not.toContain(text);
+    expect(gw.child.exitCode).toBeNull();
+    expect(gw.child.signalCode).toBeNull();
+    await expectHealthy(gw);
+  }, 180_000);
+});
+

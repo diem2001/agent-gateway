@@ -22,7 +22,7 @@ import { StdioBridge } from "./mcp-stdio-sandbox.js";
 import { createRunLogDir, removeRunLogDirAfterExit } from "./sdk-run-logs.js";
 import { SandboxRun, runtimeEnvFrom } from "./sandbox.js";
 import { SANDBOX_WORK } from "./sandbox-content.js";
-import { RunFailure, classifyRunFailure, isAbortError } from "./run-failure.js";
+import { RunFailure, classifyRunFailure, fixedFailure, isAbortError } from "./run-failure.js";
 import { builtInTools, createToolPolicyHook } from "./tool-policy.js";
 import { WEBHOOK_SERVER_NAME, computeToolGrant, mcpToolName, type ToolGrant } from "./tool-grant.js";
 import { secretValuesForMasking } from "./tool-mediation.js";
@@ -58,6 +58,16 @@ export interface QueryParams {
   userId?: string;
   /** Only for the log reference in the unknown-failure message (run-failure.ts). */
   queryId?: string;
+  /**
+   * Resolves when the run deadline expired (retry.ts). The attempt then stops once `DEADLINE_STOP_GRACE_MS`
+   * have passed, even when the SDK ignores the abort and never settles (MVP-8000). Absent: no deadline race.
+   */
+  deadline?: Promise<void>;
+  /**
+   * Called when a deadline stop could not confirm that the sandbox process exited: the request ends anyway, and the
+   * caller (query.ts) keeps the conversation locked until this promise settles.
+   */
+  holdConversation?: (until: Promise<unknown>) => void;
   /** The conversation's recorded sandbox home name (sessions.ts); without one the run has a private home. */
   sandboxDirId?: string;
   /**
@@ -215,10 +225,17 @@ async function* buildContentMessageStream(
 /** How long messages that are already on their way are still processed after the launcher ended by an outside signal. */
 export const LAUNCHER_EXIT_GRACE_MS = 1000;
 
+/**
+ * How long an SDK that ignores the abort is given to end by itself after the run deadline expired (MVP-8000). A
+ * cooperative SDK ends inside it with its own abort error; after it the run is stopped from outside.
+ */
+export const DEADLINE_STOP_GRACE_MS = 1000;
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Yields what the SDK yields until `gone` settles first, then throws `ended()`. The SDK's own next message always
+ * Yields what the SDK yields until `gone` settles first, then throws `ended()`. `gone` is the launcher's end by an
+ * outside signal (MVP-7964) or the run deadline plus its grace (MVP-8000). The SDK's own next message always
  * wins when it is ready. After `gone` the SDK iterator is abandoned: its pending promise and its `return()` get a
  * no-op rejection handler, because a late SDK error must not become an unhandled rejection of the gateway process.
  */
@@ -260,7 +277,7 @@ export async function* untilLauncherGone<T>(source: AsyncIterator<T>, gone: Prom
  * code and signal come from the sandbox (`SandboxRun.runtimeExit`), not from the
  * SDK's error text. Client aborts (AbortError) are rethrown unchanged.
  */
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools, sandboxDirId, label, grant: givenGrant }: QueryParams): Promise<QueryResult> {
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools, sandboxDirId, label, grant: givenGrant, deadline, holdConversation }: QueryParams): Promise<QueryResult> {
   const enforced = enforcedTools !== undefined;
   // The trusted grant of this run: policy for the caller's label intersected with the caller's own narrowing.
   const callerLabel = label ?? webhookContext?.api_key_label ?? "";
@@ -540,17 +557,25 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   const assistantErrors: { error: unknown; text: string }[] = [];
   const pendingTools = new Map<string, { name: string }>();
   const toolTimings = new Map<string, number>();
+  // Once the run deadline expired the sandbox is stopped at once and boundedly, however this attempt ends.
+  let deadlineExpired = false;
+  void deadline?.then(() => { deadlineExpired = true; });
 
   try {
   const conversation = query({ prompt: promptArg, options });
   // A launcher that ended by a signal the gateway did not send ends this run after a short grace, even when the
-  // SDK never notices (MVP-7964). Messages that arrive inside the grace are still processed.
-  const launcherGone = sandbox.unownedExit().then(() => sleep(LAUNCHER_EXIT_GRACE_MS));
-  const launcherEnded = (): RunFailure => {
+  // SDK never notices (MVP-7964). The run deadline does the same for an SDK that ignores the abort (MVP-8000).
+  // Messages that arrive inside either grace are still processed.
+  let stop: "launcher" | "deadline" | null = null;
+  const launcherGone = sandbox.unownedExit().then(() => sleep(LAUNCHER_EXIT_GRACE_MS)).then(() => { stop ??= "launcher"; });
+  const deadlineGone = deadline ? deadline.then(() => sleep(DEADLINE_STOP_GRACE_MS)).then(() => { stop ??= "deadline"; }) : new Promise<never>(() => {});
+  const runStopped = (): RunFailure => {
     sandbox.releaseOutput();
+    // The deadline's text is substituted by retry.ts; this failure only says which kind it is.
+    if (stop === "deadline") return fixedFailure("run_deadline", "");
     return classifyRunFailure({ installedVersion, result: resultData, assistantErrors, runtimeExit: sandbox.runtimeExit }, queryId);
   };
-  for await (const message of untilLauncherGone(conversation[Symbol.asyncIterator](), launcherGone, launcherEnded)) {
+  for await (const message of untilLauncherGone(conversation[Symbol.asyncIterator](), Promise.race([launcherGone, deadlineGone]), runStopped)) {
     if (abortController.signal.aborted) break;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const msg = message as any;
@@ -647,7 +672,14 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     // The sandbox process is gone before this run returns, so the conversation's lock (query.ts) is
     // released only after its home has no process left.
     void removeRunLogDirAfterExit(runLogs.dir, sandbox.child);
-    await sandbox.dispose();
+    if (deadlineExpired) {
+      // The SDK is not trusted to stop its runtime: kill it now and wait for its exit only briefly. A launcher
+      // whose exit is not observed in time does not hold the request, but the conversation stays locked for it.
+      const unconfirmed = await sandbox.disposeAfterDeadline();
+      if (unconfirmed) holdConversation?.(unconfirmed.exited);
+    } else {
+      await sandbox.dispose();
+    }
   }
 
   // A sandbox that failed to start while the SDK ended without an error: nothing ran.

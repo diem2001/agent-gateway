@@ -33,15 +33,20 @@ export async function runQueryWithRetry(retryParams: RetryParams): Promise<Query
   // One deadline for the whole request, retries and backoff included (AGENT_RUN_TIMEOUT_MS, MVP-7678).
   // It stops the run through the same abort a client disconnect uses, and its expiry is reported as
   // its own failure: the run's answer is discarded and nothing is saved to the conversation.
+  // An SDK that ignores the abort cannot hold the request open: the same expiry resolves `deadline`,
+  // which every attempt races against its SDK iterator (agent.ts, MVP-8000).
   const limitMs = loadIsolationConfig().runTimeoutMs;
   let deadlineHit = false;
+  let expire: () => void = () => {};
+  const deadline = new Promise<void>((resolve) => { expire = resolve; });
   const timer = setTimeout(() => {
     deadlineHit = true;
     retryParams.abortController.abort();
+    expire();
   }, limitMs);
   const deadlineFailure = (): RunFailure => fixedFailure("run_deadline", runDeadlineMessage(limitMs, retryParams.queryId));
   try {
-    const result = await runWithRetry(retryParams, () => deadlineHit);
+    const result = await runWithRetry({ ...retryParams, deadline }, () => deadlineHit);
     if (deadlineHit) throw deadlineFailure();
     return result;
   } catch (err) {

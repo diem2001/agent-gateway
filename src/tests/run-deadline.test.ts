@@ -63,4 +63,23 @@ describe("the run deadline", () => {
     await new Promise((r) => setTimeout(r, 120));
     expect(controller.signal.aborted).toBe(false);
   });
+
+  it("hands every attempt a deadline promise that resolves at the limit and not before", async () => {
+    process.env.AGENT_RUN_TIMEOUT_MS = "300";
+    let seen: Promise<void> | undefined;
+    let resolvedAtAttempt: boolean | undefined;
+    runQuery.mockImplementation(async (attempt: { deadline?: Promise<void> }) => {
+      seen = attempt.deadline;
+      resolvedAtAttempt = await Promise.race([seen!.then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100))]);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return { response: "late answer", resultData: null };
+    });
+    const started = Date.now();
+    const error = await runQueryWithRetry(params(new AbortController())).catch((e: unknown) => e);
+
+    expect(resolvedAtAttempt).toBe(false);
+    await expect(seen).resolves.toBeUndefined();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(300);
+    expect((error as RunFailure).kind).toBe("run_deadline");
+  });
 });

@@ -144,7 +144,7 @@ What an agent wants to keep goes to **`/work`**: `<AGENT_SANDBOX_ROOT>/sessions/
 | Variable | Default | When to change it |
 |----------|---------|-------------------|
 | `ISOLATION_STARTUP_TIMEOUT_MS` | `10000` | Raise it on a very loaded host where `/health` or users report "could not start a protected workspace in time"; the sandbox itself starts in about 10 ms. |
-| `AGENT_RUN_TIMEOUT_MS` | `7200000` (120 min) | Lower it to stop runaway agents sooner, raise it for tasks that legitimately run longer. It covers the whole request including retries and backoff. |
+| `AGENT_RUN_TIMEOUT_MS` | `7200000` (120 min) | Lower it to stop runaway agents sooner, raise it for tasks that legitimately run longer. It covers the whole request including retries and backoff. The request ends at most about 2 s after the limit even when the runtime does not stop: the sandbox is killed and its late output is dropped. |
 | `MODEL_PROXY_IDLE_TIMEOUT_MS` | `600000` | The time a provider request may stay silent before it is cut. Raise it only for extremely slow answers. |
 | `AGENT_MCP_TOOL_TIMEOUT_MS` | `600000` | Overall deadline of one mediated MCP `tools/call` in an agent run (http, SSE, stdio); an empty value is the default. Raise it only for tools that legitimately run longer. |
 | `AGENT_TOOL_POLICY` | unset | Tool grant per API-key label, see [Tool mediation](#tool-mediation). Empty or unset means no restriction. |
@@ -558,7 +558,7 @@ See [`.env.example`](.env.example) for all environment variables. Key settings:
 | `AGENT_TOOL_POLICY` | -- | Tool grant per API-key label (JSON); empty = no restriction; see [Tool mediation](#tool-mediation) |
 | `MCP_SERVER_OWNERS` | -- | Deploy-step mapping `<server>:<label>,...` assigning the owner of ownerless registered MCP servers at startup; malformed value stops startup; see [Registry ownership](#registry-ownership) |
 | `ISOLATION_STARTUP_TIMEOUT_MS` | `10000` | A sandbox must pass its start check within this time; see [Agent isolation](#agent-isolation) |
-| `AGENT_RUN_TIMEOUT_MS` | `7200000` | Deadline of one query request, retries included |
+| `AGENT_RUN_TIMEOUT_MS` | `7200000` | Deadline of one query request, retries included; ends the request at most about 2 s after the limit even when the runtime does not stop |
 | `MODEL_PROXY_IDLE_TIMEOUT_MS` | `600000` | No-progress timeout of one proxied provider request |
 | `AGENT_SANDBOX_ROOT` | `$HOME/.agent-sandbox` | Trusted storage of the sandbox homes |
 | `AGENT_SANDBOX_BWRAP` | `/usr/bin/bwrap` | Path of the isolation runtime |

@@ -4,6 +4,10 @@
  * allowlist, the fixed public failure texts and their kinds, and the run deadline.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   IsolationConfigError,
@@ -18,6 +22,7 @@ import {
   runtimeEnvFrom,
   sdkProcessOf,
   SandboxRun,
+  DEADLINE_KILL_CONFIRM_MS,
   type BwrapSpec,
 } from "../sandbox.js";
 import { RunFailure, fixedFailure, isolationTimeoutMessage, isolationUnavailableMessage, runDeadlineMessage } from "../run-failure.js";
@@ -504,5 +509,82 @@ describe("a launcher that ends by an outside signal (MVP-7964)", () => {
       await gone;
       expect(process_.killed).toBe(true);
     });
+  });
+});
+
+describe("the bounded stop of a run whose deadline expired (MVP-8000)", () => {
+  const reaped: ChildProcess[] = [];
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    for (const child of reaped.splice(0)) {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** A SandboxRun that owns a run directory and the given launcher. */
+  function stoppable(child: unknown) {
+    const run = new SandboxRun({ runLogDir: "/nonexistent/run-log", runLogEnv: {}, queryId: "q-stop" });
+    const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp8000-rundir-"));
+    dirs.push(runDir);
+    (run as unknown as { launch: unknown; runDir: string }).launch = { child, failure: () => null, ready: Promise.resolve() };
+    (run as unknown as { runDir: string }).runDir = runDir;
+    return { run, runDir };
+  }
+
+  it("kills a launcher that ignores SIGTERM at once, confirms its exit and removes the run directory", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); process.stdout.write('ready'); setTimeout(() => {}, 60000)"], { stdio: ["ignore", "pipe", "ignore"] });
+    reaped.push(child);
+    await new Promise((resolve) => child.stdout!.once("data", resolve));
+    const { run, runDir } = stoppable(child);
+    run.watchLaunch({ child, failure: () => null, ready: Promise.resolve() } as never);
+
+    const started = Date.now();
+    const pending = await run.disposeAfterDeadline();
+
+    expect(pending).toBeNull();
+    expect(Date.now() - started).toBeLessThan(DEADLINE_KILL_CONFIRM_MS);
+    expect(child.signalCode).toBe("SIGKILL");
+    expect(run.runtimeExit).toBeNull();
+    expect(fs.existsSync(runDir)).toBe(false);
+    const stayed = await Promise.race([run.unownedExit().then(() => "resolved"), new Promise((resolve) => setTimeout(() => resolve("pending"), 200))]);
+    expect(stayed).toBe("pending");
+  });
+
+  it("returns within the confirm bound for a launcher whose exit is never observed, logs one line and hands back its pending exit", async () => {
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(" ")); });
+    const stub = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null, kill: vi.fn(() => true) });
+    const { run, runDir } = stoppable(stub);
+
+    const started = Date.now();
+    const pending = await run.disposeAfterDeadline();
+    const elapsed = Date.now() - started;
+
+    expect(stub.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(elapsed).toBeGreaterThanOrEqual(DEADLINE_KILL_CONFIRM_MS - 50);
+    expect(elapsed).toBeLessThan(DEADLINE_KILL_CONFIRM_MS + 100);
+    expect(lines.filter((line) => /^\[query\] sandbox exit not confirmed after deadline stop queryId=q-stop waitedMs=\d+$/.test(line))).toHaveLength(1);
+    expect(pending).not.toBeNull();
+    const settled = await Promise.race([pending!.exited.then(() => "exited"), new Promise((resolve) => setTimeout(() => resolve("pending"), 100))]);
+    expect(settled).toBe("pending");
+    expect(fs.existsSync(runDir)).toBe(true);
+
+    stub.emit("exit", null, "SIGKILL");
+    await pending!.exited;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(fs.existsSync(runDir)).toBe(false);
+  });
+
+  it("revokes the run token even when no launcher was started", async () => {
+    const proxy = { revoke: vi.fn() };
+    const run = new SandboxRun({ runLogDir: "/nonexistent/run-log", runLogEnv: {}, proxy: proxy as never });
+    (run as unknown as { proxyToken: string }).proxyToken = "mpt_synthetic";
+
+    expect(await run.disposeAfterDeadline()).toBeNull();
+
+    expect(proxy.revoke).toHaveBeenCalledWith("mpt_synthetic");
   });
 });
