@@ -847,7 +847,8 @@ describe("loader settings of a tool server", () => {
     const executions = planted.executions();
     if (executions > 0) problems.push(`${LOADER_PROBLEM} (${executions} execution(s))`);
     else controls.push("planted_library_recorded_no_execution");
-    finishRow(recorder, rig, { id: "X.loader-env", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS, surfaces: surfacesOf(rig, [turn]), controls, problems });
+    // The server's answer is one short line; the other surfaces keep their floors.
+    finishRow(recorder, rig, { id: "X.loader-env", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS, surfaces: surfacesOf(rig, [turn]), controls, problems, floors: { "tool-results": 10 } });
   });
 });
 
