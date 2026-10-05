@@ -919,6 +919,24 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
       clearInterval(timer);
       const sample = snapshot();
       for (const clear of sample.clears) emit(`SECURITY-PROCESS-AUDIT ${kv({ pid: clear.record.pid, explanation: clear.explanation, record: describeRecords([clear.record], markers) })}`);
+      if (sample.records.length > 0) {
+        const count = (match: (record: ProcessRecord) => boolean): number => sample.records.filter(match).length;
+        // Counts only: how the candidates of this window ended up, and why the unresolved ones are unresolved.
+        emit(
+          `SECURITY-PROCESS-SUMMARY ${kv({
+            records: sample.records.length,
+            runtime: count((record) => record.verdict === "runtime"),
+            launcher: count((record) => record.verdict === "launcher"),
+            other: count((record) => record.verdict === "other"),
+            descendant: count((record) => record.verdict === "descendant"),
+            unresolved: count((record) => record.verdict === "unresolved"),
+            unresolved_unreadable: count((record) => record.verdict === "unresolved" && record.firstMissingProof?.startsWith("executable unreadable") === true),
+            unresolved_torn: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads > 0),
+            unresolved_unread: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads === 0),
+            flagged_unreadable: count((record) => record.firstMissingProof?.startsWith("executable unreadable") === true),
+          })}`,
+        );
+      }
       return sample;
     },
   };

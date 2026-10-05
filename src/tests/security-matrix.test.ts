@@ -586,7 +586,7 @@ describe("process sampler launcher exemption", () => {
   type Stage = { name: string; until: (sample: ProcessSample) => boolean; settleMs?: number };
 
   /** Runs the sampler beside `start()`, takes a snapshot when each stage is reached (undefined when it never was), and returns the final sample and the audit lines `stop(markers)` printed. */
-  async function stages(start: () => ChildProcess, steps: Stage[], markers: Record<string, string> = {}): Promise<{ snapshots: (ProcessSample | undefined)[]; final: ProcessSample; audit: string[] }> {
+  async function stages(start: () => ChildProcess, steps: Stage[], markers: Record<string, string> = {}): Promise<{ snapshots: (ProcessSample | undefined)[]; final: ProcessSample; audit: string[]; summary: string[] }> {
     const sampler = startProcessSampler(() => process.pid, []);
     const child = start();
     children.push(child);
@@ -609,7 +609,8 @@ describe("process sampler launcher exemption", () => {
     } finally {
       spy.mockRestore();
     }
-    return { snapshots, final, audit: lines.join("").split("\n").filter((line) => line.startsWith("SECURITY-PROCESS-AUDIT")) };
+    const printed = lines.join("").split("\n");
+    return { snapshots, final, audit: printed.filter((line) => line.startsWith("SECURITY-PROCESS-AUDIT")), summary: printed.filter((line) => line.startsWith("SECURITY-PROCESS-SUMMARY")) };
   }
 
   const exeUnreadable = (pid: number): boolean => {
@@ -754,7 +755,7 @@ describe("process sampler launcher exemption", () => {
       dirs.push(dir);
       const named = path.join(dir, marker);
       fs.symlinkSync(SHELL, named);
-      const { snapshots, audit } = await stages(
+      const { snapshots, audit, summary } = await stages(
         () => spawn(named, ["-c", `/bin/sh -c 'sleep 3; :' sh cli.js --${marker}; :`, "sh", "cli.js", `--${marker}`], { stdio: "ignore" }),
         [{ name: "both candidates recorded", until: (seen) => seen.records.length >= 2 }],
         withMarkers ? { synthetic: marker } : {},
@@ -763,6 +764,8 @@ describe("process sampler launcher exemption", () => {
       expect(audit.length, "precondition not reached: no audit line was printed").toBeGreaterThanOrEqual(2);
       for (const line of audit) expect(line.includes(marker), "an audit line carried the synthetic name").toBe(false);
       expect(audit.some((line) => line.includes("comm sh exe") && line.includes("verdict=launcher")), "the allowlisted process lost its detail").toBe(true);
+      expect(summary, "one summary line of counts per window").toHaveLength(1);
+      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+$/);
     }
   });
 });
