@@ -119,7 +119,9 @@ const LEGACY = "This conversation was started before a gateway security update a
  * `bypass` and `bypass-ready` are the negative controls of the process sampler: the launcher drops the sandbox and runs
  * the runtime command (`bypass`: a stand-in Node with the same executable and `cli.js` argument, so nothing real runs
  * outside the sandbox; `bypass-ready`: after printing the sandbox check line, the real runtime in a scratch home) in the
- * gateway's own namespaces.
+ * gateway's own namespaces. A mode that must start no runtime (`pass`, `startup-exit`, `startup-hang`, `no-userns`) forks
+ * nothing before it execs or exits: the sampler cannot tell a fork of this script, whose command line carries `cli.js`, from
+ * a runtime, so the mode file, the time stamp and the `--disable-userns` strip use shell builtins only.
  */
 type WrapperMode = "pass" | "startup-exit" | "startup-hang" | "no-userns" | "bypass" | "bypass-ready";
 
@@ -134,17 +136,22 @@ function makeWrapper(): Wrapper {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7677-launcher-"));
   cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   const script = path.join(dir, "bwrap");
-  fs.writeFileSync(path.join(dir, "mode"), "pass");
+  fs.writeFileSync(path.join(dir, "mode"), "pass\n");
   fs.writeFileSync(
     script,
     String.raw`#!/bin/bash
 DIR=${shellQuote(dir)}
-MODE=$(cat "$DIR/mode" 2>/dev/null || echo pass)
-printf '%s\t%s\t%s\n' "$(date +%s%3N)" "$MODE" "${"$"}{CLAUDE_CODE_DEBUG_LOGS_DIR:-none}" >> "$DIR/launches.log"
+{ read -r MODE < "$DIR/mode"; } 2>/dev/null
+MODE=${"$"}{MODE:-pass}
+NOW=${"$"}{EPOCHREALTIME/./}
+printf '%s\t%s\t%s\n' "${"$"}{NOW%???}" "$MODE" "${"$"}{CLAUDE_CODE_DEBUG_LOGS_DIR:-none}" >> "$DIR/launches.log"
 case "$MODE" in
   startup-exit) exit 3 ;;
   startup-hang) exec sleep 120 ;;
-  no-userns) exec /usr/bin/bwrap --args 4 "${"$"}{@:3}" 4< <(perl -0777 -pe 's/--disable-userns\0//' <&3) ;;
+  no-userns)
+    ARGS="$DIR/args.$$"
+    while IFS= read -r -d '' ARG; do [ "$ARG" = --disable-userns ] || printf '%s\0' "$ARG"; done <&3 > "$ARGS"
+    exec /usr/bin/bwrap --args 4 "${"$"}{@:3}" 4< "$ARGS" ;;
   bypass)
     for ((i = 1; i <= $#; i++)); do [ "${"$"}{!i}" = sandbox ] && break; done
     exec "${"$"}{@:i+1:1}" -e 'setInterval(() => {}, 1000)' "${"$"}{@:i+2:1}" ;;
@@ -160,7 +167,7 @@ esac
   );
   return {
     path: script,
-    setMode: (mode) => fs.writeFileSync(path.join(dir, "mode"), mode),
+    setMode: (mode) => fs.writeFileSync(path.join(dir, "mode"), `${mode}\n`),
     launches: () => {
       try {
         return fs
@@ -207,7 +214,7 @@ function windowOf(rig: SecurityRig, tags: string[] = []) {
     requestsBefore: rig.api.requests.length,
     startsBefore: (rig.log().match(/SDK options:/g) ?? []).length,
     peek: () => processes.peek(),
-    close: () => ({ sample: processes.stop(), egress: egress.stop() }),
+    close: () => ({ sample: processes.stop(rig.markers.values), egress: egress.stop() }),
   };
 }
 
