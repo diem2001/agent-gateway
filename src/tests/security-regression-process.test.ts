@@ -214,7 +214,7 @@ async function startRoles(rig: SecurityRig, fake: FakeGit): Promise<Roles> {
         }
       }
       await Promise.all([b1, b2, clone]);
-      sampler.stop();
+      sampler.stop(rig.markers.values);
     },
   };
 }
