@@ -334,7 +334,7 @@ describe("host-side samplers", () => {
     wrappedFixture.children.push(wrapped);
     const sampler = startProcessSampler(() => process.pid, [bareTag, wrappedTag, absentTag]);
     await new Promise((resolve) => setTimeout(resolve, 600));
-    const sample = sampler.stop();
+    const sample = sampler.stop({});
     const record = (wrappedFixture.record = sandboxFixtureRecord(wrappedTag));
     bare.kill("SIGKILL");
     wrapped.kill("SIGKILL");
@@ -383,8 +383,10 @@ describe("host-side samplers", () => {
       "/bin/sh",
     ];
     const shape = redactArgv(argv);
-    expect(shape).toMatch(/^node cli\.js --mcp-config <len \d+> --x=<len \d+> <len \d+> <len \d+> sh$/);
+    expect(shape).toMatch(/^node cli\.js --mcp-config <len \d+> <flag len 3>=<len \d+> <len \d+> <len \d+> sh$/);
     for (const forbidden of [token, marker, "127.0.0.1", "jira", "Bearer"]) expect(shape).not.toContain(forbidden);
+    // A flag name that is not on the allowlist can itself be a secret (`--<marker>`): it is printed as its length.
+    expect(redactArgv(["/usr/bin/node", "cli.js", `--${marker}`, "--verbose"])).toMatch(/^node cli\.js <flag len \d+> --verbose$/);
     const record: ProcessRecord = {
       pid: 1,
       startTicks: "9",
@@ -404,6 +406,11 @@ describe("host-side samplers", () => {
     };
     expect(describeRecords([record], { marker })).toContain("pid 1 comm sh exe sh");
     expect(describeRecords([{ ...record, argvShape: `leak ${marker}` }], { marker })).toBe("[process records withheld: a marker was detected]");
+    // A process name that is not on the allowlist (a comm or an ancestor) is printed as `other`, with or without markers.
+    const named = describeRecords([{ ...record, comms: [marker.slice(0, 15)], ancestors: [marker.slice(0, 15), "gateway"] }], {});
+    expect(named.includes(marker.slice(0, 15))).toBe(false);
+    expect(named).toContain("comm other exe sh");
+    expect(named).toContain("ancestors [other,gateway]");
   });
 
   it("the offline mode gives a command a loopback-only network under the caller's own uid", async () => {
@@ -441,7 +448,7 @@ describe("process sampler classification", () => {
     const deadline = Date.now() + 30_000;
     while (!until(sampler.peek(), pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
     await new Promise((resolve) => setTimeout(resolve, 150));
-    const sample = sampler.stop();
+    const sample = sampler.stop({});
     child.kill("SIGKILL");
     return { sample, pid };
   }
