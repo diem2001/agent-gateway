@@ -1803,7 +1803,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
     <li>A file an agent writes in its home is rebuilt away only at the next start, so a process of the same run (for example a shell the agent starts itself when Bash is granted) can still read it; no trusted step does.</li>
     <li>Conversation homes and work areas are never removed (MVP-7402), there is no size cap on a home or a private <code>/tmp</code>, and <code>pids_limit</code> is shared by all runs: an availability risk, not a credential exposure.</li>
     <li>An ownerless pre-update conversation id stays visible: a refusal versus a fresh conversation reveals that such an id exists.</li>
-    <li>The gateway process can exit when a client closes its connection while a hook or an in-process tool call is in flight (SDK 0.1.77 handles control requests unawaited; pre-existing, tracked as MVP-7866). The acceptance cancel row cancels during a Bash call, which is not that path, and does not claim it closed.</li>
+    <li>A client that closes its connection while a hook or an in-process tool call is in flight stops only its own run (MVP-7866): a startup guard drops the SDK's late <code>AbortError</code> with one <code>[process] late abort rejection ignored</code> line, and any other unhandled rejection still ends the process. A webhook call already in flight still reaches its webhook and its answer is discarded. An aborted request is never retried.</li>
     <li>The runtime in the sandbox shares the network namespace and can make its own credential-free calls to its vendor host (egress residual, TD-9 of the Epic). The acceptance records non-loopback destinations held by the gateway's processes and runs the negative controls offline; it does not block them.</li>
     <li>The known-value scan hides a mounted file that holds a secret value the gateway knows now. A copy of a credential value that was rotated before the run (for example an OAuth token before a refresh) is not recognized; the scan compares current values.</li>
   </ul>
@@ -2080,7 +2080,7 @@ curl -s http://localhost:3001/health | jq .isolation</code></pre>
       <div class="vflow-num n-red">5</div>
       <div class="vflow-body">
         <h4 class="c-red">Retry Layer</h4>
-        <p>On rate limits, overloads or empty answers: exponential backoff (1s, 2s, 4s), up to 3 retries, 60s total budget. Emits <code>rate_limited</code> events to the client. Permanent failures (runtime too old, authentication, unknown) end at once with one <code>error</code> event. A retry resumes only a session an earlier successful answer established; otherwise it starts fresh under a new SDK session ID.</p>
+        <p>On rate limits, overloads or empty answers: exponential backoff (1s, 2s, 4s), up to 3 retries, 60s total budget. Emits <code>rate_limited</code> events to the client. Permanent failures (runtime too old, authentication, unknown) end at once with one <code>error</code> event. A retry resumes only a session an earlier successful answer established; otherwise it starts fresh under a new SDK session ID. A client that closes its connection ends only its own run, and an aborted request is never retried: no new attempt starts after the abort. A late SDK write for a tool call still in flight at that moment is dropped by a startup guard (one fixed log line), and other clients' runs go on.</p>
       </div>
     </div>
     <div class="vflow-step">

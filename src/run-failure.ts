@@ -334,6 +334,13 @@ export function isAbortError(err: unknown): boolean {
   return err instanceof Error && (err.name === "AbortError" || err.constructor?.name === "AbortError");
 }
 
+/** The abort a client disconnect ends a request with: the SDK's own error name and text, so `isAbortError` and the client's text are unchanged. */
+export function abortError(): Error {
+  const error = new Error("Operation aborted");
+  error.name = "AbortError";
+  return error;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Isolation and deadline failures (MVP-7678)                          */
 /* ------------------------------------------------------------------ */

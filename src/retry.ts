@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { log } from "./logging.js";
 import { runQuery, type QueryParams, type QueryResult } from "./agent.js";
-import { RunFailure, classifyRunFailure, fixedFailure, isAbortError, runDeadlineMessage } from "./run-failure.js";
+import { RunFailure, abortError, classifyRunFailure, fixedFailure, isAbortError, runDeadlineMessage } from "./run-failure.js";
 import { loadIsolationConfig } from "./sandbox.js";
 
 const RETRY_MAX_ATTEMPTS = 3;
@@ -19,6 +19,9 @@ export interface RetryParams extends QueryParams { queryId: string; }
  * Runs the query and retries empty answers and transient failures
  * (`RunFailure.retryable`) within RETRY_MAX_ATTEMPTS retries and
  * RETRY_BUDGET_MS. A permanent failure is thrown at once.
+ *
+ * A client abort ends the request with the abort error and starts no further attempt: an attempt that
+ * ends empty or failed after the abort, or an abort during a backoff, is not retried.
  *
  * A retry resumes only an established session: the original request resumed
  * one, or an earlier attempt ended with a result that is not `is_error` and
@@ -66,6 +69,7 @@ async function runWithRetry({ queryId, ...params }: RetryParams, deadlineHit: ()
       const { response, resultData } = await runQuery(attemptParams(attempt));
       const resultSessionId = typeof resultData?.session_id === "string" ? resultData.session_id : undefined;
       if (resultSessionId && params.sessionId) { established = true; sessionId = resultSessionId; }
+      if (params.abortController.signal.aborted && isEmptyResponse(response)) throw abortError();
       if (attempt < RETRY_MAX_ATTEMPTS && isEmptyResponse(response)) {
         const elapsed = Date.now() - startTime;
         const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
@@ -78,6 +82,7 @@ async function runWithRetry({ queryId, ...params }: RetryParams, deadlineHit: ()
       return { response, resultData };
     } catch (err) {
       if (isAbortError(err)) throw err;
+      if (params.abortController.signal.aborted && !deadlineHit()) throw abortError();
       const failure = err instanceof RunFailure ? err : classifyRunFailure({ thrown: err }, queryId);
       if (attempt < RETRY_MAX_ATTEMPTS && failure.retryable) {
         const elapsed = Date.now() - startTime;
@@ -91,7 +96,7 @@ async function runWithRetry({ queryId, ...params }: RetryParams, deadlineHit: ()
       throw failure;
     }
   }
-  // The deadline ended the loop: no further run is started.
+  // The deadline or a client abort ended the loop: no further run is started.
   if (deadlineHit()) throw fixedFailure("run_deadline", "");
-  return runQuery(attemptParams(RETRY_MAX_ATTEMPTS + 1));
+  throw abortError();
 }

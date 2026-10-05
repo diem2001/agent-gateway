@@ -31,6 +31,7 @@ import { loadMcpServers } from "./mcp-registry.js";
 import { McpServerOwnersConfigError, applyMcpServerOwners, parseMcpServerOwners } from "./mcp-server-owners.js";
 import { persistenceReport } from "./persistence.js";
 import { installShutdownHandlers } from "./shutdown.js";
+import { installAbortRejectionGuard } from "./process-guards.js";
 import mcpRoutes from "./routes/mcp.js";
 import gitRoutes from "./routes/git.js";
 import { credentialRelay } from "./mcp-credential-relay.js";
@@ -264,6 +265,9 @@ function isEntryPoint(): boolean {
     return false;
   }
 }
-if (isEntryPoint()) installShutdownHandlers(server);
+if (isEntryPoint()) {
+  installShutdownHandlers(server);
+  installAbortRejectionGuard();
+}
 
 export default app;
