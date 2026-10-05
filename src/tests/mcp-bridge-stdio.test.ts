@@ -150,6 +150,32 @@ describe("the tool sandbox environment", () => {
     });
   });
 
+  it("removes every loader setting of the server's env before launch and keeps every other key unchanged (MVP-8020)", () => {
+    const serverEnv = {
+      LD_PRELOAD: "/home/node/evil.so",
+      LD_AUDIT: "/home/node/audit.so",
+      LD_LIBRARY_PATH: "/home/node",
+      LD_DEBUG: "all",
+      LD_X: "anything",
+      GLIBC_TUNABLES: "glibc.malloc.check=3",
+      TOKEN: "server-own",
+      LDAP_URI: "ldap://example.invalid",
+      OLD_LD_PRELOAD: "kept",
+      PATH: "/srv/bin",
+    };
+    expect(buildToolSandboxEnv({}, serverEnv)).toEqual({
+      HOME: "/home/node",
+      USER: "node",
+      PATH: "/srv/bin",
+      LANG: "C.UTF-8",
+      TERM: "xterm",
+      TMPDIR: "/tmp",
+      TOKEN: "server-own",
+      LDAP_URI: "ldap://example.invalid",
+      OLD_LD_PRELOAD: "kept",
+    });
+  });
+
   it("the server's own env wins over the base values", () => {
     expect(buildToolSandboxEnv({}, { PATH: "/srv/bin", HOME: "/srv" })).toMatchObject({ PATH: "/srv/bin", HOME: "/srv" });
   });
