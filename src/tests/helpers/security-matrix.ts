@@ -724,7 +724,7 @@ export function sampleProblems(sample: ProcessSample, markers: Record<string, st
  * Blind spots: a runtime that lives less than one tick; a runtime with neither `cli.js` in its command line nor the
  * `claude` title; a process that left the gateway's process tree (`descendants` follows the children lists only).
  */
-export function startProcessSampler(gatewayPid: () => number, tags: string[] = [], intervalMs = 20): { stop: () => ProcessSample; peek: () => ProcessSample } {
+export function startProcessSampler(gatewayPid: () => number, tags: string[] = [], intervalMs = 20): { stop: (markers?: Record<string, string>) => ProcessSample; peek: () => ProcessSample } {
   const known = knownExecutables();
   const windows: ProcessSample["windows"] = {};
   const records = new Map<string, ProcessRecord>();
