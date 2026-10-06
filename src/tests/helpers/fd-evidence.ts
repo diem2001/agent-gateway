@@ -284,7 +284,7 @@ except OSError:
     pid1 = None
 # One file per launch (a gateway also starts a boot self-check through the same wrapper); "runtime" marks the start of the agent runtime.
 out_path = "%s.%d.json" % (out_path, time.time_ns())
-runtime = any(arg.endswith("cli.js") for arg in command)
+runtime = any(arg.endswith("cli.js") or arg.endswith("/claude") for arg in command)
 with open(out_path, "w") as handle:
     json.dump({"point": point, "runtime": runtime, "entries": rows, "pid1": pid1}, handle)
 after = survivors(snapshot())
@@ -332,7 +332,7 @@ export interface RecorderCapture {
   table: FdTable;
   /** Descriptors that survive the recorder's exec (no close-on-exec flag), read after it closed its evidence file; null when unreadable. */
   survivors: number[] | null;
-  /** The command that follows names the agent runtime (`cli.js`). */
+  /** The command that follows names the agent runtime (`cli.js` or native `claude`). */
   runtime: boolean;
   /** Link targets of the sandbox init's descriptors (`/proc/1/fd`), null when unreadable. */
   pid1: string[] | null;

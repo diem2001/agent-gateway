@@ -2,7 +2,6 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createRequire } from "node:module";
 import type { SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import { log, logAlways, logDebug } from "./logging.js";
 import { gatewayModelProxy, type ModelProxy } from "./model-proxy.js";
@@ -23,6 +22,7 @@ import {
 } from "./sandbox-content.js";
 import { gatewayKnownValues } from "./tool-mediation.js";
 import { getWorkspaceRoot } from "./workspace.js";
+import { bundledCliPath } from "./runtime-cli.js";
 
 /**
  * Per-run process isolation (MVP-7678, TD-1 to TD-7).
@@ -712,15 +712,15 @@ const RUNTIME_EXIT_WAIT_MS = 10_000;
 export const DEADLINE_KILL_CONFIRM_MS = 500;
 
 function runtimeSdkDir(cliPath: string): string {
-  const sdkEntry = createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk");
-  const sdkDir = path.dirname(fs.realpathSync(sdkEntry));
-  let cliDir: string;
+  let trustedCli: string;
+  let resolvedCli: string;
   try {
-    cliDir = path.dirname(fs.realpathSync(cliPath));
+    trustedCli = fs.realpathSync(bundledCliPath());
+    resolvedCli = fs.realpathSync(cliPath);
   } catch {
     throw new SandboxPrepError("content_invalid");
   }
-  if (cliDir !== sdkDir) throw new SandboxPrepError("content_invalid");
+  if (resolvedCli !== trustedCli) throw new SandboxPrepError("content_invalid");
   return path.dirname(cliPath);
 }
 
@@ -859,13 +859,13 @@ export class SandboxRun {
     if (plan.skipped > 0 || plan.hiddenCount > 0) log("audit", `sandbox.content skipped=${plan.skipped} hidden=${plan.hiddenCount}`);
 
     // The runtime and the trusted directories it needs, each validated without following links.
-    const cliPath = spawnOptions.args.find((arg) => arg.endsWith("cli.js"));
+    const cliPath = [spawnOptions.command, ...spawnOptions.args].find((arg) => arg === bundledCliPath());
     if (!cliPath) throw new SandboxPrepError("content_invalid");
     const sdkDir = runtimeSdkDir(cliPath);
     const roBinds = [sdkDir];
     const command = spawnOptions.command === "node" ? process.execPath : spawnOptions.command;
     if (!path.isAbsolute(command)) throw new SandboxPrepError("content_invalid");
-    if (!command.startsWith("/usr/")) roBinds.push(command);
+    if (!command.startsWith("/usr/") && !roBinds.includes(command) && !command.startsWith(`${sdkDir}/`)) roBinds.push(command);
     const tmpRoot = fs.realpathSync(os.tmpdir());
     const rwBinds: string[] = [];
     const logCheck = checkTrusted(path.join(tmpRoot, path.basename(this.options.runLogDir)), "dir", tmpRoot);

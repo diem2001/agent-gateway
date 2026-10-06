@@ -8,6 +8,7 @@ import { DEFAULT_TOOLS } from "../agent.js";
 describe("DEFAULT_TOOLS", () => {
   it("includes TodoWrite so the agent can emit todo lists (MVP-6497)", () => {
     expect(DEFAULT_TOOLS).toContain("TodoWrite");
+    for (const tool of ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"]) expect(DEFAULT_TOOLS).toContain(tool);
   });
 
   it("retains the core built-in tools", () => {

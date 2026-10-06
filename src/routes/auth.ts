@@ -1,9 +1,8 @@
 import { Router } from "express";
 import { execSync } from "node:child_process";
-import { createRequire } from "node:module";
-import path from "node:path";
 import { log } from "../logging.js";
 import { readAuthStatus } from "../model-proxy.js";
+import { bundledCliPath } from "../runtime-cli.js";
 
 const router = Router();
 const AUTH_TMUX_SESSION = "claude-auth";
@@ -17,10 +16,9 @@ function execEnv(): NodeJS.ProcessEnv { return { ...process.env, HOME }; }
  * (MVP-7678). The bundled CLI is the same runtime the agent runs use.
  */
 export function bundledCliCommand(): string {
-  const sdkEntry = createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk");
-  const command = `${process.execPath} ${path.join(path.dirname(sdkEntry), "cli.js")}`;
+  const command = bundledCliPath();
   // The command is typed into tmux and a shell: refuse anything but a plain path.
-  if (!/^[A-Za-z0-9_@.\/-]+ [A-Za-z0-9_@.\/-]+$/.test(command)) throw new Error("bundled CLI path is not a plain path");
+  if (!/^[A-Za-z0-9_@.\/-]+$/.test(command)) throw new Error("bundled CLI path is not a plain path");
   return command;
 }
 

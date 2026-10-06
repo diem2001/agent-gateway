@@ -40,7 +40,7 @@ const ANSWER: Attempt = {
 
 const ALL_BUILT_INS = [
   "AskUserQuestion", "Bash", "Edit", "EnterPlanMode", "ExitPlanMode", "Glob", "Grep", "KillShell", "LSP", "NotebookEdit",
-  "Read", "Skill", "Task", "TaskOutput", "TodoWrite", "WebFetch", "WebSearch", "Write",
+  "Read", "Skill", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskUpdate", "TodoWrite", "WebFetch", "WebSearch", "Write",
 ];
 
 beforeEach(() => {

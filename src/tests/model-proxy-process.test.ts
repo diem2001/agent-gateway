@@ -18,10 +18,11 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { FINAL_ANSWER, startFakeAnthropicApi, type FakeAnthropicApi, type FakeApiMode } from "./helpers/fake-anthropic-api.js";
 import { assertFreshBuild, gatewayRequest, spawnGateway, type Cleanup } from "./helpers/git-process-gateway.js";
+import { bundledCliPath } from "../runtime-cli.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(here, "..", "..");
-const RUNTIME_CLI = path.join(REPO_ROOT, "node_modules", "@anthropic-ai", "claude-agent-sdk", "cli.js");
+const RUNTIME_CLI = bundledCliPath();
 
 const PROVIDER_KEY = "SYNTH-PROVIDER-KEY-7678-process";
 const ACCESS_2 = "SYNTH-OAUTH-ACCESS-2-7678-process";
@@ -101,7 +102,7 @@ interface RuntimeRun {
 /** The real bundled runtime: one print-mode turn, with the run token as its only credential. */
 async function runRuntime(baseUrl: string, token: string): Promise<RuntimeRun> {
   const home = tempDir("mvp7678-runtime-home-");
-  const child = spawn(process.execPath, [RUNTIME_CLI, "-p", "say hello", "--output-format", "json", "--dangerously-skip-permissions"], {
+  const child = spawn(RUNTIME_CLI, ["-p", "say hello", "--output-format", "json", "--dangerously-skip-permissions"], {
     cwd: home,
     env: {
       PATH: process.env.PATH ?? "",

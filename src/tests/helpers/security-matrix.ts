@@ -172,10 +172,9 @@ export interface EvidenceInfo {
 
 /** The runtime facts a `SECURITY-EVIDENCE` line carries. */
 export function runtimeFacts(): Record<string, string> {
-  const sdk = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "node_modules", "@anthropic-ai", "claude-agent-sdk", "package.json"), "utf8")) as { version: string };
-  const cli = fs.readFileSync(path.join(REPO_ROOT, "node_modules", "@anthropic-ai", "claude-agent-sdk", "cli.js"), "utf8");
+  const sdk = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "node_modules", "@anthropic-ai", "claude-agent-sdk", "package.json"), "utf8")) as { version: string; claudeCodeVersion: string };
   return {
-    claude_code_version: /VERSION:"([0-9.]+)"/.exec(cli)?.[1] ?? "unknown",
+    claude_code_version: sdk.claudeCodeVersion,
     sdk: sdk.version,
     bwrap: tryExec("bwrap", ["--version"]).replace(/^bubblewrap\s*/, ""),
     node: process.version,

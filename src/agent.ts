@@ -197,7 +197,7 @@ function webhookBearer(tool: ToolDefinition, callerLabel: string, token: string 
   return undefined;
 }
 
-export const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite"];
+export const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
 
 /**
  * Build a fresh single-message AsyncIterable<SDKUserMessage> from the resolved

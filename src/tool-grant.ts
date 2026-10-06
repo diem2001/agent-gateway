@@ -18,7 +18,7 @@
 
 import { log } from "./logging.js";
 
-/** The built-in tools of the pinned runtime (Claude Code 2.0.77, `system/init` of the MVP-7679 Gate A spike). */
+/** Built-in tools supported by the bundled Claude Code runtime. */
 export const RUNTIME_BUILT_IN_TOOLS: readonly string[] = [
   "AskUserQuestion",
   "Bash",
@@ -33,7 +33,11 @@ export const RUNTIME_BUILT_IN_TOOLS: readonly string[] = [
   "Read",
   "Skill",
   "Task",
+  "TaskCreate",
+  "TaskGet",
+  "TaskList",
   "TaskOutput",
+  "TaskUpdate",
   "TodoWrite",
   "WebFetch",
   "WebSearch",

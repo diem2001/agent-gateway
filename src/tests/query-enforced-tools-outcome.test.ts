@@ -178,7 +178,7 @@ describe("enforcedTools (MVP-7637)", () => {
     // MVP-7679: only the user source (the project source reads a `.mcp.json` the agent can write), so no `tools`.
     expect(options.settingSources).toEqual(["user"]);
     expect(options.allowedTools).toEqual([
-      "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite",
+      "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList",
       "probe_read", "probe_write", "mcp__jira__*", "mcp__other__*",
     ]);
     expect(Object.keys(options).sort()).toEqual([

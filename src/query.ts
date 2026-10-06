@@ -33,7 +33,7 @@ import { computeToolGrant } from "./tool-grant.js";
  */
 export type ContentBlock =
   | { type: "text"; text: string }
-  | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+  | { type: "image"; source: { type: "base64"; media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp"; data: string } };
 
 interface QueryRequestBody {
   queryId?: string; sessionId?: string; prompt?: string; systemPrompt?: string;
@@ -76,7 +76,9 @@ function validateContentBlock(block: unknown, index: number): string | null {
       return `content[${index}].source must be an object`;
     }
     if (source.type !== "base64") return `content[${index}].source.type must be "base64"`;
-    if (typeof source.media_type !== "string") return `content[${index}].source.media_type must be a string`;
+    if (!["image/jpeg", "image/png", "image/gif", "image/webp"].includes(source.media_type as string)) {
+      return `content[${index}].source.media_type must be a supported image MIME type`;
+    }
     if (typeof source.data !== "string") return `content[${index}].source.data must be a string`;
     return null;
   }

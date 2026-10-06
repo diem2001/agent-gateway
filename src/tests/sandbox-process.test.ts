@@ -12,7 +12,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ModelProxy, ProviderCredentials } from "../model-proxy.js";
@@ -38,6 +37,7 @@ import { FINAL_ANSWER, startFakeAnthropicApi, type FakeAnthropicApi, type FakeAp
 import { assertFreshBuild, descendants, gatewayRequest, getHealth, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
 import { checkDescriptors, crossReference, emitEvidence, evidenceLines, inheritedAtExec, isCloseOnExec, parseFdRecords, readFdTable, summaryLine, writeRecorderWrapper, type FdTable, type RecorderWrapperOptions, type RedactContext } from "./helpers/fd-evidence.js";
 import { buildToolSandboxEnv } from "../mcp-stdio-sandbox.js";
+import { bundledCliPath } from "../runtime-cli.js";
 import { DETACHED_MAX_AGE_S, detachedAgeS, detachedCommand, detachedEvidence, detachedProof, detachedTag, killRun, runPresence, tagPresence, waitRunGone, type DetachedRecord } from "./helpers/security-matrix.js";
 
 // Real processes on a shared, loaded host: every row gets a generous deadline.
@@ -45,7 +45,7 @@ vi.setConfig({ testTimeout: 60_000 });
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(here, "..", "..");
-const SDK_CLI = path.join(path.dirname(createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk")), "cli.js");
+const SDK_CLI = bundledCliPath();
 
 const PROVIDER_KEY = "SYNTH-PROVIDER-KEY-7678-process";
 const GATEWAY_KEY = "SYNTH-GATEWAY-API-KEY-7678";
@@ -359,6 +359,7 @@ describe("environment and processes", () => {
       "GIT_CONFIG_VALUE_2",
       "HOME",
       "LANG",
+      ...["LC_ALL", "LC_CTYPE"].filter((key) => typeof process.env[key] === "string" && /^[A-Za-z0-9_.@-]{1,64}$/.test(process.env[key]!)),
       "PATH",
       "TERM",
       "TMPDIR",

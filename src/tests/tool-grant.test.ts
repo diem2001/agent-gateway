@@ -22,7 +22,7 @@ afterEach(() => {
 const LABELS = ["reqlift", "diemcrm"];
 const ALL_BUILT_INS = [
   "AskUserQuestion", "Bash", "Edit", "EnterPlanMode", "ExitPlanMode", "Glob", "Grep", "KillShell", "LSP", "NotebookEdit",
-  "Read", "Skill", "Task", "TaskOutput", "TodoWrite", "WebFetch", "WebSearch", "Write",
+  "Read", "Skill", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskUpdate", "TodoWrite", "WebFetch", "WebSearch", "Write",
 ];
 
 function parse(value: unknown): ReturnType<typeof parseToolPolicy> {
@@ -40,7 +40,7 @@ function reasonOf(value: unknown): string | undefined {
 }
 
 describe("the pinned built-in tool list", () => {
-  it("is the 18 built-ins Claude Code 2.0.77 reports (Gate A)", () => {
+  it("includes the task tools of the bundled runtime", () => {
     expect([...RUNTIME_BUILT_IN_TOOLS]).toEqual(ALL_BUILT_INS);
   });
 });
@@ -215,7 +215,7 @@ describe("the startup line per label", () => {
     loadToolPolicy({ AGENT_TOOL_POLICY: JSON.stringify({ labels: { reqlift: { deny: ["Bash", "mcp__jira__delete_issue"] }, diemcrm: { allow: ["Read", "mcp__jira__*"] } } }) }, LABELS);
     const policyLines = lines.filter((l) => l.includes("tool.policy label="));
     expect(policyLines).toEqual([
-      "[audit] tool.policy label=reqlift builtIns=AskUserQuestion,Edit,EnterPlanMode,ExitPlanMode,Glob,Grep,KillShell,LSP,NotebookEdit,Read,Skill,Task,TaskOutput,TodoWrite,WebFetch,WebSearch,Write servers=all deny=mcp__jira__delete_issue",
+      "[audit] tool.policy label=reqlift builtIns=AskUserQuestion,Edit,EnterPlanMode,ExitPlanMode,Glob,Grep,KillShell,LSP,NotebookEdit,Read,Skill,Task,TaskCreate,TaskGet,TaskList,TaskOutput,TaskUpdate,TodoWrite,WebFetch,WebSearch,Write servers=all deny=mcp__jira__delete_issue",
       "[audit] tool.policy label=diemcrm builtIns=Read servers=mcp__jira__*",
     ]);
   });
