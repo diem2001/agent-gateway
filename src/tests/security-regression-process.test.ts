@@ -20,12 +20,18 @@
  *   `GLIBC_TUNABLES`. Those settings are removed before launch, so a gcc-built library at a test-owned host path, whose constructor
  *   records its own execution, never runs on the gateway side (the launcher process); the server's tool still works and reports none
  *   of the five keys. The in-sandbox load point is covered by `sandbox-process.test.ts` (a library planted in the server's home).
+ * - `AD.same-label-writer`, `AD.other-label`, `AD.relay-token-replay` (MVP-8044, DEC-ISO-007): a conversation belongs to the
+ *   API-key label. Another person of the label continues it with their own skills, webhook identity and credential, never
+ *   the creator's (read on per-run surfaces: what a shared conversation holds of earlier writers is visible to later ones
+ *   by design); another label gets its own conversation and sees nothing of the first; a relay URL saved in the creator's
+ *   run is refused in a later writer's run. The negative controls run these rows against four vulnerable builds.
  * - The negative controls prove the detector end to end: a child vitest run of the same row against a deliberately
  *   vulnerable copy of `dist/` (offline, in a loopback-only namespace) must exit nonzero, name the row and report
  *   hits, and print no marker value.
  *
  * The child run selects rows with `-t`, so a row's test name carries its selector: `regression row` for the regression
- * scenario, `route config probe` for the file detector, `loader env probe` for the loader-setting row. No other test name may contain either phrase.
+ * scenario, `route config probe` for the file detector, `loader env probe` for the loader-setting row, `same-label writer probe`,
+ * `other-label probe` and `relay replay probe` for the shared-conversation rows. No other test name may contain these phrases.
  *
  * Needs `npm run build`, `bwrap`, user namespaces, `unshare`, `git` and `python3`; a missing prerequisite fails with
  * `host prerequisite missing: <name>`. Linux only.
@@ -75,6 +81,19 @@ import {
   type TurnObservation,
 } from "./helpers/security-matrix.js";
 import { ROUTE_IDS, credentialSteps, regressionRowIds, routeTurn, type RouteId, type RouteTurn } from "./helpers/security-routes.js";
+import {
+  emitEvidence,
+  otherLabelProblems,
+  otherLabelSurfaces,
+  replayProblems,
+  runOtherLabelScenario,
+  runReplayScenario,
+  runWriterScenario,
+  scenarioSurfaces,
+  setupWriterFixtures,
+  verdictProblems,
+  writerProblems,
+} from "./helpers/shared-conversation.js";
 
 const ROW_TEST_TIMEOUT_MS = 600_000;
 vi.setConfig({ testTimeout: ROW_TEST_TIMEOUT_MS });
@@ -853,22 +872,81 @@ describe("loader settings of a tool server", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/*  Conversations belong to the API-key label (MVP-8044)                */
+/* ------------------------------------------------------------------ */
+
+/** Problem texts the negative controls look for in the child's output (names of checks, never values). */
+const IDENTITY_PROBLEM = "the webhook context did not carry the writer's user id";
+const CREDENTIAL_PROBLEM = "a credential of an earlier writer reached the upstream in a run without a credential";
+// The vulnerable build really resumed the creator's conversation: the creator's prompt is in the other label's request and the
+// other label has no entry of its own (it used the creator's); or really shares the creator's home with an entry of its own.
+const RESUMED_EVIDENCE = "other_label_resumed_creator_conversation=true creator_prompt_in_other_label_request=true other_label_has_own_entry=false";
+const SHARED_HOME_EVIDENCE = "other_label_resumed_creator_conversation=false creator_prompt_in_other_label_request=false other_label_has_own_entry=true other_label_shares_creator_home=true";
+
+describe("shared conversations belong to the API-key label", () => {
+  it("AD.same-label-writer: same-label writer probe: another person of the label continues the conversation with their own skills, webhook identity and credential, never the creator's; a writer without a credential gets the fixed text", async () => {
+    const rig = await newRig();
+    const fixture = await setupWriterFixtures(rig, cleanups);
+    const started = Date.now();
+    const scenario = await runWriterScenario(rig, fixture, "AD-WRITER");
+    const verdict = writerProblems(rig, scenario);
+    const observed = [scenario.creator, scenario.writer, scenario.replay, scenario.third];
+    const problems = [...observed.flatMap((entry) => turnProblems(entry.turn)), ...verdictProblems(verdict)];
+    finishRow(recorder, rig, { id: "AD.same-label-writer", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS * 4, surfaces: scenarioSurfaces(rig, observed), controls: verdict.controls, problems, floors: { "tool-results": 50 } });
+  });
+
+  it("AD.other-label: other-label probe: another app sending the conversation's id gets its own conversation and sees nothing of the first", async () => {
+    const rig = await newRig();
+    const started = Date.now();
+    const scenario = await runOtherLabelScenario(rig, "AD-OTHER");
+    const verdict = otherLabelProblems(rig, scenario);
+    // Names and booleans only: the negative controls read these lines in the child's output.
+    emitEvidence("AD.other-label", verdict.evidence);
+    finishRow(recorder, rig, {
+      id: "AD.other-label",
+      durationMs: Date.now() - started,
+      deadlineMs: TURN_DEADLINE_MS * 3,
+      surfaces: otherLabelSurfaces(rig, scenario),
+      controls: verdict.controls,
+      problems: [...turnProblems(scenario.other.turn), ...verdict.problems],
+      floors: { "tool-results": 20 },
+    });
+  });
+
+  it("AD.relay-token-replay: relay replay probe: a relay URL saved in the creator's run is refused in the next writer's run and nothing reaches the upstream", async () => {
+    const rig = await newRig();
+    const fixture = await setupWriterFixtures(rig, cleanups);
+    const started = Date.now();
+    const scenario = await runReplayScenario(rig, fixture, "AD-REPLAY");
+    const verdict = replayProblems(rig, scenario);
+    const observed = [scenario.creator, scenario.writer];
+    finishRow(recorder, rig, { id: "AD.relay-token-replay", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS * 2, surfaces: scenarioSurfaces(rig, observed), controls: verdict.controls, problems: [...observed.flatMap((entry) => turnProblems(entry.turn)), ...verdict.problems], floors: { "tool-results": 20 } });
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /*  Negative controls                                                   */
 /* ------------------------------------------------------------------ */
 
-/** A copy of `dist/` under the temp directory whose `file` has `from` replaced by `to`; the patch must apply exactly once. */
-function vulnerableDist(file: string, from: string, to: string): string {
+/** A copy of `dist/` under the temp directory whose `file` has `from` replaced by `to`; every patch must apply exactly once. */
+function vulnerableDistPatched(patches: { file: string; from: string; to: string }[]): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7677-vulnerable-"));
   cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.cpSync(path.join(REPO_ROOT, "dist"), path.join(root, "dist"), { recursive: true, filter: (source) => !source.startsWith(path.join(REPO_ROOT, "dist", "tests")) });
   fs.copyFileSync(path.join(REPO_ROOT, "package.json"), path.join(root, "package.json"));
   fs.symlinkSync(path.join(REPO_ROOT, "node_modules"), path.join(root, "node_modules"));
-  const target = path.join(root, "dist", file);
-  const source = fs.readFileSync(target, "utf8");
-  expect(source.split(from).length - 1, `the patch of ${file} must match exactly once`).toBe(1);
-  fs.writeFileSync(target, source.replace(from, to));
-  expect(fs.readFileSync(target, "utf8")).not.toBe(source);
+  for (const { file, from, to } of patches) {
+    const target = path.join(root, "dist", file);
+    const source = fs.readFileSync(target, "utf8");
+    expect(source.split(from).length - 1, `the patch of ${file} must match exactly once`).toBe(1);
+    fs.writeFileSync(target, source.replace(from, () => to));
+    expect(fs.readFileSync(target, "utf8")).not.toBe(source);
+  }
   return path.join(root, "dist", "server.js");
+}
+
+function vulnerableDist(file: string, from: string, to: string): string {
+  return vulnerableDistPatched([{ file, from, to }]);
 }
 
 interface ChildResult {
@@ -959,6 +1037,58 @@ describe("negative control", () => {
     expect(result.namesProblem, "the child must name the gateway-side library execution").toBe(true);
     expect(result.printsAMarkerValue).toBe(false);
     recorder.record({ id: "RP.negative-control.loader-env", expected: "fail", observed: result.failed && result.namesTheRow && result.namesProblem ? "fail" : "pass", hits: result.namesProblem ? 1 : 0, durationMs: Date.now() - started, deadlineMs: 240_000, surfaces: [], controls: ["child_exited_nonzero", "row_named", "library_execution_named", "no_marker_value_printed"] });
+  });
+});
+
+describe("negative controls of the shared-conversation rows", () => {
+  /** Runs `selector` against `dist` in a child and records the control: nonzero exit, the row named, the problem or evidence named, no marker value. */
+  async function sharedControl(id: string, selector: string, rowId: string, dist: string, problemText: string, expectHits: boolean): Promise<void> {
+    expect(offlineAvailable(), "the offline execution mode (a loopback-only network namespace) is required").toBe(true);
+    const started = Date.now();
+    const result = await runChildRow(selector, rowId, dist, randomBytes(4).toString("hex"), problemText);
+    expect(result.timedOut, "the child run hit its deadline").toBe(false);
+    expect(result.failed, "the row must exit nonzero against the vulnerable build").toBe(true);
+    expect(result.namesTheRow, "the child output must name the row with observed=fail").toBe(true);
+    expect(result.reportsExpectedFailure, "the failure must be the row's own").toBe(true);
+    expect(result.namesProblem, "the child must name why the vulnerable build was caught").toBe(true);
+    if (expectHits) expect(result.hits, "the child must report hits above 0").toBeGreaterThan(0);
+    expect(result.printsAMarkerValue, "the child output must contain no marker value").toBe(false);
+    recorder.record({ id, expected: "fail", observed: result.failed && result.namesTheRow && result.namesProblem ? "fail" : "pass", hits: result.hits, durationMs: Date.now() - started, deadlineMs: 360_000, surfaces: [], controls: ["child_exited_nonzero", "row_named", "vulnerable_condition_named", "no_marker_value_printed"] });
+  }
+
+  it("negative control: a lookup that ignores the API-key label lets another app resume the conversation; the child first shows the vulnerable build really resumed it, then fails AD.other-label", async () => {
+    const dist = vulnerableDist(
+      "sessions.js",
+      "return sessionsByLabel.get(label)?.get(clientId);",
+      "for (const byLabel of sessionsByLabel.values()) {\n        const found = byLabel.get(clientId);\n        if (found) return found;\n    }\n    return undefined;",
+    );
+    await sharedControl("RP.negative-control.label-blind-admission", "other-label probe", "AD.other-label", dist, RESUMED_EVIDENCE, true);
+  });
+
+  it("negative control: one sandbox home for every conversation lets another app read the first conversation's files; the child fails AD.other-label (turns run one after another)", async () => {
+    const dist = vulnerableDist("sessions.js", 'const sandboxDirId = randomBytes(12).toString("hex");', 'const sandboxDirId = "0123456789abcdef01234567";');
+    await sharedControl("RP.negative-control.shared-home", "other-label probe", "AD.other-label", dist, SHARED_HOME_EVIDENCE, true);
+  });
+
+  it("negative control: a run that takes the stored creator's user id instead of the request's loads the creator's identity; the child fails AD.same-label-writer", async () => {
+    const dist = vulnerableDistPatched([
+      { file: "sessions.js", from: "export function admitSession(", to: "export function creatorUserId(label, id) {\n    return labelEntry(label, id)?.owner?.userId ?? undefined;\n}\nexport function admitSession(" },
+      {
+        file: "query.js",
+        from: "useSession, sshTarget, user_id, conversation_id, mcpCredentialOverrides, mcpServers } = req.body;",
+        to: 'useSession, sshTarget, user_id: requestUserId, conversation_id, mcpCredentialOverrides, mcpServers } = req.body;\n    const user_id = (await import("./sessions.js")).creatorUserId(req.clientLabel, sessionId) ?? requestUserId;',
+      },
+    ]);
+    await sharedControl("RP.negative-control.creator-identity", "same-label writer probe", "AD.same-label-writer", dist, IDENTITY_PROBLEM, false);
+  });
+
+  it("negative control: a conversation that reuses its last credential override when the request has none gives a writer without credentials another person's; the child fails AD.same-label-writer", async () => {
+    const dist = vulnerableDist(
+      "query.js",
+      "mcpCredentialOverrides: overrideValidation.overrides,",
+      "mcpCredentialOverrides: (() => {\n                    const store = (globalThis.__lastOverrides ??= new Map());\n                    const given = overrideValidation.overrides;\n                    if (given && Object.keys(given).length > 0) {\n                        store.set(conversationId ?? \"\", given);\n                        return given;\n                    }\n                    return store.get(conversationId ?? \"\") ?? given;\n                })(),",
+    );
+    await sharedControl("RP.negative-control.creator-credentials", "same-label writer probe", "AD.same-label-writer", dist, CREDENTIAL_PROBLEM, false);
   });
 });
 

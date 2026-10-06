@@ -271,7 +271,6 @@ function scriptsFor(gateway: SpawnedGateway): ExactToolScript[] {
 const FIXED_TEXTS = {
   unavailable: (id: string) =>
     `The gateway cannot start a protected workspace, so this request did not run. Ask your gateway administrator to check the gateway's isolation status. Retrying will not help until the administrator has done this. (reference: ${id})`,
-  otherOwner: "This conversation cannot be continued from your account. Please start a new conversation.",
   legacy: "This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help.",
   busy: "This conversation is still answering an earlier request. Please wait until it has finished, then try again.",
 };
@@ -406,13 +405,18 @@ describe("the fail-closed rows end with the exact text within their deadline and
     await ends(f, { queryId: "q-closed", sessionId: "conv-closed", prompt: "OUTCOME-CLOSED", user_id: "user-1" }, KEY_ALPHA, FIXED_TEXTS.unavailable("q-closed"), 3000);
   });
 
-  it("another owner, a legacy conversation and a busy conversation", async () => {
+  it("another user of the same label continues the conversation; a legacy conversation and a busy conversation are refused", async () => {
     const f = await fixture("api-key", (gateway) => scriptsFor(gateway));
     f.scripts.push(bash("OUTCOME-LONG", "sleep 6; echo LONG-DONE"));
     const first = await queryAs(f.gateway.port, KEY_ALPHA, { queryId: "q-own", sessionId: "conv-own", prompt: PROMPTS.turn1, user_id: "user-1", useSession: true });
     expect(first.at(-1)?.type).toBe("done");
-    // Another user of the same API-key label is refused; another label does not see the conversation at all (MVP-7679).
-    await ends(f, { queryId: "q-steal", sessionId: "conv-own", prompt: PROMPTS.turn2, user_id: "user-2" }, KEY_ALPHA, FIXED_TEXTS.otherOwner, 2000);
+    // Another user of the same API-key label continues the conversation (the label decides, MVP-8044): a run that
+    // ends in `done` with no error event. Another label does not see the conversation at all (MVP-7679).
+    const modelBefore = f.api.requests.length;
+    const other = await queryAs(f.gateway.port, KEY_ALPHA, { queryId: "q-steal", sessionId: "conv-own", prompt: PROMPTS.turn2, user_id: "user-2", useSession: true });
+    expect(other.at(-1)?.type, JSON.stringify(other.at(-1))).toBe("done");
+    expect(other.some((event) => event.type === "error")).toBe(false);
+    expect(f.api.requests.length).toBeGreaterThan(modelBefore);
     await ends(f, { queryId: "q-legacy", sessionId: "legacy-conv", prompt: PROMPTS.turn2, user_id: "user-1" }, KEY_ALPHA, FIXED_TEXTS.legacy, 2000);
     const long = queryAs(f.gateway.port, KEY_ALPHA, { queryId: "q-long", sessionId: "conv-long", prompt: "OUTCOME-LONG", user_id: "user-1", useSession: true });
     const end = Date.now() + 30_000;

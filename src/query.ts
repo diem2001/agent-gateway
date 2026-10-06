@@ -8,7 +8,6 @@ import {
   RunFailure,
   SESSION_BUSY_MESSAGE,
   SESSION_LEGACY_MESSAGE,
-  SESSION_OTHER_OWNER_MESSAGE,
   classifyRunFailure,
   fixedFailure,
   formatLogFields,
@@ -197,14 +196,15 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
 
   const startTime = Date.now();
 
-  // Who is asking (MVP-7678): the API-key label and the request's user id (null when it has none).
-  // A conversation belongs to exactly one such owner; null and a present user id are different owners.
+  // Who is asking: the API-key label and the request's user id (null when it has none). The label decides which
+  // conversations the caller reaches (DEC-ISO-007); the user id is passed on for the writer's skills, the webhook
+  // context and per-request credentials only, and is recorded on a new conversation as informational metadata.
   const caller = { label: req.clientLabel ?? "", userId: typeof user_id === "string" && user_id.length > 0 ? user_id : null };
   const conversationId = useSession !== false && typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
 
   // Admission comes before anything else happens for this request: a refused caller gets one fixed
   // `error` event and nothing ran (no runtime, no session change, no acknowledgment).
-  const refuse = (kind: "session_other_owner" | "session_legacy" | "session_busy", message: string): void => {
+  const refuse = (kind: "session_legacy" | "session_busy", message: string): void => {
     log("query", `Refused queryId=${queryId} kind=${kind}`);
     emit({ type: "error", content: fixedFailure(kind, message).message });
     markDone(label, queryId);
@@ -225,7 +225,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   if (conversationId) {
     const admission = admitSession(conversationId, caller);
     if (admission.kind === "refused") {
-      refuse(admission.reason === "legacy" ? "session_legacy" : "session_other_owner", admission.reason === "legacy" ? SESSION_LEGACY_MESSAGE : SESSION_OTHER_OWNER_MESSAGE);
+      refuse("session_legacy", SESSION_LEGACY_MESSAGE);
       return;
     }
     // One active request per conversation: the lock is taken before the conversation entry is touched.

@@ -61,6 +61,10 @@ const MARKER_NAMES: Record<string, MarkerClass> = {
   sessionB2File: "secondSession",
   legacyTranscript: "legacy",
   stateFile: "state",
+  // MVP-8044: the creator of a shared conversation. Neither value may appear on any surface of a later writer's run:
+  // the skill is never invoked in the creator's own turn, the credential only ever goes to the upstream double.
+  creatorSkill: "state",
+  creatorCredential: "mcp",
 };
 
 export interface SecurityMarkers {
@@ -313,6 +317,13 @@ export const AC_ROWS: Record<string, string> = {
   "X.extension-writes": "Writes into the read-only extension directories fail",
   "X.loader-env": "Tool-server loader settings (LD_*, GLIBC_TUNABLES) are removed before launch; a planted library never runs",
   "X.run-leftovers": "Per-run runtime and sandbox directories hold no marker during a held run and after SIGKILL; the next start sweeps them",
+  "AD.same-label-writer": "Another person of the same app continues a shared conversation: the writer's skills, webhook identity and credentials apply, none of the creator's",
+  "AD.other-label": "Another app sending a conversation's id gets its own conversation and sees nothing of the first one",
+  "AD.relay-token-replay": "A relay URL saved in the creator's run is refused when called in a later writer's run",
+  "RP.negative-control.label-blind-admission": "Negative control: a lookup that ignores the API-key label lets another app resume the conversation",
+  "RP.negative-control.shared-home": "Negative control: one shared sandbox home for every conversation lets another app read the first conversation's files",
+  "RP.negative-control.creator-identity": "Negative control: a run that takes the stored creator's user id instead of the request's loads the creator's skills and webhook identity",
+  "RP.negative-control.creator-credentials": "Negative control: a conversation that reuses its last credential override gives a writer without credentials another person's",
   "EI.profile": "Epic integration: the container runs under the committed security profile and reports isolation ok",
   "EI.registration": "Epic integration: both callers register their tools; the deploy read-back shows zero ownerless tools and servers",
   "EI.auth": "Epic integration: query, direct MCP call and upload relay with no key, an unknown key and the valid key",
@@ -1397,8 +1408,11 @@ export interface SecurityRig {
   log: () => string;
   /** `POST /v1/query` as `label`; `control.abort()` closes the caller's connection. */
   ask: (label: "reqlift" | "diemcrm", body: Record<string, unknown>, deadlineMs?: number, control?: { abort?: () => void }) => Promise<QueryOutcome>;
-  /** Stops the gateway with `signal` (SIGTERM by default), waits for the exit and starts a new process on the same directories. */
-  restart: (signal?: "SIGTERM" | "SIGKILL") => Promise<void>;
+  /**
+   * Stops the gateway with `signal` (SIGTERM by default), waits for the exit and starts a new process on the same
+   * directories. `between` runs while no gateway process is up (to edit its persisted state, MVP-8044).
+   */
+  restart: (signal?: "SIGTERM" | "SIGKILL", between?: () => void) => Promise<void>;
   /** Registered ownership aware helper: `PUT /v1/mcp-servers/<name>` as `label`. */
   register: (label: "reqlift" | "diemcrm", name: string, body: Record<string, unknown>) => Promise<void>;
   baseEnv: Record<string, string>;
@@ -1538,10 +1552,11 @@ export async function createRig(cleanups: Cleanup[], options: RigOptions = {}): 
       const put = await gatewayRequest(rig.gateway.port, "PUT", `/v1/mcp-servers/${name}`, body, keys[label]);
       if (put.status !== 201 && put.status !== 200) throw new Error(`registering ${name} as ${label} answered ${put.status}`);
     },
-    restart: async (signal = "SIGTERM") => {
+    restart: async (signal = "SIGTERM", between) => {
       const old = rig.gateway;
       old.child.kill(signal);
       await new Promise<void>((resolve) => (old.child.exitCode !== null || old.child.signalCode !== null ? resolve() : old.child.once("exit", () => resolve())));
+      between?.();
       rig.gateway = track(await spawnGateway(cleanups, { reuse: old, env: gatewayEnv, distServer: options.distServer, fakeGitBin: options.fakeGitBin }));
     },
   };

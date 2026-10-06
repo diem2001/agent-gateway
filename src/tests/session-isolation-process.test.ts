@@ -1,9 +1,10 @@
 /**
  * Conversation isolation through the compiled gateway, the real Claude runtime and real bwrap
  * (MVP-7678, Gate D): legacy conversations are refused and their transcripts never reach the
- * model, conversations of different owners running at the same time cannot see each other, a
- * conversation survives a gateway restart in its own home (and still cannot read credentials),
- * and a second request for a conversation that is still answering is refused. Every secret is
+ * model, conversations of different callers running at the same time cannot see each other (another
+ * person of the same API-key label continues the conversation, MVP-8044), a conversation survives a
+ * gateway restart in its own home (and still cannot read credentials), and a second request for a
+ * conversation that is still answering is refused. Every secret is
  * synthetic; the model is a scripted stand-in.
  *
  * Needs `npm run build`, `bwrap` and user namespaces. Linux only.
@@ -221,7 +222,7 @@ describe("legacy conversations (created before the update)", () => {
   });
 });
 
-describe("conversations of different owners that run at the same time", () => {
+describe("conversations of different callers that run at the same time", () => {
   it("neither sees the other's files, processes, transcript or model traffic", async () => {
     const SECRET_A = "SYNTH-A-SECRET-7678";
     const SECRET_B = "SYNTH-B-SECRET-7678";
@@ -273,16 +274,19 @@ describe("conversations of different owners that run at the same time", () => {
     expect(grepTree(homeA, SECRET_A).length).toBeGreaterThan(0);
     expect(grepTree(homeB, SECRET_B).length).toBeGreaterThan(0);
 
-    // Neither owner can continue the other's conversation, nor list or delete it. Another API-key label does not see
-    // the conversation at all (MVP-7679): it is not refused, it gets its own new conversation under the same id.
-    const before = r.api.requests.length;
-    const sameLabelOtherUser0 = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-steal0", sessionId: "conv-A", prompt: "PROBE-A", user_id: "user-b" });
-    expect(sameLabelOtherUser0.events).toEqual([{ seq: 0, type: "error", content: "This conversation cannot be continued from your account. Please start a new conversation." }]);
-    const sameLabelOtherUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-steal2", sessionId: "conv-A", prompt: "PROBE-A", user_id: "user-other" });
-    expect(sameLabelOtherUser.events[0]?.content).toBe("This conversation cannot be continued from your account. Please start a new conversation.");
-    const noUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-steal3", sessionId: "conv-A", prompt: "PROBE-A" });
-    expect(noUser.events[0]?.content).toBe("This conversation cannot be continued from your account. Please start a new conversation.");
-    expect(r.api.requests.length).toBe(before);
+    // Another person of the same API-key label continues conv-A in conv-A's own home (the label decides, MVP-8044):
+    // with another user id and with none, each gets a run that reads conv-A's file and no refusal text. Another
+    // API-key label does not see the conversation at all (MVP-7679): it gets its own new conversation under the same
+    // id. Neither label lists or deletes the other's conversation.
+    r.scripts.push(bash("WRITER-OF-A", "echo SEEN=$(cat /work/a.txt)"), bash("NOUSER-OF-A", "echo SEEN=$(cat /work/a.txt)"));
+    const sameLabelOtherUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-writer", sessionId: "conv-A", prompt: "WRITER-OF-A", user_id: "user-other" });
+    expect(sameLabelOtherUser.events.at(-1)?.type, JSON.stringify(sameLabelOtherUser.events.at(-1))).toBe("done");
+    expect(sameLabelOtherUser.events.some((e) => e.type === "error")).toBe(false);
+    expect(resultsFor(r.api, "WRITER-OF-A").at(-1)?.text).toContain(`SEEN=${SECRET_A}`);
+    const noUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-nouser", sessionId: "conv-A", prompt: "NOUSER-OF-A" });
+    expect(noUser.events.at(-1)?.type, JSON.stringify(noUser.events.at(-1))).toBe("done");
+    expect(resultsFor(r.api, "NOUSER-OF-A").at(-1)?.text).toContain(`SEEN=${SECRET_A}`);
+    expect(sessionHome(r.gateway, "conv-A")).toBe(homeA);
     const listBeta = await getAs(r.gateway.port, KEY_BETA, "GET", "/v1/sessions");
     expect((listBeta.json?.sessions as { id: string }[]).map((s) => s.id)).toEqual(["conv-B"]);
     expect((await getAs(r.gateway.port, KEY_BETA, "DELETE", "/v1/sessions/conv-A")).status).toBe(404);
@@ -328,9 +332,11 @@ describe("a conversation created after the update", () => {
     expect(result?.text).toContain("PERSISTED=SYNTH-PERSIST-7678");
     expect(result?.text).toContain("CREDS=0");
     expect(result?.text).toContain("CREDS_ANYWHERE=0");
-    // Still the same owner, still refused for any other user of the label (another label has its own conversations).
-    const other = await queryAs(restarted.port, KEY_ALPHA, { queryId: "q-3", sessionId: "keep", prompt: "PROBE-TURN2", user_id: "user-2" });
-    expect(other.events[0]?.content).toBe("This conversation cannot be continued from your account. Please start a new conversation.");
+    // Another user of the label continues it after the restart as well, in the same work area (the label decides, MVP-8044).
+    r.scripts.push(bash("PROBE-TURN3", "echo PERSISTED=$(cat /work/persist.txt)"));
+    const other = await queryAs(restarted.port, KEY_ALPHA, { queryId: "q-3", sessionId: "keep", prompt: "PROBE-TURN3", user_id: "user-2" });
+    expect(other.events.at(-1)?.type, JSON.stringify(other.events.at(-1))).toBe("done");
+    expect(resultsFor(r.api, "PROBE-TURN3").at(-1)?.text).toContain("PERSISTED=SYNTH-PERSIST-7678");
     // The home is the same directory before and after.
     expect(sessionHome(restarted, "keep")).toBe(home);
   });

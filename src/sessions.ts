@@ -6,7 +6,11 @@ import { createPersistentStore } from "./persistence.js";
 /*  Types                                                               */
 /* ------------------------------------------------------------------ */
 
-/** The caller a conversation belongs to: the API-key label and the `user_id` of the request (null when it had none). */
+/**
+ * The caller of a request: the API-key label and the `user_id` of the request (null when it had none). The label
+ * decides which conversations the caller can reach (DEC-ISO-007, MVP-8044); the `user_id` is recorded on a new
+ * conversation as informational metadata and never read for an admission decision.
+ */
 export interface SessionOwner {
   label: string;
   userId: string | null;
@@ -19,9 +23,9 @@ export interface Session {
   model: string;
   lastUsed: number;
   /**
-   * Who created the conversation (MVP-7678). A conversation can only be continued by the exact same owner;
-   * `null` and a present `user_id` are different owners. Entries from before the isolation update have none
-   * and are refused on resume.
+   * Who created the conversation (MVP-7678): the API-key label it belongs to and the creator's `user_id`
+   * (informational only, may be absent in a stored file). Any writer of the label can continue it. Entries from
+   * before the isolation update have no owner and are refused on resume.
    */
   owner?: SessionOwner;
   /** Random name of the conversation's sandbox home below the storage root. Entries without one are legacy. */
@@ -117,14 +121,15 @@ function isPersistedData(data: unknown): boolean {
 
 /**
  * The fields added by the isolation update are optional (older files load), but a present one must be
- * usable: an owner with a label and a string or null user id, a directory id of the expected shape.
+ * usable: an owner with a label and, when it carries one, a string or null creator user id (the key may be absent:
+ * the label decides, MVP-8044), a directory id of the expected shape.
  * An entry that fails this sets the whole file aside like any other unexpected content (MVP-7616).
  */
 function hasValidIsolationFields(session: Record<string, unknown>): boolean {
   if (session.owner !== undefined) {
     const owner = session.owner;
     if (!isObject(owner) || typeof owner.label !== "string" || owner.label.length === 0) return false;
-    if (owner.userId !== null && typeof owner.userId !== "string") return false;
+    if (owner.userId !== undefined && owner.userId !== null && typeof owner.userId !== "string") return false;
   }
   if (session.sandboxDirId !== undefined && !(typeof session.sandboxDirId === "string" && SANDBOX_DIR_ID.test(session.sandboxDirId))) return false;
   return true;
@@ -198,26 +203,21 @@ export interface GetSessionResult {
   sandboxDirId?: string;
 }
 
-export type Admission = { kind: "new" } | { kind: "resume"; sandboxDirId: string } | { kind: "refused"; reason: "legacy" | "other_owner" };
+export type Admission = { kind: "new" } | { kind: "resume"; sandboxDirId: string } | { kind: "refused"; reason: "legacy" };
 
 let legacyRefusals = 0;
-
-function sameOwner(a: SessionOwner, b: SessionOwner): boolean {
-  return a.label === b.label && a.userId === b.userId;
-}
 
 /**
  * Decides, without changing anything, whether `caller` may use the conversation `clientId`: conversations are
  * keyed by (API-key label, client id), so another label's conversation is not visible and the caller gets a new
- * one; within the label the exact owner (same `user_id`) resumes and any other user is refused; an entry from
- * before the isolation update (no recorded owner or home, raw id) is refused for everyone, because the gateway has
- * no record of who it belongs to. Must run before `getSession`, which updates the entry.
+ * one; within the label any `user_id`, null or present, resumes (the app decides who may write, DEC-ISO-007); an
+ * entry from before the isolation update (no recorded owner or home, raw id) is refused for everyone, because the
+ * gateway has no record of who it belongs to. Must run before `getSession`, which updates the entry.
  */
 export function admitSession(clientId: string, caller: SessionOwner): Admission {
   const own = labelEntry(caller.label, clientId);
   if (own) {
     if (!own.owner || !own.sandboxDirId) return { kind: "refused", reason: "legacy" };
-    if (!sameOwner(own.owner, caller)) return { kind: "refused", reason: "other_owner" };
     return { kind: "resume", sandboxDirId: own.sandboxDirId };
   }
   // Another label's conversation with the same id is invisible here: this caller gets a new conversation of its
