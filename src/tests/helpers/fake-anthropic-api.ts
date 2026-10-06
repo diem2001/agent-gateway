@@ -248,7 +248,10 @@ export async function startFakeAnthropicApi(options: {
         if (!Array.isArray(message.content)) continue;
         for (const block of message.content) {
           if (block.type === "tool_result") {
-            toolResults.push({ toolUseId: String(block.tool_use_id ?? ""), isError: block.is_error === true, text: blockText(block.content) });
+            // Newer runtimes append an internal token-budget reminder to tool results. Keep the raw body above for
+            // security scans; normalize only this assertion-friendly projection of the actual tool result.
+            const toolText = blockText(block.content).replace(/\n\n<system-reminder>\n<total_tokens>\d+ tokens left<\/total_tokens>\n<\/system-reminder>$/, "");
+            toolResults.push({ toolUseId: String(block.tool_use_id ?? ""), isError: block.is_error === true, text: toolText });
             resultAt.push(messageIndex);
           }
         }
