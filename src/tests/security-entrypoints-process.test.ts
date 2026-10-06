@@ -54,7 +54,6 @@ import { MiB, sendUpload, startUploadStub } from "./helpers/upload-relay-stub.js
 vi.setConfig({ testTimeout: 300_000 });
 
 const markers: SecurityMarkers = createMarkers();
-const NO_SUCH_TOOL = (tool: string): string => `<tool_use_error>Error: No such tool available: ${tool}</tool_use_error>`;
 const EXPECTED_ROWS = entrypointRowIds();
 const recorder = new MatrixRecorder("security-entrypoints-process", EXPECTED_ROWS);
 
@@ -229,9 +228,7 @@ describe("denied tool and grant enlargement", () => {
     turns.push(turn);
     problems.push(...turnProblems(turn));
     const deniedResult = sub ? resultsFor(rig.api, sub).at(-1) : turn.results[1];
-    if (!deniedResult || !deniedResult.isError || deniedResult.text !== NO_SUCH_TOOL("Bash")) {
-      problems.push(`${row.name}: the denied tool call was not refused by the runtime itself (present=${Boolean(deniedResult)} error=${deniedResult?.isError ?? "none"} noSuchTool=${deniedResult?.text.includes("No such tool available: Bash") ?? false})`);
-    }
+    if (!deniedResult || !deniedResult.isError || !deniedResult.text.includes("No such tool available: Bash")) problems.push(`${row.name}: the denied tool call was not refused by the runtime itself`);
     const offered = requestsFor(rig.api, sub ?? prompt).filter((request) => !request.warmup).flatMap((request) => request.tools);
     if (offered.includes("Bash")) problems.push(`${row.name}: the denied tool was offered to the model`);
     const read = turn.results.at(-1);
