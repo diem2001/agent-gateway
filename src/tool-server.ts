@@ -1,4 +1,4 @@
-import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { buildToolInputShape } from "./tool-input-schema.js";
 import type { ToolDefinition } from "./tools.js";
@@ -39,50 +39,44 @@ export function createToolMcpServer(
   authToken?: WebhookAuth,
   options: ToolServerOptions = {},
 ): McpSdkServerConfigWithInstance {
-  const sdkTools = tools.map((toolDef) => {
+  const server = new McpServer({ name: "agent-gateway-tools", version: "1.0.0" });
+  for (const toolDef of tools) {
     const inputSchema = buildToolInputShape(toolDef.name, toolDef.input_schema);
-
-    return {
-      name: toolDef.name,
+    server.registerTool(toolDef.name, {
       description: toolDef.description,
       inputSchema,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      handler: async (args: Record<string, unknown>, extra: any) => {
-        const toolUseId = String(extra?.requestId ?? "mcp-call");
-        if (options.isGranted && !options.isGranted(toolDef.name)) {
-          return mcpFailureResult({ kind: "denied" });
-        }
-        const bearer = typeof authToken === "function" ? authToken(toolDef) : authToken;
-        const result = await executeWebhook(toolDef, toolUseId, toolDef.name, args, context, bearer, options.secrets?.() ?? []);
+      // The SDK defers MCP tools behind search by default in the new runtime. These registered tools must be offered
+      // on the first turn, as they were before the upgrade.
+      _meta: { "anthropic/alwaysLoad": true },
+    }, async (args: Record<string, unknown>, extra: unknown) => {
+      const request = extra as { requestId?: unknown };
+      const toolUseId = String(request?.requestId ?? "mcp-call");
+      if (options.isGranted && !options.isGranted(toolDef.name)) {
+        return mcpFailureResult({ kind: "denied" });
+      }
+      const bearer = typeof authToken === "function" ? authToken(toolDef) : authToken;
+      const result = await executeWebhook(toolDef, toolUseId, toolDef.name, args, context, bearer, options.secrets?.() ?? []);
 
-        if ("isError" in result && result.isError) {
-          return {
-            isError: true as const,
-            content: [{ type: "text" as const, text: result.output }],
-          };
-        }
+      if ("isError" in result && result.isError) {
+        return {
+          isError: true as const,
+          content: [{ type: "text" as const, text: result.output }],
+        };
+      }
 
-        // Include metadata as structured JSON so Claude sees the full data
-        const success = result as WebhookResponse;
-        const parts: Array<{ type: "text"; text: string }> = [
-          { type: "text" as const, text: success.output },
-        ];
-        if (success.metadata && Object.keys(success.metadata).length > 0) {
-          parts.push({
-            type: "text" as const,
-            text: "\n\n```json\n" + JSON.stringify(success.metadata, null, 2) + "\n```",
-          });
-        }
-        return { content: parts };
-      },
-    };
-  });
-
-  return createSdkMcpServer({
-    name: "agent-gateway-tools",
-    version: "1.0.0",
-    // Cast required: our dynamic shape satisfies SdkMcpToolDefinition<any> at runtime
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    tools: sdkTools as any,
-  });
+      // Include metadata as structured JSON so Claude sees the full data
+      const success = result as WebhookResponse;
+      const parts: Array<{ type: "text"; text: string }> = [
+        { type: "text" as const, text: success.output },
+      ];
+      if (success.metadata && Object.keys(success.metadata).length > 0) {
+        parts.push({
+          type: "text" as const,
+          text: "\n\n```json\n" + JSON.stringify(success.metadata, null, 2) + "\n```",
+        });
+      }
+      return { content: parts };
+    });
+  }
+  return { type: "sdk", name: "agent-gateway-tools", instance: server };
 }

@@ -521,7 +521,7 @@ for pid in os.listdir('/proc'):
         env = open('/proc/%s/environ' % pid, 'rb').read().split(b'\0')
     except Exception:
         continue
-    if cmd.startswith(b'claude'):
+    if os.path.basename(cmd.split(b' ', 1)[0]) == b'claude':
         found = str(len([e for e in env if e.startswith(b'GIT_CONFIG_COUNT=3')]))
 print('RUNTIME_GIT_CONFIG_COUNT_3=' + found)
 PY

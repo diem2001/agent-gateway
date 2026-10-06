@@ -229,7 +229,7 @@ describe("unsupported constructs fall back to any value for that property only",
     const client = await connect([tool("f", { type: "object", properties: { id: { type: "string", format: "uuid" } }, required: ["id"] })]);
     const result = await client.call("f", "{}");
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('"id"');
+    expect(result.content[0].text).toContain("at id");
     expect(result.content[0].text).toContain("expected a value, received undefined");
     expect(webhookBodies).toEqual([]);
   });
@@ -301,19 +301,19 @@ describe("tools/call validates before the webhook (AC-2)", () => {
     ["number for an integer", { ...VALID_PAGE_ARGS, count: 1.5 }, "count", "expected int, received number"],
     ["string for a number", { ...VALID_PAGE_ARGS, amount: "1" }, "amount", "expected number, received string"],
     ["string for a boolean", { ...VALID_PAGE_ARGS, enabled: "true" }, "enabled", "expected boolean, received string"],
-    ["value outside the enum", { ...VALID_PAGE_ARGS, mode: "c" }, "mode", 'expected one of \\"a\\"|\\"b\\"'],
+    ["value outside the enum", { ...VALID_PAGE_ARGS, mode: "c" }, "mode", 'expected one of "a"|"b"'],
     ["value outside an integer enum", { ...VALID_PAGE_ARGS, level: 4 }, "level", "expected one of 1|2|3"],
     ["null for an optional typed field", { ...VALID_PAGE_ARGS, note: null }, "note", "expected string, received null"],
-    ["nested required field missing", { ...VALID_PAGE_ARGS, target: { label: "x" } }, '"target",\n      "id"', "expected string, received undefined"],
-    ["nested wrong type", { ...VALID_PAGE_ARGS, target: { id: 7 } }, '"target",\n      "id"', "expected string, received number"],
-    ["array item violation", { ...VALID_PAGE_ARGS, lines: [{ sku: "S", qty: "2" }] }, '"lines",\n      0,\n      "qty"', "expected number, received string"],
+    ["nested required field missing", { ...VALID_PAGE_ARGS, target: { label: "x" } }, "target.id", "expected string, received undefined"],
+    ["nested wrong type", { ...VALID_PAGE_ARGS, target: { id: 7 } }, "target.id", "expected string, received number"],
+    ["array item violation", { ...VALID_PAGE_ARGS, lines: [{ sku: "S", qty: "2" }] }, "lines[0].qty", "expected number, received string"],
     ["array instead of object", { ...VALID_PAGE_ARGS, target: [] }, "target", "expected object, received array"],
   ])("%s: tool error naming the field path and the expectation; the webhook gets no request", async (_row, args, path, expectation) => {
     const client = await connect([PAGE_TOOL]);
     const result = await client.call("page", JSON.stringify(args));
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toMatch(/^MCP error -32602: Input validation error: Invalid arguments for tool page: \[/);
-    expect(result.content[0].text).toContain(path.includes("\n") ? path : `"${path}"`);
+    expect(result.content[0].text).toMatch(/^MCP error -32602: Input validation error: Invalid arguments for tool page: /);
+    expect(result.content[0].text).toContain(`at ${path}`);
     expect(result.content[0].text).toContain(expectation);
     expect(webhookBodies).toEqual([]);
   });
@@ -398,10 +398,10 @@ describe("prototype-hazard property names (F3)", () => {
     expect(lines).toContain("tools.schema.property_excluded tool=proto property=constructor");
   });
 
-  it("why constructor is left out: the SDK's MCP protocol rejects any call whose arguments hold a constructor key (unchanged)", async () => {
+  it("a top-level constructor argument is stripped before the webhook", async () => {
     const client = await connect([PROTO_TOOL]);
-    await expect(client.call("proto", '{"city": "Berlin", "constructor": "x"}')).rejects.toThrow(/expected record/);
-    expect(webhookBodies).toEqual([]);
+    expect((await client.call("proto", '{"city": "Berlin", "constructor": "x"}')).isError).toBeFalsy();
+    expect(webhookBodies.map((body) => body.body)).toEqual([{ city: "Berlin" }]);
   });
 
   it("the handler receives the model's arguments (not the SDK request context), with or without the optional prototype-named field", async () => {
@@ -412,7 +412,7 @@ describe("prototype-hazard property names (F3)", () => {
 
     const wrong = await client.call("proto", '{"city": "Rome", "toString": "3"}');
     expect(wrong.isError).toBe(true);
-    expect(wrong.content[0].text).toContain('"toString"');
+    expect(wrong.content[0].text).toContain("at toString");
     expect(webhookBodies).toHaveLength(2);
   });
 
@@ -436,7 +436,7 @@ describe("prototype-hazard property names (F3)", () => {
 
     const missing = await client.call("nested", '{"o": {"constructor": "x"}}');
     expect(missing.isError).toBe(true);
-    expect(missing.content[0].text).toContain('"valueOf"');
+    expect(missing.content[0].text).toContain("at o.valueOf");
     expect(missing.content[0].text).toContain("expected number, received undefined");
     expect(webhookBodies).toHaveLength(2);
   });
