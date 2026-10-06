@@ -47,11 +47,18 @@ beforeEach(() => {
   script = [];
   capturedOptions = [];
   sdkServers = [];
+  vi.doMock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
+    McpServer: class {
+      tools: { name: string }[] = [];
+      constructor(options: { name: string }) {
+        sdkServers.push({ name: options.name, tools: this.tools });
+      }
+      registerTool(name: string) {
+        this.tools.push({ name });
+      }
+    },
+  }));
   vi.doMock("@anthropic-ai/claude-agent-sdk", () => ({
-    createSdkMcpServer: vi.fn((options: { name: string; tools: { name: string }[] }) => {
-      sdkServers.push({ name: options.name, tools: options.tools });
-      return { type: "sdk", name: options.name };
-    }),
     query: vi.fn(({ options }) => {
       capturedOptions.push(options as Record<string, unknown>);
       const attempt = script.shift() ?? ANSWER;
@@ -66,6 +73,7 @@ afterEach(async () => {
   const { credentialRelay } = await import("../mcp-credential-relay.js");
   await credentialRelay.close();
   vi.doUnmock("@anthropic-ai/claude-agent-sdk");
+  vi.doUnmock("@modelcontextprotocol/sdk/server/mcp.js");
   delete process.env.TOOLS_PERSIST_PATH;
   delete process.env.MCP_SERVERS_PERSIST_PATH;
   // The registries persist on a 100 ms debounce; let it land before removing the dir.
@@ -178,7 +186,7 @@ describe("enforcedTools (MVP-7637)", () => {
     // MVP-7679: only the user source (the project source reads a `.mcp.json` the agent can write), so no `tools`.
     expect(options.settingSources).toEqual(["user"]);
     expect(options.allowedTools).toEqual([
-      "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList",
+      "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "Agent", "TodoWrite", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList",
       "probe_read", "probe_write", "mcp__jira__*", "mcp__other__*",
     ]);
     expect(Object.keys(options).sort()).toEqual([

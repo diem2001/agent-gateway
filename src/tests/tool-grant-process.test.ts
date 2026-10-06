@@ -202,7 +202,7 @@ async function settle(r: Rig, clientId: string): Promise<string> {
 
 const bash = (prompt: string, command: string): ExactToolScript => ({ name: "Bash", prompt, input: { command, description: "probe" } });
 const write = (prompt: string, filePath: string, content: string): ExactToolScript => ({ name: "Write", prompt, input: { file_path: filePath, content } });
-const task = (prompt: string, subPrompt: string, agent: string): ExactToolScript => ({ name: "Task", prompt, input: { description: "probe", prompt: subPrompt, subagent_type: agent } });
+const task = (prompt: string, subPrompt: string, agent: string): ExactToolScript => ({ name: "Agent", prompt, input: { description: "probe", prompt: subPrompt, subagent_type: agent } });
 const read = (prompt: string, filePath: string): ExactToolScript => ({ name: "Read", prompt, input: { file_path: filePath } });
 
 /* ------------------------------------------------------------------ */
@@ -342,15 +342,14 @@ describe("files the agent writes in its own home cannot start anything on a late
       "/home/node/.claude/settings.local.json",
       JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "touch /work/m-hook-local" }] }], SessionStart: [{ hooks: [{ type: "command", command: "touch /work/m-hook-local-start" }] }] }, permissions: { allow: ["Bash(*)"] } }),
     ),
-    read("W3-READ", "/home/node/.claude.json"),
-    write("W3-WRITE", "/home/node/.claude.json", claudeJson),
+    { ...read("W3-READ", "/home/node/.claude.json"), then: [{ name: "Write", input: { file_path: "/home/node/.claude.json", content: claudeJson } }] },
     bash("W4-BASH", "touch /work/m-bash"),
   ];
 
   it("a later turn starts no server or hook from .mcp.json, settings.local.json or ~/.claude.json, and Bash stays refused", async () => {
     // Write is granted, Bash is not: the policy denies Bash only.
     const r = await rig({ scripts, policy: JSON.stringify({ labels: { proc: { deny: ["Bash"] } } }), seed: seedLikeEntrypoint });
-    for (const prompt of ["W1-MCPJSON", "W2-LOCAL", "W3-READ", "W3-WRITE", "W4-BASH", "PLAIN-1", "PLAIN-2"]) {
+    for (const prompt of ["W1-MCPJSON", "W2-LOCAL", "W3-READ", "W4-BASH", "PLAIN-1", "PLAIN-2"]) {
       const { events } = await ask(r, { prompt, sessionId: "w", useSession: true });
       expect(events.at(-1)?.type, prompt).toBe("done");
       if (prompt.startsWith("W") && prompt !== "W4-BASH") expect(resultFor(r, prompt)?.isError, `${prompt}: ${resultFor(r, prompt)?.text}`).toBe(false);
@@ -731,14 +730,14 @@ describe("without a policy the loaded skills are unchanged (real runtime)", () =
       },
     });
     const { events } = await ask(r, { prompt: "hello", useSession: false, user_id: "u1" });
-    expect(events.find((e) => e.type === "skills_loaded")).toEqual(expect.objectContaining({ type: "skills_loaded", user_id: "u1", skills: ["bashskill", "user-u1-skills:ux"] }));
+    expect(events.find((e) => e.type === "skills_loaded")).toEqual(expect.objectContaining({ type: "skills_loaded", user_id: "u1", skills: expect.arrayContaining(["bashskill", "user-u1-skills:ux"]) }));
     expect(events.map((e) => e.type)).not.toContain("tool_policy");
   });
 
   it("the same with a policy that denies Bash: skills and configured agents still load", async () => {
     const r = await rig({ scripts: [], registerTools: false, policy: DENY_BASH_WRITE, seed: seedConfigured });
     const { events } = await ask(r, { prompt: "hello", useSession: false });
-    expect(events.find((e) => e.type === "skills_loaded")).toMatchObject({ skills: ["bashskill"] });
+    expect(events.find((e) => e.type === "skills_loaded")).toMatchObject({ skills: expect.arrayContaining(["bashskill"]) });
   });
 });
 

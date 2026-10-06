@@ -20,6 +20,7 @@ import { log } from "./logging.js";
 
 /** Built-in tools supported by the bundled Claude Code runtime. */
 export const RUNTIME_BUILT_IN_TOOLS: readonly string[] = [
+  "Agent",
   "AskUserQuestion",
   "Bash",
   "Edit",

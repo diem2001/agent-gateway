@@ -39,7 +39,7 @@ const ANSWER: Attempt = {
 };
 
 const ALL_BUILT_INS = [
-  "AskUserQuestion", "Bash", "Edit", "EnterPlanMode", "ExitPlanMode", "Glob", "Grep", "KillShell", "LSP", "NotebookEdit",
+  "Agent", "AskUserQuestion", "Bash", "Edit", "EnterPlanMode", "ExitPlanMode", "Glob", "Grep", "KillShell", "LSP", "NotebookEdit",
   "Read", "Skill", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskUpdate", "TodoWrite", "WebFetch", "WebSearch", "Write",
 ];
 
@@ -56,11 +56,18 @@ beforeEach(() => {
   vi.spyOn(console, "log").mockImplementation((...args) => {
     logs.push(args.map(String).join(" "));
   });
+  vi.doMock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
+    McpServer: class {
+      tools: SdkTool[] = [];
+      constructor(options: { name: string }) {
+        sdkServers.push({ name: options.name, tools: this.tools });
+      }
+      registerTool(name: string, _config: unknown, handler: SdkTool["handler"]) {
+        this.tools.push({ name, handler });
+      }
+    },
+  }));
   vi.doMock("@anthropic-ai/claude-agent-sdk", () => ({
-    createSdkMcpServer: vi.fn((options: { name: string; tools: SdkTool[] }) => {
-      sdkServers.push({ name: options.name, tools: options.tools });
-      return { type: "sdk", name: options.name };
-    }),
     query: vi.fn(({ options }) => {
       capturedOptions.push(options as Record<string, unknown>);
       const attempt = script.shift() ?? ANSWER;
@@ -75,6 +82,7 @@ afterEach(async () => {
   const { credentialRelay } = await import("../mcp-credential-relay.js");
   await credentialRelay.close();
   vi.doUnmock("@anthropic-ai/claude-agent-sdk");
+  vi.doUnmock("@modelcontextprotocol/sdk/server/mcp.js");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   delete process.env.TOOLS_PERSIST_PATH;

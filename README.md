@@ -307,7 +307,7 @@ One JSON object in the environment, per API-key label (single-quote it in `.env`
 }
 ```
 
-- An entry is a built-in tool name (case-sensitive: `AskUserQuestion`, `Bash`, `Edit`, `EnterPlanMode`, `ExitPlanMode`, `Glob`, `Grep`, `KillShell`, `LSP`, `NotebookEdit`, `Read`, `Skill`, `Task`, `TaskCreate`, `TaskGet`, `TaskList`, `TaskOutput`, `TaskUpdate`, `TodoWrite`, `WebFetch`, `WebSearch`, `Write`), `mcp__<server>__*` or `mcp__<server>__<tool>`. Webhook tools are tools of the server `agent-gateway-tools`.
+- An entry is a built-in tool name (case-sensitive: `Agent`, `AskUserQuestion`, `Bash`, `Edit`, `EnterPlanMode`, `ExitPlanMode`, `Glob`, `Grep`, `KillShell`, `LSP`, `NotebookEdit`, `Read`, `Skill`, `Task`, `TaskCreate`, `TaskGet`, `TaskList`, `TaskOutput`, `TaskUpdate`, `TodoWrite`, `WebFetch`, `WebSearch`, `Write`), `mcp__<server>__*` or `mcp__<server>__<tool>`. Webhook tools are tools of the server `agent-gateway-tools`.
 - Deny beats allow. An absent `allow` means everything a run gets without a policy; `allow: []` means nothing. A label entry replaces `default` for that label. An empty or unset value means no restriction.
 - Startup stops with one fixed line `FATAL config key=AGENT_TOOL_POLICY reason=<reason>` for `must be a JSON object`, `unknown field`, `label not in API_KEYS`, `unknown built-in tool name` or `invalid tool pattern`. One startup audit line per label lists its effective built-in tools and server patterns (names only).
 - **Operator warning:** removing or renaming a label in `API_KEYS` while the policy still names it stops the gateway at startup; because the container restarts automatically it keeps restarting. Update both settings together.
