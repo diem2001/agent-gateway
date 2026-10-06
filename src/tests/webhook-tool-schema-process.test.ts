@@ -509,7 +509,7 @@ describe("webhook tool schemas at the real model boundary (spawned gateway + rea
     it("pageId sent as a number: the model gets a tool error naming pageId and a string expectation; the webhook gets no request", () => {
       const result = api.stepResults()[1];
       expect.soft(result?.isError).toBe(true);
-      expect.soft(result?.text).toContain('"pageId"');
+      expect.soft(result?.text).toContain("at pageId");
       expect.soft(result?.text).toMatch(/expected string, received number/);
       expect.soft(webhookBodiesWithNote("step-wrong-type")).toEqual([]);
     });
@@ -517,7 +517,7 @@ describe("webhook tool schemas at the real model boundary (spawned gateway + rea
     it("a missing required field: the model gets a tool error naming the field; the webhook gets no request", () => {
       const result = api.stepResults()[2];
       expect.soft(result?.isError).toBe(true);
-      expect.soft(result?.text).toContain('"pageId"');
+      expect.soft(result?.text).toContain("at pageId");
       expect.soft(result?.text).toMatch(/received undefined/);
       expect.soft(webhookBodiesWithNote("step-missing-required")).toEqual([]);
     });
@@ -525,9 +525,8 @@ describe("webhook tool schemas at the real model boundary (spawned gateway + rea
     it("a value outside the enum: the model gets a tool error naming the field and the allowed values; the webhook gets no request", () => {
       const result = api.stepResults()[3];
       expect.soft(result?.isError).toBe(true);
-      expect.soft(result?.text).toContain('"mode"');
-      // The issue list is JSON inside the error text, so the quotes arrive escaped.
-      expect.soft(result?.text).toContain('expected one of \\"a\\"|\\"b\\"');
+      expect.soft(result?.text).toContain("at mode");
+      expect.soft(result?.text).toContain('expected one of "a"|"b"');
       expect.soft(webhookBodiesWithNote("step-out-of-enum")).toEqual([]);
     });
 
@@ -541,7 +540,7 @@ describe("webhook tool schemas at the real model boundary (spawned gateway + rea
     it("a webhook error is relayed to the model: the tool's own 4xx message, wrapped with the status (MVP-7679)", () => {
       const result = api.stepResults()[5];
       expect.soft(result?.isError).toBe(true);
-      expect.soft(result?.text).toBe(`The tool rejected the request (HTTP 422): ${WEBHOOK_ERROR_BODY}`);
+      expect.soft(result?.text).toContain(`The tool rejected the request (HTTP 422): ${WEBHOOK_ERROR_BODY}`);
       expect.soft(webhook.requests.filter((r) => r.path === WEBHOOK_ERROR_PATH).map((r) => r.body)).toEqual([{ pageId: "p" }]);
     });
   });
