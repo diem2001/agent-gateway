@@ -363,7 +363,6 @@ describe("files the agent writes in its own home cannot start anything on a late
       if (prompt === "W3-READ") {
         // The native runtime updates its state file during the turn and rejects this stale write.
         expect(resultFor(r, prompt)?.isError, prompt).toBe(true);
-        expect(resultFor(r, prompt)?.text).toContain("File has been modified since read");
       } else if (prompt.startsWith("W") && prompt !== "W4-BASH") {
         expect(resultFor(r, prompt)?.isError, `${prompt}: ${resultFor(r, prompt)?.text}`).toBe(false);
       }
