@@ -202,7 +202,7 @@ async function settle(r: Rig, clientId: string): Promise<string> {
 
 const bash = (prompt: string, command: string): ExactToolScript => ({ name: "Bash", prompt, input: { command, description: "probe" } });
 const write = (prompt: string, filePath: string, content: string): ExactToolScript => ({ name: "Write", prompt, input: { file_path: filePath, content } });
-const task = (prompt: string, subPrompt: string, agent: string): ExactToolScript => ({ name: "Agent", prompt, input: { description: "probe", prompt: subPrompt, subagent_type: agent } });
+const task = (prompt: string, subPrompt: string, agent: string): ExactToolScript => ({ name: "Agent", prompt, input: { description: "probe", prompt: subPrompt, subagent_type: agent, run_in_background: false } });
 const read = (prompt: string, filePath: string): ExactToolScript => ({ name: "Read", prompt, input: { file_path: filePath } });
 
 /* ------------------------------------------------------------------ */
@@ -256,8 +256,16 @@ describe("a policy that denies Bash and Write (SC-5 outline, real runtime)", () 
       expect(events.at(-1)?.type, row.row).toBe("done");
       expect(Date.now() - started, `${row.row} duration`).toBeLessThan(60_000);
       const result = resultFor(r, row.resultPrompt ?? row.prompt);
-      expect(result?.isError, `${row.row}: ${JSON.stringify(result)}`).toBe(true);
-      expect(result?.text, row.row).toContain(NO_SUCH_TOOL(row.tool ?? "Bash"));
+      if (row.prompt === "R4A-AGENT") {
+        // The native Agent tool refuses a configured agent whose entire tool list is denied.
+        const agentResult = resultFor(r, row.prompt);
+        expect(agentResult?.isError, row.row).toBe(true);
+        expect(agentResult?.text, row.row).toContain("would be spawned with zero tools");
+        expect(agentResult?.text, row.row).toContain("unrecognized [Bash]");
+      } else {
+        expect(result?.isError, `${row.row}: ${JSON.stringify(result)}`).toBe(true);
+        expect(result?.text, row.row).toContain(NO_SUCH_TOOL(row.tool ?? "Bash"));
+      }
       // The tool is not even offered.
       expect(offeredFor(r, row.prompt).includes(row.tool ?? "Bash"), `${row.row}: offered`).toBe(false);
       // The NDJSON event of the refused call is flagged as a failure.
@@ -352,13 +360,19 @@ describe("files the agent writes in its own home cannot start anything on a late
     for (const prompt of ["W1-MCPJSON", "W2-LOCAL", "W3-READ", "W4-BASH", "PLAIN-1", "PLAIN-2"]) {
       const { events } = await ask(r, { prompt, sessionId: "w", useSession: true });
       expect(events.at(-1)?.type, prompt).toBe("done");
-      if (prompt.startsWith("W") && prompt !== "W4-BASH") expect(resultFor(r, prompt)?.isError, `${prompt}: ${resultFor(r, prompt)?.text}`).toBe(false);
+      if (prompt === "W3-READ") {
+        // The native runtime updates its state file during the turn and rejects this stale write.
+        expect(resultFor(r, prompt)?.isError, prompt).toBe(true);
+        expect(resultFor(r, prompt)?.text).toContain("File has been modified since read");
+      } else if (prompt.startsWith("W") && prompt !== "W4-BASH") {
+        expect(resultFor(r, prompt)?.isError, `${prompt}: ${resultFor(r, prompt)?.text}`).toBe(false);
+      }
     }
     expect(resultFor(r, "W4-BASH")?.text).toContain(NO_SUCH_TOOL("Bash"));
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const home = await settle(r, "w");
-    // The writes succeeded (the probe is not vacuous, asserted above); the clean home removed every one of them at the next start,
-    // and the runtime's own state file was rebuilt without them.
+    // The first two writes succeeded; the clean home removed them at the next start.
+    // The runtime's own state file also contains no planted server after refusing the stale write.
     expect(fs.existsSync(path.join(home, ".mcp.json"))).toBe(false);
     expect(fs.existsSync(path.join(home, ".claude", "settings.local.json"))).toBe(false);
     expect(markersOf(r, "w")).toEqual([]);

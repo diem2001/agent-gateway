@@ -653,8 +653,9 @@ describe("a run's credentials do not remain in the Claude runtime's own log file
 });
 
 describe("the relay carries a working MCP server (real runtime)", () => {
-  it("SSE answers, the Mcp-Session-Id round trip and a multi-MB tool result reach the model", async () => {
-    const stub = await mcpStub({ responseMode: "sse", toolResultBytes: 3 * 1024 * 1024 });
+  it("SSE answers, the Mcp-Session-Id round trip and a large tool result reach the model", async () => {
+    // The native runtime rejects multi-MB MCP results before sending them to the model.
+    const stub = await mcpStub({ responseMode: "sse", toolResultBytes: 256 * 1024 });
     const api = await fakeApi();
     const gateway = await spawnGateway(api);
     await registerHttpServer(gateway, SERVER, stub);
@@ -666,14 +667,12 @@ describe("the relay carries a working MCP server (real runtime)", () => {
     expect(results).toHaveLength(1);
     expect(results[0].isError).toBe(false);
     expect(results[0].text).toContain(stub.toolResultPrefix);
-    const afterInitialize = stub.requests.filter((r) => r.path === "/mcp" && r.method === "POST" && !r.rpcMethods.includes("initialize"));
+    const afterInitialize = stub.requests.filter((r) => r.path === "/mcp" && r.method === "POST" && !r.rpcMethods.includes("initialize") && !r.rpcMethods.includes("server/discover"));
     expect(afterInitialize.length).toBeGreaterThan(0);
     expect(afterInitialize.every((r) => r.headers["mcp-session-id"] === "stub-session-1")).toBe(true);
   }, 90_000);
 
-  it("a lost upstream session (404) reaches the runtime as a plain 404: a tool error, as with a direct connection, and no login", async () => {
-    // Claude Code 2.0.77 does not initialize a new session after the 404; it reports the call as failed.
-    // A direct connection (before the relay) gives the same tool result.
+  it("a lost upstream session (404) is reinitialized by the native runtime without login", async () => {
     const stub = await mcpStub({ loseSessionOn: "tools/call" });
     const api = await fakeApi();
     const gateway = await spawnGateway(api);
@@ -683,11 +682,11 @@ describe("the relay carries a working MCP server (real runtime)", () => {
 
     expect(outcome.finalText).toContain(FINAL_ANSWER);
     expect(outcome.events.at(-1)?.type).toBe("done");
-    expect(stub.requests.find((r) => r.rpcMethods.includes("tools/call"))?.status).toBe(404);
+    expect(stub.requests.filter((r) => r.rpcMethods.includes("tools/call")).map((r) => r.status)).toEqual([404, 200]);
     const results = api.agentRequests().flatMap((r) => r.toolResults);
     expect(results).toHaveLength(1);
-    expect(results[0].isError).toBe(true);
-    expect(results[0].text).toBe("Streamable HTTP error: Error POSTing to endpoint:");
+    expect(results[0].isError).toBe(false);
+    expect(results[0].text).toContain(stub.toolResultPrefix);
     expect({ metadata: stub.counters.metadata, registration: stub.counters.registration }).toEqual({ metadata: 0, registration: 0 });
   }, 90_000);
 
