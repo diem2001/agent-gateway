@@ -28,7 +28,6 @@ export type RunFailureKind =
   | "isolation_unavailable"
   | "isolation_timeout"
   | "run_deadline"
-  | "session_other_owner"
   | "session_legacy"
   | "session_busy";
 
@@ -369,7 +368,6 @@ export function fixedFailure(kind: RunFailureKind, message: string): RunFailure 
   return new RunFailure(kind, message, fields, null);
 }
 
-/** Conversation admission refusals (MVP-7678). The "other owner" text does not confirm that the conversation exists. */
-export const SESSION_OTHER_OWNER_MESSAGE = "This conversation cannot be continued from your account. Please start a new conversation.";
+/** Conversation admission refusals (MVP-7678). Both texts are pinned: reqlift matches them byte for byte (MVP-8045). */
 export const SESSION_LEGACY_MESSAGE = "This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help.";
 export const SESSION_BUSY_MESSAGE = "This conversation is still answering an earlier request. Please wait until it has finished, then try again.";
