@@ -278,14 +278,14 @@ describe("conversations of different callers that run at the same time", () => {
     // with another user id and with none, each gets a run that reads conv-A's file and no refusal text. Another
     // API-key label does not see the conversation at all (MVP-7679): it gets its own new conversation under the same
     // id. Neither label lists or deletes the other's conversation.
-    r.scripts.push(bash("PROBE-A-WRITER", "echo SEEN=$(cat /work/a.txt)"), bash("PROBE-A-NOUSER", "echo SEEN=$(cat /work/a.txt)"));
-    const sameLabelOtherUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-writer", sessionId: "conv-A", prompt: "PROBE-A-WRITER", user_id: "user-other" });
+    r.scripts.push(bash("WRITER-OF-A", "echo SEEN=$(cat /work/a.txt)"), bash("NOUSER-OF-A", "echo SEEN=$(cat /work/a.txt)"));
+    const sameLabelOtherUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-writer", sessionId: "conv-A", prompt: "WRITER-OF-A", user_id: "user-other" });
     expect(sameLabelOtherUser.events.at(-1)?.type, JSON.stringify(sameLabelOtherUser.events.at(-1))).toBe("done");
     expect(sameLabelOtherUser.events.some((e) => e.type === "error")).toBe(false);
-    expect(resultsFor(r.api, "PROBE-A-WRITER").at(-1)?.text).toContain(`SEEN=${SECRET_A}`);
-    const noUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-nouser", sessionId: "conv-A", prompt: "PROBE-A-NOUSER" });
+    expect(resultsFor(r.api, "WRITER-OF-A").at(-1)?.text).toContain(`SEEN=${SECRET_A}`);
+    const noUser = await queryAs(r.gateway.port, KEY_ALPHA, { queryId: "q-nouser", sessionId: "conv-A", prompt: "NOUSER-OF-A" });
     expect(noUser.events.at(-1)?.type, JSON.stringify(noUser.events.at(-1))).toBe("done");
-    expect(resultsFor(r.api, "PROBE-A-NOUSER").at(-1)?.text).toContain(`SEEN=${SECRET_A}`);
+    expect(resultsFor(r.api, "NOUSER-OF-A").at(-1)?.text).toContain(`SEEN=${SECRET_A}`);
     expect(sessionHome(r.gateway, "conv-A")).toBe(homeA);
     const listBeta = await getAs(r.gateway.port, KEY_BETA, "GET", "/v1/sessions");
     expect((listBeta.json?.sessions as { id: string }[]).map((s) => s.id)).toEqual(["conv-B"]);
