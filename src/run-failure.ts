@@ -151,6 +151,9 @@ function providerFacts(text: string): ProviderFacts {
   try {
     parsed = JSON.parse(body);
   } catch {
+    // Recent native runtimes flatten the provider JSON to its message before
+    // emitting the error-flagged assistant/result frames.
+    facts.message = body.slice(0, MAX_VERSION_TEXT_CHARS);
     return facts;
   }
   for (const path of [["error", "type"], ["error", "error", "type"]]) {
@@ -265,10 +268,13 @@ function classify(diagnostics: RunDiagnostics, queryId: string | undefined): Run
 
   let kind: RunFailureKind = "unknown";
   let required: string | null = null;
-  if (codes.includes("claude_code_version_too_old")) {
+  const plainVersion = facts.some((f) => f.status === 400 && f.message !== null &&
+    (/^This model requires Claude Code version \d{1,5}\.\d{1,5}\.\d{1,5} or newer\./.test(f.message) ||
+      /^This version of Claude Code is no longer supported for this model\./.test(f.message)));
+  if (codes.includes("claude_code_version_too_old") || plainVersion) {
     kind = "runtime_version_unsupported";
     for (const f of facts) {
-      if (f.codes.includes("claude_code_version_too_old") || f.types.includes("claude_code_version_too_old")) required ??= requiredVersion(f.message);
+      if (f.codes.includes("claude_code_version_too_old") || f.types.includes("claude_code_version_too_old") || (plainVersion && f.status === 400)) required ??= requiredVersion(f.message);
     }
   } else if (errorEnums.includes("authentication_failed") || types.includes("authentication_error") || types.includes("permission_error")) {
     kind = "authentication";

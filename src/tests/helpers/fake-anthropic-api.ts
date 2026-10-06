@@ -260,7 +260,17 @@ export async function startFakeAnthropicApi(options: {
       const model = body.model ?? "unknown";
       const stream = body.stream === true;
       const warmup = userTexts.length > 0 && userTexts.every((text) => text === "Warmup");
-      const session = typeof body.metadata?.user_id === "string" ? (/_session_([^_]*)$/.exec(body.metadata.user_id)?.[1] ?? "") : "";
+      const userId = body.metadata?.user_id;
+      let session = typeof userId === "string" ? (/_session_([^_]*)$/.exec(userId)?.[1] ?? "") : "";
+      if (!session && typeof userId === "string") {
+        // New native runtimes encode the session in JSON metadata.user_id.
+        try {
+          const metadata = JSON.parse(userId) as { session_id?: unknown };
+          if (typeof metadata.session_id === "string") session = metadata.session_id;
+        } catch {
+          // Legacy IDs are not JSON.
+        }
+      }
       const url = new URL(req.url ?? "/", "http://fake.invalid");
       const header = (name: string): string | null => (typeof req.headers[name] === "string" ? (req.headers[name] as string) : null);
       const record: RecordedMessagesRequest = {

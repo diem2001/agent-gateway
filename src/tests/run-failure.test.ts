@@ -57,6 +57,20 @@ const ROWS: Row[] = [
     message: VERSION_BOTH,
   },
   {
+    name: "native runtime plain-text version rejection",
+    diagnostics: rejection("API Error: 400 This model requires Claude Code version 2.1.280 or newer. Please update Claude Code."),
+    kind: "runtime_version_unsupported",
+    retryable: false,
+    message: VERSION_BOTH,
+  },
+  {
+    name: "native runtime plain-text version rejection without required version",
+    diagnostics: rejection("API Error: 400 This version of Claude Code is no longer supported for this model. Please update Claude Code."),
+    kind: "runtime_version_unsupported",
+    retryable: false,
+    message: VERSION_INSTALLED_ONLY,
+  },
+  {
     name: "version rejection with a >= required version",
     diagnostics: rejection(versionError("Claude Code >= 2.1.280 is required for this model.")),
     kind: "runtime_version_unsupported",

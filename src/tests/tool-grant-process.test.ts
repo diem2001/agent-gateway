@@ -893,7 +893,7 @@ describe("startup with the new configuration keys", () => {
   it("a valid policy starts the gateway and logs one line per label", async () => {
     const { code, output } = await startGateway({ AGENT_TOOL_POLICY: JSON.stringify({ labels: { proc: { deny: ["Bash"] } } }) });
     expect(code).toBeNull();
-    expect(output).toMatch(/\[audit\] tool\.policy label=proc builtIns=AskUserQuestion,Edit,/);
+    expect(output).toMatch(/\[audit\] tool\.policy label=proc builtIns=Agent,AskUserQuestion,Edit,/);
     expect(output).toContain("tool.policy label=other builtIns=all servers=all");
   });
 
