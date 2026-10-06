@@ -1,10 +1,10 @@
 /**
- * Conversation ownership and legacy refusal (MVP-7678, sessions.ts, query.ts): conversations are keyed by
- * (API-key label, client id) (MVP-7679), within a label the exact-owner rule (user id, null and a present user id
- * being different owners), admission without any change to the entry, legacy entries, caller-scoped list and delete,
- * the recorded sandbox home name, persistence across a restart, and the query route's refusals (fixed texts, 0 runs,
- * no session change). The agent run is mocked here; the real-runtime rows are in
- * session-isolation-process.test.ts.
+ * Conversation admission and legacy refusal (MVP-7678, MVP-8044, sessions.ts, query.ts): conversations are keyed by
+ * (API-key label, client id) (MVP-7679) and belong to the label (DEC-ISO-007): within a label any `user_id`, null or
+ * present, continues the conversation; admission without any change to the entry, legacy entries, caller-scoped list
+ * and delete, the recorded sandbox home name, persistence across a restart, and the query route's refusals (fixed
+ * texts, 0 runs, no session change). The agent run is mocked here; the real-runtime rows are in
+ * session-isolation-process.test.ts and shared-conversation-process.test.ts.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -65,7 +65,7 @@ describe("the owner rule", () => {
     expect(saved.sessionsByLabel.reqlift.c1.sandboxDirId).toBe(created.sandboxDirId);
   });
 
-  it("the exact owner resumes, with the same sandbox home", async () => {
+  it("the creator resumes, with the same sandbox home", async () => {
     const m = await sessionsModule();
     const created = m.getSession("c1", "sys", "model", true, A);
     m.updateSessionSdkId("c1", "sdk-1", A.label);
@@ -75,13 +75,28 @@ describe("the owner rule", () => {
   });
 
   it.each([
-    ["the same label with another user id", { label: "reqlift", userId: "user-2" }],
-    ["the same label without a user id (null is not a user)", { label: "reqlift", userId: null }],
-  ])("%s is refused as another owner", async (_label, caller) => {
+    ["A", "B", "user-A", "user-B"],
+    ["none", "B", null, "user-B"],
+    ["B", "none", "user-B", null],
+    ["A", "A", "user-A", "user-A"],
+  ])("creator %s, writer %s: the same label resumes the conversation in the same home (the label decides, not the user id)", async (_c, _w, creatorId, writerId) => {
+    const m = await sessionsModule();
+    const created = m.getSession("c1", "sys", "model", true, { label: "reqlift", userId: creatorId });
+    m.updateSessionSdkId("c1", "sdk-1", "reqlift");
+    const writer = { label: "reqlift", userId: writerId };
+    expect(m.admitSession("c1", writer)).toEqual({ kind: "resume", sandboxDirId: created.sandboxDirId });
+    const resumed = m.getSession("c1", "sys", "model", true, writer);
+    expect(resumed).toEqual({ sessionId: "sdk-1", isNew: false, sandboxDirId: created.sandboxDirId });
+  });
+
+  it("the creator's user id stays on the entry as metadata and a later writer does not replace it", async () => {
     const m = await sessionsModule();
     m.getSession("c1", "sys", "model", true, A);
-    m.updateSessionSdkId("c1", "sdk-1", A.label);
-    expect(m.admitSession("c1", caller)).toEqual({ kind: "refused", reason: "other_owner" });
+    m.updateSessionSdkId("c1", "sdk-1", "reqlift");
+    m.getSession("c1", "sys", "model", true, { label: "reqlift", userId: "user-2" });
+    m.flushSessions();
+    const saved = JSON.parse(fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8")) as { sessionsByLabel: Record<string, Record<string, { owner: unknown }>> };
+    expect(saved.sessionsByLabel.reqlift.c1.owner).toEqual(A);
   });
 
   it.each([
@@ -115,21 +130,23 @@ describe("the owner rule", () => {
     expect(m.listSessions("diemai").map((x) => x.id)).toEqual(["reqlift:abc"]);
   });
 
-  it("a conversation created without a user id is not continued with one", async () => {
+  it("a conversation created without a user id is continued with one, and the reverse", async () => {
     const m = await sessionsModule();
     m.getSession("c1", "sys", "model", true, { label: "reqlift", userId: null });
     expect(m.admitSession("c1", { label: "reqlift", userId: null }).kind).toBe("resume");
-    expect(m.admitSession("c1", { label: "reqlift", userId: "user-1" })).toEqual({ kind: "refused", reason: "other_owner" });
+    expect(m.admitSession("c1", { label: "reqlift", userId: "user-1" }).kind).toBe("resume");
+    m.getSession("c2", "sys", "model", true, A);
+    expect(m.admitSession("c2", { label: "reqlift", userId: null }).kind).toBe("resume");
   });
 
-  it("admission changes nothing: a refused caller leaves the entry exactly as it was", async () => {
+  it("admission changes nothing: an admission of another writer or another label leaves the entry exactly as it was", async () => {
     const m = await sessionsModule();
     m.getSession("c1", "original system prompt", "model-a", true, A);
     m.updateSessionSdkId("c1", "sdk-1", A.label);
     m.flushSessions();
     const before = fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8");
     await new Promise((r) => setTimeout(r, 20));
-    expect(m.admitSession("c1", { label: A.label, userId: "user-2" })).toEqual({ kind: "refused", reason: "other_owner" });
+    expect(m.admitSession("c1", { label: A.label, userId: "user-2" }).kind).toBe("resume");
     expect(m.admitSession("c1", B)).toEqual({ kind: "new" });
     m.flushSessions();
     expect(fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8")).toBe(before);
@@ -224,7 +241,7 @@ describe("list and delete are scoped to the caller's label", () => {
 });
 
 describe("restart", () => {
-  it("owner and sandbox home name survive a restart, and the same owner resumes", async () => {
+  it("owner and sandbox home name survive a restart, and any writer of the label resumes", async () => {
     const m1 = await sessionsModule();
     const created = m1.getSession("c1", "sys", "model", true, A);
     m1.updateSessionSdkId("c1", "sdk-1", A.label);
@@ -233,7 +250,8 @@ describe("restart", () => {
     const m2 = await sessionsModule();
     m2.loadSessions();
     expect(m2.admitSession("c1", A)).toEqual({ kind: "resume", sandboxDirId: created.sandboxDirId });
-    expect(m2.admitSession("c1", { label: A.label, userId: "user-2" })).toEqual({ kind: "refused", reason: "other_owner" });
+    expect(m2.admitSession("c1", { label: A.label, userId: "user-2" })).toEqual({ kind: "resume", sandboxDirId: created.sandboxDirId });
+    expect(m2.admitSession("c1", { label: A.label, userId: null })).toEqual({ kind: "resume", sandboxDirId: created.sandboxDirId });
     expect(m2.admitSession("c1", B)).toEqual({ kind: "new" });
   });
 });
@@ -261,7 +279,7 @@ describe("the query route", () => {
     return { res, events };
   }
 
-  it("a new conversation runs with its recorded sandbox home name, the same owner resumes with it, anyone else is refused without a run", async () => {
+  it("a new conversation runs with its recorded sandbox home name, any writer of the label resumes with it, another label gets its own", async () => {
     runQuery.mockResolvedValue(ok);
     const { app: server, sessions } = await app();
     const first = await ask(server, { queryId: "q1", sessionId: "c1", user_id: "user-1" });
@@ -275,24 +293,25 @@ describe("the query route", () => {
     expect(runQuery).toHaveBeenCalledTimes(2);
     expect((runQuery.mock.calls[1][0] as { sandboxDirId?: string; isResume?: boolean })).toMatchObject({ sandboxDirId: firstDir, isResume: true });
 
-    const snapshot = JSON.stringify(sessions.listSessions());
-    for (const [label, body] of [
-      ["reqlift", { user_id: "user-2" }],
-      ["reqlift", {}],
+    // Another person of the same label (another user id, none) continues the conversation in the same home: one run
+    // each, no refusal text (MVP-8044).
+    for (const [n, body] of [
+      [3, { user_id: "user-2" }],
+      [4, {}],
     ] as const) {
-      const refused = await ask(server, { queryId: `q-${label}-${JSON.stringify(body)}`, sessionId: "c1", ...body }, label);
-      expect(refused.events).toEqual([{ seq: 0, type: "error", content: "This conversation cannot be continued from your account. Please start a new conversation." }]);
+      const writer = await ask(server, { queryId: `q-writer-${n}`, sessionId: "c1", ...body });
+      expect(writer.events.at(-1)?.type).toBe("done");
+      expect(writer.events.some((e) => e.type === "error")).toBe(false);
+      expect(runQuery).toHaveBeenCalledTimes(n);
+      expect(runQuery.mock.calls[n - 1][0]).toMatchObject({ sandboxDirId: firstDir, isResume: true });
     }
-    // 0 runs for the refusals, and the conversation is untouched.
-    expect(runQuery).toHaveBeenCalledTimes(2);
-    expect(JSON.stringify(sessions.listSessions())).toBe(snapshot);
 
     // Another label using the same id is not refused and learns nothing: it gets its own new conversation
     // (MVP-7679), with its own home, and reqlift's conversation is untouched.
     const other = await ask(server, { queryId: "q-other-label", sessionId: "c1", user_id: "user-1" }, "diemai");
     expect(other.events.at(-1)?.type).toBe("done");
-    expect(runQuery).toHaveBeenCalledTimes(3);
-    const otherCall = runQuery.mock.calls[2][0] as { sandboxDirId?: string; isResume?: boolean };
+    expect(runQuery).toHaveBeenCalledTimes(5);
+    const otherCall = runQuery.mock.calls[4][0] as { sandboxDirId?: string; isResume?: boolean };
     expect(otherCall.isResume).toBe(false);
     expect(otherCall.sandboxDirId).toMatch(/^[0-9a-f]{24}$/);
     expect(otherCall.sandboxDirId).not.toBe(firstDir);
@@ -301,7 +320,7 @@ describe("the query route", () => {
     // reqlift resumes its own conversation, not the other label's.
     const resumed = await ask(server, { queryId: "q-again", sessionId: "c1", user_id: "user-1" });
     expect(resumed.events.at(-1)?.type).toBe("done");
-    expect(runQuery.mock.calls[3][0]).toMatchObject({ sandboxDirId: firstDir, isResume: true });
+    expect(runQuery.mock.calls[5][0]).toMatchObject({ sandboxDirId: firstDir, isResume: true });
   });
 
   it("a legacy conversation is refused with the fixed text, no run, no change; with the exact NDJSON shape (one error event, no done)", async () => {
@@ -313,8 +332,24 @@ describe("the query route", () => {
     expect(refused.events).toEqual([
       { seq: 0, type: "error", content: "This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help." },
     ]);
+    // Refused for every caller alike (another user id, none, another label), each with exactly one error and no done.
+    for (const [label, body] of [
+      ["reqlift", { user_id: "user-2" }],
+      ["reqlift", {}],
+      ["diemai", { user_id: "user-1" }],
+    ] as const) {
+      const again = await ask(server, { queryId: `q-legacy-${label}-${JSON.stringify(body)}`, sessionId: "old", ...body }, label);
+      expect(again.events).toEqual(refused.events);
+    }
     expect(runQuery).not.toHaveBeenCalled();
     expect(sessions.getSessionCount()).toBe(1);
+  });
+
+  it("the refusal texts of the legacy and busy cases are pinned verbatim, and the other-owner text no longer exists", async () => {
+    const failure = await import("../run-failure.js");
+    expect(failure.SESSION_LEGACY_MESSAGE).toBe("This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help.");
+    expect(failure.SESSION_BUSY_MESSAGE).toBe("This conversation is still answering an earlier request. Please wait until it has finished, then try again.");
+    expect(Object.keys(failure).filter((name) => /OTHER_OWNER/i.test(name))).toEqual([]);
   });
 
   it("a second request for a conversation that is still answering is refused as busy with no run, and the first request is unaffected", async () => {
@@ -323,18 +358,25 @@ describe("the query route", () => {
     const { app: server } = await app();
     const firstDone = ask(server, { queryId: "q1", sessionId: "busy", user_id: "user-1" });
     await vi.waitFor(() => expect(runQuery).toHaveBeenCalledTimes(1));
-    const second = await ask(server, { queryId: "q2", sessionId: "busy", user_id: "user-1" });
-    expect(second.events).toEqual([{ seq: 0, type: "error", content: "This conversation is still answering an earlier request. Please wait until it has finished, then try again." }]);
+    // The lock is per conversation: a request of another user id or without one is refused as busy too.
+    for (const [n, body] of [
+      [2, { user_id: "user-1" }],
+      [3, { user_id: "user-2" }],
+      [4, {}],
+    ] as const) {
+      const second = await ask(server, { queryId: `q${n}`, sessionId: "busy", ...body });
+      expect(second.events).toEqual([{ seq: 0, type: "error", content: "This conversation is still answering an earlier request. Please wait until it has finished, then try again." }]);
+    }
     expect(runQuery).toHaveBeenCalledTimes(1);
     // Another conversation of the same owner is not blocked.
     runQuery.mockResolvedValueOnce(ok);
-    const other = await ask(server, { queryId: "q3", sessionId: "other", user_id: "user-1" });
+    const other = await ask(server, { queryId: "q5", sessionId: "other", user_id: "user-1" });
     expect(other.events.at(-1)?.type).toBe("done");
     finish(ok);
     expect((await firstDone).events.at(-1)?.type).toBe("done");
     // Free again once the run ended: the next request is accepted.
     runQuery.mockResolvedValueOnce(ok);
-    const third = await ask(server, { queryId: "q4", sessionId: "busy", user_id: "user-1" });
+    const third = await ask(server, { queryId: "q6", sessionId: "busy", user_id: "user-2" });
     expect(third.events.at(-1)?.type).toBe("done");
   });
 
