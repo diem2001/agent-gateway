@@ -938,7 +938,7 @@ describe("sampler and refusal-check controls", () => {
     expect(problems.filter((problem) => problem.includes("runtime process(es) started in a window that must start none")).length).toBe(1);
     const flagged = seen.records.filter((record) => record.unsandboxed);
     expect(flagged.map((record) => record.pid)).toEqual(expect.arrayContaining(seen.unsandboxedRuntimes));
-    expect(flagged.some((record) => record.exe === "node" && record.verdict === "runtime")).toBe(true);
+    expect(flagged.some((record) => record.exe === "claude" && record.verdict === "runtime")).toBe(true);
     expect(problems.join(" ")).not.toContain(rig.markers.values.providerApiKey);
     void asked;
   });
@@ -949,7 +949,7 @@ describe("sampler and refusal-check controls", () => {
     const turn = await chatTurn(rig, { prompt: "IF-CONTROL-BYPASS-READY", sessionId: "conv-control-bypass-ready", steps: [bashStep("echo CONTROL")], withCredentials: false });
     const problems = turnProblems(turn);
     expect(problems.filter((problem) => problem.includes("agent runtime(s) ran without a sandbox ancestor")).length).toBe(1);
-    expect(turn.sample.records.some((record) => record.unsandboxed && record.exe === "node" && record.verdict === "runtime")).toBe(true);
+    expect(turn.sample.records.some((record) => record.unsandboxed && record.exe === "claude" && record.verdict === "runtime")).toBe(true);
   });
 
   it("control: a sandboxed runtime in a window that must start none is reported as a started runtime, and not as one outside the sandbox", async () => {

@@ -161,7 +161,7 @@ describe("evidence lines", () => {
 
   it("the evidence line names commit, tree, versions, log level and deadlines", () => {
     const line = evidenceLine({ suite: "t1", config: { LOG_LEVEL: "debug" }, deadlines: { turn: 120000 }, offline: true, logLevel: "debug" });
-    expect(line).toMatch(/^SECURITY-EVIDENCE suite=t1 commit=[0-9a-f]{40} tree=[0-9a-f]{40} tracked_changes=\d+ claude_code_version=2\.0\.\d+ sdk=0\.1\.\d+ bwrap=\S+ node=v\d+/);
+    expect(line).toMatch(/^SECURITY-EVIDENCE suite=t1 commit=[0-9a-f]{40} tree=[0-9a-f]{40} tracked_changes=\d+ claude_code_version=2\.1\.292 sdk=0\.3\.292 bwrap=\S+ node=v\d+/);
     expect(line).toContain("log_level=debug offline=true config=LOG_LEVEL:debug deadlines=turn:120000");
   });
 

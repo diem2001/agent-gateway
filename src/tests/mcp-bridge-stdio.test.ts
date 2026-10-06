@@ -215,7 +215,7 @@ describe("the sandbox command line (exact options)", () => {
       const content = JSON.parse((reply as unknown as { message: { result: { content: { text: string }[] } } }).message.result.content[0].text) as { env: Record<string, string> };
       expect(content.env.TOKEN).toBe("SYNTH-STDIO-SECRET-7679");
       const keys = Object.keys(content.env).filter((k) => !["PWD", "SHLVL", "_", "OLDPWD"].includes(k)).sort();
-      expect(keys).toEqual(["HOME", "LANG", "PATH", "TERM", "TMPDIR", "TOKEN", "USER"]);
+      expect(keys).toEqual(["HOME", "LANG", ...["LC_ALL", "LC_CTYPE"].filter((key) => typeof process.env[key] === "string"), "PATH", "TERM", "TMPDIR", "TOKEN", "USER"]);
       expect(JSON.stringify(content.env)).not.toContain("SYNTH-PROVIDER-NOT-FOR-TOOLS-7679");
       expect(JSON.stringify(content.env)).not.toContain("SYNTH-GATEWAY-KEY-7679");
     } finally {

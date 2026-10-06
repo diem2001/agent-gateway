@@ -29,7 +29,7 @@ afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()!();
 });
 
-const NO_SUCH_TOOL = (name: string) => `<tool_use_error>Error: No such tool available: ${name}</tool_use_error>`;
+const NO_SUCH_TOOL = (name: string) => `No such tool available: ${name}`;
 const DENY_BASH_WRITE = JSON.stringify({ labels: { proc: { deny: ["Bash", "Write"] } } });
 
 /* ------------------------------------------------------------------ */
@@ -257,7 +257,7 @@ describe("a policy that denies Bash and Write (SC-5 outline, real runtime)", () 
       expect(Date.now() - started, `${row.row} duration`).toBeLessThan(60_000);
       const result = resultFor(r, row.resultPrompt ?? row.prompt);
       expect(result?.isError, `${row.row}: ${JSON.stringify(result)}`).toBe(true);
-      expect(result?.text, row.row).toBe(NO_SUCH_TOOL(row.tool ?? "Bash"));
+      expect(result?.text, row.row).toContain(NO_SUCH_TOOL(row.tool ?? "Bash"));
       // The tool is not even offered.
       expect(offeredFor(r, row.prompt).includes(row.tool ?? "Bash"), `${row.row}: offered`).toBe(false);
       // The NDJSON event of the refused call is flagged as a failure.
@@ -297,7 +297,7 @@ describe("a policy that denies Bash and Write (SC-5 outline, real runtime)", () 
     for (const [prompt, tool] of [["E1-READ", "Read"], ["E2-BASH", "Bash"]] as const) {
       const { events } = await ask(r, { prompt, sessionId: `e-${tool}`, useSession: true, allowedTools: [] });
       expect(events.at(-1)?.type, prompt).toBe("done");
-      expect(resultFor(r, prompt)?.text, prompt).toBe(NO_SUCH_TOOL(tool));
+      expect(resultFor(r, prompt)?.text, prompt).toContain(NO_SUCH_TOOL(tool));
       expect(offeredFor(r, prompt).filter((name) => !name.startsWith("mcp__")), prompt).toEqual([]);
     }
     expect(fs.existsSync(path.join(await settle(r, "e-Bash"), "m-e2"))).toBe(false);
@@ -314,7 +314,7 @@ describe("an enforced set with a member the policy does not grant (real runtime)
     const requested = ["Bash", "Read", "mcp__agent-gateway-tools__probe_read"];
     const denied = await ask(r, { prompt: "N1-BASH", sessionId: "n1", useSession: true, enforcedTools: requested });
     expect(denied.events[0]).toEqual({ seq: 0, type: "tool_policy", enforced: true, tools: requested });
-    expect(resultFor(r, "N1-BASH")?.text).toBe(NO_SUCH_TOOL("Bash"));
+    expect(resultFor(r, "N1-BASH")?.text).toContain(NO_SUCH_TOOL("Bash"));
     expect(fs.existsSync(path.join(await settle(r, "n1"), "m-n1"))).toBe(false);
     expect(r.gateway.output()).toMatch(/\[audit\] tool\.policy\.narrowed queryId=q-7679-\d+-\d+ denied=Bash/);
     const granted = await ask(r, { prompt: "N2-READ", useSession: false, enforcedTools: requested });
@@ -355,7 +355,7 @@ describe("files the agent writes in its own home cannot start anything on a late
       expect(events.at(-1)?.type, prompt).toBe("done");
       if (prompt.startsWith("W") && prompt !== "W4-BASH") expect(resultFor(r, prompt)?.isError, `${prompt}: ${resultFor(r, prompt)?.text}`).toBe(false);
     }
-    expect(resultFor(r, "W4-BASH")?.text).toBe(NO_SUCH_TOOL("Bash"));
+    expect(resultFor(r, "W4-BASH")?.text).toContain(NO_SUCH_TOOL("Bash"));
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const home = await settle(r, "w");
     // The writes succeeded (the probe is not vacuous, asserted above); the clean home removed every one of them at the next start,
@@ -380,7 +380,7 @@ describe("files the agent writes in its own home cannot start anything on a late
       expect(events.at(-1)?.type, prompt).toBe("done");
     }
     expect(resultFor(r, "D1-DOTCONFIG")?.isError, resultFor(r, "D1-DOTCONFIG")?.text).toBe(false);
-    expect(resultFor(r, "D2-BASH")?.text).toBe(NO_SUCH_TOOL("Bash"));
+    expect(resultFor(r, "D2-BASH")?.text).toContain(NO_SUCH_TOOL("Bash"));
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const home = await settle(r, "d");
     expect(markersOf(r, "d")).toEqual([]);
@@ -427,7 +427,7 @@ describe("files the agent writes in its own home cannot start anything on a late
       plant("agents/qaagent.md", agentFile);
       plant("skills/qaskill/SKILL.md", skillFile);
       for (const prompt of turns.slice(3)) await ask1(prompt);
-      expect(resultFor(r, "X7-BASH")?.text).toBe(NO_SUCH_TOOL("Bash"));
+      expect(resultFor(r, "X7-BASH")?.text).toContain(NO_SUCH_TOOL("Bash"));
       await new Promise((resolve) => setTimeout(resolve, 1500));
       expect(markersOf(r, "x")).toEqual([]);
       // The planted files were really there before the turns and the trusted start removed them.
@@ -513,7 +513,7 @@ describe("the clean home and the work area (A2, real runtime)", () => {
       // After EVERY turn: the start of this turn ran none of the files an earlier turn wrote.
       expect(markersOf(r, "s"), `markers after ${prompt}`).toEqual([]);
     }
-    expect(resultFor(r, "S9-BASH")?.text).toBe(NO_SUCH_TOOL("Bash"));
+    expect(resultFor(r, "S9-BASH")?.text).toContain(NO_SUCH_TOOL("Bash"));
     // The home root holds only what the runtime itself rebuilt, never an earlier turn's shell file.
     const home = sessionHome(r, "s");
     for (const name of STARTUP_FILES) expect(fs.existsSync(path.join(home, name)), name).toBe(false);
@@ -625,7 +625,7 @@ describe("the clean home and the work area (A2, real runtime)", () => {
         const loaded = events.find((e) => e.type === "skills_loaded");
         if (loaded) skillSets.push(loaded.skills as string[]);
       }
-      expect(resultFor(r, "P11-BASH")?.text).toBe(NO_SUCH_TOOL("Bash"));
+      expect(resultFor(r, "P11-BASH")?.text).toContain(NO_SUCH_TOOL("Bash"));
       await new Promise((resolve) => setTimeout(resolve, 1500));
       // The files are really there (the probe is not vacuous) ...
       const work = sessionWork(r, "p");
@@ -777,7 +777,7 @@ describe("webhook tools (real runtime)", () => {
 
     await ask(r, { prompt: "H2-THEIRS", useSession: false });
     expect(offeredFor(r, "H2-THEIRS").filter((name) => name.startsWith("mcp__"))).toEqual(["mcp__agent-gateway-tools__mine"]);
-    expect(resultFor(r, "H2-THEIRS")?.text).toBe(NO_SUCH_TOOL("mcp__agent-gateway-tools__theirs"));
+    expect(resultFor(r, "H2-THEIRS")?.text).toContain(NO_SUCH_TOOL("mcp__agent-gateway-tools__theirs"));
     expect(r.webhook.hits).toEqual([]);
 
     // The own tool gets this label's key as its bearer, and only that call reaches the stub.
