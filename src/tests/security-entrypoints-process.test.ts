@@ -229,7 +229,9 @@ describe("denied tool and grant enlargement", () => {
     turns.push(turn);
     problems.push(...turnProblems(turn));
     const deniedResult = sub ? resultsFor(rig.api, sub).at(-1) : turn.results[1];
-    if (!deniedResult || !deniedResult.isError || deniedResult.text !== NO_SUCH_TOOL("Bash")) problems.push(`${row.name}: the denied tool call was not refused by the runtime itself`);
+    if (!deniedResult || !deniedResult.isError || deniedResult.text !== NO_SUCH_TOOL("Bash")) {
+      problems.push(`${row.name}: the denied tool call was not refused by the runtime itself (present=${Boolean(deniedResult)} error=${deniedResult?.isError ?? "none"} noSuchTool=${deniedResult?.text.includes("No such tool available: Bash") ?? false})`);
+    }
     const offered = requestsFor(rig.api, sub ?? prompt).filter((request) => !request.warmup).flatMap((request) => request.tools);
     if (offered.includes("Bash")) problems.push(`${row.name}: the denied tool was offered to the model`);
     const read = turn.results.at(-1);
