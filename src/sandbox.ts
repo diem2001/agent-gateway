@@ -368,6 +368,8 @@ export function buildSandboxEnv(input: SandboxEnvInput): Record<string, string> 
     LANG: "C.UTF-8",
     TERM: "xterm",
     TMPDIR: "/tmp",
+    // The gateway promises MCP tools are available on the first turn. New SDK runtimes connect in the background unless disabled.
+    MCP_CONNECTION_NONBLOCKING: "0",
   };
   for (const [key, value] of Object.entries(input.gatewayEnv)) {
     if ((key === "LANG" || /^LC_[A-Z_]+$/.test(key)) && typeof value === "string" && /^[A-Za-z0-9_.@-]{1,64}$/.test(value)) env[key] = value;

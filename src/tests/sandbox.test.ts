@@ -309,6 +309,7 @@ describe("sandbox environment", () => {
         "HOME",
         "LANG",
         "LC_ALL",
+        "MCP_CONNECTION_NONBLOCKING",
         "PATH",
         "TERM",
         "TMPDIR",

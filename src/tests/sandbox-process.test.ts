@@ -360,6 +360,7 @@ describe("environment and processes", () => {
       "HOME",
       "LANG",
       ...["LC_ALL", "LC_CTYPE"].filter((key) => typeof process.env[key] === "string" && /^[A-Za-z0-9_.@-]{1,64}$/.test(process.env[key]!)),
+      "MCP_CONNECTION_NONBLOCKING",
       "PATH",
       "TERM",
       "TMPDIR",
