@@ -613,6 +613,13 @@ export function regressionRowIds(): string[] {
     "RP.negative-control",
     "RP.negative-control.file-detector",
     "RP.negative-control.loader-env",
+    "AD.same-label-writer",
+    "AD.other-label",
+    "AD.relay-token-replay",
+    "RP.negative-control.label-blind-admission",
+    "RP.negative-control.shared-home",
+    "RP.negative-control.creator-identity",
+    "RP.negative-control.creator-credentials",
   ];
 }
 
