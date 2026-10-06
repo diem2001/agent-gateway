@@ -11,7 +11,9 @@
  *   profile   docker inspect shows the compose options; the gateway process has `NoNewPrivs: 1`,
  *             `CapEff: 0` and a seccomp filter; the compose health command succeeds;
  *   chat      an ordinary chat runs `env | sort` and writes a fixture file; after `docker restart`
- *             the conversation resumes and reads it;
+ *             the conversation resumes and reads it, another user id of the same API-key label continues it
+ *             and finds the file, and the same id under a second label (MVP-8044) is its own conversation
+ *             and finds nothing;
  *   sandbox   from inside a run: process 1 is bwrap, a nested user namespace is refused, `CapEff` 0,
  *             no trusted file, key, clone token or Docker socket, no host path on any command line;
  *   control   under the same profile, a cancelled run (the client closes its connection), `docker stop`
@@ -46,9 +48,12 @@ const PREFIX = "agw-mvp7678-probe-";
 const RAND = randomBytes(4).toString("hex");
 const IMAGE = `agw-mvp7678-probe:${RAND}`;
 const API_KEY = `SYNTH-GW-KEY-${randomBytes(12).toString("hex")}`;
+// A second API-key label (MVP-8044): a conversation belongs to its label, so the same id under this label is another conversation.
+const API_KEY_OTHER = `SYNTH-GW-KEY-OTHER-${randomBytes(12).toString("hex")}`;
 const PROVIDER_KEY = `SYNTH-PROVIDER-KEY-${randomBytes(12).toString("hex")}`;
 const MARKERS = {
   apiKey: API_KEY,
+  otherApiKey: API_KEY_OTHER,
   providerKey: PROVIDER_KEY,
   githubToken: `SYNTH-GITHUB-TOKEN-${randomBytes(12).toString("hex")}`,
   oauthAccess: `SYNTH-OAUTH-ACCESS-${randomBytes(12).toString("hex")}`,
@@ -107,11 +112,11 @@ async function freePort() {
   return port;
 }
 
-function httpRequest(port, method, urlPath, body) {
+function httpRequest(port, method, urlPath, body, key = API_KEY) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
     const req = http.request(
-      { host: "127.0.0.1", port, method, path: urlPath, agent: false, headers: { Authorization: `Bearer ${API_KEY}`, ...(payload ? { "Content-Type": "application/json", "Content-Length": payload.length } : {}) } },
+      { host: "127.0.0.1", port, method, path: urlPath, agent: false, headers: { Authorization: `Bearer ${key}`, ...(payload ? { "Content-Type": "application/json", "Content-Length": payload.length } : {}) } },
       (res) => {
         let text = "";
         res.on("data", (d) => (text += d));
@@ -123,8 +128,8 @@ function httpRequest(port, method, urlPath, body) {
   });
 }
 
-async function query(port, body) {
-  const reply = await httpRequest(port, "POST", "/v1/query", { model: "claude-sonnet-4-5", useSession: true, ...body });
+async function query(port, body, key = API_KEY) {
+  const reply = await httpRequest(port, "POST", "/v1/query", { model: "claude-sonnet-4-5", useSession: true, ...body }, key);
   return reply.text
     .split("\n")
     .filter((l) => l.trim().startsWith("{"))
@@ -324,7 +329,7 @@ async function startContainer(name, port, apiUrl, profileArgs) {
   fs.writeFileSync(
     envFile,
     [
-      `API_KEYS=probe:${API_KEY}`,
+      `API_KEYS=probe:${API_KEY},probe-other:${API_KEY_OTHER}`,
       `PORT=${port}`,
       "HOST=127.0.0.1",
       `ANTHROPIC_BASE_URL=${apiUrl}`,
@@ -410,7 +415,7 @@ async function main() {
   row("an ordinary chat answers and shows its environment", first.at(-1)?.type === "done" && !!envResult && envResult.text.includes("HOME=/home/node") && /ANTHROPIC_API_KEY=mpt_/.test(envResult.text), { done: first.at(-1)?.type === "done" });
   const leaked = Object.entries(MARKERS).filter(([, v]) => (envResult?.text ?? "").includes(v)).map(([k]) => k);
   const surfaces = [JSON.stringify(first), await docker("logs", id).catch(() => "")].join("\n");
-  const leakedElsewhere = Object.entries(MARKERS).filter(([k, v]) => k !== "apiKey" && surfaces.includes(v)).map(([k]) => k);
+  const leakedElsewhere = Object.entries(MARKERS).filter(([k, v]) => k !== "apiKey" && k !== "otherApiKey" && surfaces.includes(v)).map(([k]) => k);
   row("`env | sort` and the events and the gateway log hold no synthetic credential", leaked.length === 0 && leakedElsewhere.length === 0, { markers: Object.keys(MARKERS).length, hitsInResult: leaked.length, hitsInEventsAndLog: leakedElsewhere.length });
 
   // From inside a run: process, namespace, capability and file rows with their controls.
@@ -466,9 +471,17 @@ async function main() {
   const resumed = await query(port, { queryId: "q-resume", sessionId: "conv-docker", prompt: `PROBE-RESUME ${readTag}`, user_id: "user-1" });
   const resumedResult = api.results.get(readTag);
   row("after a container restart the conversation resumes and finds its file", resumed.at(-1)?.type === "done" && !!resumedResult && resumedResult.text.includes("FIXTURE-7678"), { done: resumed.at(-1)?.type === "done" });
+  // A conversation belongs to its API-key label (MVP-8044): another user id of the same label continues it and finds its file;
+  // the same id under another label is another conversation and finds nothing.
   const requestsBefore = api.messageRequests();
-  const other = await query(port, { queryId: "q-other", sessionId: "conv-docker", prompt: `PROBE-OTHER ${bash("echo should-not-run")}`, user_id: "someone-else" });
-  row("another user id is refused with the fixed text and no provider request", other.length === 1 && other[0].type === "error" && other[0].content === "This conversation cannot be continued from your account. Please start a new conversation." && api.messageRequests() === requestsBefore, { events: other.length, providerRequests: api.messageRequests() - requestsBefore });
+  const otherUserTag = bash("echo OTHER-USER-SEES=$(cat /work/fixture.txt)");
+  const other = await query(port, { queryId: "q-other", sessionId: "conv-docker", prompt: `PROBE-OTHER ${otherUserTag}`, user_id: "someone-else" });
+  const otherUserText = api.results.get(otherUserTag)?.text ?? "";
+  row("another user id of the same label continues after the restart and finds its file", other.at(-1)?.type === "done" && !other.some((e) => e.type === "error") && otherUserText.includes("OTHER-USER-SEES=FIXTURE-7678") && api.messageRequests() > requestsBefore, { done: other.at(-1)?.type === "done", errors: other.filter((e) => e.type === "error").length, providerRequests: api.messageRequests() - requestsBefore });
+  const otherLabelTag = bash("echo FILE=$(test -e /work/fixture.txt && echo yes || echo no); echo FILES=$(ls -A /work | wc -l)");
+  const otherLabel = await query(port, { queryId: "q-other-label", sessionId: "conv-docker", prompt: `PROBE-OTHER-LABEL ${otherLabelTag}`, user_id: "user-1" }, API_KEY_OTHER);
+  const otherLabelText = api.results.get(otherLabelTag)?.text ?? "";
+  row("the same id and user id under another API-key label gets its own conversation and does not find the file", otherLabel.at(-1)?.type === "done" && /FILE=no\b/.test(otherLabelText) && /FILES=0\b/.test(otherLabelText), { done: otherLabel.at(-1)?.type === "done", FILE: /FILE=(\w+)/.exec(otherLabelText)?.[1], FILES: /FILES=(\d+)/.exec(otherLabelText)?.[1] });
 
   // Process control under the same profile: cancel, container stop and a SIGKILL of the gateway.
   if (APPARMOR_PROFILE) {
