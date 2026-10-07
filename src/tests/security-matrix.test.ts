@@ -559,7 +559,17 @@ describe("process sampler launcher exemption", () => {
   const children: ChildProcess[] = [];
   const dirs: string[] = [];
   const stoppedPids: number[] = [];
+  /** Processes a row recorded to be killed at the end, besides the descendants of its children (the reference's whole thread group). */
+  const recordedPids: number[] = [];
   afterEach(() => {
+    // A holder the exit seam stopped is continued first, then every recorded process and every process of the fixture is killed.
+    for (const pid of recordedPids.splice(0)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
     // A holder the exit seam stopped is continued first, then every process of the fixture is killed.
     for (const pid of stoppedPids.splice(0)) {
       try {
@@ -1163,6 +1173,102 @@ describe("process sampler launcher exemption", () => {
     expect(runtimeEnded(state), "the runtime's exit was not confirmed before the window closed").toBe(true);
     flaggedNever(final, record, "the runtime below the live reference");
   });
+
+  /*  The reference ends in two steps (MVP-8090 rev 3.1): its main thread first, its other thread later or never  */
+
+  /** A reference whose main thread ends alone with the raw `exit` syscall on SIGUSR1 (one thread, unlike exit_group) while a background thread keeps it a zombie that still counts threads. */
+  const LEADER_ONLY_REFERENCE =
+    "import ctypes, platform, signal, subprocess, sys, threading, time\nlibc = ctypes.CDLL(None)\nexit_thread = 60 if platform.machine() == 'x86_64' else 93\nsignal.signal(signal.SIGUSR1, lambda *_: libc.syscall(exit_thread, 0))\nchild = subprocess.Popen(sys.argv[1:])\ndef spin():\n    while True:\n        time.sleep(0.05)\nthreading.Thread(target=spin).start()\nwhile True:\n    time.sleep(0.05)";
+  /** P (sh, stopped before the reference ends) -> reference R (python, a background thread) -> M -> H -> real bwrap -> stand-in runtime. */
+  const leaderOnlyTree = (): ChildProcess => spawn("/bin/sh", ["-c", `python3 -c ${quote(LEADER_ONLY_REFERENCE)} /bin/bash -c ${quote(referenceScript)}; :`], { stdio: "ignore" });
+  const firstChildOf = (parent: ChildProcess): number => {
+    try {
+      return Number(fs.readFileSync(`/proc/${parent.pid}/task/${parent.pid}/children`, "utf8").trim().split(" ")[0]) || 0;
+    } catch {
+      return 0;
+    }
+  };
+  const threadsNow = (pid: number): number => threadsOf(pid);
+
+  interface LeaderOnlyState extends ChainState {
+    reference?: number;
+  }
+  /**
+   * On the `atReading`-th stable reading: stops P, ends R's main thread (R becomes `Z` with threads still showing), kills M so the
+   * chain breaks and holds the tick until both are done; then ends H after 100 ms (the runtime's exit is confirmed inside the bound)
+   * and, with `endReferenceAfterMs`, kills R's whole thread group (a group exit: `Z` with one thread behind the stopped P).
+   */
+  const leaderOnlySeam =
+    (state: LeaderOnlyState, parent: ChildProcess, endReferenceAfterMs?: number) =>
+    (pid: number): void => {
+      state.pid ??= pid;
+      if (pid !== state.pid || state.forced) return;
+      state.readings += 1;
+      if (state.readings < 3) return;
+      state.forced = true;
+      state.runtime = { pid, startTicks: startOf(pid) ?? "" };
+      let holder = pid;
+      for (let hop = 0; hop < 3; hop++) holder = ppidOf(holder);
+      state.holder = holder;
+      const middle = ppidOf(holder);
+      const reference = ppidOf(middle);
+      state.reference = reference;
+      recordedPids.push(reference);
+      process.kill(parent.pid!, "SIGSTOP");
+      stoppedPids.push(parent.pid!);
+      process.kill(reference, "SIGUSR1");
+      const zombieWithThreads = waitSync(() => statOf(reference)?.state === "Z" && threadsNow(reference) >= 2);
+      process.kill(middle, "SIGKILL");
+      state.reached = zombieWithThreads && waitSync(() => (isZombie(middle) || isGone(middle)) && ppidOf(holder) !== middle);
+      setTimeout(() => safeKill(holder, "SIGKILL"), 100);
+      if (endReferenceAfterMs !== undefined) setTimeout(() => safeKill(reference, "SIGKILL"), endReferenceAfterMs);
+    };
+
+  it("R5: a reference that is a zombie leader whose other thread keeps running past the bound (Zn) is pending at first, then flagged for good (expired on the reference), although the runtime's exit is confirmed", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: LeaderOnlyState = newExitState();
+    let parent: ChildProcess | undefined;
+    const { snapshots, final, summary } = await stages(
+      () => (parent = leaderOnlyTree()),
+      referenceStages(state, { name: "expired on the reference", until: (seen) => seen.records.some((record) => record.pending?.state === "expired-reference") }),
+      {},
+      (pid) => leaderOnlySeam(state, parent!)(pid),
+      () => (parent ? firstChildOf(parent) : 0),
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the reference did not become a zombie leader with threads, or the chain did not break, within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    expect(record!.proofFailure).toMatchObject({ ownProof: true, chain: "broken", reference: "cached", referenceEnded: false, referenceExit: "Zn", pending: "expired-reference" });
+    expect(runtimeEnded(state), "the runtime's exit was not confirmed before the window closed").toBe(true);
+    expect(statOf(state.reference!)?.state, "the reference stayed a zombie leader").toBe("Z");
+    expect(threadsNow(state.reference!), "the reference still counted threads").toBeGreaterThanOrEqual(2);
+    reported(final, record!);
+    expect(summary[0]).toContain("pending_expired=1");
+  });
+
+  it("R5-ends: the same reference whose last thread ends inside the bound (Zn, then Z1) is cleared, and the failing tick was pending with the reference still Zn", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: LeaderOnlyState = newExitState();
+    let parent: ChildProcess | undefined;
+    const { snapshots, final, audit, summary } = await stages(
+      () => (parent = leaderOnlyTree()),
+      referenceStages(state, { name: "cleared", until: (seen) => seen.records.some((record) => record.pending?.state === "cleared") }),
+      {},
+      (pid) => leaderOnlySeam(state, parent!, 600)(pid),
+      () => (parent ? firstChildOf(parent) : 0),
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the reference did not become a zombie leader with threads, or the chain did not break, within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    // On the failing tick the reference was still Zn and the record went pending; it can only have been cleared from that state.
+    expect(record!.proofFailure).toMatchObject({ ownProof: true, chain: "broken", reference: "cached", referenceExit: "Zn", pending: "cleared" });
+    expect(record!.clearedBy).toBe("reference-ended");
+    expect(record!.unsandboxed).toBe(false);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("reference ended after the runtime's own proof read while alive; runtime exit confirmed"))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_reference=1");
+  });
 });
 
 /**
@@ -1220,14 +1326,18 @@ describe("process sampler exit rule: decision table", () => {
     expect(exitConfirmed(given)).toBe(expected);
   });
 
-  const reference = (partial: Partial<Parameters<typeof referenceEndedPending>[0]> = {}) => ({ ownProof: true, launcherProof: false, referenceEnded: true, symptom: true, escapeEvidence: false, cacheExists: true, ...partial });
+  const reference = (partial: Partial<Parameters<typeof referenceEndedPending>[0]> = {}) => ({ ownProof: true, launcherProof: false, referenceEnding: true, symptom: true, escapeEvidence: false, cacheExists: true, ...partial });
+  const ending = (partial: Partial<ExitReading>): boolean => exitKind({ vanished: false, startChanged: false, state: "S", threads: 1, cmdline: "gateway", exe: "readable", ...partial }) !== "alive";
 
   it.each([
     ["T-ref: all four conditions hold", reference(), true],
     ["T-ref: no own proof (first tick)", reference({ ownProof: false }), false],
     ["T-ref: launcher proof only, no own proof", reference({ ownProof: false, launcherProof: true }), false],
-    ["T-ref: reference alive (not ended)", reference({ referenceEnded: false }), false],
-    ["T-ref: reference not confirmed ended (a zombie leader whose threads run)", reference({ referenceEnded: exitConfirmed({ vanished: false, startChanged: false, state: "Z", threads: 3, cmdline: "", exe: "gone" }) }), false],
+    ["T-ref: reference alive (S with a command line, not ending)", reference({ referenceEnding: ending({}) }), false],
+    ["T-ref: reference alive but non-dumpable (command line readable, exe denied)", reference({ referenceEnding: ending({ exe: "denied" }) }), false],
+    ["T-ref: reference a zombie leader whose threads still show (Zn) is ending, so the record is pending", reference({ referenceEnding: ending({ state: "Z", threads: 3, cmdline: "", exe: "gone" }) }), true],
+    ["T-ref: reference ended (Z1) is ending", reference({ referenceEnding: ending({ state: "Z", threads: 1, cmdline: "", exe: "gone" }) }), true],
+    ["T-ref: reference vanished is ending", reference({ referenceEnding: ending({ vanished: true }) }), true],
     ["T-ref: no reference symptom (live readable reference, complete chain)", reference({ symptom: referenceSymptom("live", "complete") }), false],
     ["T-ref-escape: the runtime's pid link equals the reference's", reference({ escapeEvidence: true }), false],
     ["T-ref: no cache for the reference identity", reference({ cacheExists: false }), false],
@@ -1245,11 +1355,15 @@ describe("process sampler exit rule: decision table", () => {
   });
 
   it.each([
-    ["exit confirmed within the bound clears", { elapsedMs: 100, exitConfirmed: true, final: false }, "cleared"],
-    ["no exit yet inside the bound waits", { elapsedMs: 100, exitConfirmed: false, final: false }, "waiting"],
-    ["no exit at the bound expires", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: false, final: false }, "expired"],
-    ["an exit seen only after the bound does not clear", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: true, final: false }, "expired"],
-    ["no exit at stop() expires", { elapsedMs: 100, exitConfirmed: false, final: true }, "expired"],
+    ["both confirmed within the bound clears", { elapsedMs: 100, exitConfirmed: true, referenceEnded: true, final: false }, "cleared"],
+    ["no exit yet inside the bound waits", { elapsedMs: 100, exitConfirmed: false, referenceEnded: true, final: false }, "waiting"],
+    ["the runtime's exit confirmed but the reference still Zn inside the bound waits", { elapsedMs: 100, exitConfirmed: true, referenceEnded: false, final: false }, "waiting"],
+    ["the runtime's exit confirmed and the reference still Zn at the bound expires on the reference", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: true, referenceEnded: false, final: false }, "expired-reference"],
+    ["the runtime's exit confirmed and the reference still Zn at stop() expires on the reference", { elapsedMs: 100, exitConfirmed: true, referenceEnded: false, final: true }, "expired-reference"],
+    ["no exit at the bound expires", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: false, referenceEnded: true, final: false }, "expired"],
+    ["an exit seen only after the bound does not clear", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: true, referenceEnded: true, final: false }, "expired"],
+    ["no exit at stop() expires", { elapsedMs: 100, exitConfirmed: false, referenceEnded: true, final: true }, "expired"],
+    ["neither confirmed at the bound expires", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: false, referenceEnded: false, final: false }, "expired"],
   ] as const)("pending: %s", (_name, given, expected) => {
     expect(resolvePending(given)).toBe(expected);
   });

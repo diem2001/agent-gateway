@@ -580,7 +580,7 @@ export interface ProcessRecord {
    * not flagged yet, `waiting` until the runtime's own exit is confirmed (`cleared`) or the bound passes (`expired`, flagged for
    * good). A waiting record counts as flagged in every snapshot.
    */
-  pending?: { state: "waiting" | "cleared" | "expired"; sinceMs: number };
+  pending?: { state: "waiting" | "cleared" | "expired" | "expired-reference"; sinceMs: number; reference: { pid: number; startTicks: string } };
   /** Ticks whose proof succeeded with a reference namespace read from the cache (the cache was used and the proof still held). */
   provedReferenceCached?: number;
   /** `running` when the same process still existed at `stop()`, else `exited`. */
@@ -603,7 +603,7 @@ export interface ProofFailure {
   /** How the reference looked on that re-read (`Zn` is a zombie leader whose threads still show). */
   referenceExit: ExitKind;
   runtimeExit: ExitKind;
-  pending: "none" | "waiting" | "cleared" | "expired";
+  pending: "none" | "waiting" | "cleared" | "expired" | "expired-reference";
 }
 
 /** A process the old rule counted or flagged that the current rule does not, and why that is acceptable (or not). */
@@ -973,13 +973,14 @@ export function flagAfterProofFailure(prior: boolean, clearedBy: "own" | "launch
 export const PENDING_BOUND_MS = 2000;
 
 /**
- * Whether the reference having ended makes a failed proof pending (not flagged yet): the runtime had its own full proof at an
- * earlier tick, the reference is confirmed ended, the failure shows the reference's symptom, and nothing the runtime reads
- * equals the cached reference (pid, user or mount) and a cache exists. A launcher proof is no route here: the launcher's own
- * proof walks the same broken chain. A pending record is only cleared by `resolvePending`.
+ * Whether the reference ending makes a failed proof pending (not flagged yet): the runtime had its own full proof at an earlier
+ * tick, the reference is ending (confirmed ended, or a zombie leader whose threads still show: that must resolve to ended within
+ * the bound), the failure shows the reference's symptom, and nothing the runtime reads equals the cached reference (pid, user or
+ * mount) and a cache exists. A launcher proof is no route here: the launcher's own proof walks the same broken chain. A pending
+ * record is only cleared by `resolvePending`.
  */
-export function referenceEndedPending(evidence: { ownProof: boolean; launcherProof: boolean; referenceEnded: boolean; symptom: boolean; escapeEvidence: boolean; cacheExists: boolean }): boolean {
-  return evidence.ownProof && evidence.referenceEnded && evidence.symptom && !evidence.escapeEvidence && evidence.cacheExists;
+export function referenceEndedPending(evidence: { ownProof: boolean; launcherProof: boolean; referenceEnding: boolean; symptom: boolean; escapeEvidence: boolean; cacheExists: boolean }): boolean {
+  return evidence.ownProof && evidence.referenceEnding && evidence.symptom && !evidence.escapeEvidence && evidence.cacheExists;
 }
 
 /** The failed proof shows the reference's symptom: a namespace read from the cache or missing, or a chain that broke. */
@@ -987,11 +988,16 @@ export function referenceSymptom(reference: ReferenceSource, chain: "complete" |
   return reference !== "live" || chain === "broken";
 }
 
-/** What becomes of a pending record: cleared when its runtime's exit is confirmed within the bound, expired at the bound or at `stop()`. */
-export function resolvePending(evidence: { elapsedMs: number; exitConfirmed: boolean; final: boolean }): "waiting" | "cleared" | "expired" {
-  if (evidence.elapsedMs > PENDING_BOUND_MS) return "expired";
-  if (evidence.exitConfirmed) return "cleared";
-  return evidence.final ? "expired" : "waiting";
+/**
+ * What becomes of a pending record: cleared only when, within the bound, the runtime's own exit is confirmed AND the reference is
+ * confirmed ended. Otherwise it waits inside the bound; at the bound or at `stop()` it expires (`expired-reference` when the
+ * runtime's exit was confirmed and only the reference stayed a zombie that still shows threads).
+ */
+export function resolvePending(evidence: { elapsedMs: number; exitConfirmed: boolean; referenceEnded: boolean; final: boolean }): "waiting" | "cleared" | "expired" | "expired-reference" {
+  const within = evidence.elapsedMs <= PENDING_BOUND_MS;
+  if (within && evidence.exitConfirmed && evidence.referenceEnded) return "cleared";
+  if (within && !evidence.final) return "waiting";
+  return evidence.exitConfirmed && !evidence.referenceEnded ? "expired-reference" : "expired";
 }
 
 /** `<prefix>-<first 10 hex of sha256(file + full name)>`: the prefix is the leading token (before `:`) of the last ` > ` segment when it is a plain token, else `t`. */
@@ -1105,11 +1111,16 @@ export function startProcessSampler(
     const at = Date.now();
     for (const [key, record] of records) {
       if (record.pending?.state !== "waiting") continue;
-      const outcome = resolvePending({ elapsedMs: at - record.pending.sinceMs, exitConfirmed: endedNow(record.pid, record.startTicks).ended, final });
+      const outcome = resolvePending({
+        elapsedMs: at - record.pending.sinceMs,
+        exitConfirmed: endedNow(record.pid, record.startTicks).ended,
+        referenceEnded: endedNow(record.pending.reference.pid, record.pending.reference.startTicks).ended,
+        final,
+      });
       if (outcome === "waiting") continue;
       records.set(key, {
         ...record,
-        unsandboxed: record.unsandboxed || outcome === "expired",
+        unsandboxed: record.unsandboxed || outcome === "expired" || outcome === "expired-reference",
         clearedBy: outcome === "cleared" ? "reference-ended" : record.clearedBy,
         pending: { ...record.pending, state: outcome },
         proofFailure: record.proofFailure ? { ...record.proofFailure, pending: outcome } : record.proofFailure,
@@ -1194,6 +1205,7 @@ export function startProcessSampler(
               // The reference is read after the proof: if it ended, the failure may only say so (pending, never a clear by itself).
               const referenceNow = reference.startTicks === null ? null : endedNow(root, reference.startTicks);
               const referenceEnded = referenceNow?.ended === true;
+              const referenceEnding = referenceNow !== null && referenceNow.kind !== "alive";
               const chainState = proof.brokenChain ? ("broken" as const) : ("complete" as const);
               pendingNow =
                 cleared === null &&
@@ -1202,12 +1214,12 @@ export function startProcessSampler(
                 referenceEndedPending({
                   ownProof: failure.ownProof,
                   launcherProof: failure.launcherProof,
-                  referenceEnded,
+                  referenceEnding,
                   symptom: referenceSymptom(proof.reference, chainState),
                   escapeEvidence: failure.escapeEvidence,
                   cacheExists: reference.hasCache,
                 });
-              if (pendingNow) pending = prior?.pending ?? { state: "waiting", sinceMs: now };
+              if (pendingNow) pending = prior?.pending ?? { state: "waiting", sinceMs: now, reference: { pid: root, startTicks: reference.startTicks! } };
               proofFailure = proofFailure
                 ? {
                     ...proofFailure,
@@ -1344,7 +1356,7 @@ export function startProcessSampler(
             exit_cleared_own: sample.clears.filter((clear) => clear.explanation.endsWith("(own)")).length,
             exit_cleared_launcher: sample.clears.filter((clear) => clear.explanation.endsWith("(launcher)")).length,
             exit_cleared_reference: sample.clears.filter((clear) => clear.explanation.endsWith("runtime exit confirmed")).length,
-            pending_expired: count((record) => record.pending?.state === "expired"),
+            pending_expired: count((record) => record.pending?.state === "expired" || record.pending?.state === "expired-reference"),
             proved_reference_cached: sample.records.reduce((sum, record) => sum + (record.provedReferenceCached ?? 0), 0),
             failed_reference_cached: count((record) => record.proofFailure?.reference === "cached"),
             failed_reference_missing: count((record) => record.proofFailure?.reference === "missing"),
