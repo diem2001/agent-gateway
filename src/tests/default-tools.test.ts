@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { DEFAULT_TOOLS } from "../agent.js";
+import { APPROVED_DEFAULT_SET as DEFAULT_TOOLS } from "../tool-grant.js";
 
 // MVP-6497: the agent must be allowed to call TodoWrite by default, otherwise the
 // Claude Agent SDK's allowedTools filter blocks it, no tool_use:"TodoWrite" event is
@@ -9,7 +9,7 @@ import { DEFAULT_TOOLS } from "../agent.js";
 // MVP-8088 (DEC-ISO-008): the default is exactly the 12 reviewed tools. The task tools
 // (TaskCreate, TaskGet, TaskList, TaskUpdate) are hidden by CLAUDE_CODE_ENABLE_TASKS=false
 // so TodoWrite stays offered; none of the tools newer runtimes add belongs to it.
-describe("DEFAULT_TOOLS", () => {
+describe("the default tools (APPROVED_DEFAULT_SET)", () => {
   it("is exactly the reviewed default set (DEC-ISO-008)", () => {
     expect([...DEFAULT_TOOLS].sort()).toEqual(["Agent", "Bash", "Edit", "Glob", "Grep", "NotebookEdit", "Read", "Skill", "TodoWrite", "WebFetch", "WebSearch", "Write"]);
   });

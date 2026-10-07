@@ -511,6 +511,8 @@ async function observeRuntime(tools?: string[]): Promise<string[]> {
         abortController: abort,
         permissionMode: "bypassPermissions",
         settingSources: ["user"],
+        // The gateway's default model: the runtime's default set depends on the model (without one it offers no TodoWrite).
+        model: "claude-opus-4-6",
         systemPrompt: { type: "preset", preset: "claude_code" },
         // Measured (Gate A): the runtime leaves Glob and Grep out of its default set unless the run pre-approves them, as the
         // gateway's runs do; an explicit `tools` list offers them either way.

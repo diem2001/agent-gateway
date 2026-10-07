@@ -5,17 +5,18 @@
  * tools the run may call, as the SDK names them (built-ins such as `Bash`, MCP
  * tools as `mcp__<server>__<tool>`; the gateway's webhook tools are served by
  * the `agent-gateway-tools` server). Every other tool is refused before it
- * runs. The field is additive: without it a run's options are exactly what
- * they were before, and the existing `allowedTools` keeps its meaning.
+ * runs. The field is additive: without it a run's options are those of an
+ * unenforced run, and the existing `allowedTools` keeps its meaning.
  *
- * `agent.ts` enforces the set in layers, because each alone has a gap on the
- * pinned SDK (0.1.77):
+ * `agent.ts` enforces the set in layers, because each alone had a gap in the
+ * MVP-7637 measurements (SDK 0.1.77); the layers are kept as they were:
  *   1. `settingSources: []` — no user/project settings, hooks, permission
  *      rules, `.mcp.json` or user-scope `mcpServers` from the (writable) HOME.
  *   2. `permissionMode: "dontAsk"` + `allowedTools` = exactly the set: an
  *      unlisted tool is denied, not asked for (the primary deny).
  *   3. `tools` = the built-ins in the set (`[]` for none), so other built-ins
- *      are not even offered.
+ *      are not even offered. (Every other run passes an explicit `tools` list too
+ *      since MVP-8088: the granted built-ins of tool-grant.ts.)
  *   4. `agent-gateway-tools` holds only the registered tools in the set, and a
  *      registry or request MCP server is attached only when the set names one
  *      of its tools.

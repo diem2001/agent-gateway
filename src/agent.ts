@@ -197,8 +197,6 @@ function webhookBearer(tool: ToolDefinition, callerLabel: string, token: string 
   return undefined;
 }
 
-export const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "Agent", "TodoWrite", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
-
 /**
  * Build a fresh single-message AsyncIterable<SDKUserMessage> from the resolved
  * content blocks. The Claude Agent SDK's `query()` accepts
@@ -341,7 +339,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // `allowedTools` is the runtime's pre-approval list; the caller's list is a narrowing and was applied to the grant.
   const effectiveTools = allowedTools
     ? allowedTools.filter((name) => grant.allows(name))
-    : [...DEFAULT_TOOLS.filter((name) => grant.allows(name)), ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
+    : [...grant.builtIns(), ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
   const options: Record<string, unknown> = {
     allowedTools: effectiveTools,
     permissionMode: "bypassPermissions",
@@ -364,10 +362,11 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     options.tools = builtInTools(enforcedSet!);
     options.hooks = { PreToolUse: [{ hooks: [createToolPolicyHook(enforcedSet!, queryId)] }] };
     log("query", `enforced tool set: ${enforcedSet!.length} tool(s)`);
-  } else if (grant.restrictsBuiltIns) {
-    // The policy or the caller restricts the built-ins: the runtime is offered only the granted ones, and the others
-    // are named as denied. A built-in that is not offered is refused by the runtime itself, for the main agent, a
-    // configured agent, a skill, a sub-agent and a resumed conversation alike (Gate A).
+  } else {
+    // Every run names its built-ins (MVP-8088): the runtime is offered only the granted ones, never its own default
+    // set, so a runtime update cannot widen it by itself; the other inventory names are denied by name as a second
+    // layer. A built-in that is not offered is refused by the runtime itself, for the main agent, a configured agent,
+    // a skill, a sub-agent and a resumed conversation alike (MVP-7679 Gate A).
     options.tools = grant.builtIns();
     options.disallowedTools = grant.deniedBuiltIns();
   }
