@@ -409,8 +409,8 @@ describe("host-side samplers", () => {
       fate: "exited",
     };
     expect(describeRecords([record], { marker })).toContain("pid 1 comm sh exe sh");
-    const failed = describeRecords([{ ...record, proofFailure: { failedWhile: "exiting", ownProof: false, launcherProof: true, escapeEvidence: false } }], { marker });
-    expect(failed).toContain("proof-failure [failed-while=exiting own-proof=false launcher-proof=true escape-evidence=false]");
+    const failed = describeRecords([{ ...record, proofFailure: { failedWhile: "exiting", ownProof: false, launcherProof: true, escapeEvidence: false, ownUnreadable: "mnt", reference: "cached", chain: "broken", referenceEnded: true, runtimeExit: "Z1", pending: "waiting" }, clearedBy: "reference-ended", provedReferenceCached: 2 }], { marker });
+    expect(failed).toContain("proof-failure [failed-while=exiting own-proof=false launcher-proof=true escape-evidence=false own-unreadable=mnt reference=cached chain=broken reference-ended=true runtime-exit=Z1 pending=waiting] cleared-by=reference-ended proved-reference-cached=2");
     expect(describeRecords([{ ...record, argvShape: `leak ${marker}` }], { marker })).toBe("[process records withheld: a marker was detected]");
     // A process name that is not on the allowlist (a comm or an ancestor) is printed as `other`, with or without markers.
     const named = describeRecords([{ ...record, comms: [marker.slice(0, 15)], ancestors: [marker.slice(0, 15), "gateway"] }], {});
@@ -785,7 +785,7 @@ describe("process sampler launcher exemption", () => {
       for (const line of audit) expect(line.includes(marker), "an audit line carried the synthetic name").toBe(false);
       expect(audit.some((line) => line.includes("comm sh exe") && line.includes("verdict=launcher")), "the allowlisted process lost its detail").toBe(true);
       expect(summary, "one summary line of counts per window").toHaveLength(1);
-      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+ failed_exiting=\d+ failed_alive=\d+ failed_own_proof=\d+ failed_launcher_proof=\d+ failed_escape_evidence=\d+ exit_cleared_own=\d+ exit_cleared_launcher=\d+$/);
+      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+ failed_exiting=\d+ failed_alive=\d+ failed_own_proof=\d+ failed_launcher_proof=\d+ failed_escape_evidence=\d+ exit_cleared_own=\d+ exit_cleared_launcher=\d+ exit_cleared_reference=\d+ pending_expired=\d+ proved_reference_cached=\d+ failed_reference_cached=\d+ failed_reference_missing=\d+ failed_own_unreadable=\d+ failed_chain_broken=\d+ reference_changed=\d+ row=(none|withheld|[A-Za-z0-9().,_-]+-[0-9a-f]{10}) flagged=\d+$/);
     }
   });
 
@@ -884,7 +884,7 @@ describe("process sampler launcher exemption", () => {
     const { snapshots, final, audit } = await stages(() => sandboxed(["/bin/bash", "-c", standIn]), forcedStages(state), {}, forceExit(state, "reaped-with-launcher", 3));
     const record = outcomeOf(state, snapshots, "the sandboxed runtime");
     expect(record.verdict).toBe("runtime");
-    expect(record.proofFailure).toEqual({ failedWhile: "exiting", ownProof: true, launcherProof: false, escapeEvidence: false });
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: true, launcherProof: false, escapeEvidence: false });
     expect(record.clearedBy).toBe("own");
     expect(record.unsandboxed).toBe(false);
     expect(final.unsandboxedRuntimes).toEqual([]);
@@ -897,7 +897,7 @@ describe("process sampler launcher exemption", () => {
     const state = newExitState();
     const { snapshots, final, audit, summary } = await stages(() => sandboxed(["/bin/bash", "-c", `(${standIn}) & wait`]), forcedStages(state), {}, forceExit(state, "zombie"));
     const record = outcomeOf(state, snapshots, "the sandboxed runtime");
-    expect(record.proofFailure).toEqual({ failedWhile: "exiting", ownProof: false, launcherProof: true, escapeEvidence: false });
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: false, launcherProof: true, escapeEvidence: false });
     expect(record.clearedBy).toBe("launcher");
     expect(record.unsandboxed).toBe(false);
     expect(final.unsandboxedRuntimes).toEqual([]);
@@ -913,7 +913,7 @@ describe("process sampler launcher exemption", () => {
     const record = outcomeOf(state, snapshots, "the renamed runtime");
     expect(record.verdict).toBe("runtime");
     // A zombie still reads the gateway's pid and user namespaces (positive evidence of no sandbox); a reaped one reads nothing.
-    expect(record.proofFailure).toEqual({ failedWhile: "exiting", ownProof: false, launcherProof: false, escapeEvidence: shape === "zombie" });
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: false, launcherProof: false, escapeEvidence: shape === "zombie" });
     reported(final, record);
   });
 
@@ -924,7 +924,7 @@ describe("process sampler launcher exemption", () => {
     const record = outcomeOf(state, snapshots, "the runtime in new namespaces");
     expect(record.sameNamespaces.pid, "precondition not reached: the namespaces did not differ").toBe(false);
     expect(record.sameNamespaces.user, "precondition not reached: the namespaces did not differ").toBe(false);
-    expect(record.proofFailure).toEqual({ failedWhile: "exiting", ownProof: false, launcherProof: false, escapeEvidence: false });
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: false, launcherProof: false, escapeEvidence: false });
     reported(final, record);
   });
 
@@ -946,7 +946,7 @@ describe("process sampler launcher exemption", () => {
     const withoutPidNamespace = BWRAP.slice(1).filter((argument) => argument !== "--unshare-pid");
     const { snapshots, final } = await stages(() => spawn(BWRAP[0], [...withoutPidNamespace, "/bin/bash", "-c", `(${standIn}) & wait; sleep 5`], { stdio: "ignore" }), forcedStages(state), {}, forceExit(state, "reaped"));
     const record = outcomeOf(state, snapshots, "the runtime below the real bwrap");
-    expect(record.proofFailure).toEqual({ failedWhile: "exiting", ownProof: false, launcherProof: false, escapeEvidence: false });
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: false, launcherProof: false, escapeEvidence: false });
     reported(final, record);
   });
 });
