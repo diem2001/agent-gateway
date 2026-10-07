@@ -569,6 +569,12 @@ export interface ProcessRecord {
    * as the gateway's.
    */
   proofFailure?: { failedWhile: "alive" | "exiting"; ownProof: boolean; launcherProof: boolean; escapeEvidence: boolean };
+  /**
+   * The proof route that kept a proof failure on an exiting tick from flagging the record (`exitProofClears`): `own` (the
+   * same pid and start time had the full proof at an earlier tick) or `launcher` (a live real bwrap ancestor had it in the
+   * same tick). Set only when that tick was what kept the record unflagged; it never resets a flag set earlier.
+   */
+  clearedBy?: "own" | "launcher";
   /** `running` when the same process still existed at `stop()`, else `exited`. */
   fate: "running" | "exited";
 }
@@ -581,6 +587,8 @@ export interface ProcessClear {
     | "settled into another process after an inconsistent read" // the old rule read the new `comm` with the old command line, mid-exec
     | "settled after an inconsistent read"
     | "vanished before a stable reading below a process with the sandbox proof"
+    | "exiting after a proof read while alive (own)"
+    | "exiting after a proof read while alive (launcher)"
     | "unexplained";
 }
 
@@ -802,6 +810,23 @@ export function exitConfirmed(reading: ExitReading): boolean {
   return reading.cmdline === "" && reading.exe === "gone";
 }
 
+/**
+ * The route that lets a failed sandbox proof on one tick pass without flagging the runtime, or null. Only a process that is
+ * confirmed to be ending can pass, never one that leaks the gateway's pid or user namespace, and only on a proof that was
+ * read while a process was alive: the runtime's own full proof at an earlier tick, or a live real bwrap ancestor's own full
+ * proof in the same tick. An unreadable mount namespace, a broken chain, an unreadable executable or a `bwrap` name is no route.
+ */
+export function exitProofClears(evidence: { exitConfirmed: boolean; escapeEvidence: boolean; ownProof: boolean; launcherProof: boolean }): "own" | "launcher" | null {
+  if (!evidence.exitConfirmed || evidence.escapeEvidence) return null;
+  if (evidence.ownProof) return "own";
+  return evidence.launcherProof ? "launcher" : null;
+}
+
+/** The record's flag after a tick whose proof failed outside a proven ancestor: a flag set earlier stays, whatever this tick cleared. */
+export function flagAfterProofFailure(prior: boolean, clearedBy: "own" | "launcher" | null): boolean {
+  return prior || clearedBy === null;
+}
+
 function readExitReading(pid: number, startTicks: string): ExitReading {
   const info = readProc(pid);
   if (info === null) return { vanished: true, startChanged: false, state: "", threads: 0, cmdline: "", exe: "gone" };
@@ -824,7 +849,7 @@ function liveLauncherProof(ancestorPids: number[], infos: Map<number, ProcInfo>,
   for (const pid of ancestorPids) {
     const info = infos.get(pid);
     const before = readExe(pid);
-    if (!info || !("id" in before) || !bwraps.has(before.id)) continue;
+    if (!info || !("id" in before) || !bwraps.has(before.id) || readProc(pid)?.startTicks !== info.startTicks) continue;
     if (!sandboxProof(pid, root, bwraps).proven) continue;
     const after = readProc(pid);
     const exeAfter = readExe(pid);
@@ -839,7 +864,7 @@ export function describeRecords(records: ProcessRecord[], markers: Record<string
   const text = records
     .map((record) => {
       const ns = record.sameNamespaces;
-      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence}]` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
+      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence}]` : ""}${record.clearedBy ? ` cleared-by=${record.clearedBy}` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
     })
     .join("; ");
   return detect([{ name: "process-records", text }], markers).length > 0 ? "[process records withheld: a marker was detected]" : text;
@@ -875,7 +900,12 @@ export function sampleProblems(sample: ProcessSample, markers: Record<string, st
  * (a process that vanished keeps its last stable verdict); a runtime with neither `cli.js` in its command line nor the
  * `claude` title; a process that left the gateway's process tree (`descendants` follows the children lists only).
  */
-export function startProcessSampler(gatewayPid: () => number, tags: string[] = [], intervalMs = 20): { stop: (markers: Record<string, string>) => ProcessSample; peek: () => ProcessSample } {
+export function startProcessSampler(
+  gatewayPid: () => number,
+  tags: string[] = [],
+  intervalMs = 20,
+  seam: { afterStableReading?: (pid: number) => void } = {},
+): { stop: (markers: Record<string, string>) => ProcessSample; peek: () => ProcessSample } {
   const known = knownExecutables();
   const windows: ProcessSample["windows"] = {};
   const records = new Map<string, ProcessRecord>();
@@ -915,6 +945,7 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
         let unsandboxed = prior?.unsandboxed ?? false;
         let firstMissingProof = prior?.firstMissingProof;
         let proofFailure = prior?.proofFailure;
+        let clearedBy = prior?.clearedBy;
         const comms = prior?.comms ?? [];
         let seen = info;
         let ancestors = chain.length > 0 ? [...chain, "gateway"] : ["gateway"];
@@ -927,18 +958,26 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
             if (sandboxProof(info.pid, root, known.bwraps).proven) proven.add(key);
           } else {
             verdict = "runtime";
+            // Test seam (default none): lets a control force the exit between the stable reading and the proof.
+            try {
+              seam.afterStableReading?.(info.pid);
+            } catch {
+              // A failing control must not end the sampler; its own assertions report the precondition.
+            }
             const proof = sandboxProof(info.pid, root, known.bwraps);
             ancestors = proof.chain.length > 0 ? proof.chain : ancestors;
+            let cleared: "own" | "launcher" | null = null;
             if (proof.proven) proven.add(key);
             else if (!belowProven) {
               firstMissingProof ??= proof.detail;
-              // Observation beside the rule: was this failure read while the process was alive or ending, and which proofs existed.
+              // Was this failure read while the process was alive or ending, and which proof routes exist?
               const failure = {
                 failedWhile: exitConfirmed(readExitReading(info.pid, info.startTicks)) ? ("exiting" as const) : ("alive" as const),
                 ownProof: proven.has(key),
                 launcherProof: liveLauncherProof(ancestorPids, infos, root, known.bwraps),
                 escapeEvidence: proof.namespaces.pid === true || proof.namespaces.user === true,
               };
+              cleared = exitProofClears({ exitConfirmed: failure.failedWhile === "exiting", ...failure });
               proofFailure = proofFailure
                 ? {
                     failedWhile: proofFailure.failedWhile === "alive" || failure.failedWhile === "alive" ? "alive" : "exiting",
@@ -949,7 +988,9 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
                 : failure;
             }
             // A flag stays: one tick without proof is a run outside the sandbox, whatever the next tick shows.
-            unsandboxed = unsandboxed || !(proof.proven || belowProven);
+            const flaggedBefore = unsandboxed;
+            if (!proof.proven && !belowProven) unsandboxed = flagAfterProofFailure(unsandboxed, cleared);
+            if (cleared && !flaggedBefore && !unsandboxed) clearedBy = cleared;
           }
         } else {
           if (read.kind === "alive") {
@@ -990,6 +1031,7 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
           unsandboxed,
           firstMissingProof,
           proofFailure,
+          clearedBy,
           inconsistentReads: (prior?.inconsistentReads ?? 0) + (read.kind === "stable" ? 0 : read.torn),
           fate: "running",
         });
@@ -1012,7 +1054,8 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
     const clears: ProcessClear[] = [];
     for (const record of all) {
       if (record.unsandboxed) continue;
-      if (record.oldCounted && record.verdict === "launcher") clears.push({ record, explanation: "known non-runtime executable at a stable reading" });
+      if (record.clearedBy) clears.push({ record, explanation: `exiting after a proof read while alive (${record.clearedBy})` });
+      else if (record.oldCounted && record.verdict === "launcher") clears.push({ record, explanation: "known non-runtime executable at a stable reading" });
       else if (record.oldCounted && record.verdict === "descendant") clears.push({ record, explanation: "vanished before a stable reading below a process with the sandbox proof" });
       else if (record.oldCounted && record.verdict === "other") clears.push({ record, explanation: "settled into another process after an inconsistent read" });
       else if (record.oldUnsandboxed && record.verdict === "runtime") clears.push({ record, explanation: record.inconsistentReads > 0 || record.comms.length > 1 ? "settled after an inconsistent read" : "unexplained" });
@@ -1051,6 +1094,8 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
             failed_own_proof: count((record) => record.proofFailure?.ownProof === true),
             failed_launcher_proof: count((record) => record.proofFailure?.launcherProof === true),
             failed_escape_evidence: count((record) => record.proofFailure?.escapeEvidence === true),
+            exit_cleared_own: sample.clears.filter((clear) => clear.explanation.endsWith("(own)")).length,
+            exit_cleared_launcher: sample.clears.filter((clear) => clear.explanation.endsWith("(launcher)")).length,
           })}`,
         );
       }
