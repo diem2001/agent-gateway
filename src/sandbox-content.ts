@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { log } from "./logging.js";
+import { neutralizeCommandSettings, type SettingKind } from "./command-settings.js";
 
 /**
  * What an agent sandbox may see of the trusted workspace (MVP-7678, TD-4).
@@ -724,6 +725,17 @@ export const contentScanner = new KnownValueScanner();
 /*  Mount plan                                                          */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Workspace entries whose markdown files the runtime loads as skills, agents or commands, and whose frontmatter
+ * can start a command (`hooks`, a stdio `mcpServers` entry). Measured on the bundled runtime (MVP-8116); `plugins`
+ * is not in the list because the generated `settings.json` never enables a plugin.
+ */
+export const COMMAND_SETTING_ENTRIES: readonly string[] = ["skills", "agents", "commands"];
+
+/** Caps of one snapshot (per entry): a file above either is left out, with the audit reason `too_large`. */
+export const SNAPSHOT_MAX_FILES = 2000;
+export const SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
+
 export interface PlanOptions {
   /** The workspace root (`WORKSPACE_ROOT`). */
   workspaceRoot: string;
@@ -732,6 +744,15 @@ export interface PlanOptions {
   /** The gateway's known secret values. */
   needles: Buffer[];
   scanner?: KnownValueScanner;
+  /**
+   * The run has no `Bash` grant (MVP-8106): the `skills`, `agents` and `commands` entries are not bound live but as a
+   * run-scoped snapshot whose markdown files carry no command setting. Absent or false: the mount plan is unchanged.
+   */
+  neutralizeCommands?: boolean;
+  /** The caller's API-key label, for the audit line of a rewritten file. */
+  label?: string;
+  /** Tests: caps of one snapshot other than `SNAPSHOT_MAX_FILES` and `SNAPSHOT_MAX_BYTES`. */
+  snapshotLimits?: { maxFiles: number; maxBytes: number };
 }
 
 /** An empty read-only stand-in below the trusted directory (created once per start, shared by every entry of that kind). */
@@ -800,6 +821,78 @@ function gitConfigFiles(repo: string): string[] | null {
   return files.filter((f) => f === ".git/config" || /^\.git\/(modules|worktrees)\/.+\/config$/.test(f));
 }
 
+/** A name for an audit line: the skill or agent a file belongs to, only when it is a safe name. */
+function settingFileName(rel: string): string {
+  const parts = rel.split("/");
+  const base = parts[parts.length - 1];
+  const stem = /^SKILL\.md$/i.test(base) && parts.length > 1 ? parts[parts.length - 2] : base.replace(/\.md$/i, "");
+  return SAFE_NAME.test(stem) ? stem : "invalid";
+}
+
+/** One content-free line per rewritten file: the label, where the file came from, its name and the kinds of setting ignored. */
+export function auditIgnoredCommandSettings(label: string | undefined, source: string, name: string, ignored: readonly SettingKind[]): void {
+  if (ignored.length === 0) return;
+  log("audit", `command-settings.ignored label=${label !== undefined && SAFE_NAME.test(label) ? label : "invalid"} source=${source} name=${name} setting=${ignored.join(",")}`);
+}
+
+/**
+ * A copy of one workspace entry for a run without the `Bash` grant. Only regular files and directories owned by
+ * the gateway user are copied (no link is followed or entered); every file is read with an explicit size limit;
+ * every `.md` file is rewritten by `neutralizeCommandSettings`. A file that cannot be copied is left out with an
+ * audit reason, never copied raw. The stored files are not touched, and later changes to them do not reach the copy.
+ */
+function snapshotEntry(source: string, target: string, entryName: string, label: string | undefined, limits: { maxFiles: number; maxBytes: number }): void {
+  fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+  let files = 0;
+  let bytes = 0;
+  const leave = (rel: string, reason: SkipReason | "too_large"): void => audit(`snapshot-${entryName}`, settingFileName(rel), reason);
+  const walk = (dir: string, targetDir: string, relDir: string): void => {
+    for (const name of fs.readdirSync(dir).sort()) {
+      const rel = relDir ? `${relDir}/${name}` : name;
+      const full = path.join(dir, name);
+      const stat = lstatOrNull(full);
+      if (!stat) continue;
+      if (stat.isSymbolicLink()) {
+        leave(rel, "symlink");
+      } else if (stat.isDirectory()) {
+        if (!ownedByGatewayUser(stat)) {
+          leave(rel, "not_owned");
+          continue;
+        }
+        const copy = path.join(targetDir, name);
+        fs.mkdirSync(copy, { mode: 0o700 });
+        walk(full, copy, rel);
+      } else if (stat.isFile()) {
+        if (!ownedByGatewayUser(stat)) {
+          leave(rel, "not_owned");
+          continue;
+        }
+        if (files >= limits.maxFiles || bytes + stat.size > limits.maxBytes) {
+          leave(rel, "too_large");
+          continue;
+        }
+        const content = readFileNoFollow(full, limits.maxBytes - bytes);
+        if (!content) {
+          leave(rel, "unreadable");
+          continue;
+        }
+        files++;
+        bytes += content.length;
+        let data = content;
+        if (/\.md$/i.test(name)) {
+          const rewritten = neutralizeCommandSettings(content);
+          data = rewritten.data;
+          auditIgnoredCommandSettings(label, entryName, settingFileName(rel), rewritten.ignored);
+        }
+        fs.writeFileSync(path.join(targetDir, name), data, { flag: "wx", mode: 0o600 | (stat.mode & 0o100) });
+      } else {
+        leave(rel, "wrong_type");
+      }
+    }
+  };
+  walk(source, target, "");
+}
+
 /**
  * The read-only mounts of one sandbox: the global workspace entries, a generated
  * `settings.json` that keeps only `permissions`, every repository under
@@ -842,6 +935,24 @@ export function planTrustedContent(options: PlanOptions): MountPlan {
         plan.hiddenCount++;
         audit("global", entry.name, verdict === "too_large" ? "too_large" : "known_value");
       }
+    }
+    if (options.neutralizeCommands === true && entry.kind === "dir" && COMMAND_SETTING_ENTRIES.includes(entry.name)) {
+      const dest = `${SANDBOX_CLAUDE_DIR}/${entry.name}`;
+      const snapshot = path.join(options.trustedDir, "neutralized", entry.name);
+      try {
+        snapshotEntry(source, snapshot, entry.name, options.label, options.snapshotLimits ?? { maxFiles: SNAPSHOT_MAX_FILES, maxBytes: SNAPSHOT_MAX_BYTES });
+      } catch {
+        // Fail closed: an entry that cannot be copied is seen as empty, never bound live.
+        fs.rmSync(snapshot, { recursive: true, force: true });
+        skip("global", entry.name, "unreadable");
+        plan.mounts.push({ src: trustedEmpty(options.trustedDir, "dir"), dest });
+        continue;
+      }
+      plan.mounts.push({ src: snapshot, dest });
+      hide("global", entry.name, snapshot, dest);
+      // The snapshot is single-use: its scan results would only fill the cache.
+      scanner.invalidate(snapshot);
+      continue;
     }
     plan.mounts.push({ src: source, dest: `${SANDBOX_CLAUDE_DIR}/${entry.name}` });
     if (entry.kind === "dir") hide("global", entry.name, source, `${SANDBOX_CLAUDE_DIR}/${entry.name}`);
