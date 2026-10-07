@@ -939,11 +939,12 @@ describe("process sampler launcher exemption", () => {
     reported(final, record);
   });
 
+  // E5 keeps its holder (and so the real bwrap above it) alive after it reaped the runtime: the control is the launcher route, so the launcher must still be there.
   it("E5: a runtime below a real bwrap that has no pid namespace of its own (so no full proof) and is reaped at its first reading is reported", async () => {
     requireHost(["bwrap"]);
     const state = newExitState();
     const withoutPidNamespace = BWRAP.slice(1).filter((argument) => argument !== "--unshare-pid");
-    const { snapshots, final } = await stages(() => spawn(BWRAP[0], [...withoutPidNamespace, "/bin/bash", "-c", `(${standIn}) & wait`], { stdio: "ignore" }), forcedStages(state), {}, forceExit(state, "reaped"));
+    const { snapshots, final } = await stages(() => spawn(BWRAP[0], [...withoutPidNamespace, "/bin/bash", "-c", `(${standIn}) & wait; sleep 5`], { stdio: "ignore" }), forcedStages(state), {}, forceExit(state, "reaped"));
     const record = outcomeOf(state, snapshots, "the runtime below the real bwrap");
     expect(record.proofFailure).toEqual({ failedWhile: "exiting", ownProof: false, launcherProof: false, escapeEvidence: false });
     reported(final, record);
