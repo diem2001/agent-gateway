@@ -766,7 +766,7 @@ export function createReferenceTracker(io: ReferenceIo = realReferenceIo): { beg
 const worseSource = (a: ReferenceSource, b: ReferenceSource): ReferenceSource => (a === "missing" || b === "missing" ? "missing" : a === "cached" || b === "cached" ? "cached" : "live");
 
 /** The runtime's own link against the reference's: `unreadable` when either side has no value (the runtime side is never cached). */
-function sameNamespace(pid: number, reference: Reference, kind: NsKind): { result: boolean | "unreadable"; ownUnreadable: boolean; source: ReferenceSource } {
+export function sameNamespace(pid: number, reference: Reference, kind: NsKind): { result: boolean | "unreadable"; ownUnreadable: boolean; source: ReferenceSource } {
   const own = readlinkOrNull(`/proc/${pid}/ns/${kind}`);
   const ref = reference.link(kind);
   return { result: own === null || ref.value === null ? "unreadable" : own === ref.value, ownUnreadable: own === null, source: ref.source };

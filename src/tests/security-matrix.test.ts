@@ -38,12 +38,23 @@ import {
   type PresenceKey,
   type ProcessSample,
   redactArgv,
+  PENDING_BOUND_MS,
+  createReferenceTracker,
+  currentRowId,
+  deriveRowId,
   describeRecords,
+  endedNow,
   exitConfirmed,
+  exitKind,
   exitProofClears,
   flagAfterProofFailure,
+  referenceEndedPending,
+  referenceSymptom,
+  resolvePending,
+  sameNamespace,
   sampleProblems,
   type ExitReading,
+  type ReferenceIo,
   type ProcessRecord,
   type MatrixRow,
   type Surface,
@@ -606,8 +617,9 @@ describe("process sampler launcher exemption", () => {
     steps: Stage[],
     markers: Record<string, string> = {},
     seam: (pid: number) => void = () => {},
+    referencePid: () => number = () => process.pid,
   ): Promise<{ snapshots: (ProcessSample | undefined)[]; final: ProcessSample; audit: string[]; summary: string[] }> {
-    const sampler = startProcessSampler(() => process.pid, [], 20, { afterStableReading: seam });
+    const sampler = startProcessSampler(referencePid, [], 20, { afterStableReading: seam });
     const child = start();
     children.push(child);
     const snapshots: (ProcessSample | undefined)[] = [];
@@ -949,6 +961,208 @@ describe("process sampler launcher exemption", () => {
     expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: false, launcherProof: false, escapeEvidence: false });
     reported(final, record);
   });
+
+  /*  The reference ends (MVP-8090 rev 3): the gateway stand-in is killed while the runtime below it is still alive  */
+
+  interface ChainState extends ExitState {
+    runtime?: { pid: number; startTicks: string };
+    holder?: number;
+  }
+  const ppidOf = (pid: number): number => statOf(pid)?.ppid ?? 0;
+  const startOf = (pid: number): string | null => {
+    try {
+      const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      return text.slice(text.lastIndexOf(")") + 2).split(" ")[19];
+    } catch {
+      return null;
+    }
+  };
+  const mntLinkDenied = (pid: number): boolean => {
+    try {
+      fs.readlinkSync(`/proc/${pid}/ns/mnt`);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EACCES";
+    }
+  };
+  const safeKill = (pid: number | undefined, signal: NodeJS.Signals): void => {
+    if (pid === undefined) return;
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Already gone.
+    }
+  };
+  /** A reference stand-in that keeps running (so it never ends by itself) and makes itself non-dumpable on SIGUSR1: its namespace links then fail with EACCES while it lives. */
+  const NON_DUMPABLE_REFERENCE = "import ctypes, signal, subprocess, sys, time\nlibc = ctypes.CDLL(None)\nsignal.signal(signal.SIGUSR1, lambda *_: libc.prctl(4, 0, 0, 0, 0))\nchild = subprocess.Popen(sys.argv[1:])\nwhile True:\n    time.sleep(0.05)";
+  const pythonReference = (argv: string[]): ChildProcess => spawn("python3", ["-c", NON_DUMPABLE_REFERENCE, ...argv], { stdio: "ignore" });
+  /** H: the process that holds the real bwrap around the stand-in runtime; R: the bash reference above H. */
+  const holderScript = `${BWRAP.map(quote).join(" ")} /bin/bash -c ${quote(standIn)}; :`;
+  const referenceScript = `/bin/bash -c ${quote(holderScript)}; :`;
+
+  /**
+   * The seam of a reference-end control. On the `atReading`-th stable reading of the runtime it records the runtime, finds the holder
+   * `holderHops` parents above it and kills the holder's parent (the reference, or a middle process below a live reference), then
+   * holds the tick until that process is a zombie or gone and the holder has a new parent. `before` runs first. The holder or the
+   * runtime is then ended from the event loop, `endAfterMs` later, when the row needs the runtime to end within the bound.
+   */
+  const chainSeam =
+    (state: ChainState, options: { atReading: number; holderHops: number; before?: () => boolean; end?: "holder" | "runtime"; endAfterMs?: number }) =>
+    (pid: number): void => {
+      state.pid ??= pid;
+      if (pid !== state.pid || state.forced) return;
+      state.readings += 1;
+      if (state.readings < options.atReading) return;
+      state.forced = true;
+      state.runtime = { pid, startTicks: startOf(pid) ?? "" };
+      let holder = pid;
+      for (let hop = 0; hop < options.holderHops; hop++) holder = ppidOf(holder);
+      state.holder = holder;
+      const victim = ppidOf(holder);
+      const prepared = options.before?.() ?? true;
+      process.kill(victim, "SIGKILL");
+      state.reached = prepared && waitSync(() => (isZombie(victim) || isGone(victim)) && ppidOf(holder) !== victim);
+      if (options.end) setTimeout(() => safeKill(options.end === "holder" ? holder : pid, "SIGKILL"), options.endAfterMs ?? 100);
+    };
+  const runtimeEnded = (state: ChainState): boolean => state.runtime !== undefined && endedNow(state.runtime.pid, state.runtime.startTicks).ended;
+  const referenceStages = (state: ChainState, last: Stage): Stage[] => [...forcedStages(state), last];
+  const flaggedNever = (final: ProcessSample, record: ProcessRecord, what: string): void => {
+    reported(final, record);
+    expect(record.pending, `${what} was never pending`).toBeUndefined();
+    expect(record.proofFailure?.pending, `${what} was never pending`).toBe("none");
+  };
+
+  it("R0: a reference that turns non-dumpable while alive (its namespace links fail with EACCES) is read from the cache: the proof holds, nothing is flagged or cleared", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const seam = (pid: number): void => {
+      state.pid ??= pid;
+      if (pid !== state.pid || state.forced) return;
+      state.readings += 1;
+      if (state.readings < 3) return;
+      state.forced = true;
+      process.kill(reference!.pid!, "SIGUSR1");
+      state.reached = waitSync(() => mntLinkDenied(reference!.pid!));
+    };
+    const { snapshots, final } = await stages(
+      () => (reference = pythonReference([BWRAP[0], ...BWRAP.slice(1), "/bin/bash", "-c", standIn])),
+      [...forcedStages(state), { name: "proofs on the cache", until: (seen) => seen.records.some((record) => (record.provedReferenceCached ?? 0) > 0) }],
+      {},
+      seam,
+      () => reference?.pid ?? 0,
+    );
+    const record = outcomeOf(state, snapshots, "the runtime below the non-dumpable reference");
+    expect(record.proofFailure, "the proof failed").toBeUndefined();
+    expect(record.unsandboxed).toBe(false);
+    expect(record.clearedBy).toBeUndefined();
+    expect(record.provedReferenceCached ?? 0).toBeGreaterThan(0);
+    expect(final.referenceChanged).toBe(0);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(endedNow(reference!.pid!, startOf(reference!.pid!)!).ended, "a live non-dumpable reference is not an ended one").toBe(false);
+  });
+
+  it("R1: the reference ends (a zombie, chain broken) after the runtime's own proof: the record waits, the runtime ends within the bound, and it is cleared and audited", async () => {
+    requireHost(["bwrap"]);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const { snapshots, final, audit, summary } = await stages(
+      () => (reference = spawn("/bin/bash", ["-c", referenceScript], { stdio: "ignore" })),
+      referenceStages(state, { name: "cleared", until: (seen) => seen.records.some((record) => record.pending?.state === "cleared") }),
+      {},
+      chainSeam(state, { atReading: 3, holderHops: 3, end: "holder" }),
+      () => reference?.pid ?? 0,
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the reference did not end as a zombie within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    expect(record!.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, referenceEnded: true, chain: "broken", reference: "cached", runtimeExit: "alive", pending: "cleared" });
+    expect(record!.clearedBy).toBe("reference-ended");
+    expect(record!.unsandboxed).toBe(false);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("reference ended after the runtime's own proof read while alive; runtime exit confirmed"))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_reference=1");
+  });
+
+  it("R1-alive: the same record whose runtime outlives the bound is flagged for good (pending expired)", async () => {
+    requireHost(["bwrap"]);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const { snapshots, final, summary } = await stages(
+      () => (reference = spawn("/bin/bash", ["-c", referenceScript], { stdio: "ignore" })),
+      referenceStages(state, { name: "expired", until: (seen) => seen.records.some((record) => record.pending?.state === "expired") }),
+      {},
+      chainSeam(state, { atReading: 3, holderHops: 3 }),
+      () => reference?.pid ?? 0,
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the reference did not end as a zombie within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    expect(record!.proofFailure).toMatchObject({ referenceEnded: true, chain: "broken", runtimeExit: "alive", pending: "expired" });
+    expect(endedNow(record!.pid, record!.startTicks).ended, "the runtime outlived the bound by construction").toBe(false);
+    reported(final, record!);
+    expect(summary[0]).toContain("pending_expired=1");
+  });
+
+  it("R2: a runtime below a script named bwrap, in the reference's namespaces, whose reference ends is reported (escape evidence against the cache), and its exit is confirmed before the window closes", async () => {
+    const launcher = renamedLauncher(`(${standIn})`);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const { snapshots, final } = await stages(
+      () => (reference = spawn("/bin/bash", ["-c", `${launcher}; :`], { stdio: "ignore" })),
+      referenceStages(state, { name: "runtime ended", until: () => runtimeEnded(state) }),
+      {},
+      chainSeam(state, { atReading: 1, holderHops: 1, end: "runtime" }),
+      () => reference?.pid ?? 0,
+    );
+    const record = outcomeOf(state, snapshots, "the renamed runtime");
+    expect(record.proofFailure).toMatchObject({ ownProof: false, escapeEvidence: true, referenceEnded: true });
+    expect(runtimeEnded(state), "the runtime's exit was not confirmed before the window closed").toBe(true);
+    flaggedNever(final, record, "the renamed runtime");
+  });
+
+  it("R3: the reference ends on the runtime's first stable reading, before any own proof: reported, never pending", async () => {
+    requireHost(["bwrap"]);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const { snapshots, final } = await stages(
+      () => (reference = spawn("/bin/bash", ["-c", referenceScript], { stdio: "ignore" })),
+      referenceStages(state, { name: "runtime ended", until: () => runtimeEnded(state) }),
+      {},
+      chainSeam(state, { atReading: 1, holderHops: 3, end: "holder" }),
+      () => reference?.pid ?? 0,
+    );
+    const record = outcomeOf(state, snapshots, "the runtime on its first reading");
+    expect(record.proofFailure).toMatchObject({ ownProof: false, referenceEnded: true });
+    expect(runtimeEnded(state), "the runtime's exit was not confirmed before the window closed").toBe(true);
+    flaggedNever(final, record, "the runtime on its first reading");
+  });
+
+  it("R4: a middle process dies below a reference that is still alive (non-dumpable, read from the cache): the chain breaks, the runtime is reported, never pending", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const { snapshots, final } = await stages(
+      () => (reference = pythonReference(["/bin/bash", "-c", referenceScript])),
+      referenceStages(state, { name: "runtime ended", until: () => runtimeEnded(state) }),
+      {},
+      chainSeam(state, {
+        atReading: 3,
+        holderHops: 3,
+        end: "holder",
+        before: () => {
+          process.kill(reference!.pid!, "SIGUSR1");
+          return waitSync(() => mntLinkDenied(reference!.pid!));
+        },
+      }),
+      () => reference?.pid ?? 0,
+    );
+    const record = outcomeOf(state, snapshots, "the runtime below the live reference");
+    expect(record.proofFailure).toMatchObject({ ownProof: true, chain: "broken", reference: "cached", referenceEnded: false, runtimeExit: "alive" });
+    expect(runtimeEnded(state), "the runtime's exit was not confirmed before the window closed").toBe(true);
+    flaggedNever(final, record, "the runtime below the live reference");
+  });
 });
 
 /**
@@ -1004,5 +1218,225 @@ describe("process sampler exit rule: decision table", () => {
     ["empty command line and missing executable together", reading({ cmdline: "", exe: "gone" }), true],
   ])("exit classifier: %s", (_name, given, expected) => {
     expect(exitConfirmed(given)).toBe(expected);
+  });
+
+  const reference = (partial: Partial<Parameters<typeof referenceEndedPending>[0]> = {}) => ({ ownProof: true, launcherProof: false, referenceEnded: true, symptom: true, escapeEvidence: false, cacheExists: true, ...partial });
+
+  it.each([
+    ["T-ref: all four conditions hold", reference(), true],
+    ["T-ref: no own proof (first tick)", reference({ ownProof: false }), false],
+    ["T-ref: launcher proof only, no own proof", reference({ ownProof: false, launcherProof: true }), false],
+    ["T-ref: reference alive (not ended)", reference({ referenceEnded: false }), false],
+    ["T-ref: reference not confirmed ended (a zombie leader whose threads run)", reference({ referenceEnded: exitConfirmed({ vanished: false, startChanged: false, state: "Z", threads: 3, cmdline: "", exe: "gone" }) }), false],
+    ["T-ref: no reference symptom (live readable reference, complete chain)", reference({ symptom: referenceSymptom("live", "complete") }), false],
+    ["T-ref-escape: the runtime's pid link equals the reference's", reference({ escapeEvidence: true }), false],
+    ["T-ref: no cache for the reference identity", reference({ cacheExists: false }), false],
+  ])("%s", (_name, given, expected) => {
+    expect(referenceEndedPending(given)).toBe(expected);
+  });
+
+  it.each([
+    ["live and complete: no symptom", "live", "complete", false],
+    ["cached reference: symptom", "cached", "complete", true],
+    ["missing reference: symptom", "missing", "complete", true],
+    ["broken chain: symptom", "live", "broken", true],
+  ] as const)("reference symptom: %s", (_name, source, chain, expected) => {
+    expect(referenceSymptom(source, chain)).toBe(expected);
+  });
+
+  it.each([
+    ["exit confirmed within the bound clears", { elapsedMs: 100, exitConfirmed: true, final: false }, "cleared"],
+    ["no exit yet inside the bound waits", { elapsedMs: 100, exitConfirmed: false, final: false }, "waiting"],
+    ["no exit at the bound expires", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: false, final: false }, "expired"],
+    ["an exit seen only after the bound does not clear", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: true, final: false }, "expired"],
+    ["no exit at stop() expires", { elapsedMs: 100, exitConfirmed: false, final: true }, "expired"],
+  ] as const)("pending: %s", (_name, given, expected) => {
+    expect(resolvePending(given)).toBe(expected);
+  });
+
+  it("exit kinds name how a process looked on the re-read", () => {
+    const base: ExitReading = { vanished: false, startChanged: false, state: "S", threads: 1, cmdline: "x", exe: "readable" };
+    expect(exitKind(base)).toBe("alive");
+    expect(exitKind({ ...base, vanished: true })).toBe("vanished");
+    expect(exitKind({ ...base, startChanged: true })).toBe("start-changed");
+    expect(exitKind({ ...base, state: "X" })).toBe("X");
+    expect(exitKind({ ...base, state: "Z" })).toBe("Z1");
+    expect(exitKind({ ...base, state: "Z", threads: 2 })).toBe("Zn");
+    expect(exitKind({ ...base, cmdline: "", exe: "gone" })).toBe("empty-gone");
+  });
+});
+
+/**
+ * The reference resolver (MVP-8090 rev 3) over a fake `/proc`: the cache of the reference's namespace links per identity,
+ * live-first comparison and the start-time bracket. The fake stands in for a reference that no unprivileged real process can
+ * be made to leave at a chosen moment; R0 and R1 run the same tracker against real processes.
+ */
+describe("process sampler reference resolver", () => {
+  const LINKS = { pid: "pid:[1]", user: "user:[2]", mnt: "mnt:[3]" };
+  function fake(initial: { startTicks?: string; state?: string; cmdline?: string; links?: Partial<Record<"pid" | "user" | "mnt", string | null>> } = {}) {
+    const proc = { startTicks: initial.startTicks ?? "100", state: initial.state ?? "S", cmdline: initial.cmdline ?? "gateway", links: { ...LINKS, ...initial.links } as Record<"pid" | "user" | "mnt", string | null>, gone: false, changeStartAfterInfoCalls: Infinity, infoCalls: 0 };
+    const io: ReferenceIo = {
+      info: () => {
+        proc.infoCalls += 1;
+        return proc.gone ? null : { startTicks: proc.infoCalls > proc.changeStartAfterInfoCalls ? "999" : proc.startTicks, state: proc.state, cmdline: proc.cmdline };
+      },
+      link: (_pid, kind) => (proc.gone ? null : proc.links[kind]),
+    };
+    return { proc, io };
+  }
+
+  it("a readable live link equal to the cache is used live, and nothing changed", () => {
+    const { io } = fake();
+    const tracker = createReferenceTracker(io);
+    const reference = tracker.begin(10);
+    expect(reference.hasCache).toBe(true);
+    expect(reference.link("mnt")).toEqual({ value: LINKS.mnt, source: "live" });
+    expect(tracker.changed()).toBe(0);
+  });
+
+  it("an unreadable live link falls back to the cache taken while the reference was healthy", () => {
+    const { proc, io } = fake();
+    const tracker = createReferenceTracker(io);
+    tracker.begin(10);
+    proc.links.mnt = null;
+    proc.state = "Z";
+    expect(tracker.begin(10).link("mnt")).toEqual({ value: LINKS.mnt, source: "cached" });
+    expect(tracker.begin(10).link("pid")).toEqual({ value: LINKS.pid, source: "live" });
+  });
+
+  it("without a cache an unreadable link stays unreadable", () => {
+    const { io } = fake({ state: "Z", links: { mnt: null } });
+    const tracker = createReferenceTracker(io);
+    const reference = tracker.begin(10);
+    expect(reference.hasCache).toBe(false);
+    expect(reference.link("mnt")).toEqual({ value: null, source: "missing" });
+  });
+
+  it("a readable live link that differs from the cache is counted and the live value is returned", () => {
+    const { proc, io } = fake();
+    const tracker = createReferenceTracker(io);
+    tracker.begin(10);
+    proc.links.mnt = "mnt:[99]";
+    expect(tracker.begin(10).link("mnt")).toEqual({ value: "mnt:[99]", source: "live" });
+    expect(tracker.changed()).toBe(1);
+  });
+
+  it("a new identity (another start time) gets no cache from the old one, and the old cache is not used for it", () => {
+    const { proc, io } = fake();
+    const tracker = createReferenceTracker(io);
+    tracker.begin(10);
+    proc.startTicks = "200";
+    proc.state = "Z";
+    proc.links.mnt = null;
+    const reference = tracker.begin(10);
+    expect(reference.hasCache).toBe(false);
+    expect(reference.link("mnt")).toEqual({ value: null, source: "missing" });
+  });
+
+  it.each([
+    ["a zombie", { state: "Z" }],
+    ["a dead process (X)", { state: "X" }],
+    ["an empty command line", { cmdline: "" }],
+  ])("no cache is captured while the reference is ending: %s", (_name, partial) => {
+    const { io } = fake(partial);
+    expect(createReferenceTracker(io).begin(10).hasCache).toBe(false);
+  });
+
+  it("no cache is captured when a link cannot be read, or when the start time changes during the capture", () => {
+    expect(createReferenceTracker(fake({ links: { user: null } }).io).begin(10).hasCache).toBe(false);
+    const { proc, io } = fake();
+    proc.changeStartAfterInfoCalls = 1;
+    expect(createReferenceTracker(io).begin(10).hasCache).toBe(false);
+  });
+
+  it("a live link read across a start-time change is not used", () => {
+    const { proc, io } = fake();
+    const tracker = createReferenceTracker(io);
+    const reference = tracker.begin(10);
+    proc.changeStartAfterInfoCalls = proc.infoCalls;
+    expect(reference.link("mnt")).toEqual({ value: LINKS.mnt, source: "cached" });
+  });
+
+  it("an unreadable reference has no identity, no cache and reads nothing", () => {
+    const { proc, io } = fake();
+    proc.gone = true;
+    const reference = createReferenceTracker(io).begin(10);
+    expect(reference.id).toBeNull();
+    expect(reference.link("pid")).toEqual({ value: null, source: "missing" });
+  });
+
+  it("the runtime's own side is never cached: a link that was readable once and is gone now is unreadable", async () => {
+    const { io } = fake();
+    const reference = createReferenceTracker(io).begin(10);
+    const child = spawn("sleep", ["5"], { stdio: "ignore" });
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    expect(sameNamespace(child.pid!, reference, "pid").result, "precondition not reached: the child's link was not readable").not.toBe("unreadable");
+    child.kill("SIGKILL");
+    await exited;
+    expect(sameNamespace(child.pid!, reference, "pid")).toMatchObject({ result: "unreadable", ownUnreadable: true });
+  });
+});
+
+/** Row attribution (MVP-8090 rev 3): every summary line names its row by an id derived from the test's file and full name. */
+describe("process sampler row attribution", () => {
+  const FILE = "src/tests/example.test.ts";
+
+  it("the id is the plain leading token of the last segment plus a hash of file and full name; any other leading text gives the prefix t", () => {
+    expect(deriveRowId(`/work/tree/${FILE}`, "d > E1: a runtime")).toMatch(/^E1-[0-9a-f]{10}$/);
+    expect(deriveRowId(FILE, "d > control G1: a runtime")).toMatch(/^t-[0-9a-f]{10}$/);
+    expect(deriveRowId(FILE, `d > ${"x".repeat(60)}: long`)).toMatch(/^t-[0-9a-f]{10}$/);
+    expect(deriveRowId(FILE, "d > IF.detached-kill: SIGKILL of the gateway")).toMatch(/^IF\.detached-kill-[0-9a-f]{10}$/);
+  });
+
+  it("two names with the same prefix get different ids, and the same name in another file does too", () => {
+    expect(deriveRowId(FILE, "control: first")).not.toBe(deriveRowId(FILE, "control: second"));
+    expect(deriveRowId(FILE, "d > E1: same")).not.toBe(deriveRowId("src/tests/other.test.ts", "d > E1: same"));
+    expect(deriveRowId(`/a/${FILE}`, "d > E1: same")).toBe(deriveRowId(`/b/${FILE}`, "d > E1: same"));
+  });
+
+  it("the running test reads its own id through the global state, with the real describe nesting", () => {
+    const state = (globalThis as Record<symbol, { getState: () => { testPath: string } }>)[Symbol.for("expect-global")].getState();
+    expect(currentRowId()).toBe(deriveRowId(state.testPath, "process sampler row attribution > the running test reads its own id through the global state, with the real describe nesting"));
+  });
+
+  it("a window's summary line carries the row id of the test that started it and the number of flagged records", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "cli.js"], { stdio: "ignore" });
+    const sampler = startProcessSampler(() => process.pid, []);
+    const deadline = Date.now() + 10_000;
+    while (sampler.peek().runtimesSeen === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    try {
+      sampler.stop({});
+    } finally {
+      spy.mockRestore();
+      child.kill("SIGKILL");
+    }
+    const summary = lines.join("").split("\n").filter((line) => line.startsWith("SECURITY-PROCESS-SUMMARY"));
+    expect(summary, "precondition not reached: the runtime stand-in was not recorded").toHaveLength(1);
+    expect(summary[0]).toContain(`row=${currentRowId()} flagged=1`);
+  });
+
+  it("a row id that matches a run marker is withheld", async () => {
+    const sampler = startProcessSampler(() => process.pid, []);
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "cli.js"], { stdio: "ignore" });
+    const deadline = Date.now() + 10_000;
+    while (sampler.peek().runtimesSeen === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    try {
+      sampler.stop({ synthetic: currentRowId() });
+    } finally {
+      spy.mockRestore();
+      child.kill("SIGKILL");
+    }
+    expect(lines.join("")).toContain("row=withheld");
+    expect(lines.join("").includes(currentRowId())).toBe(false);
   });
 });
