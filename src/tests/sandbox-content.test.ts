@@ -4,6 +4,7 @@
  * allowlist-generated git configuration, the known-value scan and the mount plan.
  * All secret values are synthetic.
  */
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -23,6 +24,7 @@ import {
   stripUrlUserInfo,
   webhookUrlValues,
 } from "../sandbox-content.js";
+import { SandboxRun, loadIsolationConfig } from "../sandbox.js";
 
 const SECRET = "SYNTH-CRED-ACCESS-TOKEN-7678-abcdef";
 const TOKEN_URL_SECRET = "SYNTH-CLONE-TOKEN-7678-xyz";
@@ -668,3 +670,214 @@ describe("mount plan", () => {
     expect(logs.join("\n")).not.toContain(SECRET);
   });
 });
+
+describe("a snapshot of skills, agents and commands for a run without Bash (MVP-8106)", () => {
+  const HOOK_SKILL = "---\nname: probe\ndescription: probe skill\nhooks:\n  PreToolUse:\n    - matcher: Read\n      hooks:\n        - type: command\n          command: touch /work/m-HOOKCMD\n---\nINSTRUCTION-TOKEN\n";
+  const NEUTRAL_SKILL = '---\nname: "probe"\ndescription: "probe skill"\n---\nINSTRUCTION-TOKEN\n';
+  const HOOK_AGENT = "---\nname: a\ndescription: agent\ntools: Read\nmcpServers:\n  - p:\n      type: stdio\n      command: sh\n---\nAGENT-TOKEN\n";
+  const NEUTRAL_AGENT = '---\nname: "a"\ndescription: "agent"\ntools: "Read"\n---\nAGENT-TOKEN\n';
+  const trusted = () => path.join(root, "trusted");
+
+  function plan(options: { neutralize?: boolean; needles?: Buffer[]; scanner?: KnownValueScanner; limits?: { maxFiles: number; maxBytes: number }; trustedDir?: string } = {}) {
+    return planTrustedContent({
+      workspaceRoot: path.join(root, "ws"),
+      trustedDir: options.trustedDir ?? trusted(),
+      needles: options.needles ?? [],
+      scanner: options.scanner ?? new KnownValueScanner(),
+      ...(options.neutralize === undefined ? {} : { neutralizeCommands: options.neutralize }),
+      label: "reqlift",
+      ...(options.limits ? { snapshotLimits: options.limits } : {}),
+    });
+  }
+  const mountOf = (p: ReturnType<typeof plan>, entry: string) => p.mounts.find((m) => m.dest === `/home/node/.claude/${entry}`);
+  const audits = () => logs.filter((l) => l.includes("[audit]")).join("\n");
+
+  function seed(): void {
+    write("ws/skills/probe/SKILL.md", HOOK_SKILL);
+    write("ws/skills/probe/reference.txt", "reference text");
+    write("ws/skills/probe/deep/NOTES.MD", HOOK_SKILL);
+    write("ws/agents/a.md", HOOK_AGENT);
+    write("ws/agents/team/b.md", HOOK_AGENT);
+    write("ws/commands/c.md", HOOK_SKILL);
+    write("ws/memory/note.md", HOOK_SKILL);
+    write("ws/CLAUDE.md", HOOK_SKILL);
+  }
+
+  it("binds a copy instead of the live entry for skills, agents and commands only, in the same mount order and at the same paths", () => {
+    seed();
+    const off = plan({ neutralize: false, trustedDir: path.join(root, "trusted-off") });
+    const on = plan({ neutralize: true });
+    expect(on.mounts.map((m) => m.dest)).toEqual(off.mounts.map((m) => m.dest));
+    for (const entry of ["skills", "agents", "commands"]) {
+      expect(mountOf(off, entry)!.src).toBe(path.join(root, "ws", entry));
+      expect(mountOf(on, entry)!.src).toBe(path.join(trusted(), "neutralized", entry));
+    }
+    for (const entry of ["CLAUDE.md", "memory", "output-styles", "plugins", "hooks", "settings.json"]) {
+      expect(mountOf(on, entry)!.src.startsWith(path.join(trusted(), "neutralized"))).toBe(false);
+    }
+    expect(mountOf(on, "memory")!.src).toBe(path.join(root, "ws", "memory"));
+    expect(mountOf(on, "CLAUDE.md")!.src).toBe(path.join(root, "ws", "CLAUDE.md"));
+  });
+
+  it("changes nothing without the flag: the plan with the option absent or false is the plan of before, and no copy is made", () => {
+    seed();
+    const absent = plan();
+    const explicitFalse = plan({ neutralize: false, trustedDir: path.join(root, "trusted-false") });
+    const strip = (p: ReturnType<typeof plan>, dir: string) => JSON.parse(JSON.stringify(p).replaceAll(dir, "<trusted>"));
+    expect(strip(explicitFalse, path.join(root, "trusted-false"))).toEqual(strip(absent, trusted()));
+    expect(mountOf(absent, "skills")!.src).toBe(path.join(root, "ws", "skills"));
+    expect(fs.existsSync(path.join(trusted(), "neutralized"))).toBe(false);
+    expect(audits()).not.toContain("command-settings");
+  });
+
+  it("rewrites every markdown file (any case, any depth) and copies everything else as it is", () => {
+    seed();
+    write("ws/skills/probe/script.sh", "#!/bin/sh\necho x\n");
+    fs.chmodSync(path.join(root, "ws", "skills", "probe", "script.sh"), 0o755);
+    plan({ neutralize: true });
+    const snap = (rel: string) => fs.readFileSync(path.join(trusted(), "neutralized", rel), "utf8");
+    expect(snap("skills/probe/SKILL.md")).toBe(NEUTRAL_SKILL);
+    expect(snap("skills/probe/deep/NOTES.MD")).toBe(NEUTRAL_SKILL);
+    expect(snap("agents/a.md")).toBe(NEUTRAL_AGENT);
+    expect(snap("agents/team/b.md")).toBe(NEUTRAL_AGENT);
+    expect(snap("commands/c.md")).toBe(NEUTRAL_SKILL);
+    expect(snap("skills/probe/reference.txt")).toBe("reference text");
+    expect(snap("skills/probe/script.sh")).toBe("#!/bin/sh\necho x\n");
+    expect(fs.statSync(path.join(trusted(), "neutralized", "skills", "probe", "script.sh")).mode & 0o100).toBe(0o100);
+    expect(fs.statSync(path.join(trusted(), "neutralized", "skills", "probe", "reference.txt")).mode & 0o100).toBe(0);
+    // The stored files are untouched, and so are the entries the runtime does not load as skills or agents.
+    expect(fs.readFileSync(path.join(root, "ws", "skills", "probe", "SKILL.md"), "utf8")).toBe(HOOK_SKILL);
+    expect(fs.readFileSync(path.join(root, "ws", "agents", "a.md"), "utf8")).toBe(HOOK_AGENT);
+  });
+
+  it("is a copy of the moment of the plan: a file saved, changed or deleted afterwards does not reach it", () => {
+    seed();
+    plan({ neutralize: true });
+    write("ws/skills/late/SKILL.md", HOOK_SKILL);
+    write("ws/skills/probe/SKILL.md", "---\nname: probe\nhooks: {}\n---\nCHANGED\n");
+    fs.rmSync(path.join(root, "ws", "agents", "a.md"));
+    const snapshot = path.join(trusted(), "neutralized");
+    expect(fs.existsSync(path.join(snapshot, "skills", "late"))).toBe(false);
+    expect(fs.readFileSync(path.join(snapshot, "skills", "probe", "SKILL.md"), "utf8")).toBe(NEUTRAL_SKILL);
+    expect(fs.readFileSync(path.join(snapshot, "agents", "a.md"), "utf8")).toBe(NEUTRAL_AGENT);
+  });
+
+  it("leaves a symlink (to a file or a directory) and a non-regular file out, each with an audit line, and never follows them", () => {
+    seed();
+    write("outside/secret.md", `---\nname: x\n---\n${SECRET}\n`);
+    fs.mkdirSync(path.join(root, "outside", "dir"));
+    write("outside/dir/inner.md", "inner");
+    fs.symlinkSync(path.join(root, "outside", "secret.md"), path.join(root, "ws", "skills", "probe", "link.md"));
+    fs.symlinkSync(path.join(root, "outside", "dir"), path.join(root, "ws", "agents", "linked-dir"));
+    fs.symlinkSync(path.join(root, "nowhere"), path.join(root, "ws", "commands", "dangling.md"));
+    execFifo(path.join(root, "ws", "skills", "probe", "pipe.md"));
+    plan({ neutralize: true });
+    const snapshot = path.join(trusted(), "neutralized");
+    expect(fs.existsSync(path.join(snapshot, "skills", "probe", "link.md"))).toBe(false);
+    expect(fs.existsSync(path.join(snapshot, "skills", "probe", "pipe.md"))).toBe(false);
+    expect(fs.existsSync(path.join(snapshot, "agents", "linked-dir"))).toBe(false);
+    expect(fs.existsSync(path.join(snapshot, "commands", "dangling.md"))).toBe(false);
+    expect(fs.readFileSync(path.join(snapshot, "skills", "probe", "SKILL.md"), "utf8")).toBe(NEUTRAL_SKILL);
+    const text = audits();
+    expect(text).toMatch(/kind=snapshot-skills name=link reason=symlink/);
+    expect(text).toMatch(/kind=snapshot-skills name=pipe reason=wrong_type/);
+    expect(text).toMatch(/kind=snapshot-agents name=linked-dir reason=symlink/);
+    expect(text).toMatch(/kind=snapshot-commands name=dangling reason=symlink/);
+    expect(logs.join("\n")).not.toContain(SECRET);
+  });
+
+  it("leaves a file the gateway user does not own out, with the audit reason not_owned", () => {
+    seed();
+    write("ws/skills/probe/foreign.md", HOOK_SKILL);
+    const foreign = path.join(root, "ws", "skills", "probe", "foreign.md");
+    const real = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      const stat = (real as (...args: unknown[]) => fs.Stats)(target, ...rest);
+      if (String(target) !== foreign) return stat;
+      return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: (stat.uid + 1) % 65536 }) as fs.Stats;
+    }) as typeof fs.lstatSync);
+    plan({ neutralize: true });
+    vi.restoreAllMocks();
+    expect(fs.existsSync(path.join(trusted(), "neutralized", "skills", "probe", "foreign.md"))).toBe(false);
+    expect(fs.existsSync(path.join(trusted(), "neutralized", "skills", "probe", "SKILL.md"))).toBe(true);
+  });
+
+  it("leaves files out above the count cap and above the byte cap, audited as too_large, and reads each file with an explicit limit", () => {
+    for (let i = 0; i < 5; i++) write(`ws/skills/s${i}/SKILL.md`, `---\nname: s${i}\n---\nbody\n`);
+    plan({ neutralize: true, limits: { maxFiles: 3, maxBytes: 1_000_000 } });
+    const names = fs.readdirSync(path.join(trusted(), "neutralized", "skills"));
+    expect(names).toEqual(["s0", "s1", "s2", "s3", "s4"]);
+    const copied = names.filter((name) => fs.existsSync(path.join(trusted(), "neutralized", "skills", name, "SKILL.md")));
+    expect(copied).toEqual(["s0", "s1", "s2"]);
+    expect(audits().match(/reason=too_large/g)?.length).toBe(2);
+    fs.rmSync(trusted(), { recursive: true, force: true });
+    logs.length = 0;
+    write("ws/skills/big/SKILL.md", `---\nname: big\n---\n${"x".repeat(600)}\n`);
+    plan({ neutralize: true, limits: { maxFiles: 100, maxBytes: 640 } });
+    const afterBig = ["big", "s0", "s1", "s2", "s3", "s4"].filter((name) => fs.existsSync(path.join(trusted(), "neutralized", "skills", name, "SKILL.md")));
+    expect(afterBig).toEqual(["big"]);
+    expect(audits()).toMatch(/reason=too_large/);
+  });
+
+  it("fails closed when an entry cannot be copied: it is seen as empty, nothing of it is left in the copy and the live entry is not bound", () => {
+    seed();
+    const real = fs.readdirSync;
+    vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target) === path.join(root, "ws", "skills", "probe")) throw new Error("EACCES");
+      return (real as (...args: unknown[]) => unknown)(target, ...rest);
+    }) as typeof fs.readdirSync);
+    const p = plan({ neutralize: true });
+    vi.restoreAllMocks();
+    expect(mountOf(p, "skills")!.src).toBe(path.join(trusted(), "empty-dir"));
+    expect(fs.existsSync(path.join(trusted(), "neutralized", "skills"))).toBe(false);
+    expect(mountOf(p, "agents")!.src).toBe(path.join(trusted(), "neutralized", "agents"));
+    expect(p.mounts.some((m) => m.src === path.join(root, "ws", "skills"))).toBe(false);
+  });
+
+  it("scans the copy for known values and hides the file, without keeping the single-use snapshot paths in the scanner cache", () => {
+    seed();
+    write("ws/skills/probe/planted.md", `---\nname: planted\n---\ntoken ${SECRET}\n`);
+    const scanner = new KnownValueScanner();
+    const p = plan({ neutralize: true, needles: [Buffer.from(SECRET)], scanner });
+    expect(p.hidden).toEqual(["/home/node/.claude/skills/probe/planted.md"]);
+    expect(audits()).toMatch(/kind=global name=skills reason=known_value/);
+    const cached = [...(scanner as unknown as { cache: Map<string, unknown> }).cache.keys()];
+    expect(cached.some((key) => key.includes("neutralized"))).toBe(false);
+    expect(logs.join("\n")).not.toContain(SECRET);
+  });
+
+  it("writes one content-free audit line per rewritten file: label, source, name and the kinds, never a path, a value or a command", () => {
+    seed();
+    write("ws/skills/odd name/SKILL.md", HOOK_SKILL);
+    write("ws/agents/clean.md", "---\nname: clean\ndescription: nothing to drop\n---\nbody\n");
+    plan({ neutralize: true });
+    const lines = logs.filter((l) => l.includes("command-settings.ignored"));
+    expect(lines).toContain("[audit] command-settings.ignored label=reqlift source=skills name=probe setting=hooks");
+    expect(lines).toContain("[audit] command-settings.ignored label=reqlift source=agents name=a setting=mcpServers");
+    expect(lines).toContain("[audit] command-settings.ignored label=reqlift source=agents name=b setting=mcpServers");
+    expect(lines).toContain("[audit] command-settings.ignored label=reqlift source=commands name=c setting=hooks");
+    expect(lines).toContain("[audit] command-settings.ignored label=reqlift source=skills name=invalid setting=hooks");
+    expect(lines.some((l) => l.includes("clean"))).toBe(false);
+    const text = lines.join("\n");
+    expect(text).not.toContain(root);
+    expect(text).not.toContain("HOOKCMD");
+    expect(text).not.toContain("touch");
+  });
+
+  it("leaves nothing behind after a start that fails once the content was planned: the run directory, with the copy, is removed", async () => {
+    seed();
+    const proxy = { isListening: () => true } as never;
+    const config = { ...loadIsolationConfig({ HOME: root, AGENT_SANDBOX_ROOT: path.join(root, "sandbox") }), bwrapPath: "/usr/bin/true" };
+    const run = new SandboxRun({ queryId: "q-8106", runLogDir: path.join(root, "no-log-dir"), runLogEnv: {}, neutralizeCommands: true, label: "reqlift", workspaceRoot: path.join(root, "ws"), config, proxy });
+    expect(() => run.spawnHook({ command: "/bin/sh", args: ["-c", "true"], env: {}, signal: new AbortController().signal })).toThrow();
+    const runs = path.join(root, "sandbox", "runs");
+    const [name] = fs.readdirSync(runs);
+    expect(fs.existsSync(path.join(runs, name, "trusted", "neutralized", "skills", "probe", "SKILL.md"))).toBe(true);
+    await run.dispose();
+    expect(fs.readdirSync(runs)).toEqual([]);
+  });
+});
+
+function execFifo(file: string): void {
+  execFileSync("mkfifo", [file]);
+}

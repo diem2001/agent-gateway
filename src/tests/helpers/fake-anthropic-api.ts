@@ -198,6 +198,12 @@ export async function startFakeAnthropicApi(options: {
   exactTool?: ExactToolScript | ExactToolScript[];
   /** The address to listen on and to put in `baseUrl` (default 127.0.0.1; the Docker integration probe uses a bridge address). */
   host?: string;
+  /**
+   * Awaited before a scripted main request is answered (MVP-8106): `prompt` is the script that matched and
+   * `resultsAfterLatestPrompt` how many tool results followed its latest prompt, so a test can hold the "model" between
+   * two turns of a run and change the world meanwhile.
+   */
+  beforeAnswer?: (info: { prompt: string; resultsAfterLatestPrompt: number }) => Promise<void> | void;
 }): Promise<FakeAnthropicApi> {
   const mode = options.mode ?? "normal";
   const exactTools: ExactToolScript[] = options.exactTool === undefined ? [] : Array.isArray(options.exactTool) ? options.exactTool : [options.exactTool];
@@ -209,7 +215,7 @@ export async function startFakeAnthropicApi(options: {
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => {
+    req.on("end", async () => {
       const pathname = new URL(req.url ?? "/", "http://fake.invalid").pathname;
       if (req.method !== "POST" || !pathname.startsWith("/v1/messages")) {
         res.writeHead(404, { "Content-Type": "application/json" });
@@ -314,6 +320,8 @@ export async function startFakeAnthropicApi(options: {
       }
       if (mode === "hang-after-tool" && tools.length > 0 && toolResults.length > 0) return;
       if (mode === "hang" && tools.length > 0) return;
+
+      if (exact && main && options.beforeAnswer) await options.beforeAnswer({ prompt: exact.prompt, resultsAfterLatestPrompt });
 
       const target = tools.find((name) => name.endsWith(`__${options.toolName}`));
       type Block = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } | { type: "text"; text: string };
