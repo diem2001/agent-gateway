@@ -20,7 +20,7 @@ import net, { type AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { buildSandboxEnv } from "../sandbox.js";
 import * as toolGrant from "../tool-grant.js";
 import { startFakeAnthropicApi, type ExactToolScript, type FakeAnthropicApi, type RecordedMessagesRequest } from "./helpers/fake-anthropic-api.js";
@@ -77,18 +77,21 @@ interface RigOptions {
   scripts?: ExactToolScript[];
   /** Records the argument vector of every sandbox launch (`AGENT_SANDBOX_BWRAP` wrapper) and returns its directory. */
   recordLaunches?: boolean;
+  /** Where the rig registers its cleanup (default: the per-test list); a describe that shares one rig passes its own. */
+  cleanupList?: Cleanup[];
 }
 
 async function startRig(options: RigOptions = {}): Promise<Rig & { launchDir?: string }> {
   const labels = options.labels ?? ["reqlift", "diemcrm"];
   const scripts = options.scripts ?? [];
+  const into = options.cleanupList ?? cleanups;
   const api = await startFakeAnthropicApi({ toolName: "unused-8088", exactTool: scripts });
-  cleanups.push(() => api.close());
+  into.push(() => api.close());
   let launchDir: string | undefined;
   const extraEnv: Record<string, string> = {};
   if (options.recordLaunches) {
     launchDir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp8088-launch-"));
-    cleanups.push(() => fs.rmSync(launchDir!, { recursive: true, force: true }));
+    into.push(() => fs.rmSync(launchDir!, { recursive: true, force: true }));
     const wrapper = path.join(launchDir, "bwrap");
     fs.writeFileSync(wrapper, `#!/bin/bash\nprintf '%s\\0' "$@" > "${launchDir}/argv.$$.$RANDOM"\nexec /usr/bin/bwrap "$@"\n`, { mode: 0o755 });
     extraEnv.AGENT_SANDBOX_BWRAP = wrapper;
@@ -106,7 +109,7 @@ async function startRig(options: RigOptions = {}): Promise<Rig & { launchDir?: s
     if (value === null) delete env[key];
     else env[key] = value;
   }
-  const gateway = await spawnGateway(cleanups, { rootPrefix: "mvp8088-grant-", seed: (dirs) => options.seed?.(dirs.workspace), env });
+  const gateway = await spawnGateway(into, { rootPrefix: "mvp8088-grant-", seed: (dirs) => options.seed?.(dirs.workspace), env });
   return { api, gateway, scripts, labels, launchDir };
 }
 
@@ -329,27 +332,42 @@ describe("policies bind the offered set (real runtime)", () => {
       expectNoUnreviewed(run.requests, type);
     }
   }, 600_000);
+});
 
-  it("the policy can name every tool the runtime offers, one at a time, and the Task alias resolves to Agent", async () => {
-    const names = [...INVENTORY, "Task"];
-    const policy = {
-      default: { allow: ["Read"] },
-      labels: Object.fromEntries(names.flatMap((name) => [[`allow-${name}`, { allow: [name] }], [`deny-${name}`, { deny: [name] }]])),
-    };
-    const labels = ["reqlift", "diemcrm", ...names.flatMap((name) => [`allow-${name}`, `deny-${name}`])];
-    const r = await startRig({ policy, labels });
-    const fallback = await chat(r, "reqlift", { prompt: "N0-DEFAULT hello" });
+describe("the policy can name every tool the runtime offers, one at a time (real runtime)", () => {
+  const names = [...INVENTORY, "Task"];
+  const policy = {
+    default: { allow: ["Read"] },
+    labels: Object.fromEntries(names.flatMap((name) => [[`allow-${name}`, { allow: [name] }], [`deny-${name}`, { deny: [name] }]])),
+  };
+  const labels = ["reqlift", "diemcrm", ...names.flatMap((name) => [`allow-${name}`, `deny-${name}`])];
+  const own: Cleanup[] = [];
+  let shared: Rig;
+  beforeAll(async () => {
+    shared = await startRig({ policy, labels, cleanupList: own });
+  }, 120_000);
+  afterAll(async () => {
+    while (own.length > 0) await own.pop()!();
+  });
+
+  it("a label without an entry falls back to the default entry", async () => {
+    const fallback = await chat(shared, "reqlift", { prompt: "N0-DEFAULT hello" });
     expectOffered(fallback.requests, "N0-DEFAULT", ["Read"], "default allow [Read]");
-    for (const [index, name] of names.entries()) {
-      const offered = ALIASES[name] ?? name;
-      const only = await chat(r, `allow-${name}`, { prompt: `N${index}-ALLOW-${name} hello` });
-      expectOffered(only.requests, `N${index}-ALLOW-${name}`, [offered], `allow only ${name}`);
-      const rest = await chat(r, `deny-${name}`, { prompt: `N${index}-DENY-${name} hello` });
-      expectOffered(rest.requests, `N${index}-DENY-${name}`, without(APPROVED_DEFAULT_SET, offered), `deny only ${name}`);
-    }
-    // The policy accepts TodoWrite: startup succeeded above and its denial removes exactly the checklist tool.
-    expect(r.gateway.output()).not.toContain("FATAL");
-  }, 1_800_000);
+  });
+
+  it.each(names.map((name, index) => [name, index] as const))("%s: allowed alone it is the only tool offered; denied alone it is the only tool missing from the default set", async (name, index) => {
+    const offered = ALIASES[name] ?? name;
+    const only = await chat(shared, `allow-${name}`, { prompt: `N${index}-ALLOW-${name} hello` });
+    expectOffered(only.requests, `N${index}-ALLOW-${name}`, [offered], `allow only ${name}`);
+    const rest = await chat(shared, `deny-${name}`, { prompt: `N${index}-DENY-${name} hello` });
+    expectOffered(rest.requests, `N${index}-DENY-${name}`, without(APPROVED_DEFAULT_SET, offered), `deny only ${name}`);
+  });
+
+  it("the policy accepts TodoWrite: the gateway started with it and its denial removes exactly the checklist tool", async () => {
+    expect(shared.gateway.output()).not.toContain("FATAL");
+    const rest = await chat(shared, "deny-TodoWrite", { prompt: "N-TODO-DENY hello" });
+    expectOffered(rest.requests, "N-TODO-DENY", without(APPROVED_DEFAULT_SET, "TodoWrite"), "deny TodoWrite for one label");
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -493,6 +511,10 @@ async function observeRuntime(tools?: string[]): Promise<string[]> {
         abortController: abort,
         permissionMode: "bypassPermissions",
         settingSources: ["user"],
+        systemPrompt: { type: "preset", preset: "claude_code" },
+        // Measured (Gate A): the runtime leaves Glob and Grep out of its default set unless the run pre-approves them, as the
+        // gateway's runs do; an explicit `tools` list offers them either way.
+        allowedTools: ["Glob", "Grep"],
         ...(tools ? { tools } : {}),
         env: { ...gatewayRuntimeEnv(), HOME: home, TMPDIR: home, PATH: process.env.PATH ?? "", ANTHROPIC_BASE_URL: api.baseUrl, ANTHROPIC_API_KEY: "sk-ant-fake-inventory-8088" },
       },
