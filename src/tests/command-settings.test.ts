@@ -4,6 +4,8 @@
  * rewritten files still load and still narrow tools) was measured on the bundled runtime in Gate A (MVP-8116) and
  * is proven again through a spawned gateway in command-settings-process.test.ts.
  */
+import fs from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { neutralizeCommandSettings } from "../command-settings.js";
 
@@ -240,6 +242,35 @@ describe("a seeded mutation sweep over a file that carries every command setting
       const output = run(text).text;
       const block = gatewayBlock(output);
       assertCanonicalBlock(block);
+    }
+  });
+});
+
+describe("the documentation of the enforcement point", () => {
+  const repo = path.resolve(import.meta.dirname, "..", "..");
+  const doc = (rel: string): string => fs.readFileSync(path.join(repo, rel), "utf8");
+
+  it("docs/architecture.md says the settings are ignored without the Bash grant and still run inside the isolated executor with it", () => {
+    const text = doc("docs/architecture.md");
+    expect(text).toContain("loads no command settings (hooks, stdio startup commands) from skill, agent and command files");
+    expect(text).toContain("still runs them inside the isolated executor");
+    expect(text).toContain("### command-settings.ts -- Command Settings of Skill, Agent and Command Files");
+  });
+
+  it("the architecture diagram of docs/index.html says the same", () => {
+    const text = doc("docs/index.html");
+    const diagram = text.slice(text.indexOf('<h2 id="architecture">Architecture</h2>'));
+    expect(diagram).toContain("ignores the command settings (hooks, stdio startup commands) of skill, agent and command files");
+    expect(diagram).toContain("still runs them inside the isolated executor");
+    expect(diagram).toContain("run start, no Bash grant: skills, agents, commands copied without hooks and mcpServers commands");
+    expect(text).toContain('<h3 id="command-settings">');
+  });
+
+  it("no document still says a caller can place hooks or servers that get past the label's Bash denial and that this is not fixed", () => {
+    for (const rel of ["README.md", "docs/index.html", "docs/architecture.md", "CLAUDE.md"]) {
+      const text = doc(rel);
+      expect(text, rel).not.toContain("bypass its own label's Bash denial");
+      expect(text, rel).not.toContain("Reachable by callers, not by agent code; not fixed here.");
     }
   });
 });
