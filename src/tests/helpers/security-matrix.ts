@@ -600,6 +600,8 @@ export interface ProofFailure {
   chain: "complete" | "broken";
   /** The reference was confirmed ended when read right after the proof. */
   referenceEnded: boolean;
+  /** How the reference looked on that re-read (`Zn` is a zombie leader whose threads still show). */
+  referenceExit: ExitKind;
   runtimeExit: ExitKind;
   pending: "none" | "waiting" | "cleared" | "expired";
 }
@@ -1048,7 +1050,7 @@ export function describeRecords(records: ProcessRecord[], markers: Record<string
   const text = records
     .map((record) => {
       const ns = record.sameNamespaces;
-      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence} own-unreadable=${record.proofFailure.ownUnreadable} reference=${record.proofFailure.reference} chain=${record.proofFailure.chain} reference-ended=${record.proofFailure.referenceEnded} runtime-exit=${record.proofFailure.runtimeExit} pending=${record.proofFailure.pending}]` : ""}${record.clearedBy ? ` cleared-by=${record.clearedBy}` : ""}${record.provedReferenceCached ? ` proved-reference-cached=${record.provedReferenceCached}` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
+      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence} own-unreadable=${record.proofFailure.ownUnreadable} reference=${record.proofFailure.reference} chain=${record.proofFailure.chain} reference-ended=${record.proofFailure.referenceEnded} reference-exit=${record.proofFailure.referenceExit} runtime-exit=${record.proofFailure.runtimeExit} pending=${record.proofFailure.pending}]` : ""}${record.clearedBy ? ` cleared-by=${record.clearedBy}` : ""}${record.provedReferenceCached ? ` proved-reference-cached=${record.provedReferenceCached}` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
     })
     .join("; ");
   return detect([{ name: "process-records", text }], markers).length > 0 ? "[process records withheld: a marker was detected]" : text;
@@ -1190,7 +1192,8 @@ export function startProcessSampler(
               };
               cleared = exitProofClears({ exitConfirmed: failure.failedWhile === "exiting", ...failure });
               // The reference is read after the proof: if it ended, the failure may only say so (pending, never a clear by itself).
-              const referenceEnded = reference.startTicks !== null && endedNow(root, reference.startTicks).ended;
+              const referenceNow = reference.startTicks === null ? null : endedNow(root, reference.startTicks);
+              const referenceEnded = referenceNow?.ended === true;
               const chainState = proof.brokenChain ? ("broken" as const) : ("complete" as const);
               pendingNow =
                 cleared === null &&
@@ -1220,6 +1223,7 @@ export function startProcessSampler(
                     reference: proof.reference,
                     chain: chainState,
                     referenceEnded,
+                    referenceExit: referenceNow?.kind ?? "vanished",
                     runtimeExit: runtimeExit.kind,
                     pending: pending ? pending.state : "none",
                   };

@@ -420,8 +420,8 @@ describe("host-side samplers", () => {
       fate: "exited",
     };
     expect(describeRecords([record], { marker })).toContain("pid 1 comm sh exe sh");
-    const failed = describeRecords([{ ...record, proofFailure: { failedWhile: "exiting", ownProof: false, launcherProof: true, escapeEvidence: false, ownUnreadable: "mnt", reference: "cached", chain: "broken", referenceEnded: true, runtimeExit: "Z1", pending: "waiting" }, clearedBy: "reference-ended", provedReferenceCached: 2 }], { marker });
-    expect(failed).toContain("proof-failure [failed-while=exiting own-proof=false launcher-proof=true escape-evidence=false own-unreadable=mnt reference=cached chain=broken reference-ended=true runtime-exit=Z1 pending=waiting] cleared-by=reference-ended proved-reference-cached=2");
+    const failed = describeRecords([{ ...record, proofFailure: { failedWhile: "exiting", ownProof: false, launcherProof: true, escapeEvidence: false, ownUnreadable: "mnt", reference: "cached", chain: "broken", referenceEnded: true, referenceExit: "Z1", runtimeExit: "Z1", pending: "waiting" }, clearedBy: "reference-ended", provedReferenceCached: 2 }], { marker });
+    expect(failed).toContain("proof-failure [failed-while=exiting own-proof=false launcher-proof=true escape-evidence=false own-unreadable=mnt reference=cached chain=broken reference-ended=true reference-exit=Z1 runtime-exit=Z1 pending=waiting] cleared-by=reference-ended proved-reference-cached=2");
     expect(describeRecords([{ ...record, argvShape: `leak ${marker}` }], { marker })).toBe("[process records withheld: a marker was detected]");
     // A process name that is not on the allowlist (a comm or an ancestor) is printed as `other`, with or without markers.
     const named = describeRecords([{ ...record, comms: [marker.slice(0, 15)], ancestors: [marker.slice(0, 15), "gateway"] }], {});
