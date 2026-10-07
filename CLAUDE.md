@@ -173,6 +173,7 @@ src/
     sandbox-process.test.ts # Real bwrap: env, /proc, trusted files, planted links, git masks, read-only content, fail-closed rows, cancel and SIGKILL, detached `setsid nohup` child rows D1-D4 with negative controls NC1/NC2 (MVP-7977), plus the real runtime through the gateway (needs `npm run build`)
     model-proxy.test.ts / model-proxy-process.test.ts # Trusted model proxy: token, path, header and refresh rules; real runtime through it
     sdk-login-guard-process.test.ts # Real-runtime probe: spawned gateway, OAuth-capable MCP stub, scripted Anthropic API (needs `npm run build`)
+    tool-result-size-process.test.ts # Real-runtime probe (MVP-8089): a registered `jira` stub returns exactly N characters framed by start and end markers; annotated (`maxResultSizeChars` 250,000) 200,000 / 250,000 arrive in full, 250,001 and 3 MiB give the saved-output preview; unannotated 50,000 in full, 50,001 preview, 3 MiB the `Error: result (` notice; a run without Read/Bash still gets 200,000 in full; `SIZE_PROBE_OMIT_ANNOTATION=1` is the red control (needs `npm run build`)
     run-failure.test.ts             # Failure classifier table: kinds, exact messages, version bounds, hostile inputs
     tool-policy.test.ts             # enforcedTools validation table + the hook never allows
     query-enforced-tools-outcome.test.ts # enforcedTools through query/agent/retry with the SDK mocked: options layers, tool_policy first and once, unchanged options without it

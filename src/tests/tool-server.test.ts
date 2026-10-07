@@ -124,6 +124,31 @@ describe("createToolMcpServer", () => {
     expect(listed.inputSchema.required).toEqual(["city"]);
   });
 
+  it("tools/list declares no result size limit: webhook tools keep the runtime default (MVP-8089)", async () => {
+    const { createToolMcpServer } = await import("../tool-server.js");
+    const server = createToolMcpServer([TOOL, { ...TOOL, name: "forecast" }], CONTEXT);
+
+    const responses = new Map<number, unknown>();
+    const transport = {
+      onmessage: undefined as ((message: unknown) => void) | undefined,
+      async start() {},
+      async close() {},
+      async send(message: { id?: number; result?: unknown }) {
+        if (message.id !== undefined) responses.set(message.id, message.result);
+      },
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await server.instance.connect(transport as any);
+    transport.onmessage!({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+    transport.onmessage!({ jsonrpc: "2.0", method: "notifications/initialized" });
+    transport.onmessage!({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    await vi.waitFor(() => expect(responses.has(2)).toBe(true));
+
+    const { tools } = responses.get(2) as { tools: { name: string; _meta?: Record<string, unknown> }[] };
+    expect(tools.map((t) => t.name)).toEqual(["weather", "forecast"]);
+    for (const tool of tools) expect(JSON.stringify(tool._meta ?? {}), tool.name).not.toContain("maxResultSizeChars");
+  });
+
   it("returns empty tool list server when no tools provided", async () => {
     const { createToolMcpServer } = await import("../tool-server.js");
     const server = createToolMcpServer([], CONTEXT);

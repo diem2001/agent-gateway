@@ -19,7 +19,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { FINAL_ANSWER, startFakeAnthropicApi, type FakeAnthropicApi } from "./helpers/fake-anthropic-api.js";
-import { STUB_TOOL_NAME, startOAuthMcpStub, type OAuthMcpStub, type OAuthStubOptions } from "./helpers/oauth-mcp-stub.js";
+import { STUB_TOOL_NAME, framedToolText, startOAuthMcpStub, type OAuthMcpStub, type OAuthStubOptions } from "./helpers/oauth-mcp-stub.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(here, "..", "..");
@@ -653,9 +653,9 @@ describe("a run's credentials do not remain in the Claude runtime's own log file
 });
 
 describe("the relay carries a working MCP server (real runtime)", () => {
-  it("SSE answers, the Mcp-Session-Id round trip and a large tool result reach the model", async () => {
-    // The native runtime rejects multi-MB MCP results before sending them to the model.
-    const stub = await mcpStub({ responseMode: "sse", toolResultBytes: 256 * 1024 });
+  it("SSE answers and the Mcp-Session-Id round trip reach the model, with a result below the default size limit", async () => {
+    // 32 KiB is under the runtime's 50,000-character default, so the result arrives whole (the size classes are tool-result-size-process.test.ts).
+    const stub = await mcpStub({ responseMode: "sse", toolResultChars: 32 * 1024 });
     const api = await fakeApi();
     const gateway = await spawnGateway(api);
     await registerHttpServer(gateway, SERVER, stub);
@@ -666,7 +666,7 @@ describe("the relay carries a working MCP server (real runtime)", () => {
     const results = api.agentRequests().flatMap((r) => r.toolResults);
     expect(results).toHaveLength(1);
     expect(results[0].isError).toBe(false);
-    expect(results[0].text).toContain(stub.toolResultPrefix);
+    expect(results[0].text).toBe(framedToolText(32 * 1024));
     const afterInitialize = stub.requests.filter((r) => r.path === "/mcp" && r.method === "POST" && !r.rpcMethods.includes("initialize") && !r.rpcMethods.includes("server/discover"));
     expect(afterInitialize.length).toBeGreaterThan(0);
     expect(afterInitialize.every((r) => r.headers["mcp-session-id"] === "stub-session-1")).toBe(true);

@@ -346,6 +346,25 @@ A request-supplied `command` server is code the caller picked: it is attached on
 
 **Tool ownership.** Every `PUT /v1/tools/:name` records the authenticated API-key label as `owner` (an `owner` in the body is ignored). Another label's `PUT` or `DELETE` of an owned tool is HTTP 403 `{"error":{"code":"TOOL_OWNED_BY_OTHER_CLIENT","message":"This tool was registered by another client and can only be changed or deleted by that client."}}` (no owner name). A run is offered only its own label's tools plus legacy ownerless entries, and the calling client's gateway key is forwarded as Bearer only to tools its label owns. Legacy entries registered before the update keep today's forwarding until they are registered again (the first label that registers one claims it), with one audit line `tool.webhook.legacy_forward toolName=<name>` per such call and a startup line `tools.legacy.ownerless count=<n>`. `X-Webhook-Context` comes only from the authenticated request; tool input keys such as `context` or `user_id` stay in the body.
 
+### Tool result size limits
+
+The runtime decides how much of an MCP or webhook tool result the model receives. Sizes are text characters.
+
+| Tool | Limit | Where it comes from |
+|------|-------|---------------------|
+| Webhook tools, other registered MCP servers, request `mcpServers` | 50,000 | The runtime default; the gateway declares nothing for these |
+| The Jira server (mcp-jira, registered here as `jira`) | 250,000 | Every mcp-jira tool declares `_meta["anthropic/maxResultSizeChars"]: 250000`. It takes effect once the operator runs an mcp-jira build that carries it (see its `CHANGELOG.md`) |
+
+- **Up to the limit** the model receives the whole result.
+- **Above the limit** the runtime saves the result to a file in the conversation's private home (`projects/-work/<session>/tool-results/`) and the model receives a short notice instead. No gateway API exposes that file.
+  - The notice is usually the saved-output preview: `<persisted-output>`, `Output too large (...)`, `Full output saved to: <path>` and the first 2 KB of the result. A Jira tool receives it at every size above 250,000 (3,145,728 characters measured).
+  - A tool without the annotation receives a different notice far above its limit (3,145,728 characters measured): `Error: result (<n> characters across 1 line) exceeds maximum allowed tokens. Output has been saved to <path>` plus instructions to the model.
+  - Both arrive as ordinary tool results: no error flag, and the `tool_result` event has no `success: false`. They are runtime texts and can change with a runtime upgrade.
+- **Reaching a saved file.** The model can read it with `Read` (in parts) or `Bash`. A run whose tool set has neither, such as an [enforced tool set](#enforced-tool-set-enforcedtools) of MCP tools only, cannot read it. For such a run the Jira limit is the only way to receive a result above 50,000 characters, and above 250,000 it receives only the notice.
+- The `tool_result` event shows at most the first 3,000 characters of any result, whatever its size.
+
+Run [`tool-result-size-process.test.ts`](src/tests/tool-result-size-process.test.ts) (needs `npm run build`) to check each size class against the real runtime.
+
 ## API Overview
 
 All endpoints except `/health` require `Authorization: Bearer <api-key>`.
@@ -436,6 +455,7 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 - **Acknowledgment.** The first NDJSON event of such a run is `{"seq":0,"type":"tool_policy","enforced":true,"tools":[…]}`, echoing the set. It is sent once, before any retry, and every retry attempt keeps the same set. A caller can require it and drop the run when it is missing (reqlift does): an older gateway ignores the field and would send no acknowledgment.
 - **Validation (400 before streaming):** the value must be an array (also `null` is refused) of at most 64 distinct names, each 1–128 characters of `A-Z a-z 0-9 _ -`; not together with `allowedTools`; `Task` and `Agent` are refused (whether a sub-agent inherits the set is not proven); an `mcp__…` name that fits more than one attachable server (registry names may contain `__`) is refused as ambiguous. `[]` means "no tool at all", never the default set.
 - **Policy interplay.** The effective grant is the policy for the caller's label intersected with the set, so a caller can only narrow. When `enforcedTools` names a tool the policy denies, the request is accepted, the `tool_policy` acknowledgment still echoes the requested set, the gateway logs `audit tool.policy.narrowed queryId=<id> denied=<names>`, and the tool is refused at call time.
+- **Large results.** A run without `Read` and `Bash` cannot read a result the runtime saved to a file; see [Tool result size limits](#tool-result-size-limits).
 - **Without `enforcedTools`** the run keeps `bypassPermissions` and its other defaults, reads only the user setting source and loads the per-user bundle; its tools are the trusted grant (see [Tool mediation](#tool-mediation)).
 
 ### Multimodal Content (`content[]`)
