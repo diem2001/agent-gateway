@@ -198,6 +198,12 @@ export async function startFakeAnthropicApi(options: {
   exactTool?: ExactToolScript | ExactToolScript[];
   /** The address to listen on and to put in `baseUrl` (default 127.0.0.1; the Docker integration probe uses a bridge address). */
   host?: string;
+  /**
+   * Called with every request after it is recorded and before the answer is computed; the answer waits for it, so a test can
+   * change host state between a tool result and the next scripted call (MVP-8107). A throw answers HTTP 500. Absent: the answer
+   * is computed in the same tick, as before.
+   */
+  beforeAnswer?: (request: RecordedMessagesRequest) => void | Promise<void>;
 }): Promise<FakeAnthropicApi> {
   const mode = options.mode ?? "normal";
   const exactTools: ExactToolScript[] = options.exactTool === undefined ? [] : Array.isArray(options.exactTool) ? options.exactTool : [options.exactTool];
@@ -209,7 +215,7 @@ export async function startFakeAnthropicApi(options: {
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => {
+    req.on("end", async () => {
       const pathname = new URL(req.url ?? "/", "http://fake.invalid").pathname;
       if (req.method !== "POST" || !pathname.startsWith("/v1/messages")) {
         res.writeHead(404, { "Content-Type": "application/json" });
@@ -289,6 +295,15 @@ export async function startFakeAnthropicApi(options: {
         body: bodyText,
       };
       requests.push(record);
+      if (options.beforeAnswer) {
+        try {
+          await options.beforeAnswer(record);
+        } catch {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "beforeAnswer hook failed" } }));
+          return;
+        }
+      }
       const latestText = userTexts.at(-1) ?? "";
       const exact = exactTools.find((script) => latestText.includes(script.prompt));
       const main = exactTools.length > 0 ? exact !== undefined && !warmup : tools.length > 0 && !warmup;

@@ -191,7 +191,7 @@ src/
     query-mcp-mediation-outcome.test.ts # Relay bindings and request-server routing through query/agent with the SDK mocked
     mcp-bridge-sse.test.ts / mcp-bridge-stdio.test.ts # SSE bridge and stdio tool sandbox bridge
     mcp-direct-mediation.test.ts    # Direct call, test and health: header merge, no redirect, user-credential refusal
-    tool-grant-process.test.ts / mcp-mediation-process.test.ts / mcp-stdio-sandbox-process.test.ts # Real-runtime probes: built-in refusal for every actor, relay mediation, stdio tool sandbox (need `npm run build`)
+    tool-grant-process.test.ts / mcp-mediation-process.test.ts / mcp-stdio-sandbox-process.test.ts # Real-runtime probes: built-in refusal for every actor, relay mediation, stdio tool sandbox; the `~/.claude.json` rows (MVP-8107) judge only whether planted state starts anything at the next start, with the accepted and refused write forced and a negative control against a dist copy that keeps the file (need `npm run build`)
     public-auth-matrix-process.test.ts / mediation-outcome-process.test.ts # Public auth matrix per label; end-to-end Outcome Probe of the mediation (need `npm run build`)
     helpers/sse-mcp-stub.ts         # SSE MCP server stub for the bridge tests
     security-matrix.test.ts         # T1 for the security harness: detector, evidence lines, route probes, samplers, offline mode
