@@ -56,6 +56,7 @@ import {
   startProcessSampler,
   DETACHED_MAX_AGE_S,
   describeRecords,
+  endedNow,
   detachedAgeS,
   detachedCommand,
   detachedEvidence,
@@ -1022,6 +1023,107 @@ describe("sampler and refusal-check controls", () => {
     };
     return { state, seam, release };
   }
+
+  /**
+   * The seam of a gateway-end control (MVP-8090 rev 3): on the `atReading`-th stable reading of the native runtime (the executable
+   * `claude`) it SIGKILLs the gateway and holds the sampler tick until the gateway is a zombie (or gone) and the process `hops`
+   * parents above the runtime, the gateway's own child, is gone or has a new parent. The tick is synchronous, so the test worker
+   * cannot reap the gateway before the proof runs. With `endRuntime` the runtime is also killed from the event loop 100 ms later,
+   * so the row can assert its exit before the window closes.
+   */
+  function gatewayEnd(gatewayPid: number, atReading: number, hops: number, endRuntime: boolean) {
+    const state = { pid: 0, startTicks: "", readings: 0, forced: false, reached: false };
+    const statOf = (pid: number): { state: string; ppid: number; startTicks: string } | null => {
+      try {
+        const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+        const rest = text.slice(text.lastIndexOf(")") + 2).split(" ");
+        return { state: rest[0], ppid: Number(rest[1]), startTicks: rest[19] };
+      } catch {
+        return null;
+      }
+    };
+    const threads = (pid: number): number => {
+      try {
+        return Number(/^Threads:\s*(\d+)/m.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"))?.[1] ?? 1);
+      } catch {
+        return 0;
+      }
+    };
+    const ended = (pid: number): boolean => statOf(pid) === null || (statOf(pid)?.state === "Z" && threads(pid) <= 1);
+    const seam = (pid: number): void => {
+      let exe = "";
+      try {
+        exe = path.basename(fs.readlinkSync(`/proc/${pid}/exe`));
+      } catch {
+        return;
+      }
+      if (exe !== "claude" || state.forced || (state.pid !== 0 && state.pid !== pid)) return;
+      state.pid = pid;
+      state.readings += 1;
+      if (state.readings < atReading) return;
+      state.forced = true;
+      state.startTicks = statOf(pid)?.startTicks ?? "";
+      let top = pid;
+      for (let hop = 0; hop < hops; hop++) top = statOf(top)?.ppid ?? 0;
+      process.kill(gatewayPid, "SIGKILL");
+      for (const end = Date.now() + 2000; !(state.reached = ended(gatewayPid) && (statOf(top) === null || statOf(top)!.ppid !== gatewayPid)) && Date.now() < end; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2));
+      if (endRuntime) setTimeout(() => {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }, 100);
+    };
+    return { state, seam };
+  }
+
+  it("control G3 (smoke): the gateway is SIGKILLed after the sandboxed native runtime's own proof; the runtime is not reported, whichever of the two clear routes applies", async () => {
+    const { rig } = await wrapperRig();
+    const end = gatewayEnd(rig.gateway.child.pid!, 3, 2, false);
+    const prompt = "IF-CONTROL-GATEWAY-END";
+    rig.scripts.push(scriptOf(prompt, [bashStep("echo CONTROL")]));
+    const window = windowOf(rig, [], { afterStableReading: end.seam });
+    const asked = rig.ask("reqlift", { queryId: "q-control-gateway-end", sessionId: "conv-control-gateway-end", prompt, user_id: "user-1", useSession: true, allowedTools: ["Bash"] }, 90_000).catch(() => undefined);
+    await waitFor(() => end.state.forced, 60_000, "the sampler to end the gateway");
+    await waitFor(() => endedNow(end.state.pid, end.state.startTicks).ended, 15_000, "the runtime to end after its gateway");
+    await waitFor(() => window.peek().records.every((record) => record.pending?.state !== "waiting"), 10_000, "pending records to settle");
+    const { sample } = window.close();
+    expect(end.state.reached, "precondition not reached: the gateway was not a zombie within its bound").toBe(true);
+    const record = sample.records.find((candidate) => candidate.pid === end.state.pid);
+    expect(record, "precondition not reached: the sampler did not record the runtime").toBeDefined();
+    expect(record!.unsandboxed).toBe(false);
+    expect(["own", "reference-ended"]).toContain(record!.clearedBy);
+    expect(sample.unsandboxedRuntimes).toEqual([]);
+    expect(sample.referenceChanged).toBe(0);
+    expect(sampleProblems(sample, rig.markers.values)).toEqual([]);
+    void asked;
+  });
+
+  it("control G4: the real native runtime outside the sandbox below a script named bwrap, whose gateway is SIGKILLed on the first reading, is reported", async () => {
+    const { rig, wrapper } = await wrapperRig();
+    wrapper.setMode("bypass-fork");
+    const end = gatewayEnd(rig.gateway.child.pid!, 1, 1, true);
+    const prompt = "IF-CONTROL-GATEWAY-END-BYPASS";
+    rig.scripts.push(scriptOf(prompt, [bashStep("echo CONTROL")]));
+    const window = windowOf(rig, [], { afterStableReading: end.seam });
+    const asked = rig.ask("reqlift", { queryId: "q-control-gateway-end-bypass", sessionId: "conv-control-gateway-end-bypass", prompt, user_id: "user-1", useSession: true, allowedTools: ["Bash"] }, 90_000).catch(() => undefined);
+    await waitFor(() => end.state.forced, 60_000, "the sampler to end the gateway");
+    await waitFor(() => endedNow(end.state.pid, end.state.startTicks).ended, 15_000, "the runtime to end");
+    const { sample } = window.close();
+    expect(end.state.reached, "precondition not reached: the gateway was not a zombie within its bound").toBe(true);
+    const record = sample.records.find((candidate) => candidate.pid === end.state.pid);
+    expect(record, "precondition not reached: the sampler did not record the runtime").toBeDefined();
+    expect(endedNow(end.state.pid, end.state.startTicks).ended, "the runtime's exit was not confirmed before the window closed").toBe(true);
+    expect(record!.clearedBy).toBeUndefined();
+    expect(record!.pending).toBeUndefined();
+    expect(record!.proofFailure).toMatchObject({ ownProof: false, escapeEvidence: true, pending: "none" });
+    expect(sample.unsandboxedRuntimes).toContain(record!.pid);
+    const text = sampleProblems(sample, rig.markers.values).join("\n");
+    expect(text).toContain("ran without a sandbox ancestor");
+    expect(text).toContain(`pid ${record!.pid}`);
+    void asked;
+  });
 
   it("control G1: a sandboxed native runtime that exits after its own proof, with its parent stopped, is cleared by that proof and audited, not reported", async () => {
     const { rig } = await wrapperRig();
