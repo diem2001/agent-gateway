@@ -123,14 +123,15 @@ const LEGACY = "This conversation was started before a gateway security update a
  * `bypass` and `bypass-ready` are the negative controls of the process sampler: the launcher drops the sandbox and runs
  * the runtime command (`bypass`: a stand-in Node with the same executable and `cli.js` argument, so nothing real runs
  * outside the sandbox; `bypass-ready`: after printing the sandbox check line, the real runtime in a scratch home) in the
- * gateway's own namespaces. A mode that must start no runtime (`pass`, `startup-exit`, `startup-hang`, `no-userns`,
+ * gateway's own namespaces. `bypass-fork` is `bypass-ready` with the runtime as a child of this script (named `bwrap`) instead of
+ * an exec, the shape of the exit-rule control (MVP-8090): a real runtime outside the sandbox below a process named `bwrap`. A mode that must start no runtime (`pass`, `startup-exit`, `startup-hang`, `no-userns`,
  * `mask-unshare`, `mask-true`) forks
  * nothing before it execs or exits: the sampler cannot tell a fork of this script, whose command line carries `cli.js`, from
  * a runtime, so the mode file, the time stamp and the `--disable-userns` strip use shell builtins only. `startup-exit` holds
  * 0.4 s on a FIFO (`read -t` on a builtin, no fork) before it exits: a process that ends before the sampler can read its
  * executable cannot be classified by it (a stated blind spot), so the double stays alive for several sampler ticks.
  */
-type WrapperMode = "pass" | "startup-exit" | "startup-hang" | "no-userns" | "mask-unshare" | "mask-true" | "bypass" | "bypass-ready";
+type WrapperMode = "pass" | "startup-exit" | "startup-hang" | "no-userns" | "mask-unshare" | "mask-true" | "bypass" | "bypass-ready" | "bypass-fork";
 
 interface Wrapper {
   path: string;
@@ -175,6 +176,11 @@ case "$MODE" in
     echo ${SANDBOX_CHECK_LINE} >&2
     export HOME="$DIR/home"; mkdir -p "$HOME"; cd "$DIR"
     exec "${"$"}{@:i+1}" ;;
+  bypass-fork)
+    for ((i = 1; i <= $#; i++)); do [ "${"$"}{!i}" = sandbox ] && break; done
+    echo ${SANDBOX_CHECK_LINE} >&2
+    export HOME="$DIR/home"; mkdir -p "$HOME"; cd "$DIR"
+    "${"$"}{@:i+1}"; exit $? ;;
   *) exec /usr/bin/bwrap "$@" ;;
 esac
 `,
@@ -221,8 +227,8 @@ async function wrapperRig(startupTimeoutMs: number = STARTUP_TIMEOUT_MS): Promis
 /* ------------------------------------------------------------------ */
 
 /** The failure window: a process sampler, an egress sampler and the counters every row compares afterwards. */
-function windowOf(rig: SecurityRig, tags: string[] = []) {
-  const processes = startProcessSampler(() => rig.gateway.child.pid!, tags);
+function windowOf(rig: SecurityRig, tags: string[] = [], seam: { afterStableReading?: (pid: number) => void } = {}) {
+  const processes = startProcessSampler(() => rig.gateway.child.pid!, tags, 20, seam);
   const egress = startEgressSampler(() => rig.gateway.child.pid!);
   return {
     logFrom: rig.log().length,
@@ -960,6 +966,112 @@ describe("sampler and refusal-check controls", () => {
     expect(problems.some((problem) => problem.includes("runtime process(es) started in a window that must start none"))).toBe(true);
     expect(problems.some((problem) => problem.includes("ran without a sandbox ancestor"))).toBe(false);
     expect(turnProblems(turn)).toEqual([]);
+  });
+
+  /**
+   * The exit-rule seam for a gateway-level control (MVP-8090): on the `atReading`-th stable reading of the native runtime
+   * (the executable `claude`) it stops the runtime's parent, kills the runtime and holds the sampler tick until the runtime is
+   * a zombie (bound 2 s; a missed bound leaves `reached` false and the control fails as a precondition). Only the runtime the
+   * gateway started is signalled, and the stopped parent is continued by `release` once the window is closed.
+   */
+  function runtimeExit(atReading: number) {
+    const state = { pid: 0, readings: 0, forced: false, reached: false, stopped: [] as number[] };
+    const statOf = (pid: number): { state: string; ppid: number } | null => {
+      try {
+        const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+        const rest = text.slice(text.lastIndexOf(")") + 2).split(" ");
+        return { state: rest[0], ppid: Number(rest[1]) };
+      } catch {
+        return null;
+      }
+    };
+    const threads = (pid: number): number => Number(/^Threads:\s*(\d+)/m.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"))?.[1] ?? 1);
+    const isZombie = (pid: number): boolean => {
+      try {
+        return statOf(pid)?.state === "Z" && threads(pid) <= 1;
+      } catch {
+        return false;
+      }
+    };
+    const seam = (pid: number): void => {
+      let exe = "";
+      try {
+        exe = path.basename(fs.readlinkSync(`/proc/${pid}/exe`));
+      } catch {
+        return;
+      }
+      if (exe !== "claude" || state.forced || (state.pid !== 0 && state.pid !== pid)) return;
+      state.pid = pid;
+      state.readings += 1;
+      if (state.readings < atReading) return;
+      state.forced = true;
+      const parent = statOf(pid)?.ppid ?? 0;
+      process.kill(parent, "SIGSTOP");
+      state.stopped.push(parent);
+      process.kill(pid, "SIGKILL");
+      for (const end = Date.now() + 2000; !(state.reached = isZombie(pid)) && Date.now() < end; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2));
+    };
+    const release = (): void => {
+      for (const pid of state.stopped.splice(0)) {
+        try {
+          process.kill(pid, "SIGCONT");
+        } catch {
+          // Already gone.
+        }
+      }
+    };
+    return { state, seam, release };
+  }
+
+  it("control G1: a sandboxed native runtime that exits after its own proof, with its parent stopped, is cleared by that proof and audited, not reported", async () => {
+    const { rig } = await wrapperRig();
+    const exit = runtimeExit(3);
+    const prompt = "IF-CONTROL-EXIT-SANDBOXED";
+    rig.scripts.push(scriptOf(prompt, [bashStep("echo CONTROL")]));
+    const window = windowOf(rig, [], { afterStableReading: exit.seam });
+    const asked = rig.ask("reqlift", { queryId: "q-control-exit-sandboxed", sessionId: "conv-control-exit-sandboxed", prompt, user_id: "user-1", useSession: true, allowedTools: ["Bash"] }, 90_000).catch(() => undefined);
+    try {
+      await waitFor(() => exit.state.forced, 60_000, "the sampler to force the runtime's exit");
+      const { sample } = window.close();
+      expect(exit.state.reached, "precondition not reached: the runtime was not a zombie within its bound").toBe(true);
+      const record = sample.records.find((candidate) => candidate.pid === exit.state.pid);
+      expect(record, "precondition not reached: the sampler did not record the runtime").toBeDefined();
+      expect(record!.exe).toBe("claude");
+      expect(record!.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: true, escapeEvidence: false });
+      expect(record!.clearedBy).toBe("own");
+      expect(sample.unsandboxedRuntimes).toEqual([]);
+      expect(sampleProblems(sample, rig.markers.values)).toEqual([]);
+      expect(sample.clears.some((clear) => clear.record.pid === record!.pid && clear.explanation === "exiting after a proof read while alive (own)")).toBe(true);
+    } finally {
+      exit.release();
+    }
+    void asked;
+  });
+
+  it("control G2: the real native runtime started outside the sandbox below a script named bwrap is reported when its exit is forced at the first reading", async () => {
+    const { rig, wrapper } = await wrapperRig();
+    wrapper.setMode("bypass-fork");
+    const exit = runtimeExit(1);
+    const prompt = "IF-CONTROL-EXIT-BYPASS";
+    rig.scripts.push(scriptOf(prompt, [bashStep("echo CONTROL")]));
+    const window = windowOf(rig, [], { afterStableReading: exit.seam });
+    const asked = rig.ask("reqlift", { queryId: "q-control-exit-bypass", sessionId: "conv-control-exit-bypass", prompt, user_id: "user-1", useSession: true, allowedTools: ["Bash"] }, 90_000).catch(() => undefined);
+    try {
+      await waitFor(() => exit.state.forced, 60_000, "the sampler to force the runtime's exit");
+      const { sample } = window.close();
+      expect(exit.state.reached, "precondition not reached: the runtime was not a zombie within its bound").toBe(true);
+      const record = sample.records.find((candidate) => candidate.pid === exit.state.pid);
+      expect(record, "precondition not reached: the sampler did not record the runtime").toBeDefined();
+      // The seam acted on the executable `claude`; a record created on a zombie reading has no readable executable name.
+      expect(record!.clearedBy).toBeUndefined();
+      expect(sample.unsandboxedRuntimes).toContain(record!.pid);
+      const text = sampleProblems(sample, rig.markers.values).join("\n");
+      expect(text).toContain("ran without a sandbox ancestor");
+      expect(text).toContain(`pid ${record!.pid}`);
+    } finally {
+      exit.release();
+    }
+    void asked;
   });
 
   it("control: an upstream that accepts the credential fails both refusal texts and the missing audit lines after the bounded wait", async () => {
