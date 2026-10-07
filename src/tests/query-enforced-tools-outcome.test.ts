@@ -177,21 +177,26 @@ describe("enforcedTools (MVP-7637)", () => {
     expect(stream.at(-1)?.type).toBe("done");
   }, 15_000);
 
-  it("without enforcedTools the options are exactly the unenforced ones", async () => {
+  it("without enforcedTools the options are the unenforced ones with the approved default built-ins named", async () => {
     const app = await createApp();
     const res = await request(app).post("/v1/query").send({ queryId: "q-plain", prompt: "go", useSession: false, user_id: "user-1" });
     expect(res.status).toBe(200);
     const options = capturedOptions[0];
     expect(options.permissionMode).toBe("bypassPermissions");
-    // MVP-7679: only the user source (the project source reads a `.mcp.json` the agent can write), so no `tools`.
+    // MVP-7679: only the user source (the project source reads a `.mcp.json` the agent can write).
     expect(options.settingSources).toEqual(["user"]);
     expect(options.allowedTools).toEqual([
-      "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "Agent", "TodoWrite", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList",
+      "Agent", "Bash", "Edit", "Glob", "Grep", "NotebookEdit", "Read", "Skill", "TodoWrite", "WebFetch", "WebSearch", "Write",
       "probe_read", "probe_write", "mcp__jira__*", "mcp__other__*",
     ]);
+    // MVP-8088: every run names its built-ins explicitly (the approved default set) and denies the other inventory names.
+    expect(options.tools).toEqual(["Agent", "Bash", "Edit", "Glob", "Grep", "NotebookEdit", "Read", "Skill", "TodoWrite", "WebFetch", "WebSearch", "Write"]);
+    expect(options.disallowedTools).toEqual([
+      "CronCreate", "CronDelete", "CronList", "EnterWorktree", "ExitWorktree", "ListAgents", "ReportFindings", "ScheduleWakeup", "SendMessage", "TaskStop", "Workflow",
+    ]);
     expect(Object.keys(options).sort()).toEqual([
-      "abortController", "allowedTools", "cwd", "env", "includePartialMessages", "mcpServers", "model",
-      "permissionMode", "sessionId", "settingSources", "spawnClaudeCodeProcess", "systemPrompt",
+      "abortController", "allowedTools", "cwd", "disallowedTools", "env", "includePartialMessages", "mcpServers", "model",
+      "permissionMode", "sessionId", "settingSources", "spawnClaudeCodeProcess", "systemPrompt", "tools",
     ]);
     expect(Object.keys(options.mcpServers as object).sort()).toEqual(["agent-gateway-tools", "jira", "other"]);
     expect(sdkServers[0].tools.map((t) => t.name)).toEqual(["probe_read", "probe_write"]);

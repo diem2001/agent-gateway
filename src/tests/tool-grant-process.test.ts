@@ -906,14 +906,17 @@ describe("startup with the new configuration keys", () => {
   it("a valid policy starts the gateway and logs one line per label", async () => {
     const { code, output } = await startGateway({ AGENT_TOOL_POLICY: JSON.stringify({ labels: { proc: { deny: ["Bash"] } } }) });
     expect(code).toBeNull();
-    expect(output).toMatch(/\[audit\] tool\.policy label=proc builtIns=Agent,AskUserQuestion,Edit,/);
-    expect(output).toContain("tool.policy label=other builtIns=all servers=all");
+    expect(output).toContain("[audit] tool.policy label=proc builtIns=Agent,Edit,Glob,Grep,NotebookEdit,Read,Skill,TodoWrite,WebFetch,WebSearch,Write servers=all");
+    expect(output).toContain("[audit] tool.policy label=other builtIns=Agent,Bash,Edit,Glob,Grep,NotebookEdit,Read,Skill,TodoWrite,WebFetch,WebSearch,Write servers=all");
   });
 
-  it.each([["unset policy", {}], ["an empty policy", { AGENT_TOOL_POLICY: "" }]])("%s starts without a policy line", async (_label, env) => {
+  it.each([["unset policy", {}], ["an empty policy", { AGENT_TOOL_POLICY: "" }]])("%s logs the approved default set per label, never all (MVP-8088)", async (_label, env) => {
     const { code, output } = await startGateway(env);
     expect(code).toBeNull();
-    expect(output).not.toContain("tool.policy");
+    for (const label of ["proc", "other"]) {
+      expect(output).toContain(`[audit] tool.policy label=${label} builtIns=Agent,Bash,Edit,Glob,Grep,NotebookEdit,Read,Skill,TodoWrite,WebFetch,WebSearch,Write servers=all`);
+    }
+    expect(output).not.toContain("builtIns=all");
   });
 
   it.each([["0"], ["-1"], ["abc"], ["1.5"]])("AGENT_MCP_TOOL_TIMEOUT_MS=%s stops the gateway with one fixed line", async (value) => {

@@ -287,7 +287,8 @@ describe("sandbox environment", () => {
     const env = buildSandboxEnv({
       ...base,
       gatewayEnv: { ...secrets, LANG: "de_DE.UTF-8", LC_ALL: "de_DE.UTF-8", LC_CTYPE: "bad value with spaces" },
-      sdkEnv: { ...secrets, CLAUDE_CODE_ENTRYPOINT: "sdk-ts", CLAUDE_AGENT_SDK_VERSION: "0.1.77", CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING: "true", CLAUDE_CODE_SECRET_THING: "x" },
+      // The gateway's own environment asks for the task tools: the fixed key below must win (MVP-8088).
+      sdkEnv: { ...secrets, CLAUDE_CODE_ENTRYPOINT: "sdk-ts", CLAUDE_AGENT_SDK_VERSION: "0.1.77", CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING: "true", CLAUDE_CODE_SECRET_THING: "x", CLAUDE_CODE_ENABLE_TASKS: "true" },
     });
     expect(Object.keys(env).sort()).toEqual(
       [
@@ -297,6 +298,7 @@ describe("sandbox environment", () => {
         "CLAUDE_CODE_DEBUG_LOGS_DIR",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
         "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+        "CLAUDE_CODE_ENABLE_TASKS",
         "CLAUDE_CODE_ENTRYPOINT",
         "DISABLE_AUTOUPDATER",
         "GIT_CONFIG_COUNT",
@@ -327,6 +329,8 @@ describe("sandbox environment", () => {
       ANTHROPIC_API_KEY: "mpt_RUN_TOKEN",
       DISABLE_AUTOUPDATER: "1",
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+      // DEC-ISO-008: the runtime offers TodoWrite (reqlift's checklist), not the task tools; the gateway's environment cannot change that.
+      CLAUDE_CODE_ENABLE_TASKS: "false",
     });
     expect(env.PATH).toBe("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
     // Trusted, highest-precedence git configuration: no fsmonitor, no hooks, no implicit bare repository.
