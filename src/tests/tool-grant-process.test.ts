@@ -361,8 +361,11 @@ describe("files the agent writes in its own home cannot start anything on a late
       const { events } = await ask(r, { prompt, sessionId: "w", useSession: true });
       expect(events.at(-1)?.type, prompt).toBe("done");
       if (prompt === "W3-READ") {
-        // The native runtime updates its state file during the turn and rejects this stale write.
-        expect(resultFor(r, prompt)?.isError, prompt).toBe(true);
+        // Whether the runtime rewrote its state file during the turn (then it refuses this stale write) depends on what the
+        // run did: with the task tools disabled (MVP-8088) the write lands. The guarantee below holds either way.
+        const outcome = resultFor(r, prompt)?.isError;
+        expect(typeof outcome, prompt).toBe("boolean");
+        process.stderr.write(`TOOL-GRANT-EVIDENCE row=W3 claude.json write landed=${outcome === false}\n`);
       } else if (prompt.startsWith("W") && prompt !== "W4-BASH") {
         expect(resultFor(r, prompt)?.isError, `${prompt}: ${resultFor(r, prompt)?.text}`).toBe(false);
       }
@@ -371,7 +374,7 @@ describe("files the agent writes in its own home cannot start anything on a late
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const home = await settle(r, "w");
     // The first two writes succeeded; the clean home removed them at the next start.
-    // The runtime's own state file also contains no planted server after refusing the stale write.
+    // The runtime's own state file contains no planted server, whether the write was refused or landed and was rewritten at the next start.
     expect(fs.existsSync(path.join(home, ".mcp.json"))).toBe(false);
     expect(fs.existsSync(path.join(home, ".claude", "settings.local.json"))).toBe(false);
     expect(markersOf(r, "w")).toEqual([]);
