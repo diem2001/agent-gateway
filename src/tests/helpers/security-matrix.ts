@@ -562,6 +562,13 @@ export interface ProcessRecord {
   firstMissingProof?: string;
   /** Reads that disagreed with themselves (a process in the middle of an exec, or one that vanished) before the verdict. */
   inconsistentReads: number;
+  /**
+   * What the sampler saw at the tick(s) where a runtime's proof failed outside a proven ancestor: booleans and enums only.
+   * `failedWhile` is `alive` once any failing tick found the process not confirmed exiting; `ownProof` and `launcherProof`
+   * hold only when they held on every failing tick; `escapeEvidence` once any failing proof read the pid or user namespace
+   * as the gateway's.
+   */
+  proofFailure?: { failedWhile: "alive" | "exiting"; ownProof: boolean; launcherProof: boolean; escapeEvidence: boolean };
   /** `running` when the same process still existed at `stop()`, else `exited`. */
   fate: "running" | "exited";
 }
@@ -734,7 +741,11 @@ function readTick(first: ProcInfo, firstExe: ExeRead): TickRead {
  * The sandbox proof for a runtime: an ancestor between it and the gateway is the real bwrap (by executable, not by
  * `comm`), and its pid, user and mount namespaces all differ from the gateway's. A link that cannot be read is no proof.
  */
-function sandboxProof(pid: number, root: number, bwraps: Set<string>): { proven: boolean; chain: string[]; detail: string } {
+function sandboxProof(
+  pid: number,
+  root: number,
+  bwraps: Set<string>,
+): { proven: boolean; chain: string[]; detail: string; namespaces: { pid: boolean | "unreadable"; user: boolean | "unreadable"; mnt: boolean | "unreadable" } } {
   const chain: string[] = [];
   let realBwrap = false;
   let current = pid;
@@ -760,7 +771,66 @@ function sandboxProof(pid: number, root: number, bwraps: Set<string>): { proven:
   }
   const namespaces = { pid: sameNamespace(pid, root, "pid"), user: sameNamespace(pid, root, "user"), mnt: sameNamespace(pid, root, "mnt") };
   const proven = !broken && realBwrap && namespaces.pid === false && namespaces.user === false && namespaces.mnt === false;
-  return { proven, chain, detail: `chain-${broken ? "broken" : "complete"} real-bwrap=${realBwrap} same-ns pid=${namespaces.pid} user=${namespaces.user} mnt=${namespaces.mnt}` };
+  return { proven, chain, namespaces, detail: `chain-${broken ? "broken" : "complete"} real-bwrap=${realBwrap} same-ns pid=${namespaces.pid} user=${namespaces.user} mnt=${namespaces.mnt}` };
+}
+
+/** What one re-read of a process whose proof just failed showed (see `exitConfirmed`). */
+export interface ExitReading {
+  /** `/proc/<pid>` could not be read any more. */
+  vanished: boolean;
+  /** The pid now belongs to a process with another start time. */
+  startChanged: boolean;
+  /** Field 3 of `/proc/<pid>/stat`. */
+  state: string;
+  /** `Threads:` of `/proc/<pid>/status`. */
+  threads: number;
+  cmdline: string;
+  /** `/proc/<pid>/exe`: gone (ENOENT), unreadable while alive (EACCES) or readable. */
+  exe: "gone" | "denied" | "readable";
+}
+
+/**
+ * Whether a process is confirmed to be ending: vanished, a new start time, state `X`, state `Z` with at most one thread
+ * (a thread-group leader that exited while other threads run is not ending), or an empty command line and a missing
+ * executable together. A live process that blanks its own command line is not ending. Stricter than `exiting`, which
+ * only decides whether a reading is usable.
+ */
+export function exitConfirmed(reading: ExitReading): boolean {
+  if (reading.vanished || reading.startChanged) return true;
+  if (reading.state === "X") return true;
+  if (reading.state === "Z") return reading.threads <= 1;
+  return reading.cmdline === "" && reading.exe === "gone";
+}
+
+function readExitReading(pid: number, startTicks: string): ExitReading {
+  const info = readProc(pid);
+  if (info === null) return { vanished: true, startChanged: false, state: "", threads: 0, cmdline: "", exe: "gone" };
+  let threads = 1;
+  try {
+    threads = Number(/^Threads:\s*(\d+)/m.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"))?.[1] ?? 1);
+  } catch {
+    // Gone between the reads: the next field read decides.
+  }
+  const exe = readExe(pid);
+  return { vanished: false, startChanged: info.startTicks !== startTicks, state: info.state, threads, cmdline: info.cmdline, exe: "id" in exe ? "readable" : "denied" in exe ? "denied" : "gone" };
+}
+
+/**
+ * Whether an ancestor from the tick's snapshot is the real bwrap (by executable) and has the full sandbox proof itself:
+ * its own namespaces differ from the gateway's and a real bwrap sits above it. The real bwrap by executable alone is no
+ * proof (the outer one lives in the gateway's namespaces). The ancestor's start time and executable are checked around its proof.
+ */
+function liveLauncherProof(ancestorPids: number[], infos: Map<number, ProcInfo>, root: number, bwraps: Set<string>): boolean {
+  for (const pid of ancestorPids) {
+    const info = infos.get(pid);
+    const before = readExe(pid);
+    if (!info || !("id" in before) || !bwraps.has(before.id)) continue;
+    if (!sandboxProof(pid, root, bwraps).proven) continue;
+    const after = readProc(pid);
+    const exeAfter = readExe(pid);
+    if (after?.startTicks === info.startTicks && "id" in exeAfter && exeAfter.id === before.id) return true;
+  }
+  return false;
 }
 
 /** The text a problem line appends for the records, one entry per process. `redactArgv` and the name allowlist already keep
@@ -769,7 +839,7 @@ export function describeRecords(records: ProcessRecord[], markers: Record<string
   const text = records
     .map((record) => {
       const ns = record.sameNamespaces;
-      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
+      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence}]` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
     })
     .join("; ");
   return detect([{ name: "process-records", text }], markers).length > 0 ? "[process records withheld: a marker was detected]" : text;
@@ -844,6 +914,7 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
         let verdict: ProcessRecord["verdict"] = prior?.verdict ?? "unresolved";
         let unsandboxed = prior?.unsandboxed ?? false;
         let firstMissingProof = prior?.firstMissingProof;
+        let proofFailure = prior?.proofFailure;
         const comms = prior?.comms ?? [];
         let seen = info;
         let ancestors = chain.length > 0 ? [...chain, "gateway"] : ["gateway"];
@@ -859,7 +930,24 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
             const proof = sandboxProof(info.pid, root, known.bwraps);
             ancestors = proof.chain.length > 0 ? proof.chain : ancestors;
             if (proof.proven) proven.add(key);
-            else if (!belowProven) firstMissingProof ??= proof.detail;
+            else if (!belowProven) {
+              firstMissingProof ??= proof.detail;
+              // Observation beside the rule: was this failure read while the process was alive or ending, and which proofs existed.
+              const failure = {
+                failedWhile: exitConfirmed(readExitReading(info.pid, info.startTicks)) ? ("exiting" as const) : ("alive" as const),
+                ownProof: proven.has(key),
+                launcherProof: liveLauncherProof(ancestorPids, infos, root, known.bwraps),
+                escapeEvidence: proof.namespaces.pid === true || proof.namespaces.user === true,
+              };
+              proofFailure = proofFailure
+                ? {
+                    failedWhile: proofFailure.failedWhile === "alive" || failure.failedWhile === "alive" ? "alive" : "exiting",
+                    ownProof: proofFailure.ownProof && failure.ownProof,
+                    launcherProof: proofFailure.launcherProof && failure.launcherProof,
+                    escapeEvidence: proofFailure.escapeEvidence || failure.escapeEvidence,
+                  }
+                : failure;
+            }
             // A flag stays: one tick without proof is a run outside the sandbox, whatever the next tick shows.
             unsandboxed = unsandboxed || !(proof.proven || belowProven);
           }
@@ -901,6 +989,7 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
           verdict,
           unsandboxed,
           firstMissingProof,
+          proofFailure,
           inconsistentReads: (prior?.inconsistentReads ?? 0) + (read.kind === "stable" ? 0 : read.torn),
           fate: "running",
         });
@@ -957,6 +1046,11 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
             unresolved_torn: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads > 0),
             unresolved_unread: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads === 0),
             flagged_unreadable: count((record) => record.firstMissingProof?.startsWith("executable unreadable") === true),
+            failed_exiting: count((record) => record.proofFailure?.failedWhile === "exiting"),
+            failed_alive: count((record) => record.proofFailure?.failedWhile === "alive"),
+            failed_own_proof: count((record) => record.proofFailure?.ownProof === true),
+            failed_launcher_proof: count((record) => record.proofFailure?.launcherProof === true),
+            failed_escape_evidence: count((record) => record.proofFailure?.escapeEvidence === true),
           })}`,
         );
       }
