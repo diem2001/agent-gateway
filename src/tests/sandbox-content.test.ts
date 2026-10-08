@@ -24,6 +24,7 @@ import {
   stripUrlUserInfo,
   webhookUrlValues,
 } from "../sandbox-content.js";
+import { neutralizeCommandSettings } from "../command-settings.js";
 import { SandboxRun, loadIsolationConfig } from "../sandbox.js";
 
 const SECRET = "SYNTH-CRED-ACCESS-TOKEN-7678-abcdef";
@@ -678,15 +679,16 @@ describe("a snapshot of skills, agents and commands for a run without Bash (MVP-
   const NEUTRAL_AGENT = '---\nname: "a"\ndescription: "agent"\ntools: "Read"\n---\nAGENT-TOKEN\n';
   const trusted = () => path.join(root, "trusted");
 
-  function plan(options: { neutralize?: boolean; needles?: Buffer[]; scanner?: KnownValueScanner; limits?: { maxFiles: number; maxBytes: number }; trustedDir?: string } = {}) {
+  function plan(options: { neutralize?: boolean; needles?: Buffer[]; scanner?: KnownValueScanner; limits?: Record<string, number>; trustedDir?: string; ws?: string } = {}) {
     return planTrustedContent({
-      workspaceRoot: path.join(root, "ws"),
+      workspaceRoot: options.ws ?? path.join(root, "ws"),
       trustedDir: options.trustedDir ?? trusted(),
       needles: options.needles ?? [],
       scanner: options.scanner ?? new KnownValueScanner(),
       ...(options.neutralize === undefined ? {} : { neutralizeCommands: options.neutralize }),
       label: "reqlift",
-      ...(options.limits ? { snapshotLimits: options.limits } : {}),
+      // Loosely typed on purpose: a row passes only the limit it exercises, whatever the option's declared type is.
+      ...(options.limits ? { snapshotLimits: options.limits as unknown as { maxFiles: number; maxBytes: number } } : {}),
     });
   }
   const mountOf = (p: ReturnType<typeof plan>, entry: string) => p.mounts.find((m) => m.dest === `/home/node/.claude/${entry}`);
@@ -826,6 +828,12 @@ describe("a snapshot of skills, agents and commands for a run without Bash (MVP-
       if (String(target) === path.join(root, "ws", "skills", "probe")) throw new Error("EACCES");
       return (real as (...args: unknown[]) => unknown)(target, ...rest);
     }) as typeof fs.readdirSync);
+    // The walk lists a folder through either call; the row fails the same folder through both.
+    const realOpendir = fs.opendirSync;
+    vi.spyOn(fs, "opendirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target) === path.join(root, "ws", "skills", "probe")) throw new Error("EACCES");
+      return (realOpendir as (...args: unknown[]) => unknown)(target, ...rest);
+    }) as typeof fs.opendirSync);
     const p = plan({ neutralize: true });
     vi.restoreAllMocks();
     expect(mountOf(p, "skills")!.src).toBe(path.join(trusted(), "empty-dir"));
@@ -875,6 +883,417 @@ describe("a snapshot of skills, agents and commands for a run without Bash (MVP-
     expect(fs.existsSync(path.join(runs, name, "trusted", "neutralized", "skills", "probe", "SKILL.md"))).toBe(true);
     await run.dispose();
     expect(fs.readdirSync(runs)).toEqual([]);
+  });
+
+  describe("a bounded walk and a bounded read (MVP-8126)", () => {
+    const K = Buffer.byteLength(HOOK_SKILL);
+    const wsRoot = () => path.join(root, "ws");
+    const limitedLines = () => logs.filter((l) => l.includes("sandbox.content.limited"));
+    const tooLargeLines = () => logs.filter((l) => l.includes("reason=too_large"));
+    const symlinkLines = () => logs.filter((l) => l.includes("reason=symlink"));
+    const LIMITED = /^\[audit\] sandbox\.content\.limited kind=snapshot-(skills|agents|commands) files=\d+ folders=\d+ examined=\d+ bytes=\d+ left_out=\d+ stopped=(true|false)$/;
+    const fieldsOf = (line: string): Record<string, string> => Object.fromEntries([...line.matchAll(/(\w+)=(\S+)/g)].map((m) => [m[1], m[2]]));
+    const snapOf = (entry: string, trustedDir = trusted()) => path.join(trustedDir, "neutralized", entry);
+
+    /** Exactly one summary line, of the content-free shape, for `kind`, with these counts. */
+    function expectOneLimited(kind: string, counts: Record<string, number | boolean>): void {
+      const lines = limitedLines();
+      expect(lines.length, "summary lines").toBe(1);
+      expect(lines[0]).toMatch(LIMITED);
+      const fields = fieldsOf(lines[0]);
+      expect(fields.kind).toBe(`snapshot-${kind}`);
+      for (const [key, value] of Object.entries(counts)) expect(fields[key], key).toBe(String(value));
+    }
+
+    /** Every file and folder of the copy, relative to its root (`/` separated), with a stack so a deep chain needs no recursion. */
+    function treeOf(base: string): { files: string[]; folders: string[] } {
+      const out = { files: [] as string[], folders: [] as string[] };
+      const stack = [""];
+      while (stack.length > 0) {
+        const rel = stack.pop()!;
+        for (const name of fs.readdirSync(rel ? path.join(base, rel) : base)) {
+          const childRel = rel ? `${rel}/${name}` : name;
+          if (fs.lstatSync(path.join(base, childRel)).isDirectory()) {
+            out.folders.push(childRel);
+            stack.push(childRel);
+          } else out.files.push(childRel);
+        }
+      }
+      return out;
+    }
+
+    /**
+     * What every snapshot must be: a subset of the store in which every `.md` equals its rewritten source, every other
+     * file is byte-identical, and nothing is a link or a special file.
+     */
+    function expectSnapshotInvariant(entry: string, where: { ws?: string; trustedDir?: string } = {}): { files: number; folders: number } {
+      const source = path.join(where.ws ?? wsRoot(), entry);
+      const copy = snapOf(entry, where.trustedDir);
+      const problems: string[] = [];
+      const counts = { files: 0, folders: 0 };
+      const tree = treeOf(copy);
+      for (const rel of tree.folders) {
+        const stat = fs.lstatSync(path.join(copy, rel));
+        const original = fs.lstatSync(path.join(source, rel), { throwIfNoEntry: false });
+        if (!stat.isDirectory() || !original?.isDirectory()) problems.push(`folder ${rel}`);
+        counts.folders++;
+      }
+      for (const rel of tree.files) {
+        const stat = fs.lstatSync(path.join(copy, rel));
+        const original = fs.lstatSync(path.join(source, rel), { throwIfNoEntry: false });
+        if (!stat.isFile() || !original?.isFile()) {
+          problems.push(`file ${rel}`);
+          continue;
+        }
+        const input = fs.readFileSync(path.join(source, rel));
+        const expected = /\.md$/i.test(rel) ? neutralizeCommandSettings(input).data : input;
+        if (!fs.readFileSync(path.join(copy, rel)).equals(expected)) problems.push(`content ${rel}`);
+        counts.files++;
+      }
+      expect(problems.slice(0, 5)).toEqual([]);
+      return counts;
+    }
+
+    /** Counts the directory handles opened below `prefix`, the entries read through them and the handles closed. */
+    function trackDirs(prefix: string, failAt?: string) {
+      const state = { opened: 0, closed: 0, reads: 0 };
+      const real = fs.opendirSync;
+      vi.spyOn(fs, "opendirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+        if (failAt !== undefined && String(target) === failAt) throw new Error("EMFILE");
+        const dir = (real as (...args: unknown[]) => fs.Dir)(target, ...rest);
+        if (String(target) === prefix || String(target).startsWith(prefix + path.sep)) {
+          state.opened++;
+          const read = dir.readSync.bind(dir);
+          const close = dir.closeSync.bind(dir);
+          dir.readSync = () => {
+            state.reads++;
+            return read();
+          };
+          dir.closeSync = () => {
+            state.closed++;
+            return close();
+          };
+        }
+        return dir;
+      }) as typeof fs.opendirSync);
+      return state;
+    }
+
+    /** Runs `fn` with `fs.fstatSync` of the descriptor opened for `target` growing the file by `grow` bytes (real growth, once, after the real fstat). */
+    function growAtFstat(target: string, grow: number) {
+      const realOpen = fs.openSync;
+      const realFstat = fs.fstatSync;
+      const realRead = fs.readSync;
+      const pathOf = new Map<number, string>();
+      const state = { targetFd: -1, grown: false, targetBytes: 0, bytesBeforeTarget: 0, acceptedBefore: -1, otherBytes: 0 };
+      vi.spyOn(fs, "openSync").mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+        const fd = (realOpen as (...args: unknown[]) => number)(p, ...rest);
+        pathOf.set(fd, String(p));
+        if (String(p) === target) {
+          state.targetFd = fd;
+          state.acceptedBefore = state.otherBytes;
+        }
+        return fd;
+      }) as typeof fs.openSync);
+      vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
+        const stat = (realFstat as (...args: unknown[]) => fs.Stats)(fd, ...rest);
+        if (fd === state.targetFd && !state.grown) {
+          state.grown = true;
+          const extra = realOpen(target, "a");
+          fs.writeSync(extra, Buffer.alloc(grow, 0x78));
+          fs.closeSync(extra);
+        }
+        return stat;
+      }) as typeof fs.fstatSync);
+      vi.spyOn(fs, "readSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
+        const n = (realRead as (...args: unknown[]) => number)(fd, ...rest);
+        if (fd === state.targetFd) state.targetBytes += n;
+        else if ((pathOf.get(fd) ?? "").startsWith(path.join(wsRoot(), "skills"))) state.otherBytes += n;
+        return n;
+      }) as typeof fs.readSync);
+      return state;
+    }
+
+    /* ---- A1: one row per boundary: exactly at the limit, and one over ---- */
+
+    it("B1 file limit, exactly at it: maxFiles hooked markdown files of one length are complete, with no summary line", () => {
+      for (let i = 0; i < 3; i++) write(`ws/skills/f${i}.md`, HOOK_SKILL);
+      plan({ neutralize: true, limits: { maxFiles: 3 } });
+      expect(limitedLines()).toEqual([]);
+      expect(tooLargeLines()).toEqual([]);
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 3, folders: 0 });
+    });
+
+    it("B2 file limit, one over: the walk stops at the extra file, with one content-free summary line and no too_large line", () => {
+      for (let i = 0; i < 4; i++) write(`ws/skills/f${i}.md`, HOOK_SKILL);
+      plan({ neutralize: true, limits: { maxFiles: 3 } });
+      expectOneLimited("skills", { files: 3, folders: 0, left_out: 1, stopped: true });
+      expect(tooLargeLines()).toEqual([]);
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 3, folders: 0 });
+    });
+
+    it("B3 folder limit, exactly at it: maxFolders empty folders are complete, with no summary line", () => {
+      for (let i = 0; i < 3; i++) fs.mkdirSync(path.join(wsRoot(), "skills", `d${i}`), { recursive: true });
+      plan({ neutralize: true, limits: { maxFolders: 3 } });
+      expect(limitedLines()).toEqual([]);
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 0, folders: 3 });
+    });
+
+    it("B4 folder limit, one over: the extra folder is not created and the walk stops, with one summary line", () => {
+      for (let i = 0; i < 4; i++) fs.mkdirSync(path.join(wsRoot(), "skills", `d${i}`), { recursive: true });
+      plan({ neutralize: true, limits: { maxFolders: 3 } });
+      expectOneLimited("skills", { files: 0, folders: 3, left_out: 1, stopped: true });
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 0, folders: 3 });
+    });
+
+    function linkStore(count: number): void {
+      fs.mkdirSync(path.join(wsRoot(), "skills"), { recursive: true });
+      for (let i = 0; i < count; i++) fs.symlinkSync("nowhere", path.join(wsRoot(), "skills", `l${i}`));
+    }
+
+    it("B5 examined-entry limit, exactly at it: maxExamined symlinks each get their line and there is no summary line", () => {
+      linkStore(6);
+      plan({ neutralize: true, limits: { maxExamined: 6 } });
+      expect(symlinkLines().length).toBe(6);
+      expect(limitedLines()).toEqual([]);
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 0, folders: 0 });
+    });
+
+    it("B6 examined-entry limit, one over: still six symlink lines, and one summary line with stopped=true and nothing left out", () => {
+      linkStore(7);
+      plan({ neutralize: true, limits: { maxExamined: 6 } });
+      expect(symlinkLines().length).toBe(6);
+      expectOneLimited("skills", { files: 0, folders: 0, examined: 6, left_out: 0, stopped: true });
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 0, folders: 0 });
+    });
+
+    it("B7 byte limit, exactly at it: files of one length k with maxBytes 6k are complete, with no summary line", () => {
+      for (let i = 0; i < 6; i++) write(`ws/skills/b${i}.md`, HOOK_SKILL);
+      plan({ neutralize: true, limits: { maxBytes: 6 * K } });
+      expect(limitedLines()).toEqual([]);
+      expect(tooLargeLines()).toEqual([]);
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 6, folders: 0 });
+    });
+
+    it("B8 byte limit, one over: six files are copied and the seventh is left out, with one summary line that does not stop the walk", () => {
+      for (let i = 0; i < 7; i++) write(`ws/skills/b${i}.md`, HOOK_SKILL);
+      plan({ neutralize: true, limits: { maxBytes: 6 * K } });
+      expectOneLimited("skills", { files: 6, folders: 0, bytes: 6 * K, left_out: 1, stopped: false });
+      expect(tooLargeLines()).toEqual([]);
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 6, folders: 0 });
+    });
+
+    /* ---- A2: the cost of the 40,000-folder store is bounded by operation counts ---- */
+
+    it("B9 a flat store of 40,000 empty folders (default limits): 2000 folders are copied, 2001 entries are examined, and one summary line says so", () => {
+      const big = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "mvp8126-bound-")));
+      try {
+        const entry = path.join(big, "ws", "skills");
+        fs.mkdirSync(entry, { recursive: true });
+        for (let i = 0; i < 40_000; i++) fs.mkdirSync(path.join(entry, `d${i}`));
+        const copy = path.join(big, "trusted", "neutralized", "skills");
+        const handles = trackDirs(entry);
+        const realMkdir = fs.mkdirSync;
+        const realLstat = fs.lstatSync;
+        const counts = { mkdirBelow: 0, lstatBelow: 0 };
+        vi.spyOn(fs, "mkdirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+          if (String(target).startsWith(copy + path.sep)) counts.mkdirBelow++;
+          return (realMkdir as (...args: unknown[]) => unknown)(target, ...rest);
+        }) as typeof fs.mkdirSync);
+        vi.spyOn(fs, "lstatSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+          if (String(target).startsWith(entry + path.sep)) counts.lstatBelow++;
+          return (realLstat as (...args: unknown[]) => unknown)(target, ...rest);
+        }) as typeof fs.lstatSync);
+        const started = Date.now();
+        plan({ neutralize: true, ws: path.join(big, "ws"), trustedDir: path.join(big, "trusted") });
+        const planMs = Date.now() - started;
+        vi.restoreAllMocks();
+        const copied = fs.readdirSync(copy).length;
+        const examined = Number(fieldsOf(limitedLines()[0] ?? "").examined ?? 0);
+        process.stderr.write(`MVP8126-BOUND dirsStored=40000 dirsCopied=${copied} examined=${examined} planMs=${planMs} opendir=${handles.opened} lstat=${counts.lstatBelow} mkdir=${counts.mkdirBelow} listReads=${handles.reads}\n`);
+        expect(handles.opened, "directory handles opened (the entry and 2000 folders)").toBe(2001);
+        expect(counts.lstatBelow, "lstat calls below the entry").toBe(2001);
+        expect(counts.mkdirBelow, "mkdir calls below the copy").toBe(2000);
+        expect(handles.reads, "listing reads").toBeLessThanOrEqual(2001 + 2000 + 1);
+        expect(handles.closed, "handles closed").toBe(handles.opened);
+        expectOneLimited("skills", { files: 0, folders: 2000, examined: 2001, left_out: 1, stopped: true });
+        expect(copied).toBe(2000);
+      } finally {
+        fs.rmSync(big, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    /* ---- A3: the acceptance scenarios at their own numbers ---- */
+
+    it("B10 2500 hooked markdown files in 50 folders: exactly 2000 are copied and rewritten, with one summary line that holds no file name", () => {
+      for (let d = 0; d < 50; d++) {
+        write(`ws/skills/s${d}/SKILL.md`, HOOK_SKILL);
+        for (let f = 1; f < 50; f++) write(`ws/skills/s${d}/r${f}.md`, HOOK_SKILL);
+      }
+      plan({ neutralize: true });
+      expectOneLimited("skills", { files: 2000, left_out: 1, stopped: true });
+      expect(tooLargeLines()).toEqual([]);
+      expect(expectSnapshotInvariant("skills").files).toBe(2000);
+    }, 60_000);
+
+    it("B11 2000 files in 2000 folders (far below the byte limit): the copy is complete, with no summary line", () => {
+      for (let d = 0; d < 2000; d++) write(`ws/skills/f${d}/SKILL.md`, HOOK_SKILL);
+      plan({ neutralize: true });
+      expect(limitedLines()).toEqual([]);
+      expect(tooLargeLines()).toEqual([]);
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 2000, folders: 2000 });
+    }, 60_000);
+
+    it("B12 15,000 symlinks: at most 10,000 symlink lines, one summary line with stopped=true", () => {
+      linkStore(15_000);
+      plan({ neutralize: true });
+      expect(symlinkLines().length).toBeLessThanOrEqual(10_000);
+      expectOneLimited("skills", { files: 0, folders: 0, examined: 10_000, left_out: 0, stopped: true });
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 0, folders: 0 });
+    }, 60_000);
+
+    /* ---- A4: a file behind the folder limit ---- */
+
+    it("B13 a file inside the folder the walk leaves out (2001 sibling folders) is never copied, and the same store gives the same copy every run", () => {
+      for (let i = 0; i < 2001; i++) fs.mkdirSync(path.join(wsRoot(), "skills", `d${i}`), { recursive: true });
+      const listing = fs.opendirSync(path.join(wsRoot(), "skills"));
+      let leftOut = "";
+      for (let i = 0; i < 2001; i++) leftOut = listing.readSync()!.name;
+      listing.closeSync();
+      write(`ws/skills/${leftOut}/late.md`, HOOK_SKILL);
+      const shapes: string[][] = [];
+      for (const run of ["one", "two", "three"]) {
+        logs.length = 0;
+        const trustedDir = path.join(root, `trusted-${run}`);
+        plan({ neutralize: true, trustedDir });
+        expectOneLimited("skills", { files: 0, folders: 2000, examined: 2001, left_out: 1, stopped: true });
+        expect(fs.existsSync(path.join(snapOf("skills", trustedDir), leftOut))).toBe(false);
+        expect(expectSnapshotInvariant("skills", { trustedDir })).toEqual({ files: 0, folders: 2000 });
+        const tree = treeOf(snapOf("skills", trustedDir));
+        shapes.push([...tree.folders, ...tree.files].sort());
+      }
+      expect(shapes[1]).toEqual(shapes[0]);
+      expect(shapes[2]).toEqual(shapes[0]);
+    }, 60_000);
+
+    /* ---- A5: a file that grows between fstat and read ---- */
+
+    it("B14 a file that grows past the remaining budget between fstat and read is left out whole, never truncated, and is read for at most the remaining budget plus one byte", () => {
+      for (const name of ["a.md", "b.md", "grow.md"]) write(`ws/skills/g/${name}`, HOOK_SKILL);
+      const maxBytes = 3 * K + 10;
+      const state = growAtFstat(path.join(wsRoot(), "skills", "g", "grow.md"), maxBytes);
+      plan({ neutralize: true, limits: { maxBytes } });
+      vi.restoreAllMocks();
+      expect(state.grown, "the file grew while it was being read").toBe(true);
+      expect(fs.existsSync(path.join(snapOf("skills"), "g", "grow.md"))).toBe(false);
+      expect(fs.existsSync(path.join(snapOf("skills"), "g", "a.md"))).toBe(true);
+      expect(fs.existsSync(path.join(snapOf("skills"), "g", "b.md"))).toBe(true);
+      expectOneLimited("skills", { files: 2, bytes: 2 * K, left_out: 1, stopped: false });
+      expect(tooLargeLines()).toEqual([]);
+      expect(state.targetBytes, "bytes read from the growing file").toBeLessThanOrEqual(maxBytes - state.acceptedBefore + 1);
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 2, folders: 1 });
+    });
+
+    it("B15 readFileNoFollow with a limit returns null for a file that grows past it between fstat and read, and the whole content for one that stays within it", () => {
+      const grower = write("grow.txt", "0123456789");
+      const state = growAtFstat(grower, 100);
+      expect(readFileNoFollow(grower, 20)?.length ?? null).toBeNull();
+      vi.restoreAllMocks();
+      expect(state.grown).toBe(true);
+      const steady = write("steady.txt", "0123456789");
+      expect(readFileNoFollow(steady, 20)?.toString("utf8")).toBe("0123456789");
+      expect(readFileNoFollow(steady, 10)?.toString("utf8")).toBe("0123456789");
+      expect(readFileNoFollow(steady, 9)).toBeNull();
+    });
+
+    it("B16 an unlimited read and a copy still succeed for a small file", () => {
+      const file = write("small.txt", "small content");
+      expect(readFileNoFollow(file, Number.MAX_SAFE_INTEGER)?.toString("utf8")).toBe("small content");
+      const dest = path.join(root, "copy.txt");
+      expect(copyFileNoFollow(file, dest)).toBe(true);
+      expect(fs.readFileSync(dest, "utf8")).toBe("small content");
+    });
+
+    /* ---- A6: limits are per entry ---- */
+
+    it("B17 skills over the folder limit: agents with three entries stay complete and only the skills entry names a limit", () => {
+      for (let i = 0; i < 4; i++) write(`ws/skills/s${i}/SKILL.md`, HOOK_SKILL);
+      for (let i = 0; i < 3; i++) write(`ws/agents/a${i}.md`, HOOK_AGENT);
+      plan({ neutralize: true, limits: { maxFolders: 3 } });
+      expectOneLimited("skills", { folders: 3, left_out: 1, stopped: true });
+      expect(expectSnapshotInvariant("agents")).toEqual({ files: 3, folders: 0 });
+    });
+
+    it("B18 agents over the file limit: commands with three entries stay complete and only the agents entry names a limit", () => {
+      for (let i = 0; i < 4; i++) write(`ws/agents/a${i}.md`, HOOK_AGENT);
+      for (let i = 0; i < 3; i++) write(`ws/commands/c${i}.md`, HOOK_SKILL);
+      plan({ neutralize: true, limits: { maxFiles: 3 } });
+      expectOneLimited("agents", { files: 3, left_out: 1, stopped: true });
+      expect(expectSnapshotInvariant("commands")).toEqual({ files: 3, folders: 0 });
+    });
+
+    /* ---- A7: a run with the Bash grant is unchanged ---- */
+
+    it("B19 a run with the Bash grant binds the live entry whatever its size: no copy, no summary line", () => {
+      for (let i = 0; i < 5; i++) fs.mkdirSync(path.join(wsRoot(), "skills", `d${i}`), { recursive: true });
+      const p = plan({ neutralize: false, limits: { maxFolders: 3, maxFiles: 1, maxExamined: 2 } });
+      expect(mountOf(p, "skills")!.src).toBe(path.join(wsRoot(), "skills"));
+      expect(fs.existsSync(path.join(trusted(), "neutralized"))).toBe(false);
+      expect(limitedLines()).toEqual([]);
+    });
+
+    /* ---- A8: fail closed, and no handle stays open ---- */
+
+    it("B20 a listing that fails part-way gives the empty stand-in and closes every handle it opened", () => {
+      write("ws/skills/a/SKILL.md", HOOK_SKILL);
+      write("ws/skills/probe/SKILL.md", HOOK_SKILL);
+      const handles = trackDirs(path.join(wsRoot(), "skills"), path.join(wsRoot(), "skills", "probe"));
+      const realReaddir = fs.readdirSync;
+      vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+        if (String(target) === path.join(wsRoot(), "skills", "probe")) throw new Error("EMFILE");
+        return (realReaddir as (...args: unknown[]) => unknown)(target, ...rest);
+      }) as typeof fs.readdirSync);
+      const p = plan({ neutralize: true });
+      vi.restoreAllMocks();
+      expect(mountOf(p, "skills")!.src).toBe(path.join(trusted(), "empty-dir"));
+      expect(fs.existsSync(path.join(trusted(), "neutralized", "skills"))).toBe(false);
+      expect(limitedLines()).toEqual([]);
+      expect(handles.closed).toBe(handles.opened);
+    });
+
+    it("B21 a chain of 60 folders under maxFolders 50 stops at 50 folders, with every handle closed", () => {
+      let chain = path.join(wsRoot(), "skills");
+      for (let i = 0; i < 60; i++) chain = path.join(chain, "d");
+      fs.mkdirSync(chain, { recursive: true });
+      write("ws/skills/top.md", HOOK_SKILL);
+      const handles = trackDirs(path.join(wsRoot(), "skills"));
+      plan({ neutralize: true, limits: { maxFolders: 50 } });
+      vi.restoreAllMocks();
+      expectOneLimited("skills", { folders: 50, left_out: 1, stopped: true });
+      expect(expectSnapshotInvariant("skills")).toEqual({ files: 1, folders: 50 });
+      expect(handles.closed).toBe(handles.opened);
+    });
+
+    it("B22 the deepest chain the path length allows, at default limits: the copy ends at the folder limit or fails closed, never live or unrewritten, with every handle closed", () => {
+      const sourceBase = path.join(wsRoot(), "skills");
+      const depth = Math.floor((4095 - sourceBase.length) / 2);
+      let chain = sourceBase;
+      for (let i = 0; i < depth; i++) chain = path.join(chain, "d");
+      fs.mkdirSync(chain, { recursive: true });
+      write("ws/skills/top.md", HOOK_SKILL);
+      const handles = trackDirs(sourceBase);
+      const p = plan({ neutralize: true });
+      vi.restoreAllMocks();
+      const src = mountOf(p, "skills")!.src;
+      expect([snapOf("skills"), path.join(trusted(), "empty-dir")]).toContain(src);
+      expect(p.mounts.some((m) => m.src === sourceBase)).toBe(false);
+      if (src === snapOf("skills")) {
+        expect(expectSnapshotInvariant("skills").folders).toBeLessThanOrEqual(2000);
+      } else {
+        expect(fs.existsSync(snapOf("skills"))).toBe(false);
+      }
+      expect(handles.closed).toBe(handles.opened);
+    }, 60_000);
   });
 });
 
