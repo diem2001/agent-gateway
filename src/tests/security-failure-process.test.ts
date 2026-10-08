@@ -1189,19 +1189,45 @@ describe("sampler and refusal-check controls", () => {
     void asked;
   });
 
+  /** A process the launcher-stop control recorded, with its start time: it is only ever signalled while that start time still matches. */
+  interface LauncherNode {
+    pid: number;
+    startTicks: string;
+  }
+  /** What one read of a process showed: its start time and parent (the second stat), whether its executable is the real bwrap. */
+  interface LauncherRead {
+    pid: number;
+    startTicks: string;
+    ppid: number;
+    realBwrap: boolean;
+  }
+
+  /**
+   * Which processes of the sandbox tree the control may ever signal (Security F1). `outer` is recorded only when it is the real bwrap
+   * and a direct child of the gateway at the read; `inner` only when it is the real bwrap whose parent is the recorded `outer`;
+   * `runtime` only when its parent is the recorded `inner`. Nothing is recorded until its condition holds, so a walk that reached
+   * the user's subreaper or pid 1 (the inner bwrap was already reparented) records nothing and nothing is signalled.
+   */
+  function launcherTreeToRecord(gatewayPid: number, runtime: LauncherRead | null, inner: LauncherRead | null, outer: LauncherRead | null): { outer?: LauncherNode; inner?: LauncherNode; runtime?: LauncherNode } {
+    const recorded: { outer?: LauncherNode; inner?: LauncherNode; runtime?: LauncherNode } = {};
+    if (outer === null || !outer.realBwrap || outer.ppid !== gatewayPid) return recorded;
+    recorded.outer = { pid: outer.pid, startTicks: outer.startTicks };
+    if (inner === null || !inner.realBwrap || inner.ppid !== outer.pid) return recorded;
+    recorded.inner = { pid: inner.pid, startTicks: inner.startTicks };
+    if (runtime === null || runtime.ppid !== inner.pid) return recorded;
+    recorded.runtime = { pid: runtime.pid, startTicks: runtime.startTicks };
+    return recorded;
+  }
+
   /**
    * The seam of a launcher-stop control (MVP-8125): on the `atReading`-th stable reading of the native runtime (the executable
-   * `claude`) it records the runtime, its direct parent (the inner bwrap, pid 1 of the sandbox) and the gateway's own child that is
-   * the real outer bwrap, SIGTERMs only that outer bwrap and holds the sampler tick until the inner bwrap has a new parent, so the
-   * proof runs after the reparenting. The gateway stays alive. Everything it records carries its start time; only a recorded process
-   * whose start time still matches is ever signalled again.
+   * `claude`) it reads the runtime, its parent and that parent's parent (each between two stat reads with the same start time,
+   * with the executable read in between), records what `launcherTreeToRecord` allows, SIGTERMs only the recorded outer bwrap and
+   * holds the sampler tick until the recorded inner bwrap has a new parent, so the proof runs after the reparenting. The gateway
+   * stays alive. A recorded process is signalled again only after its start time was re-read immediately before the signal.
    */
   function launcherStop(gatewayPid: number, atReading: number) {
-    interface Recorded {
-      pid: number;
-      startTicks: string;
-    }
-    const state = { pid: 0, readings: 0, forced: false, reached: false, outerIsRealBwrap: false, runtime: undefined as Recorded | undefined, inner: undefined as Recorded | undefined, outer: undefined as Recorded | undefined };
+    const state = { pid: 0, readings: 0, forced: false, reached: false, recorded: {} as { outer?: LauncherNode; inner?: LauncherNode; runtime?: LauncherNode } };
     const statOf = (pid: number): { ppid: number; startTicks: string } | null => {
       try {
         const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -1211,14 +1237,30 @@ describe("sampler and refusal-check controls", () => {
         return null;
       }
     };
-    const recordedAs = (pid: number): Recorded => ({ pid, startTicks: statOf(pid)?.startTicks ?? "" });
-    const sameProcess = (item: Recorded | undefined): boolean => item !== undefined && statOf(item.pid)?.startTicks === item.startTicks;
     const identityOf = (file: string): string | null => {
       try {
         const identity = fs.statSync(file, { bigint: true });
         return `${identity.dev}:${identity.ino}`;
       } catch {
         return null;
+      }
+    };
+    const realBwrapId = identityOf("/usr/bin/bwrap");
+    /** The process read between two stat reads that agree on the start time; null when it cannot be read consistently. */
+    const readNode = (pid: number): LauncherRead | null => {
+      if (pid <= 1) return null;
+      const before = statOf(pid);
+      const exe = identityOf(`/proc/${pid}/exe`);
+      const after = statOf(pid);
+      if (before === null || after === null || before.startTicks !== after.startTicks) return null;
+      return { pid, startTicks: after.startTicks, ppid: after.ppid, realBwrap: exe !== null && exe === realBwrapId };
+    };
+    const signalIfSame = (node: LauncherNode | undefined, signal: NodeJS.Signals): void => {
+      if (node === undefined || statOf(node.pid)?.startTicks !== node.startTicks) return;
+      try {
+        process.kill(node.pid, signal);
+      } catch {
+        // Already gone.
       }
     };
     const seam = (pid: number): void => {
@@ -1233,33 +1275,41 @@ describe("sampler and refusal-check controls", () => {
       state.readings += 1;
       if (state.readings < atReading) return;
       state.forced = true;
-      state.runtime = recordedAs(pid);
-      state.inner = recordedAs(statOf(pid)?.ppid ?? 0);
-      let top = state.inner.pid;
-      for (let hop = 0; hop < 8 && (statOf(top)?.ppid ?? 0) !== gatewayPid && (statOf(top)?.ppid ?? 0) > 1; hop++) top = statOf(top)?.ppid ?? 0;
-      state.outer = recordedAs(top);
-      const innerParent = statOf(state.inner.pid)?.ppid ?? 0;
-      state.outerIsRealBwrap = statOf(top)?.ppid === gatewayPid && identityOf(`/proc/${top}/exe`) === identityOf("/usr/bin/bwrap");
-      if (!state.outerIsRealBwrap) return;
-      process.kill(top, "SIGTERM");
-      for (const end = Date.now() + 3000; !(state.reached = (statOf(state.inner.pid)?.ppid ?? 0) !== innerParent) && Date.now() < end; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2));
+      const runtime = readNode(pid);
+      const inner = runtime === null ? null : readNode(runtime.ppid);
+      const outer = inner === null ? null : readNode(inner.ppid);
+      state.recorded = launcherTreeToRecord(gatewayPid, runtime, inner, outer);
+      if (state.recorded.outer === undefined || state.recorded.inner === undefined || state.recorded.runtime === undefined) return;
+      const outerNode = state.recorded.outer;
+      const innerNode = state.recorded.inner;
+      signalIfSame(outerNode, "SIGTERM");
+      for (const end = Date.now() + 3000; !(state.reached = (statOf(innerNode.pid)?.ppid ?? 0) !== outerNode.pid) && Date.now() < end; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2));
     };
-    /** Ends the sandbox's inner bwrap (its namespace teardown ends the runtime); a recorded process that is not the same one any more is left alone. */
-    const endInner = (): void => {
-      if (sameProcess(state.inner)) process.kill(state.inner!.pid, "SIGKILL");
-    };
+    /** Ends the sandbox's inner bwrap (its namespace teardown ends the runtime); only the recorded process, only while its start time matches. */
+    const endInner = (): void => signalIfSame(state.recorded.inner, "SIGKILL");
     const endAll = (): void => {
-      for (const item of [state.inner, state.runtime, state.outer]) {
-        if (!sameProcess(item)) continue;
-        try {
-          process.kill(item!.pid, "SIGKILL");
-        } catch {
-          // Already gone.
-        }
-      }
+      for (const node of [state.recorded.inner, state.recorded.runtime, state.recorded.outer]) signalIfSame(node, "SIGKILL");
     };
     return { state, seam, endInner, endAll };
   }
+
+  it("control G5 guard: the launcher-stop control records and signals only a tree whose outer is the gateway's own real bwrap child", () => {
+    const read = (pid: number, ppid: number, realBwrap: boolean): LauncherRead => ({ pid, startTicks: `s${pid}`, ppid, realBwrap });
+    const gateway = 100;
+    const tree = (outer: LauncherRead | null, inner: LauncherRead | null, runtime: LauncherRead | null) => launcherTreeToRecord(gateway, runtime, inner, outer);
+    // The full tree: all three are recorded, with their start times.
+    expect(tree(read(200, gateway, true), read(201, 200, true), read(202, 201, false))).toEqual({ outer: { pid: 200, startTicks: "s200" }, inner: { pid: 201, startTicks: "s201" }, runtime: { pid: 202, startTicks: "s202" } });
+    // The inner bwrap was already reparented: the walk reaches the subreaper (not a child of the gateway, not the real bwrap): nothing is recorded.
+    expect(tree(read(2606, 1, false), read(201, 2606, true), read(202, 201, false))).toEqual({});
+    // Even a real-bwrap-looking process that is not the gateway's child is not recorded.
+    expect(tree(read(2606, 1, true), read(201, 2606, true), read(202, 201, false))).toEqual({});
+    // The outer is the gateway's child but not the real bwrap.
+    expect(tree(read(200, gateway, false), read(201, 200, true), read(202, 201, false))).toEqual({});
+    // An unreadable outer records nothing; an inner that is not the outer's child records only the outer; a runtime that is not the inner's child records the outer and the inner.
+    expect(tree(null, read(201, 200, true), read(202, 201, false))).toEqual({});
+    expect(tree(read(200, gateway, true), read(201, 999, true), read(202, 201, false))).toEqual({ outer: { pid: 200, startTicks: "s200" } });
+    expect(tree(read(200, gateway, true), read(201, 200, true), read(202, 999, false))).toEqual({ outer: { pid: 200, startTicks: "s200" }, inner: { pid: 201, startTicks: "s201" } });
+  });
 
   it("control G5: the outer bwrap is stopped while the gateway lives (its sandbox keeps the inner bwrap): the native runtime is cleared by the launcher-ended route once its exit is confirmed, and audited, not reported", async () => {
     const { rig, wrapper } = await wrapperRig();
@@ -1272,18 +1322,18 @@ describe("sampler and refusal-check controls", () => {
     let closed: ReturnType<Window["close"]> | undefined;
     try {
       await waitFor(() => stop.state.forced, 60_000, "the sampler to stop the launcher");
-      expect(stop.state.outerIsRealBwrap, "precondition not reached: the gateway's own child above the runtime is not the real bwrap").toBe(true);
+      expect(stop.state.recorded.runtime, "precondition not reached: the tree was not recorded (the outer bwrap is not the gateway's own real-bwrap child, or the parents do not chain)").toBeDefined();
       expect(stop.state.reached, "precondition not reached: the inner bwrap was not reparented within its bound").toBe(true);
-      await waitFor(() => window.peek().records.some((candidate) => candidate.pid === stop.state.runtime?.pid && candidate.proofFailure !== undefined), 10_000, "the failing tick");
-      const waiting = window.peek().records.find((candidate) => candidate.pid === stop.state.runtime?.pid)!;
+      await waitFor(() => window.peek().records.some((candidate) => candidate.pid === stop.state.recorded.runtime?.pid && candidate.proofFailure !== undefined), 10_000, "the failing tick");
+      const waiting = window.peek().records.find((candidate) => candidate.pid === stop.state.recorded.runtime?.pid)!;
       expect(waiting.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, escapeEvidence: false, ownUnreadable: "none", referenceExit: "alive", runtimeExit: "alive", launcherIdentity: "verified", launcherExe: "real-bwrap", reparented: true, pending: "waiting" });
       expect(waiting.pending?.route).toBe("launcher-ended");
       stop.endInner();
-      await waitFor(() => endedNow(stop.state.runtime!.pid, stop.state.runtime!.startTicks).ended, 15_000, "the runtime to end after its inner bwrap");
+      await waitFor(() => endedNow(stop.state.recorded.runtime!.pid, stop.state.recorded.runtime!.startTicks).ended, 15_000, "the runtime to end after its inner bwrap");
       await waitFor(() => window.peek().records.every((candidate) => candidate.pending?.state !== "waiting"), 10_000, "pending records to settle");
       closed = window.close();
       const { sample } = closed;
-      const record = sample.records.find((candidate) => candidate.pid === stop.state.runtime!.pid);
+      const record = sample.records.find((candidate) => candidate.pid === stop.state.recorded.runtime!.pid);
       expect(record, "precondition not reached: the sampler did not record the runtime").toBeDefined();
       expect(record!.exe).toBe("claude");
       expect(record!.clearedBy).toBe("launcher-ended");
@@ -1295,7 +1345,7 @@ describe("sampler and refusal-check controls", () => {
     } finally {
       // A failed row must not leave a real runtime under the user's subreaper.
       stop.endAll();
-      if (stop.state.runtime) await waitFor(() => endedNow(stop.state.runtime!.pid, stop.state.runtime!.startTicks).ended, 15_000, "the runtime to end").catch(() => undefined);
+      if (stop.state.recorded.runtime) await waitFor(() => endedNow(stop.state.recorded.runtime!.pid, stop.state.recorded.runtime!.startTicks).ended, 15_000, "the runtime to end").catch(() => undefined);
       closed ??= window.close();
     }
     void asked;
