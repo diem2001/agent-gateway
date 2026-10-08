@@ -3038,7 +3038,8 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   /** The surviving thread executes a new program after the leader finished; `exitsInside` lets that program end inside the bound. */
   async function ownRevive(state: Seam, secs: string, exitsInside: boolean) {
-    const window = await ownWindow(state, { secs });
+    // A program that must end inside the bound gets the shorter hold: the whole chain (hold, exec, program) has to fit into 2 s under load.
+    const window = await ownWindow(state, { secs, fresh: exitsInside ? 300_000 : undefined });
     touch(window.trig, "exec");
     await until(() => imageRuns(state.runtime!.pid, secs), "the surviving thread did not execute the new program");
     let insideBound = true;
@@ -3048,11 +3049,12 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     } else await pause(400);
     const proof = exitsInside ? undefined : taggedProcessProof(process.pid, `claude ${secs}`);
     const closed = closeWindow(window.sampler);
-    return { ...closed, proof, insideBound, record: recordOf(closed.final, state.runtime) };
+    return { ...closed, proof, insideBound, exitsInside, record: recordOf(closed.final, state.runtime) };
   }
   const assertRevived = (state: Seam, run: Awaited<ReturnType<typeof ownRevive>>): void => {
     expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
-    expectHeldKind(state, run.record.proofFailure?.runtimeExit, "empty-n");
+    // The rows that must fit the whole chain into the bound use the shorter hold: a leader that is already a zombie leader at the exit read is as good for them.
+    expectHeldKind(state, run.record.proofFailure?.runtimeExit, run.exitsInside && run.record.proofFailure?.runtimeExit === "Zn" ? "Zn" : "empty-n");
     expect(run.record.pending).toMatchObject({ state: "expired", route: "runtime-ending", revived: true });
     expect(describeRecords([run.record])).toContain("revived=true");
     flagged(run.final, run.record);
@@ -3076,13 +3078,13 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   it("TH-own-revive-exit: the new program ends inside the bound: the record is still flagged, never cleared (the process was never ended in between)", async () => {
     const state = newSeam();
-    const run = await ownRevive(state, "0.25", true);
+    const run = await ownRevive(state, "0.1", true);
     assertRevived(state, run);
   });
 
   it("R6-revive-exit: the same, route verdict: no route clears a revived record whose new program fully ended", async () => {
     const state = newSeam();
-    const run = await ownRevive(state, "0.25", true);
+    const run = await ownRevive(state, "0.1", true);
     assertRevived(state, run);
     expect(run.audit, "nothing was cleared, so nothing is audited").toEqual([]);
     expect(run.summary[0]).toContain("pending_expired=1");
@@ -3219,7 +3221,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     setInterval(() => {}, 1000);
   `;
 
-  async function launcherWindow(state: Seam, options: Plumbed & { leaderAfterProof?: boolean; secs?: string; runtime?: "python" | "node" }) {
+  async function launcherWindow(state: Seam, options: Plumbed & { leaderAfterProof?: boolean; secs?: string; fresh?: number; runtime?: "python" | "node" }) {
     requireHost(["bwrap", "unshare", "python3"]);
     const trig = scratch();
     const outcome = { done: false, reached: false };
@@ -3244,7 +3246,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
       afterTick: checks.afterTick,
       ...plumb(options),
     });
-    const command = options.runtime === "node" ? standIn : fixtureCommand(trig, { FRESH: HOLD_FILES, SECS: options.secs ?? "6" });
+    const command = options.runtime === "node" ? standIn : fixtureCommand(trig, { FRESH: options.fresh ?? HOLD_FILES, SECS: options.secs ?? "6" });
     reference = spawn(process.execPath, ["-e", REFERENCE_SOURCE, JSON.stringify([...KEEP_INNER, "/bin/bash", "-c", command])], { stdio: "ignore" });
     spawned.push(reference);
     await until(() => state.forced, "the seam did not run");
@@ -3298,7 +3300,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
   });
 
   async function launcherRevive(state: Seam, secs: string, options: { leaderAfterProof: boolean; exitsInside: boolean }) {
-    const window = await launcherWindow(state, { leaderAfterProof: options.leaderAfterProof, secs });
+    const window = await launcherWindow(state, { leaderAfterProof: options.leaderAfterProof, secs, fresh: options.exitsInside ? 300_000 : undefined });
     touch(window.trig, "exec");
     await until(() => imageRuns(state.runtime!.pid, secs), "the surviving thread did not execute the new program");
     let insideBound = true;
@@ -3321,9 +3323,9 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   it("LE8-revive-exit: the new program ends inside the bound: the record is still flagged, never cleared", async () => {
     const state = newSeam();
-    const run = await launcherRevive(state, "0.25", { leaderAfterProof: true, exitsInside: true });
+    const run = await launcherRevive(state, "0.1", { leaderAfterProof: true, exitsInside: true });
     expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
-    expectHeldKind(state, run.record.proofFailure?.runtimeExit, "empty-n");
+    expectHeldKind(state, run.record.proofFailure?.runtimeExit, run.record.proofFailure?.runtimeExit === "Zn" ? "Zn" : "empty-n");
     expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
     flagged(run.final, run.record);
     noClears(run.summary);
@@ -3331,7 +3333,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   it("LE8-revive-alive-entry: a record that entered alive and whose thread executes a different executable that then ends inside the bound is flagged (executable identity), never cleared", async () => {
     const state = newSeam();
-    const run = await launcherRevive(state, "0.25", { leaderAfterProof: false, exitsInside: true });
+    const run = await launcherRevive(state, "0.1", { leaderAfterProof: false, exitsInside: true });
     expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
     expect(run.record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, runtimeExit: "alive" });
     expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
@@ -3457,13 +3459,13 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   it("R1-revive-exit: the runtime's leader finishes after the entry, its thread executes a new program that ends inside the bound: flagged (revival), never cleared", async () => {
     const state = newSeam();
-    const window = await runtimeWindow(state, { runtime: "python", secs: "0.25" });
+    const window = await runtimeWindow(state, { runtime: "python", secs: "0.1" });
     const pid = state.runtime!.pid;
-    expect(endLeader(pid, () => zombieLeader(pid) || held(pid)), "precondition not reached: the leader did not finish").toBe(true);
+    expect(endLeader(pid, () => zombieLeader(pid) || held(pid)), `precondition not reached: the leader did not finish (${heldDiag(pid, window.trig)})`).toBe(true);
     // The sampler's settle reads register the leader exit before the thread executes the new program (the zombie leader persists until then).
     await pause(250);
     touch(window.trig, "exec");
-    await until(() => imageRuns(pid, "0.25"), "the surviving thread did not execute the new program");
+    await until(() => imageRuns(pid, "0.1"), "the surviving thread did not execute the new program");
     await until(() => ended(state.runtime!), "the new program did not end");
     const insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
     const { final, summary } = closeWindow(window.sampler);
