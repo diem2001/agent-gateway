@@ -2700,12 +2700,13 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
   const KEEP_INNER = ["bwrap", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc"];
   /**
    * Fresh files the leader opens before it ends: its exit releases each one itself, after its namespaces are gone, so the leader stays
-   * in `empty-n` for about as long as the release takes. The counts are calibrated (MVP-8130 A0): a hold of at least about 120 ms for
-   * 300000 files, of at least about 236 ms for 600000, also under load; the mount link goes after about a quarter of it.
+   * in `empty-n` for about as long as the release takes (measured at A0: about 126 ms for 300000 files and 247 ms for 600000, the
+   * mount link going after about a quarter of it, also under load). The count is the largest the descriptor limit allows, so that a
+   * poll that is starved of CPU under load still finds the held state; it costs seconds of open phase per row.
    */
-  const HOLD_FILES = 300_000;
+  const HOLD_FILES = 1_000_000;
   /** The same for a reference stand-in, whose hold must outlast the runtime's end that follows the seam. */
-  const REFERENCE_HOLD_FILES = 600_000;
+  const REFERENCE_HOLD_FILES = HOLD_FILES;
   const IDLE = "setInterval(() => {}, 1000)";
   const quote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
   const standIn = `exec -a claude ${quote(process.execPath)} -e ${quote(IDLE)}`;
@@ -2874,7 +2875,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
       state.reached = act(pid);
     };
   /** Sends SIGUSR1 once the handler is installed and waits for `shape`; false when the handler never appeared or the shape was not reached. */
-  const endLeader = (pid: number, shape: () => boolean, boundMs = 25_000): boolean => {
+  const endLeader = (pid: number, shape: () => boolean, boundMs = 40_000): boolean => {
     if (!waitSync(() => handlerInstalled(pid), 5000)) return false;
     signal(pid, "SIGUSR1");
     return waitSync(shape, boundMs);

@@ -1800,9 +1800,10 @@ export function startProcessSampler(
               const launcherPending = pendingPossible && !referencePending && !runtimePending && launcherEndedPending(launcher);
               pendingNow = referencePending || runtimePending || launcherPending;
               if (pendingNow) {
+                // The bound runs from the moment the record became pending, not from the start of the tick (a test seam can hold the tick for seconds).
                 pending = prior?.pending
                   ? { ...prior.pending, sawLeaderExit: prior.pending.sawLeaderExit === true || runtimeExit.leaderExitSeen }
-                  : { state: "waiting", sinceMs: now, route: referencePending ? "reference-ended" : runtimePending ? "runtime-ending" : "launcher-ended", reference: referencePending ? { pid: root, startTicks: reference.startTicks! } : undefined, sawLeaderExit: runtimeExit.leaderExitSeen };
+                  : { state: "waiting", sinceMs: Date.now(), route: referencePending ? "reference-ended" : runtimePending ? "runtime-ending" : "launcher-ended", reference: referencePending ? { pid: root, startTicks: reference.startTicks! } : undefined, sawLeaderExit: runtimeExit.leaderExitSeen };
               }
               proofFailure = proofFailure
                 ? {
