@@ -11,6 +11,7 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AC_ROWS,
@@ -50,6 +51,18 @@ import {
   exitConfirmed,
   exitKind,
   exitProofClears,
+  exitBracket,
+  exitFaultAllowed,
+  exitReadOutcome,
+  exeReaderOver,
+  isConfirmedExit,
+  isReferenceEnding,
+  procMountHidesProcesses,
+  readExitReadingFrom,
+  EXIT_PAIRS,
+  type ExitKind,
+  type ExitReadFault,
+  type ExitSource,
   flagAfterProofFailure,
   referenceEndedPending,
   referenceSymptom,
@@ -1993,21 +2006,24 @@ describe("process sampler launcher ended: decision table (MVP-8125)", () => {
     expect(launcherEndedPending(given)).toBe(expected);
   });
 
-  it.each(["Zn", "Z1", "X", "vanished", "start-changed", "empty-gone"] as const)("T-le: reference %s / ended is no route (the reference-ended route takes it)", (kind) => {
+  it.each(["Zn", "Z1", "X", "vanished", "start-changed", "empty-gone", "empty-n", "unknown"] as const)("T-le: reference %s / ended is no route (the reference-ended route takes it)", (kind) => {
     expect(launcherEndedPending(holds({ referenceExit: kind }))).toBe(false);
   });
 
-  it.each(["Z1", "X", "vanished", "start-changed", "empty-gone"] as const)("T-le: runtime %s at the exit read is no launcher-ended entry (a confirmed exit is cleared by the own route)", (kind) => {
+  it.each(["Z1", "X", "vanished", "start-changed", "empty-gone", "unknown"] as const)("T-le: runtime %s at the exit read is no launcher-ended entry (a confirmed exit is cleared by the own route, an unknown one is flagged)", (kind) => {
     expect(launcherEndedPending(holds({ runtimeExit: kind }))).toBe(false);
   });
 
   it("T-le: a runtime that is a zombie leader whose threads still run (Zn) at the exit read is an entry, when every link read at the proof", () => {
     expect(launcherEndedPending(holds({ runtimeExit: "Zn" }))).toBe(true);
+    expect(launcherEndedPending(holds({ runtimeExit: "empty-n" })), "empty-n is handled exactly like Zn").toBe(true);
+    expect(launcherEndedPending(holds({ runtimeExit: "empty-n", ownUnreadable: true }))).toBe(false);
     expect(launcherEndedPending(holds({ runtimeExit: "Zn", ownUnreadable: true })), "an unreadable own link at the proof is the runtime-ending route").toBe(false);
   });
 
   it("T-le: Zn at settle is not a confirmed exit: a Zn runtime waits inside the bound and expires at it", () => {
     const leaderOnly: ExitReading = { vanished: false, startChanged: false, state: "Z", threads: 3, cmdline: "", exe: "gone" };
+    expect(exitConfirmed({ ...leaderOnly, state: "S" }), "an empty leader with other threads is not ending either").toBe(false);
     expect(exitConfirmed(leaderOnly)).toBe(false);
     expect(resolvePending({ elapsedMs: 100, exitConfirmed: exitConfirmed(leaderOnly), referenceEnded: true, final: false })).toBe("waiting");
     expect(resolvePending({ elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: exitConfirmed(leaderOnly), referenceEnded: true, final: false })).toBe("expired");
@@ -2071,10 +2087,12 @@ describe("process sampler launcher ended: decision table (MVP-8125)", () => {
     expect(launcherEndedPending(evidence)).toBe(false);
   });
 
-  it("T-le: wiring: the exit read's state is carried (Zn is an entry, Z1 is not)", () => {
+  it("T-le: wiring: the exit read's state is carried (Zn and empty-n are an entry, Z1 and unknown are not)", () => {
     expect(launcherEvidenceOf(wiring({ runtimeExit: "Zn" })).runtimeExit).toBe("Zn");
     expect(launcherEndedPending(launcherEvidenceOf(wiring({ runtimeExit: "Zn" })))).toBe(true);
+    expect(launcherEndedPending(launcherEvidenceOf(wiring({ runtimeExit: "empty-n" })))).toBe(true);
     expect(launcherEndedPending(launcherEvidenceOf(wiring({ runtimeExit: "Z1" })))).toBe(false);
+    expect(launcherEndedPending(launcherEvidenceOf(wiring({ runtimeExit: "unknown" })))).toBe(false);
   });
 
   it("T-le: wiring: an unreadable own link, a missing own proof, a parent that cannot be read and a parent that moved on are carried and are no route", () => {
@@ -2087,10 +2105,10 @@ describe("process sampler launcher ended: decision table (MVP-8125)", () => {
 
   // The reference and runtime routes already share ticks (the sampler resolves them by precedence); the launcher route shares none with either.
   it("T-le: the launcher-ended route never applies to a tick where the reference-ended or the runtime-ending route applies", () => {
-    const kinds = ["alive", "Zn", "Z1", "X", "vanished", "start-changed", "empty-gone"] as const;
+    const kinds = ["alive", "Zn", "Z1", "X", "vanished", "start-changed", "empty-gone", "empty-n", "unknown"] as const;
     for (const referenceExit of kinds) for (const runtimeExit of kinds) for (const ownUnreadable of [false, true]) {
-      const reference = referenceEndedPending({ ownProof: true, launcherProof: false, referenceEnding: referenceExit !== "alive", symptom: true, escapeEvidence: false, cacheExists: true });
-      const runtime = runtimeEndingPending({ ownProof: true, zombieLeader: runtimeExit === "Zn", ownUnreadable, escapeEvidence: false });
+      const reference = referenceEndedPending({ ownProof: true, launcherProof: false, referenceEnding: isReferenceEnding(referenceExit), symptom: true, escapeEvidence: false, cacheExists: true });
+      const runtime = runtimeEndingPending({ ownProof: true, zombieLeader: runtimeExit === "Zn" || runtimeExit === "empty-n", ownUnreadable, escapeEvidence: false });
       const launcher = launcherEndedPending(holds({ referenceExit, runtimeExit, ownUnreadable }));
       expect(launcher && (reference || runtime), `reference=${referenceExit} runtime=${runtimeExit} own-unreadable=${ownUnreadable}`).toBe(false);
     }
@@ -2209,12 +2227,14 @@ describe("process sampler exit rule: decision table", () => {
     ["vanished", reading({ vanished: true }), true],
     ["the pid now has another start time", reading({ startChanged: true }), true],
     ["empty command line and missing executable together", reading({ cmdline: "", exe: "gone" }), true],
+    ["an empty leader that finished while other threads run (empty-n)", reading({ threads: 3, cmdline: "", exe: "gone" }), false],
+    ["a read that proved nothing (unknown)", reading({ unknown: { file: "stat", errno: "EIO" } }), false],
   ])("exit classifier: %s", (_name, given, expected) => {
     expect(exitConfirmed(given)).toBe(expected);
   });
 
   const reference = (partial: Partial<Parameters<typeof referenceEndedPending>[0]> = {}) => ({ ownProof: true, launcherProof: false, referenceEnding: true, symptom: true, escapeEvidence: false, cacheExists: true, ...partial });
-  const ending = (partial: Partial<ExitReading>): boolean => exitKind({ vanished: false, startChanged: false, state: "S", threads: 1, cmdline: "gateway", exe: "readable", ...partial }) !== "alive";
+  const ending = (partial: Partial<ExitReading>): boolean => isReferenceEnding(exitKind({ vanished: false, startChanged: false, state: "S", threads: 1, cmdline: "gateway", exe: "readable", ...partial }));
 
   it.each([
     ["T-ref: all four conditions hold", reference(), true],
@@ -2224,6 +2244,8 @@ describe("process sampler exit rule: decision table", () => {
     ["T-ref: reference alive but non-dumpable (command line readable, exe denied)", reference({ referenceEnding: ending({ exe: "denied" }) }), false],
     ["T-ref: reference a zombie leader whose threads still show (Zn) is ending, so the record is pending", reference({ referenceEnding: ending({ state: "Z", threads: 3, cmdline: "", exe: "gone" }) }), true],
     ["T-ref: reference ended (Z1) is ending", reference({ referenceEnding: ending({ state: "Z", threads: 1, cmdline: "", exe: "gone" }) }), true],
+    ["T-ref: reference held in empty-n (leader finished, threads still run) is ending", reference({ referenceEnding: ending({ threads: 3, cmdline: "", exe: "gone" }) }), true],
+    ["T-ref: reference whose read proved nothing (unknown) is not ending", reference({ referenceEnding: ending({ unknown: { file: "stat", errno: "EIO" } }) }), false],
     ["T-ref: reference vanished is ending", reference({ referenceEnding: ending({ vanished: true }) }), true],
     ["T-ref: no reference symptom (live readable reference, complete chain)", reference({ symptom: referenceSymptom("live", "complete") }), false],
     ["T-ref-escape: the runtime's pid link equals the reference's", reference({ escapeEvidence: true }), false],
@@ -2291,6 +2313,1305 @@ describe("process sampler exit rule: decision table", () => {
     expect(exitKind({ ...base, state: "Z" })).toBe("Z1");
     expect(exitKind({ ...base, state: "Z", threads: 2 })).toBe("Zn");
     expect(exitKind({ ...base, cmdline: "", exe: "gone" })).toBe("empty-gone");
+    expect(exitKind({ ...base, cmdline: "", exe: "gone", threads: 2 })).toBe("empty-n");
+    expect(exitKind({ ...base, unknown: { file: "exe", errno: "EIO" } })).toBe("unknown");
+    for (const state of ["X", "Z", "S"]) {
+      const withCmdline = state === "S" ? { cmdline: "", exe: "gone" as const } : {};
+      expect(exitKind({ ...base, ...withCmdline, state, threads: 0 }), `${state} with a count of 0`).toBe("unknown");
+    }
+    expect(exitKind({ ...base, state: "X", threads: 2 }), "X with a count of 2 is an old leader of an exec, not an exit").toBe("unknown");
+  });
+});
+
+/**
+ * The thread-safe exit rule (MVP-8130): the same exported functions the sampler runs. Expected values are written out here and do
+ * not come from the production tables. Rows that no real process can produce (an unreadable `/proc` file, a torn read, a count of 0
+ * that persists) live here and in the RE-* rows, which inject the error codes through the restricted exit read seam.
+ */
+describe("process sampler thread-safe exit: decision table (MVP-8130)", () => {
+  const reading = (partial: Partial<ExitReading>): ExitReading => ({ vanished: false, startChanged: false, state: "S", threads: 1, cmdline: "claude", exe: "readable", ...partial });
+  const READ = {
+    alive: reading({}),
+    Z1: reading({ state: "Z", cmdline: "", exe: "gone" }),
+    Z0: reading({ state: "Z", threads: 0, cmdline: "", exe: "gone" }),
+    Zn: reading({ state: "Z", threads: 3, cmdline: "", exe: "gone" }),
+    X1: reading({ state: "X", cmdline: "", exe: "gone" }),
+    X0: reading({ state: "X", threads: 0, cmdline: "", exe: "gone" }),
+    X2: reading({ state: "X", threads: 2, cmdline: "", exe: "gone" }),
+    emptyGone: reading({ cmdline: "", exe: "gone" }),
+    emptyN: reading({ threads: 3, cmdline: "", exe: "gone" }),
+    empty0: reading({ threads: 0, cmdline: "", exe: "gone" }),
+    vanished: reading({ vanished: true, threads: 0, cmdline: "", exe: "gone" }),
+    startChanged: reading({ startChanged: true }),
+    unknownStat: reading({ unknown: { file: "stat", errno: "EIO" } }),
+    raceCmdline: reading({ unknown: { file: "cmdline", errno: "ENOENT" } }),
+  } as const;
+  type Shorthand = keyof typeof READ;
+
+  /** Feeds the bracket the listed readings in order and reports the decision and how many readings it consumed. */
+  const decide = (list: Shorthand[]): { kind: ExitKind; used: number } => {
+    let used = 0;
+    const { kind } = exitBracket(() => {
+      if (used >= list.length) throw new Error("the row supplied too few readings");
+      return READ[list[used++]];
+    });
+    return { kind, used };
+  };
+
+  it.each([
+    ["T-th1: alive and reading normally", reading({}), "alive"],
+    ["T-th1: a live process that blanked its command line keeps a readable executable", reading({ cmdline: "" }), "alive"],
+    ["T-th1: a live process whose executable cannot be read (EACCES) is alive", reading({ cmdline: "", exe: "denied" }), "alive"],
+    ["T-th1: a live process with a missing executable but a command line", reading({ exe: "gone" }), "alive"],
+    ["T-th1: empty-gone: empty command line, missing executable, exactly one thread", READ.emptyGone, "empty-gone"],
+    ["T-th1: empty-n: empty command line, missing executable, two or more threads (a leader that finished while other threads run)", READ.emptyN, "empty-n"],
+    ["T-th1: empty command line and missing executable with a count of 0 proves nothing", READ.empty0, "unknown"],
+    ["T-th1: Z1: a zombie with exactly one thread", READ.Z1, "Z1"],
+    ["T-th1: Zn: a zombie leader whose other threads still run", READ.Zn, "Zn"],
+    ["T-th1: a zombie with a count of 0 proves nothing", READ.Z0, "unknown"],
+    ["T-th1: X with exactly one thread", READ.X1, "X"],
+    ["T-th1: X with a count of 0 proves nothing", READ.X0, "unknown"],
+    ["T-th1: X with a count of 2 is the old leader of an exec, not an exit", READ.X2, "unknown"],
+    ["T-th1: vanished", READ.vanished, "vanished"],
+    ["T-th1: the pid now has another start time", READ.startChanged, "start-changed"],
+    ["T-th1: a read that failed with an error other than ENOENT/ESRCH", READ.unknownStat, "unknown"],
+  ] as const)("%s", (_name, given, expected) => {
+    expect(exitKind(given)).toBe(expected);
+    expect(isConfirmedExit(exitKind(given)), "only the five kinds with a kernel fact are confirmed").toBe(["vanished", "start-changed", "X", "Z1", "empty-gone"].includes(expected));
+  });
+
+  it("T-th1: consumers: only the five confirmed kinds end a process, only alive and unknown never open the reference route", () => {
+    const kinds: ExitKind[] = ["vanished", "start-changed", "X", "Z1", "Zn", "empty-gone", "empty-n", "alive", "unknown"];
+    expect(kinds.filter(isConfirmedExit)).toEqual(["vanished", "start-changed", "X", "Z1", "empty-gone"]);
+    expect(kinds.filter(isReferenceEnding)).toEqual(["vanished", "start-changed", "X", "Z1", "Zn", "empty-gone", "empty-n"]);
+    expect(runtimeLeaderExited(READ.emptyN), "empty-n is a leader that finished").toBe(true);
+    expect(runtimeLeaderExited(READ.Zn)).toBe(true);
+    for (const shorthand of ["alive", "Z1", "emptyGone", "unknownStat", "Z0"] as const) expect(runtimeLeaderExited(READ[shorthand]), shorthand).toBe(false);
+  });
+
+  it.each([
+    ["T-th2: two agreeing readings decide", ["Z1", "Z1"], "Z1", 2],
+    ["T-th2: two agreeing empty-gone readings decide", ["emptyGone", "emptyGone"], "empty-gone", 2],
+    ["T-th2: two agreeing empty-n readings decide", ["emptyN", "emptyN"], "empty-n", 2],
+    ["T-th2: (alive, Z1) is read again and an alive pair decides alive", ["alive", "Z1", "alive", "alive"], "alive", 4],
+    ["T-th2: (Z1, alive) is read again and an alive pair decides alive", ["Z1", "alive", "alive", "alive"], "alive", 4],
+    ["T-th2: the measured torn read (a zombie state with a count of 0 or 1, then alive) is never a confirmed exit", ["Z0", "alive", "alive", "alive"], "alive", 4],
+    ["T-th2: a disagreement that persists to the end is not a confirmed exit: (alive, Z1) three times decides alive", ["alive", "Z1", "alive", "Z1", "alive", "Z1"], "alive", 6],
+    ["T-th2: a disagreement that persists, the other order: (Z1, alive) three times decides alive", ["Z1", "alive", "Z1", "alive", "Z1", "alive"], "alive", 6],
+    ["T-th2: two confirmed kinds that persist take the later one", ["Z1", "emptyGone", "Z1", "emptyGone", "Z1", "emptyGone"], "empty-gone", 6],
+    ["T-th2: a confirmed kind against Zn that persists is the non-confirmed Zn", ["Z1", "Zn", "Z1", "Zn", "Z1", "Zn"], "Zn", 6],
+    ["T-th2: two non-confirmed kinds that persist take the later one", ["Zn", "emptyN", "Zn", "emptyN", "Zn", "emptyN"], "empty-n", 6],
+    ["T-th2: a vanished stat decides at once, also as the first reading", ["vanished"], "vanished", 1],
+    ["T-th2: (alive, vanished) is vanished", ["alive", "vanished"], "vanished", 2],
+    ["T-th2: another start time decides at once", ["alive", "startChanged"], "start-changed", 2],
+    ["T-th2: an unknown reading decides unknown without a re-read", ["Z1", "unknownStat"], "unknown", 2],
+    ["T-th2: unknown first, the pair is complete and decides unknown", ["unknownStat", "Z1"], "unknown", 2],
+    ["T-th2: a stat that fails with ENOENT after an unknown one is vanished (both facts are monotone)", ["unknownStat", "vanished"], "vanished", 2],
+    ["T-th2: S-C1: [Z1, Z0, ENOENT] is vanished (a count of 0 is read again before any unknown rule)", ["Z1", "Z0", "vanished"], "vanished", 3],
+    ["T-th2: S-C1: [X0, ENOENT] is vanished", ["X0", "vanished"], "vanished", 2],
+    ["T-th2: S-C1: [Z1, Z0, Z1, Z1] decides Z1 once the zero is gone", ["Z1", "Z0", "Z1", "Z1"], "Z1", 4],
+    ["T-th2: S-C1: a count of 0 that persists to the end of the budget is unknown", ["Z1", "Z0", "Z1", "Z0", "Z1", "Z0"], "unknown", 6],
+    ["T-th2: S-C1: (empty, 0) that persists is unknown", ["empty0", "empty0", "empty0", "empty0", "empty0", "empty0"], "unknown", 6],
+    ["T-th2: a command line read that failed with ENOENT/ESRCH (released between the reads) is read again and the next stat decides: vanished", ["raceCmdline", "Z1", "vanished"], "vanished", 3],
+    ["T-th2: the same race, then two agreeing readings", ["raceCmdline", "Z1", "Z1", "Z1"], "Z1", 4],
+    ["T-th2: a race that persists to the end is unknown", ["raceCmdline", "Z1", "raceCmdline", "Z1", "raceCmdline", "Z1"], "unknown", 6],
+  ] as const)("%s", (_name, list, expected, used) => {
+    const result = decide([...list]);
+    expect(result.kind).toBe(expected);
+    expect(result.used, "readings consumed").toBe(used);
+    if (!["vanished", "start-changed"].includes(expected) && expected !== "Z1" && expected !== "empty-gone") expect(isConfirmedExit(result.kind)).toBe(false);
+  });
+
+  it("T-th2: the budget is three pairs", () => {
+    expect(EXIT_PAIRS).toBe(3);
+  });
+
+  /** The text of `/proc/<pid>/stat` with the given state, thread count and start time (fields 3, 20 and 22); a comm may hold `)`. */
+  const statText = (state: string, threads: number | string, start: string, comm = "claude"): string => `1234 (${comm}) ${state} 1 ${Array.from({ length: 15 }, () => "0").join(" ")} ${threads} 0 ${start} 0 0`;
+  interface Double {
+    source: ExitSource;
+    calls: string[];
+  }
+  const doubleOf = (parts: { stat?: () => string; cmdline?: () => string; status?: () => string; exe?: () => "readable" | "denied" | "gone" }): Double => {
+    const calls: string[] = [];
+    const call = <T>(name: string, read: (() => T) | undefined, fallback: T): T => {
+      calls.push(name);
+      return read ? read() : fallback;
+    };
+    return {
+      calls,
+      source: {
+        stat: () => call("stat", parts.stat, statText("S", 1, "500")),
+        cmdline: () => call("cmdline", parts.cmdline, "claude\0--print\0"),
+        status: () => call("status", parts.status, "Name:\tclaude\nThreads:\t1\n"),
+        exe: () => call("exe", parts.exe, "readable" as const),
+      },
+    };
+  };
+  function errno(code: string): never {
+    throw Object.assign(new Error(code), { code });
+  }
+
+  it("T-th2: the thread count comes from the same stat text as the state: stat says Z with 3 threads and status says 1, the reading is Zn and status is never read", () => {
+    const given = doubleOf({ stat: () => statText("Z", 3, "500"), cmdline: () => "", exe: () => "gone", status: () => "Name:\tclaude\nThreads:\t1\n" });
+    const read = readExitReadingFrom(given.source, 4242, "500");
+    expect(exitKind(read)).toBe("Zn");
+    expect(given.calls, "the status file is not part of an exit reading").not.toContain("status");
+    expect(given.calls[0], "the stat text is read first").toBe("stat");
+  });
+
+  it("T-th2: a comm that contains ')' does not move the thread count or the start time", () => {
+    const given = doubleOf({ stat: () => statText("Z", 1, "500", "a) b (c)"), cmdline: () => "", exe: () => "gone" });
+    expect(exitKind(readExitReadingFrom(given.source, 4242, "500"))).toBe("Z1");
+    const other = doubleOf({ stat: () => statText("Z", 1, "501", "a) b (c)") });
+    expect(exitKind(readExitReadingFrom(other.source, 4242, "500")), "another start time behind a comm with ')'").toBe("start-changed");
+  });
+
+  it("T-th2: the stat text is read once per reading, then the command line, then the executable", () => {
+    const given = doubleOf({});
+    readExitReadingFrom(given.source, 4242, "500");
+    expect(given.calls).toEqual(["stat", "cmdline", "exe"]);
+  });
+
+  it.each([
+    ["RE1: a stat text cut before the start time is unknown", statText("Z", 1, "500").split(" ").slice(0, 20).join(" "), "start-field"],
+    ["RE1: a non-numeric thread field is unknown", statText("Z", "x", "500"), "thread-field"],
+    ["RE1: a non-numeric start field is unknown", statText("Z", 1, "later"), "start-field"],
+    ["RE1: a stat text without a command name is unknown", "garbage", "stat"],
+    ["RE1: an empty stat text is unknown", "", "stat"],
+  ] as const)("%s", (_name, text, file) => {
+    const read = readExitReadingFrom(doubleOf({ stat: () => text, cmdline: () => "", exe: () => "gone" }).source, 4242, "500");
+    expect(read.unknown?.file).toBe(file);
+    expect(exitKind(read)).toBe("unknown");
+    expect(exitConfirmed(read)).toBe(false);
+  });
+
+  // The read-error decision row, every file against every error code. Written out here, not read from the production function.
+  const CODES = ["ENOENT", "ESRCH", "EACCES", "EIO", "EMFILE", "ENFILE", "ENOMEM", "EPERM", "ELOOP", "EINTR", "OTHER"] as const;
+  const EXPECTED: Record<"stat" | "cmdline" | "exe", Record<(typeof CODES)[number], string>> = {
+    stat: { ENOENT: "vanished", ESRCH: "vanished", EACCES: "unknown", EIO: "unknown", EMFILE: "unknown", ENFILE: "unknown", ENOMEM: "unknown", EPERM: "unknown", ELOOP: "unknown", EINTR: "unknown", OTHER: "unknown" },
+    cmdline: { ENOENT: "unknown", ESRCH: "unknown", EACCES: "unknown", EIO: "unknown", EMFILE: "unknown", ENFILE: "unknown", ENOMEM: "unknown", EPERM: "unknown", ELOOP: "unknown", EINTR: "unknown", OTHER: "unknown" },
+    exe: { ENOENT: "gone", ESRCH: "gone", EACCES: "denied", EIO: "unknown", EMFILE: "unknown", ENFILE: "unknown", ENOMEM: "unknown", EPERM: "unknown", ELOOP: "unknown", EINTR: "unknown", OTHER: "unknown" },
+  };
+  for (const file of ["stat", "cmdline", "exe"] as const) {
+    it.each(CODES)(`RE1: ${file} read failing with %s`, (code) => {
+      expect(exitReadOutcome(file, code)).toBe(EXPECTED[file][code]);
+      // The same row through the reader: what the sampler's reading says for a double that throws.
+      const given = doubleOf({
+        stat: file === "stat" ? () => errno(code) : () => statText("S", 1, "500"),
+        cmdline: file === "cmdline" ? () => errno(code) : () => "",
+        exe: file === "exe" ? exeReaderOver({ readlink: () => errno(code), stat: () => ({}) }).bind(null, 4242) : () => "gone",
+      });
+      const read = readExitReadingFrom(given.source, 4242, "500");
+      const expectedOutcome = EXPECTED[file][code];
+      if (expectedOutcome === "vanished") expect(exitKind(read)).toBe("vanished");
+      else if (expectedOutcome === "unknown") {
+        expect(exitKind(read)).toBe("unknown");
+        expect(read.unknown?.file).toBe(file);
+      } else if (expectedOutcome === "gone") expect(exitKind(read), "an executable that is gone next to an empty command line").toBe("empty-gone");
+      else expect(exitKind(read), "an executable that is denied is alive").toBe("alive");
+    });
+  }
+
+  const EXE_ROWS: [string, { readlink: () => string; stat: () => unknown }, "readable" | "denied" | "gone"][] = [
+    ["the link is readable and its identity too", { readlink: () => "/usr/bin/x", stat: () => ({}) }, "readable"],
+    ["the link fails with ENOENT", { readlink: () => errno("ENOENT"), stat: () => ({}) }, "gone"],
+    ["the link fails with EACCES", { readlink: () => errno("EACCES"), stat: () => ({}) }, "denied"],
+    ["the identity of a readable link fails with ENOENT", { readlink: () => "/usr/bin/x (deleted)", stat: () => errno("ENOENT") }, "gone"],
+    ["the identity of a readable link fails with ESRCH", { readlink: () => "/usr/bin/x", stat: () => errno("ESRCH") }, "gone"],
+  ];
+  it.each(EXE_ROWS)("RE1: executable: %s", (_name, io, expected) => {
+    expect(exeReaderOver(io)(1)).toBe(expected);
+  });
+
+  it.each(["EACCES", "EIO", "EMFILE", "ELOOP"])("RE1: executable: the identity of a readable link fails with %s: unknown, never gone or denied", (code) => {
+    const given = doubleOf({ stat: () => statText("S", 1, "500"), cmdline: () => "", exe: exeReaderOver({ readlink: () => "/usr/bin/x", stat: () => errno(code) }).bind(null, 4242) });
+    const read = readExitReadingFrom(given.source, 4242, "500");
+    expect(exitKind(read)).toBe("unknown");
+    expect(read.unknown?.file).toBe("exe");
+  });
+
+  it.each([
+    ["EIO", "stat", true],
+    ["EMFILE", "cmdline", true],
+    ["ENFILE", "exe", true],
+    ["ENOMEM", "stat", true],
+    ["EPERM", "exe", true],
+    ["EACCES", "stat", true],
+    ["EACCES", "cmdline", true],
+    ["EACCES", "exe", false],
+    ["ENOENT", "stat", false],
+    ["ESRCH", "stat", false],
+    ["ENOENT", "exe", false],
+    ["EINTR", "stat", false],
+    ["", "stat", false],
+  ] as const)("TH-seam: the exit read seam accepts %s on %s: %s", (code, file, allowed) => {
+    expect(exitFaultAllowed(file, code)).toBe(allowed);
+  });
+
+  it("TH-seam: a real process read through the seam: an accepted code reads unknown with its code, a refused code and a throwing seam read unknown too, none reads as no fault or as vanished", () => {
+    const start = (): string => {
+      const text = fs.readFileSync("/proc/self/stat", "utf8");
+      return text.slice(text.lastIndexOf(")") + 2).split(" ")[19];
+    };
+    const ticks = start();
+    const plain = endedNow(process.pid, ticks);
+    expect(plain.kind, "this very process is alive").toBe("alive");
+    expect(plain.injected).toBe(false);
+    const run = (fault: ExitReadFault) => endedNow(process.pid, ticks, fault);
+    expect(run(() => undefined)).toMatchObject({ kind: "alive", injected: false });
+    expect(run((pid, file) => (pid === process.pid && file === "stat" ? "EIO" : undefined))).toMatchObject({ kind: "unknown", unknownRead: "stat:EIO", injected: true, ended: false });
+    expect(run((pid, file) => (pid === process.pid && file === "cmdline" ? "EMFILE" : undefined))).toMatchObject({ kind: "unknown", unknownRead: "cmdline:EMFILE", injected: true });
+    expect(run((pid, file) => (pid === process.pid && file === "exe" ? "EPERM" : undefined))).toMatchObject({ kind: "unknown", unknownRead: "exe:EPERM", injected: true });
+    expect(run(() => "ENOENT"), "ENOENT is refused: a test error, read as unknown").toMatchObject({ kind: "unknown", unknownRead: "stat:SEAM-INVALID", injected: true, ended: false });
+    expect(run(() => "ESRCH")).toMatchObject({ kind: "unknown", unknownRead: "stat:SEAM-INVALID" });
+    expect(run((_pid, file) => (file === "exe" ? "EACCES" : undefined)), "EACCES on exe would read as denied, which is alive: refused").toMatchObject({ kind: "unknown", unknownRead: "exe:SEAM-INVALID" });
+    expect(
+      run(() => {
+        throw new Error("a seam that throws");
+      }),
+      "a throwing seam is never read as no fault",
+    ).toMatchObject({ kind: "unknown", unknownRead: "stat:SEAM-THREW", injected: true });
+  });
+
+  it("TH-seam: static: only the declared RE-rows, TH-bracket and this row pass the exit read seam", () => {
+    const ALLOWED = ["RE-own", "RE-exe", "RE-rt", "RE-ref", "RE-le", "RE-launcher", "R1-RE", "TH-bracket", "TH-seam"];
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    const files = fs.readdirSync(dir, { recursive: true, encoding: "utf8" }).filter((name) => name.endsWith(".ts") && !name.startsWith("helpers"));
+    // The plumbing that forwards the seam into the sampler windows sits between two markers; every other use belongs to a row.
+    const open = "<exit-read-fault" + "-plumbing>";
+    const close = "</exit-read-fault" + "-plumbing>";
+    const offenders: string[] = [];
+    let uses = 0;
+    for (const name of files) {
+      const text = fs.readFileSync(path.join(dir, name), "utf8");
+      const titles = [...text.matchAll(/^\s*it\(\s*[`"']([^`"'$%]*)/gm)].map((match) => ({ at: match.index!, title: match[1] }));
+      const plumbing: [number, number][] = [];
+      for (let at = text.indexOf(open); at >= 0; at = text.indexOf(open, at + 1)) plumbing.push([at, text.indexOf(close, at)]);
+      for (const use of text.matchAll(/exitReadFault\b/g)) {
+        if (plumbing.some(([from, to]) => use.index! >= from && use.index! < to)) continue;
+        uses += 1;
+        const owner = [...titles].reverse().find((title) => title.at < use.index!);
+        const id = owner?.title.split(":")[0].trim() ?? "";
+        if (!ALLOWED.includes(id)) offenders.push(`${name}:${owner?.title.slice(0, 40) ?? "outside a row"}`);
+      }
+    }
+    expect(uses, "the rows that use the seam were found").toBeGreaterThanOrEqual(ALLOWED.length - 1);
+    expect(offenders).toEqual([]);
+  });
+
+  it("T-th2: the hidepid precondition reads the /proc mount options and refuses a mount that hides processes", () => {
+    const line = (options: string, superOptions: string): string => `25 29 0:23 / /proc ${options} shared:12 - proc proc ${superOptions}`;
+    expect(procMountHidesProcesses(line("rw,nosuid,nodev,noexec,relatime", "rw"))).toBe(false);
+    expect(procMountHidesProcesses(line("rw,nosuid,nodev,noexec,relatime", "rw,hidepid=2"))).toBe(true);
+    expect(procMountHidesProcesses(line("rw,nosuid,nodev,noexec,relatime,hidepid=invisible", "rw"))).toBe(true);
+    expect(procMountHidesProcesses(line("rw,hidepid=1", "rw"))).toBe(true);
+    expect(procMountHidesProcesses(line("rw,hidepid=0", "rw,hidepid=off"))).toBe(false);
+    expect(procMountHidesProcesses(`${line("rw", "rw")}\n30 29 0:30 / /sys rw - sysfs sysfs rw,hidepid=2`), "another mount").toBe(false);
+    expect(procMountHidesProcesses("")).toBe(false);
+    expect(procMountHidesProcesses(fs.readFileSync("/proc/self/mountinfo", "utf8")), "this host can run a window").toBe(false);
+  });
+
+  it("T-th2: the record shape prints names, codes and booleans only: the failed read, the injection, the revival and the confirming kinds", () => {
+    const record: ProcessRecord = {
+      pid: 4242,
+      startTicks: "1111",
+      comms: ["claude"],
+      argvShape: "claude",
+      exe: "other",
+      ancestors: ["bwrap", "other"],
+      sameNamespaces: { pid: false, user: false, mnt: false },
+      firstMs: 0,
+      lastMs: 10,
+      oldCounted: false,
+      oldUnsandboxed: false,
+      verdict: "runtime",
+      unsandboxed: true,
+      inconsistentReads: 0,
+      proofFailure: { failedWhile: "alive", ownProof: true, launcherProof: false, escapeEvidence: false, ownUnreadable: "mnt", reference: "live", chain: "complete", referenceEnded: false, referenceExit: "alive", runtimeExit: "unknown", exitRead: "stat:EIO", exitReadInjected: true, pending: "expired" },
+      pending: { state: "expired", sinceMs: 5, route: "runtime-ending", sawLeaderExit: true, revived: true },
+      provenExeId: "64769:123456789",
+      fate: "exited",
+    };
+    const text = describeRecords([record]);
+    expect(text).toContain("runtime-exit=unknown exit-read=stat:EIO exit-read-injected=true pending=expired");
+    expect(text).toContain("pending-route=runtime-ending revived=true");
+    expect(text.includes("123456789"), "the executable identity is never printed").toBe(false);
+    const hostile = describeRecords([{ ...record, proofFailure: { ...record.proofFailure!, exitRead: "stat:eio /etc/passwd", referenceExitRead: "cmdline:EMFILE" } }]);
+    expect(hostile).toContain("exit-read=other");
+    expect(hostile).toContain("reference-exit-read=cmdline:EMFILE");
+    expect(hostile.includes("passwd")).toBe(false);
+    const cleared = describeRecords([{ ...record, unsandboxed: false, pending: { state: "cleared", sinceMs: 5, route: "reference-ended" }, clearedBy: "reference-ended", exitConfirmed: { runtime: "Z1", reference: "vanished" } }]);
+    expect(cleared).toContain("cleared-by=reference-ended exit-confirmed=Z1 reference-exit-confirmed=vanished");
+    expect(describeRecords([{ ...record, unsandboxed: false, clearedBy: "own", exitConfirmed: { runtime: "empty-gone" } }])).toContain("cleared-by=own exit-confirmed=empty-gone");
+  });
+});
+
+/**
+ * Real processes for the thread-safe exit rule (MVP-8130). A python3 stand-in titled `claude` (or a reference) has a second
+ * thread that polls a trigger directory; on SIGUSR1 its leader opens `FRESH` files in a private descriptor table and then ends
+ * alone with the raw `exit` syscall, so the leader stays in its exit for a measured while after its memory (command line,
+ * executable) is gone and the other thread keeps the process alive: the state `empty-n`, then `Zn`. The trigger files `end` and
+ * `exec` make the surviving thread return (the process then ends) or execute a new program (the process is revived under the
+ * same pid and start time). The sampler windows place the leader exit between the proof and the exit read with its own seams, so
+ * a missed hold is a precondition failure of the row (INVALID), never a pass. Every fixture reaps its trees: a recorded pid is
+ * only ever signalled while its start time still matches.
+ */
+describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
+  const BWRAP_DIE = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc"];
+  const KEEP_INNER = ["bwrap", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc"];
+  /** Fresh files the leader opens before it ends: its exit releases each one itself, after its namespaces are gone (A0 calibration, MVP-8130). */
+  const HOLD_FILES = 300_000;
+  /** The same for a reference stand-in, whose hold must outlast the runtime's end that follows the seam. */
+  const REFERENCE_HOLD_FILES = 600_000;
+  const IDLE = "setInterval(() => {}, 1000)";
+  const quote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+  const standIn = `exec -a claude ${quote(process.execPath)} -e ${quote(IDLE)}`;
+
+  const THREAD_FIXTURE = [
+    "import ctypes, os, platform, resource, signal, subprocess, sys, threading, time",
+    "libc = ctypes.CDLL(None)",
+    "exit_thread = 60 if platform.machine() == 'x86_64' else 93",
+    "trig, fresh, secs, title = os.environ['TRIG'], int(os.environ.get('FRESH', '0')), os.environ.get('SECS', '6'), os.environ.get('TITLE', 'claude')",
+    "limit = resource.getrlimit(resource.RLIMIT_NOFILE)[1]",
+    "resource.setrlimit(resource.RLIMIT_NOFILE, (limit, limit))",
+    "def worker():",
+    "    while True:",
+    "        if os.path.exists(trig + '/exec'):",
+    "            os.execv('/bin/sleep', [title, secs])",
+    "        if os.path.exists(trig + '/end'):",
+    "            return",
+    "        time.sleep(0.001)",
+    "def leave(*_):",
+    "    if fresh > 0:",
+    "        os.unshare(os.CLONE_FILES)",
+    "        for _ in range(fresh):",
+    "            os.open('/dev/null', os.O_RDONLY)",
+    "    libc.syscall(exit_thread, 0)",
+    "signal.signal(signal.SIGUSR1, leave)",
+    "child = subprocess.Popen(sys.argv[1:]) if len(sys.argv) > 1 else None",
+    "threading.Thread(target=worker).start()",
+    "while True:",
+    "    time.sleep(0.05)",
+  ].join("\n");
+  const fixtureCommand = (trig: string, env: Record<string, string | number>, title = "claude", args = ""): string =>
+    `${Object.entries({ TRIG: trig, TITLE: title, ...env }).map(([key, value]) => `${key}=${quote(String(value))}`).join(" ")} ${title === "claude" ? `exec -a claude ` : ""}python3 -c ${quote(THREAD_FIXTURE)}${args}`;
+
+  interface Tracked {
+    pid: number;
+    startTicks: string;
+  }
+  const tracked: Tracked[] = [];
+  const spawned: ChildProcess[] = [];
+  const stopped: number[] = [];
+  const dirs: string[] = [];
+
+  const sleepSync = (ms: number): void => void Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  /** The seam runs inside a sampler tick and must hold it until the shape exists: this waits without releasing the event loop. */
+  const waitSync = (condition: () => boolean, boundMs = 3000): boolean => {
+    for (const end = Date.now() + boundMs; !condition(); sleepSync(2)) if (Date.now() > end) return false;
+    return true;
+  };
+  const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  const until = async (condition: () => boolean, what: string, boundMs = 30_000): Promise<void> => {
+    for (const end = Date.now() + boundMs; !condition() && Date.now() < end; ) await pause(25);
+    expect(condition(), `precondition not reached: ${what}`).toBe(true);
+  };
+
+  const statOf = (pid: number): { state: string; ppid: number; threads: number; startTicks: string } | null => {
+    try {
+      const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const rest = text.slice(text.lastIndexOf(")") + 2).split(" ");
+      return { state: rest[0], ppid: Number(rest[1]), threads: Number(rest[17]), startTicks: rest[19] };
+    } catch {
+      return null;
+    }
+  };
+  const ppidOf = (pid: number): number => statOf(pid)?.ppid ?? 0;
+  const signal = (pid: number, name: NodeJS.Signals): void => {
+    try {
+      process.kill(pid, name);
+    } catch {
+      // Already gone.
+    }
+  };
+  const track = (pid: number): Tracked => {
+    const item = { pid, startTicks: statOf(pid)?.startTicks ?? "" };
+    tracked.push(item);
+    return item;
+  };
+  const sameProcess = (item: Tracked): boolean => item.startTicks !== "" && statOf(item.pid)?.startTicks === item.startTicks;
+  const endTracked = (item: Tracked): void => {
+    if (sameProcess(item)) signal(item.pid, "SIGKILL");
+  };
+  afterEach(() => {
+    for (const pid of stopped.splice(0)) signal(pid, "SIGCONT");
+    for (const item of tracked.splice(0)) endTracked(item);
+    for (const child of spawned.splice(0)) for (const pid of [...descendants(child.pid!), child.pid!]) signal(pid, "SIGKILL");
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const scratch = (): string => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp8130-"));
+    dirs.push(dir);
+    return dir;
+  };
+  const touch = (dir: string, name: "end" | "exec"): void => fs.writeFileSync(path.join(dir, name), "");
+
+  const linkGone = (pid: number, kind: "exe" | "ns/mnt"): boolean => {
+    try {
+      fs.readlinkSync(`/proc/${pid}/${kind}`);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT";
+    }
+  };
+  const cmdlineEmpty = (pid: number): boolean => {
+    try {
+      return fs.readFileSync(`/proc/${pid}/cmdline`).length === 0;
+    } catch {
+      return false;
+    }
+  };
+  /** The shape `empty-n` stands for, read by the fixture itself: the leader finished its memory release while other threads run. */
+  const held = (pid: number): boolean => {
+    const stat = statOf(pid);
+    return stat !== null && stat.state !== "Z" && stat.state !== "X" && stat.threads >= 2 && cmdlineEmpty(pid) && linkGone(pid, "exe");
+  };
+  const zombieLeader = (pid: number): boolean => {
+    const stat = statOf(pid);
+    return stat !== null && stat.state === "Z" && stat.threads >= 2;
+  };
+  const zombieSingle = (pid: number): boolean => {
+    const stat = statOf(pid);
+    return stat !== null && stat.state === "Z" && stat.threads === 1;
+  };
+  /** The stand-in installs its SIGUSR1 handler a moment after it starts: the signal before that would kill it instead of ending its leader. */
+  const handlerInstalled = (pid: number): boolean => {
+    try {
+      return (BigInt("0x" + /^SigCgt:\s*([0-9a-f]+)/m.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"))![1]) & 0x200n) !== 0n;
+    } catch {
+      return false;
+    }
+  };
+  /** The new program the surviving thread executed runs under the same pid (its command line is the title and the seconds only). */
+  const imageRuns = (pid: number, secs: string, title = "claude"): boolean => {
+    try {
+      return fs.readFileSync(`/proc/${pid}/cmdline`).toString("latin1") === `${title}\0${secs}\0`;
+    } catch {
+      return false;
+    }
+  };
+  const ended = (item: Tracked): boolean => endedNow(item.pid, item.startTicks).ended;
+
+  /** What the seams did for the one candidate under test; the row reads every flag back before it asserts anything else. */
+  interface Seam {
+    pid?: number;
+    readings: number;
+    forced: boolean;
+    reached: boolean;
+    runtime?: Tracked;
+    /** The process whose held leader exit the row relies on (the runtime, or the reference), and whether it still showed that shape right before and right after the exit read. */
+    holdPid?: number;
+    preHold?: boolean;
+    postHold?: boolean;
+    reference?: Tracked;
+    holder?: Tracked;
+  }
+  const newSeam = (): Seam => ({ readings: 0, forced: false, reached: false });
+  /** On the `atReading`-th stable reading of the one candidate: records it and runs `act`, which returns whether the shape was reached within its bound. */
+  const seamAt =
+    (state: Seam, atReading: number, act: (pid: number) => boolean) =>
+    (pid: number): void => {
+      state.pid ??= pid;
+      if (pid !== state.pid || state.forced) return;
+      state.readings += 1;
+      if (state.readings < atReading) return;
+      state.forced = true;
+      state.runtime = track(pid);
+      state.holdPid ??= pid;
+      state.reached = act(pid);
+    };
+  /** Sends SIGUSR1 once the handler is installed and waits for `shape`; false when the handler never appeared or the shape was not reached. */
+  const endLeader = (pid: number, shape: () => boolean, boundMs = 25_000): boolean => {
+    if (!waitSync(() => handlerInstalled(pid), 5000)) return false;
+    signal(pid, "SIGUSR1");
+    return waitSync(shape, boundMs);
+  };
+  /** The fixture's own reads right before the exit read (the failed proof's seam) and right after the tick that did it. */
+  const holdChecks = (state: Seam) => ({
+    before: (): void => {
+      if (state.forced && state.holdPid !== undefined && state.preHold === undefined) state.preHold = held(state.holdPid);
+    },
+    afterTick: (): void => {
+      if (state.preHold !== undefined && state.postHold === undefined && state.holdPid !== undefined) state.postHold = held(state.holdPid);
+    },
+  });
+  /** A kind the row expects from the exit read of a held leader: a missed hold (the fixture's own reads show it ended) is INVALID, a classifier that read the intact hold differently is a failure. */
+  const expectHeldKind = (state: Seam, actual: ExitKind | undefined, expected: ExitKind): void => {
+    if (actual !== expected) expect(state.preHold === true && state.postHold === true, `precondition not reached: the held leader exit ended before the exit read finished (read ${actual})`).toBe(true);
+    expect(actual).toBe(expected);
+  };
+
+  // <exit-read-fault-plumbing>
+  interface Plumbed {
+    exitReadFault?: ExitReadFault;
+  }
+  const plumb = (options: Plumbed): Plumbed => ({ exitReadFault: options.exitReadFault });
+  // </exit-read-fault-plumbing>
+
+  function closeWindow(sampler: { stop: (markers: Record<string, string>) => ProcessSample }): { final: ProcessSample; audit: string[]; summary: string[] } {
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    let final: ProcessSample;
+    try {
+      final = sampler.stop({});
+    } finally {
+      spy.mockRestore();
+    }
+    const printed = lines.join("").split("\n");
+    return { final, audit: printed.filter((line) => line.startsWith("SECURITY-PROCESS-AUDIT")), summary: printed.filter((line) => line.startsWith("SECURITY-PROCESS-SUMMARY")) };
+  }
+  const failureRecorded = (sampler: { peek: () => ProcessSample }): boolean => sampler.peek().records.some((record) => record.proofFailure !== undefined);
+  const recordOf = (sample: ProcessSample, runtime: Tracked | undefined): ProcessRecord => {
+    const record = sample.records.find((candidate) => candidate.pid === runtime?.pid);
+    expect(record, "precondition not reached: the sampler did not record the runtime").toBeDefined();
+    return record!;
+  };
+  const flagged = (final: ProcessSample, record: ProcessRecord): void => {
+    expect(final.unsandboxedRuntimes, "the record stays flagged").toContain(record.pid);
+    expect(record.clearedBy, "the record was never cleared").toBeUndefined();
+    const text = sampleProblems(final, {}).join("\n");
+    expect(text).toContain("ran without a sandbox ancestor");
+    expect(text).toContain(`pid ${record.pid}`);
+  };
+  const noClears = (summary: string[]): void => {
+    for (const route of ["own", "launcher", "reference", "runtime_ending", "launcher_ended"]) expect(summary[0], `no clear by ${route}`).toContain(`exit_cleared_${route}=0`);
+  };
+  /** The runtime's whole life from the exit read to the end of a pending wait: bound seconds plus a margin. */
+  const pastBound = (): Promise<void> => pause(PENDING_BOUND_MS + 500);
+
+  /*  Own route: the leader finishes after the runtime's own proof, below the real bwrap (the R6 shape)  */
+
+  async function ownWindow(state: Seam, options: Plumbed & { secs?: string; fresh?: number } = {}): Promise<{ trig: string; sampler: ReturnType<typeof startProcessSampler>; child: ChildProcess }> {
+    requireHost(["bwrap", "python3"]);
+    const trig = scratch();
+    const checks = holdChecks(state);
+    const sampler = startProcessSampler(() => process.pid, [], 20, {
+      // The third reading: two proven ticks first. The proof then fails on the released mount namespace and the exit read follows at once.
+      afterStableReading: seamAt(state, 3, (pid) => endLeader(pid, () => held(pid) && linkGone(pid, "ns/mnt"))),
+      afterFailedProof: checks.before,
+      afterTick: checks.afterTick,
+      ...plumb(options),
+    });
+    const command = fixtureCommand(trig, { FRESH: options.fresh ?? HOLD_FILES, SECS: options.secs ?? "6" });
+    const child = spawn(BWRAP_DIE[0], [...BWRAP_DIE.slice(1), "/bin/bash", "-c", command], { stdio: "ignore" });
+    spawned.push(child);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the leader exit was not held within its bound").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    return { trig, sampler, child };
+  }
+
+  /** The leader finished, its thread outlives the bound: pending, then flagged for good although the process fully ends before the window closes. */
+  async function ownNever(state: Seam) {
+    const window = await ownWindow(state);
+    await pastBound();
+    touch(window.trig, "end");
+    await until(() => ended(state.runtime!), "the runtime did not fully end after its last thread");
+    const closed = closeWindow(window.sampler);
+    return { ...closed, record: recordOf(closed.final, state.runtime) };
+  }
+  const assertOwnNever = (state: Seam, run: Awaited<ReturnType<typeof ownNever>>): void => {
+    expectHeldKind(state, run.record.proofFailure?.runtimeExit, "empty-n");
+    expect(run.record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, escapeEvidence: false });
+    expect(run.record.pending).toMatchObject({ state: "expired", route: "runtime-ending", sawLeaderExit: true });
+    flagged(run.final, run.record);
+    expect(run.summary[0]).toContain("pending_expired=1");
+  };
+
+  it("TH-own-live: a runtime whose leader finished while a thread runs (empty-n at the exit read) is never cleared by its own proof, it waits and is flagged when the thread outlives the bound", async () => {
+    const state = newSeam();
+    const run = await ownNever(state);
+    assertOwnNever(state, run);
+    expect(run.record.proofFailure!.failedWhile, "not read as exiting").toBe("alive");
+    expect(run.summary[0]).toContain("exit_cleared_own=0");
+    expect(run.audit.filter((line) => line.includes("(own)"))).toEqual([]);
+  });
+
+  it("R6-emptyn-never: the same runtime, route verdict: the runtime-ending record expires flagged and no route clears it", async () => {
+    const state = newSeam();
+    const run = await ownNever(state);
+    assertOwnNever(state, run);
+    noClears(run.summary);
+    expect(run.audit, "nothing was cleared, so nothing is audited").toEqual([]);
+  });
+
+  it("R6-emptyn: the same runtime whose last thread ends inside the bound is cleared by the runtime-ending route and audited with the confirming kind (no new false alarm)", async () => {
+    const state = newSeam();
+    const window = await ownWindow(state);
+    touch(window.trig, "end");
+    await until(() => ended(state.runtime!), "the runtime did not fully end after its last thread");
+    await pause(300);
+    const { final, audit, summary } = closeWindow(window.sampler);
+    const record = recordOf(final, state.runtime);
+    expectHeldKind(state, record.proofFailure?.runtimeExit, "empty-n");
+    expect(record.pending).toMatchObject({ state: "cleared", route: "runtime-ending" });
+    expect(record.clearedBy).toBe("runtime-ending");
+    expect(record.unsandboxed).toBe(false);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("runtime exit confirmed after its own proof read while alive (leader exited first)"))).toHaveLength(1);
+    expect(audit.join("\n")).toMatch(/exit-confirmed=(Z1|vanished|empty-gone)\b/);
+    expect(summary[0]).toContain("exit_cleared_runtime_ending=1");
+  });
+
+  /** The surviving thread executes a new program after the leader finished; `exitsInside` lets that program end inside the bound. */
+  async function ownRevive(state: Seam, secs: string, exitsInside: boolean) {
+    const window = await ownWindow(state, { secs });
+    touch(window.trig, "exec");
+    await until(() => imageRuns(state.runtime!.pid, secs), "the surviving thread did not execute the new program");
+    let insideBound = true;
+    if (exitsInside) {
+      await until(() => ended(state.runtime!), "the new program did not end");
+      insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
+    } else await pause(400);
+    const proof = exitsInside ? undefined : taggedProcessProof(process.pid, `claude ${secs}`);
+    const closed = closeWindow(window.sampler);
+    return { ...closed, proof, insideBound, record: recordOf(closed.final, state.runtime) };
+  }
+  const assertRevived = (state: Seam, run: Awaited<ReturnType<typeof ownRevive>>): void => {
+    expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
+    expectHeldKind(state, run.record.proofFailure?.runtimeExit, "empty-n");
+    expect(run.record.pending).toMatchObject({ state: "expired", route: "runtime-ending", revived: true });
+    expect(describeRecords([run.record])).toContain("revived=true");
+    flagged(run.final, run.record);
+    noClears(run.summary);
+  };
+
+  it("TH-own-revive: a surviving thread executes a new program after the leader finished: the record is flagged at once (revived), the new image is judged by its own proof and the record stays flagged", async () => {
+    const state = newSeam();
+    const run = await ownRevive(state, "6", false);
+    assertRevived(state, run);
+    expect(run.record.comms, "the record saw the new program").toContain("sleep");
+    expect(run.proof, "the new program is a holder with the full sandbox proof").toMatchObject({ holders: 1, proven: 1 });
+  });
+
+  it("R6-revive: the same revival, route verdict: pending, then revived and expired although the process is alive and the new program outlives the bound", async () => {
+    const state = newSeam();
+    const run = await ownRevive(state, "6", false);
+    assertRevived(state, run);
+    expect(run.summary[0]).toContain("pending_expired=1");
+  });
+
+  it("TH-own-revive-exit: the new program ends inside the bound: the record is still flagged, never cleared (the process was never ended in between)", async () => {
+    const state = newSeam();
+    const run = await ownRevive(state, "0.4", true);
+    assertRevived(state, run);
+  });
+
+  it("R6-revive-exit: the same, route verdict: no route clears a revived record whose new program fully ended", async () => {
+    const state = newSeam();
+    const run = await ownRevive(state, "0.4", true);
+    assertRevived(state, run);
+    expect(run.audit, "nothing was cleared, so nothing is audited").toEqual([]);
+    expect(run.summary[0]).toContain("pending_expired=1");
+  });
+
+  /*  A single-thread zombie held by its stopped parent: own route (E1 shape) and live-launcher route (E2 shape)  */
+
+  async function zombieWindow(state: Seam, options: Plumbed & { atReading: number }): Promise<{ sampler: ReturnType<typeof startProcessSampler> }> {
+    requireHost(["bwrap"]);
+    const sampler = startProcessSampler(() => process.pid, [], 20, {
+      afterStableReading: seamAt(state, options.atReading, (pid) => {
+        const parent = ppidOf(pid);
+        signal(parent, "SIGSTOP");
+        stopped.push(parent);
+        waitSync(() => statOf(parent)?.state === "T");
+        signal(pid, "SIGKILL");
+        return waitSync(() => zombieSingle(pid));
+      }),
+      ...plumb(options),
+    });
+    const child = spawn(BWRAP_DIE[0], [...BWRAP_DIE.slice(1), "/bin/bash", "-c", `(${standIn}) & wait`], { stdio: "ignore" });
+    spawned.push(child);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the runtime was not a single-thread zombie within its bound").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    return { sampler };
+  }
+
+  it("RE-own-control: the same held single-thread zombie without an injected fault is Z1 and cleared by the runtime's own proof, audited with the confirming kind", async () => {
+    const state = newSeam();
+    const window = await zombieWindow(state, { atReading: 3 });
+    const { final, audit, summary } = closeWindow(window.sampler);
+    const record = recordOf(final, state.runtime);
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: true, runtimeExit: "Z1" });
+    expect(record.clearedBy).toBe("own");
+    expect(record.exitConfirmed).toEqual({ runtime: "Z1" });
+    expect(record.unsandboxed).toBe(false);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("exiting after a proof read while alive (own)") && line.includes("exit-confirmed=Z1"))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_own=1");
+  });
+
+  const reportedUnknown = (final: ProcessSample, record: ProcessRecord, read: string, summary: string[]): void => {
+    expect(record.proofFailure).toMatchObject({ runtimeExit: "unknown", exitRead: read, exitReadInjected: true });
+    expect(record.pending, "never pending").toBeUndefined();
+    expect(record.proofFailure!.pending).toBe("none");
+    flagged(final, record);
+    noClears(summary);
+    expect(describeRecords([record])).toContain(`exit-read=${read} exit-read-injected=true`);
+  };
+
+  it("RE-own: an injected EIO on the stat read of the held zombie reads unknown: not cleared by the own proof, flagged", async () => {
+    const state = newSeam();
+    const window = await zombieWindow(state, { atReading: 3, exitReadFault: (pid, file) => (pid === state.pid && state.forced && file === "stat" ? "EIO" : undefined) });
+    const { final, summary } = closeWindow(window.sampler);
+    reportedUnknown(final, recordOf(final, state.runtime), "stat:EIO", summary);
+  });
+
+  it("RE-exe: an injected EIO on the executable read of the held zombie (empty command line) reads unknown, flagged", async () => {
+    const state = newSeam();
+    const window = await zombieWindow(state, { atReading: 3, exitReadFault: (pid, file) => (pid === state.pid && state.forced && file === "exe" ? "EIO" : undefined) });
+    const { final, summary } = closeWindow(window.sampler);
+    reportedUnknown(final, recordOf(final, state.runtime), "exe:EIO", summary);
+  });
+
+  it("TH-bracket: a fault on the second full reading only (the first says Z1) reads unknown: the sampler decides on two readings, not one", async () => {
+    const state = newSeam();
+    let statReads = 0;
+    const window = await zombieWindow(state, {
+      atReading: 3,
+      exitReadFault: (pid, file) => (pid === state.pid && state.forced && file === "stat" ? (++statReads === 2 ? "EIO" : undefined) : undefined),
+    });
+    const { final, summary } = closeWindow(window.sampler);
+    expect(statReads, "precondition not reached: the exit read took two readings").toBeGreaterThanOrEqual(2);
+    reportedUnknown(final, recordOf(final, state.runtime), "stat:EIO", summary);
+  });
+
+  it("E2-kind: a runtime that is a zombie at its first reading is cleared by the live real bwrap above it, audited with the confirming kind", async () => {
+    const state = newSeam();
+    const window = await zombieWindow(state, { atReading: 1 });
+    const { final, audit, summary } = closeWindow(window.sampler);
+    const record = recordOf(final, state.runtime);
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: false, launcherProof: true, runtimeExit: "Z1" });
+    expect(record.clearedBy).toBe("launcher");
+    expect(record.exitConfirmed).toEqual({ runtime: "Z1" });
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("exiting after a proof read while alive (launcher)") && line.includes("exit-confirmed=Z1"))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_launcher=1");
+  });
+
+  it("RE-launcher: the same live-launcher shape with an injected EIO at the first reading reads unknown: not cleared by the launcher, flagged", async () => {
+    const state = newSeam();
+    const window = await zombieWindow(state, { atReading: 1, exitReadFault: (pid, file) => (pid === state.pid && state.forced && file === "stat" ? "EIO" : undefined) });
+    const { final, summary } = closeWindow(window.sampler);
+    const record = recordOf(final, state.runtime);
+    expect(record.proofFailure).toMatchObject({ ownProof: false, launcherProof: true });
+    reportedUnknown(final, record, "stat:EIO", summary);
+  });
+
+  it("R8-emptyn: a runtime held in empty-n at its first reading below the live inner bwrap that has the full proof is not cleared (the thread still runs) and is flagged", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state = newSeam();
+    const trig = scratch();
+    const checks = holdChecks(state);
+    const sampler = startProcessSampler(() => process.pid, [], 20, {
+      afterStableReading: seamAt(state, 1, (pid) => endLeader(pid, () => held(pid) && linkGone(pid, "ns/mnt"))),
+      afterFailedProof: checks.before,
+      afterTick: checks.afterTick,
+    });
+    const child = spawn(BWRAP_DIE[0], [...BWRAP_DIE.slice(1), "/bin/bash", "-c", `(${fixtureCommand(trig, { FRESH: HOLD_FILES })}) & wait`], { stdio: "ignore" });
+    spawned.push(child);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the leader exit was not held within its bound").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    touch(trig, "end");
+    await until(() => ended(state.runtime!), "the runtime did not fully end after its last thread");
+    const { final, summary } = closeWindow(sampler);
+    const record = recordOf(final, state.runtime);
+    expectHeldKind(state, record.proofFailure?.runtimeExit, "empty-n");
+    expect(record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: false, launcherProof: true, escapeEvidence: false });
+    expect(record.pending, "never pending").toBeUndefined();
+    flagged(final, record);
+    noClears(summary);
+  });
+
+  /*  Launcher-ended route (MVP-8125 shape): the launcher is stopped through the reference while the gateway lives  */
+
+  const REFERENCE_SOURCE = `
+    const { spawn } = require("node:child_process");
+    const argv = JSON.parse(process.argv[1]);
+    const m = spawn(argv[0], argv.slice(1), { stdio: "ignore" });
+    m.on("error", () => {});
+    process.on("SIGUSR2", () => m.kill("SIGKILL"));
+    setInterval(() => {}, 1000);
+  `;
+
+  async function launcherWindow(state: Seam, options: Plumbed & { leaderAfterProof?: boolean; secs?: string; runtime?: "python" | "node" }) {
+    requireHost(["bwrap", "unshare", "python3"]);
+    const trig = scratch();
+    const outcome = { done: false, reached: false };
+    let reference: ChildProcess | undefined;
+    const checks = holdChecks(state);
+    const sampler = startProcessSampler(() => reference?.pid ?? 0, [], 20, {
+      // The third reading stops the launcher through the reference and holds the tick until the inner bwrap is reparented.
+      afterStableReading: seamAt(state, 3, (pid) => {
+        const inner = track(ppidOf(pid));
+        const monitor = track(ppidOf(inner.pid));
+        signal(reference!.pid!, "SIGUSR2");
+        return waitSync(() => ppidOf(inner.pid) !== monitor.pid);
+      }),
+      afterFailedProof: (pid) => {
+        // The leader finishes between the proof (all own links readable) and the exit read that follows it.
+        if (options.leaderAfterProof && state.forced && pid === state.pid && !outcome.done) {
+          outcome.done = true;
+          outcome.reached = endLeader(pid, () => held(pid));
+        }
+        checks.before();
+      },
+      afterTick: checks.afterTick,
+      ...plumb(options),
+    });
+    const command = options.runtime === "node" ? standIn : fixtureCommand(trig, { FRESH: HOLD_FILES, SECS: options.secs ?? "6" });
+    reference = spawn(process.execPath, ["-e", REFERENCE_SOURCE, JSON.stringify([...KEEP_INNER, "/bin/bash", "-c", command])], { stdio: "ignore" });
+    spawned.push(reference);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the inner bwrap was not reparented within its bound").toBe(true);
+    if (options.leaderAfterProof) {
+      await until(() => outcome.done, "the failed proof did not reach the leader seam");
+      expect(outcome.reached, "precondition not reached: the leader exit was not held within its bound").toBe(true);
+    }
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    return { trig, sampler, reference };
+  }
+  const assertLauncherWaiting = (state: Seam, sample: ProcessSample, kind: ExitKind): ProcessRecord => {
+    const record = recordOf(sample, state.runtime);
+    expectHeldKind(state, record.proofFailure?.runtimeExit, kind);
+    expect(record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, escapeEvidence: false, ownUnreadable: "none", launcherIdentity: "verified" });
+    expect(record.pending, "pending, not flagged").toMatchObject({ route: "launcher-ended" });
+    return record;
+  };
+
+  it("LE8-emptyn: a runtime that is alive at the proof and held in empty-n at the exit read is pending and is cleared when its last thread ends, audited with the confirming kind", async () => {
+    const state = newSeam();
+    const window = await launcherWindow(state, { leaderAfterProof: true });
+    const waiting = window.sampler.peek();
+    const record = assertLauncherWaiting(state, waiting, "empty-n");
+    expect(waiting.unsandboxedRuntimes, "a waiting record counts as flagged").toContain(record.pid);
+    touch(window.trig, "end");
+    await until(() => ended(state.runtime!), "the runtime did not fully end after its last thread");
+    await pause(300);
+    const { final, audit, summary } = closeWindow(window.sampler);
+    const cleared = recordOf(final, state.runtime);
+    expect(cleared.pending?.state).toBe("cleared");
+    expect(cleared.clearedBy).toBe("launcher-ended");
+    expect(cleared.unsandboxed).toBe(false);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("launcher ended first, gateway alive") && /exit-confirmed=(Z1|vanished|empty-gone)\b/.test(line))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_launcher_ended=1");
+  });
+
+  it("LE8-emptyn-never: the same runtime whose last thread outlives the bound is flagged for good, although it fully ends before the window closes", async () => {
+    const state = newSeam();
+    const window = await launcherWindow(state, { leaderAfterProof: true });
+    await pastBound();
+    touch(window.trig, "end");
+    await until(() => ended(state.runtime!), "the runtime did not fully end after its last thread");
+    const { final, summary } = closeWindow(window.sampler);
+    const record = assertLauncherWaiting(state, final, "empty-n");
+    expect(record.pending?.state).toBe("expired");
+    flagged(final, record);
+    expect(summary[0]).toContain("pending_expired=1");
+    noClears(summary);
+  });
+
+  async function launcherRevive(state: Seam, secs: string, options: { leaderAfterProof: boolean; exitsInside: boolean }) {
+    const window = await launcherWindow(state, { leaderAfterProof: options.leaderAfterProof, secs });
+    touch(window.trig, "exec");
+    await until(() => imageRuns(state.runtime!.pid, secs), "the surviving thread did not execute the new program");
+    let insideBound = true;
+    if (options.exitsInside) {
+      await until(() => ended(state.runtime!), "the new program did not end");
+      insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
+    } else await pause(400);
+    const closed = closeWindow(window.sampler);
+    return { ...closed, insideBound, record: recordOf(closed.final, state.runtime) };
+  }
+
+  it("LE8-revive: the surviving thread executes a new program after the leader finished: the pending record is expired at once (revived) and flagged", async () => {
+    const state = newSeam();
+    const run = await launcherRevive(state, "6", { leaderAfterProof: true, exitsInside: false });
+    expectHeldKind(state, run.record.proofFailure?.runtimeExit, "empty-n");
+    expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
+    flagged(run.final, run.record);
+    noClears(run.summary);
+  });
+
+  it("LE8-revive-exit: the new program ends inside the bound: the record is still flagged, never cleared", async () => {
+    const state = newSeam();
+    const run = await launcherRevive(state, "0.4", { leaderAfterProof: true, exitsInside: true });
+    expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
+    expectHeldKind(state, run.record.proofFailure?.runtimeExit, "empty-n");
+    expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
+    flagged(run.final, run.record);
+    noClears(run.summary);
+  });
+
+  it("LE8-revive-alive-entry: a record that entered alive and whose thread executes a different executable that then ends inside the bound is flagged (executable identity), never cleared", async () => {
+    const state = newSeam();
+    const run = await launcherRevive(state, "0.4", { leaderAfterProof: false, exitsInside: true });
+    expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
+    expect(run.record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, runtimeExit: "alive" });
+    expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
+    flagged(run.final, run.record);
+    noClears(run.summary);
+  });
+
+  it("RE-le: an injected error on the runtime's exit read reads unknown: no launcher-ended entry and flagged at the failing tick; on the settle reads the pending record expires flagged", async () => {
+    // Entry: the fault is on from the first read of the runtime's exit.
+    const first = newSeam();
+    const entry = await launcherWindow(first, { runtime: "node", exitReadFault: (pid, file) => (pid === first.pid && first.forced && file === "stat" ? "EIO" : undefined) });
+    signal(first.runtime!.pid, "SIGKILL");
+    await until(() => ended(first.runtime!), "the runtime did not end");
+    const entered = closeWindow(entry.sampler);
+    const record = recordOf(entered.final, first.runtime);
+    expect(record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, runtimeExit: "unknown", exitRead: "stat:EIO", exitReadInjected: true, launcherIdentity: "verified", pending: "none" });
+    expect(record.pending, "never pending").toBeUndefined();
+    flagged(entered.final, record);
+    noClears(entered.summary);
+
+    // Settle: a normal entry, then the fault.
+    const second = newSeam();
+    const flags = { on: false };
+    const settle = await launcherWindow(second, { runtime: "node", exitReadFault: (pid, file) => (flags.on && pid === second.pid && file === "stat" ? "EIO" : undefined) });
+    expect(settle.sampler.peek().records[0].pending, "precondition not reached: a normal entry is pending").toMatchObject({ state: "waiting", route: "launcher-ended" });
+    flags.on = true;
+    signal(second.runtime!.pid, "SIGKILL");
+    await until(() => ended(second.runtime!), "the runtime did not end");
+    await pastBound();
+    const settled = closeWindow(settle.sampler);
+    const waited = recordOf(settled.final, second.runtime);
+    expect(waited.pending?.state).toBe("expired");
+    flagged(settled.final, waited);
+    noClears(settled.summary);
+  });
+
+  it("RE-rt: injected errors on every settle read of a pending runtime-ending record: it never clears and is flagged at the bound although the runtime fully ended", async () => {
+    const state = newSeam();
+    const flags = { on: false };
+    const window = await ownWindow(state, { exitReadFault: (pid) => (flags.on && pid === state.pid ? "EMFILE" : undefined) });
+    flags.on = true;
+    touch(window.trig, "end");
+    await until(() => ended(state.runtime!), "the runtime did not fully end after its last thread");
+    await pastBound();
+    const { final, summary } = closeWindow(window.sampler);
+    const record = recordOf(final, state.runtime);
+    expect(record.pending).toMatchObject({ state: "expired", route: "runtime-ending" });
+    flagged(final, record);
+    noClears(summary);
+    expect(summary[0]).toContain("pending_expired=1");
+  });
+
+  /*  Reference-ended route: the gateway ends after the runtime's own proof (R1 and R5 shapes)  */
+
+  const holderScriptOf = (runtimeCommand: string): string => `${BWRAP_DIE.map(quote).join(" ")} /bin/bash -c ${quote(runtimeCommand)}; :`;
+  const referenceScriptOf = (runtimeCommand: string): string => `/bin/bash -c ${quote(holderScriptOf(runtimeCommand))}; :`;
+
+  /**
+   * R -> H -> real bwrap -> runtime (R1 shape): on the third reading the seam optionally ends the runtime's leader (held) and then
+   * kills R, so the chain breaks while the runtime lives; with `endHolderAfterMs` the holder is killed later and the runtime ends.
+   */
+  async function runtimeWindow(state: Seam, options: Plumbed & { runtime: "python" | "node"; heldLeader?: boolean; endHolderAfterMs?: number; secs?: string }) {
+    requireHost(["bwrap", "python3"]);
+    const trig = scratch();
+    const checks = holdChecks(state);
+    let reference: ChildProcess | undefined;
+    const sampler = startProcessSampler(() => reference?.pid ?? 0, [], 20, {
+      afterStableReading: seamAt(state, 3, (pid) => {
+        let holder = pid;
+        for (let hop = 0; hop < 3; hop++) holder = ppidOf(holder);
+        state.holder = track(holder);
+        const victim = ppidOf(holder);
+        if (options.heldLeader && !endLeader(pid, () => held(pid))) return false;
+        signal(victim, "SIGKILL");
+        const reached = waitSync(() => (zombieSingle(victim) || statOf(victim) === null) && ppidOf(holder) !== victim);
+        if (options.endHolderAfterMs !== undefined) setTimeout(() => endTracked(state.holder!), options.endHolderAfterMs);
+        return reached;
+      }),
+      afterFailedProof: checks.before,
+      afterTick: checks.afterTick,
+      ...plumb(options),
+    });
+    const command = options.runtime === "node" ? standIn : fixtureCommand(trig, { FRESH: options.heldLeader ? HOLD_FILES : 0, SECS: options.secs ?? "6" });
+    reference = spawn("/bin/bash", ["-c", referenceScriptOf(command)], { stdio: "ignore" });
+    spawned.push(reference);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the reference did not end as a zombie within its bound, or the leader exit was not held").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    return { trig, sampler };
+  }
+
+  it("R1-kind: the reference ends after the runtime's own proof and the runtime ends within the bound: cleared, audited with the confirming kinds of both", async () => {
+    const state = newSeam();
+    const window = await runtimeWindow(state, { runtime: "node", endHolderAfterMs: 100 });
+    await until(() => ended(state.runtime!), "the runtime did not end");
+    await pause(300);
+    const { final, audit, summary } = closeWindow(window.sampler);
+    const record = recordOf(final, state.runtime);
+    expect(record.pending).toMatchObject({ state: "cleared", route: "reference-ended" });
+    expect(record.clearedBy).toBe("reference-ended");
+    expect(record.exitConfirmed?.runtime).toMatch(/^(Z1|vanished|empty-gone)$/);
+    expect(record.exitConfirmed?.reference).toMatch(/^(Z1|vanished|empty-gone)$/);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("reference ended after the runtime's own proof") && /exit-confirmed=\w+(-\w+)? reference-exit-confirmed=\w+(-\w+)?/.test(line))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_reference=1");
+  });
+
+  it("R1-emptyn-never: the gateway ended and the runtime is held in empty-n with a live thread past the bound: the record expires flagged", async () => {
+    const state = newSeam();
+    const window = await runtimeWindow(state, { runtime: "python", heldLeader: true });
+    await pastBound();
+    touch(window.trig, "end");
+    await until(() => ended(state.runtime!), "the runtime did not fully end after its last thread");
+    const { final, summary } = closeWindow(window.sampler);
+    const record = recordOf(final, state.runtime);
+    expectHeldKind(state, record.proofFailure?.runtimeExit, "empty-n");
+    expect(record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, referenceEnded: true, chain: "broken" });
+    expect(record.pending).toMatchObject({ state: "expired", route: "reference-ended" });
+    flagged(final, record);
+    noClears(summary);
+    expect(summary[0]).toContain("pending_expired=1");
+  });
+
+  it("R1-revive-exit: the runtime's leader finishes after the entry, its thread executes a new program that ends inside the bound: flagged (revival), never cleared", async () => {
+    const state = newSeam();
+    const window = await runtimeWindow(state, { runtime: "python", secs: "0.4" });
+    const pid = state.runtime!.pid;
+    expect(endLeader(pid, () => zombieLeader(pid) || held(pid)), "precondition not reached: the leader did not finish").toBe(true);
+    // The sampler's settle reads register the leader exit before the thread executes the new program (the zombie leader persists until then).
+    await pause(250);
+    touch(window.trig, "exec");
+    await until(() => imageRuns(pid, "0.4"), "the surviving thread did not execute the new program");
+    await until(() => ended(state.runtime!), "the new program did not end");
+    const insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
+    const { final, summary } = closeWindow(window.sampler);
+    expect(insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
+    const record = recordOf(final, state.runtime);
+    expect(record.pending).toMatchObject({ state: "expired", route: "reference-ended", revived: true });
+    flagged(final, record);
+    noClears(summary);
+  });
+
+  it("R1-RE: injected errors on the runtime's settle reads after the gateway ended: the record never clears and is flagged at the bound although the runtime ended", async () => {
+    const state = newSeam();
+    const flags = { on: false };
+    const window = await runtimeWindow(state, { runtime: "node", exitReadFault: (pid) => (flags.on && pid === state.pid ? "EMFILE" : undefined) });
+    flags.on = true;
+    endTracked(state.holder!);
+    await until(() => ended(state.runtime!), "the runtime did not end");
+    await pastBound();
+    const { final, summary } = closeWindow(window.sampler);
+    const record = recordOf(final, state.runtime);
+    expect(record.pending?.route).toBe("reference-ended");
+    expect(record.pending?.state).toMatch(/^expired/);
+    flagged(final, record);
+    noClears(summary);
+  });
+
+  /**
+   * P (sh, stopped) -> R (python reference with the thread fixture) -> M -> H -> real bwrap -> runtime (R5 shape). On the third
+   * reading of the runtime the seam ends R's leader (`held`: held in its exit; else a plain zombie leader), kills M so the chain breaks
+   * and ends the holder shortly after, so the runtime's own exit is confirmed while R's thread still runs.
+   */
+  async function referenceWindow(state: Seam, options: Plumbed & { held: boolean; secs?: string; execAtOnce?: boolean }) {
+    requireHost(["bwrap", "python3"]);
+    const trig = scratch();
+    const checks = holdChecks(state);
+    let parent: ChildProcess | undefined;
+    const firstChild = (): number => {
+      try {
+        return Number(fs.readFileSync(`/proc/${parent?.pid}/task/${parent?.pid}/children`, "utf8").trim().split(" ")[0]) || 0;
+      } catch {
+        return 0;
+      }
+    };
+    const sampler = startProcessSampler(firstChild, [], 20, {
+      afterStableReading: seamAt(state, 3, (pid) => {
+        let holder = pid;
+        for (let hop = 0; hop < 3; hop++) holder = ppidOf(holder);
+        state.holder = track(holder);
+        const middle = ppidOf(holder);
+        const reference = ppidOf(middle);
+        state.reference = track(reference);
+        state.holdPid = reference;
+        signal(parent!.pid!, "SIGSTOP");
+        stopped.push(parent!.pid!);
+        waitSync(() => statOf(parent!.pid!)?.state === "T");
+        if (!endLeader(reference, () => (options.held ? held(reference) : zombieLeader(reference)))) return false;
+        if (options.execAtOnce) touch(trig, "exec");
+        signal(middle, "SIGKILL");
+        const reached = waitSync(() => (statOf(middle)?.state === "Z" || statOf(middle) === null) && ppidOf(holder) !== middle);
+        setTimeout(() => endTracked(state.holder!), 30);
+        return reached;
+      }),
+      afterFailedProof: checks.before,
+      afterTick: checks.afterTick,
+      ...plumb(options),
+    });
+    const env = { FRESH: options.held ? REFERENCE_HOLD_FILES : 0, SECS: options.secs ?? "6" };
+    parent = spawn("/bin/sh", ["-c", `${fixtureCommand(trig, env, "gateway", ` /bin/bash -c ${quote(referenceScriptOf(standIn))}`)}; :`], { stdio: "ignore" });
+    spawned.push(parent);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the reference did not reach its leader-exit shape, or the chain did not break, within its bound").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    return { trig, sampler };
+  }
+  const assertReferenceExpired = (final: ProcessSample, record: ProcessRecord, summary: string[]): void => {
+    expect(record.proofFailure).toMatchObject({ ownProof: true, chain: "broken", reference: "cached", referenceEnded: false, pending: "expired-reference" });
+    expect(record.pending).toMatchObject({ state: "expired-reference", route: "reference-ended" });
+    flagged(final, record);
+    noClears(summary);
+    expect(summary[0]).toContain("pending_expired=1");
+  };
+
+  it("R5-emptyn: a reference held in empty-n (its thread still runs) while the runtime's own exit is confirmed is pending and expires on the reference, flagged", async () => {
+    const state = newSeam();
+    const window = await referenceWindow(state, { held: true });
+    await until(() => ended(state.runtime!), "the runtime did not end");
+    await pastBound();
+    touch(window.trig, "end");
+    const { final, summary } = closeWindow(window.sampler);
+    const record = recordOf(final, state.runtime);
+    expectHeldKind(state, record.proofFailure?.referenceExit, "empty-n");
+    assertReferenceExpired(final, record, summary);
+  });
+
+  it("R5-revive: the reference's thread executes a new program after the leader finished: the reference was never ended, the record expires on the reference, flagged", async () => {
+    const state = newSeam();
+    const window = await referenceWindow(state, { held: true, execAtOnce: true, secs: "6" });
+    await until(() => ended(state.runtime!), "the runtime did not end");
+    await until(() => imageRuns(state.reference!.pid, "6", "gateway"), "the reference's thread did not execute the new program");
+    await pastBound();
+    const { final, summary } = closeWindow(window.sampler);
+    const record = recordOf(final, state.runtime);
+    expectHeldKind(state, record.proofFailure?.referenceExit, "empty-n");
+    assertReferenceExpired(final, record, summary);
+  });
+
+  it("RE-ref: an injected error on the reference's exit read reads unknown: it is no reference ending at the failing tick (flagged, never pending), and on the settle reads the record expires on the reference", async () => {
+    // Entry: the fault is on from the reference's first exit read.
+    const first = newSeam();
+    const entry = await referenceWindow(first, { held: false, exitReadFault: (pid, file) => (first.holdPid !== undefined && pid === first.holdPid && file === "stat" ? "EIO" : undefined) });
+    await until(() => ended(first.runtime!), "the runtime did not end");
+    const entered = closeWindow(entry.sampler);
+    const record = recordOf(entered.final, first.runtime);
+    expect(record.proofFailure).toMatchObject({ ownProof: true, chain: "broken", referenceEnded: false, referenceExit: "unknown", referenceExitRead: "stat:EIO", exitReadInjected: true, pending: "none" });
+    expect(record.pending, "never pending").toBeUndefined();
+    flagged(entered.final, record);
+    noClears(entered.summary);
+
+    // Settle: a normal entry (the reference is a zombie leader whose thread runs), then the fault on the reference's reads.
+    const second = newSeam();
+    const flags = { on: false };
+    const settle = await referenceWindow(second, { held: false, exitReadFault: (pid, file) => (flags.on && second.holdPid !== undefined && pid === second.holdPid && file === "stat" ? "EIO" : undefined) });
+    flags.on = true;
+    await until(() => ended(second.runtime!), "the runtime did not end");
+    await pastBound();
+    const settled = closeWindow(settle.sampler);
+    assertReferenceExpired(settled.final, recordOf(settled.final, second.runtime), settled.summary);
+  });
+
+  /*  Classification of real processes, no sampler: the exit decision the sampler takes, read in a tight loop against raw thread counts  */
+
+  interface Trace {
+    kinds: ExitKind[];
+    /** Confirmed decisions read while the raw thread count was 2 or more on both sides of the read. */
+    violations: ExitKind[];
+    confirmed: ExitKind[];
+  }
+  const observe = (item: Tracked, done: (trace: Trace, kind: ExitKind) => boolean, boundMs: number): Trace => {
+    const trace: Trace = { kinds: [], violations: [], confirmed: [] };
+    for (const end = Date.now() + boundMs; Date.now() < end; sleepSync(1)) {
+      const before = statOf(item.pid);
+      const now = endedNow(item.pid, item.startTicks);
+      const after = statOf(item.pid);
+      if (trace.kinds.at(-1) !== now.kind) trace.kinds.push(now.kind);
+      if (now.ended) trace.confirmed.push(now.kind);
+      if (now.ended && before !== null && after !== null && before.threads >= 2 && after.threads >= 2) trace.violations.push(now.kind);
+      if (done(trace, now.kind)) break;
+    }
+    return trace;
+  };
+  async function startFixture(secs = "6"): Promise<{ trig: string; item: Tracked }> {
+    requireHost(["python3"]);
+    const trig = scratch();
+    const child = spawn("/bin/bash", ["-c", fixtureCommand(trig, { FRESH: HOLD_FILES, SECS: secs })], { stdio: "ignore" });
+    spawned.push(child);
+    const item = track(child.pid!);
+    await until(() => handlerInstalled(item.pid), "the stand-in did not install its handler");
+    return { trig, item };
+  }
+
+  it("TH1: a real process whose leader ends alone reads empty-n, then Zn, and only Z1 or vanished once its last thread ended: never a confirmed exit while a thread runs", async () => {
+    const { trig, item } = await startFixture();
+    signal(item.pid, "SIGUSR1");
+    let leaderSeen = 0;
+    const trace = observe(
+      item,
+      (seen, kind) => {
+        if (kind === "Zn") leaderSeen += 1;
+        if (leaderSeen === 3) touch(trig, "end");
+        return seen.confirmed.length >= 3;
+      },
+      30_000,
+    );
+    expect(trace.violations, "a confirmed exit was read while a thread ran").toEqual([]);
+    expect(trace.kinds, "precondition not reached: the held leader exit was not read (empty-n)").toContain("empty-n");
+    expect(trace.kinds).toContain("Zn");
+    expect(trace.confirmed.length, "the process was read as ended once its last thread ended").toBeGreaterThanOrEqual(3);
+    expect(["Z1", "vanished"], "the confirming kind").toContain(trace.confirmed[0]);
+    expect(trace.kinds.indexOf("empty-n")).toBeLessThan(trace.kinds.indexOf("Zn"));
+  });
+
+  it("TH2: a surviving thread that executes a new program after the leader ended revives the process under the same pid and start time: from the leader exit to the revival no reading is a confirmed exit", async () => {
+    const { trig, item } = await startFixture("6");
+    signal(item.pid, "SIGUSR1");
+    let leaderSeen = 0;
+    let revived = false;
+    const trace = observe(
+      item,
+      (seen, kind) => {
+        if (kind === "Zn") leaderSeen += 1;
+        if (leaderSeen === 3) touch(trig, "exec");
+        revived = imageRuns(item.pid, "6");
+        return revived && seen.kinds.at(-1) === "alive";
+      },
+      30_000,
+    );
+    expect(trace.confirmed, "a confirmed exit was read between the leader exit and the revival").toEqual([]);
+    expect(revived, "precondition not reached: the surviving thread did not execute the new program").toBe(true);
+    expect(trace.kinds, "precondition not reached: the held leader exit was not read (empty-n)").toContain("empty-n");
+    expect(sameProcess(item), "the same pid and start time run the new program").toBe(true);
+  });
+
+  it("TH3: the native runtime killed by SIGKILL (a group exit): no reading is a confirmed exit while a thread of it runs, and it ends in a confirmed kind (observation)", async () => {
+    const binary = path.resolve("node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude");
+    if (!fs.existsSync(binary)) throw new Error("host prerequisite missing: native runtime");
+    const home = scratch();
+    const child = spawn(binary, ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"], { stdio: ["pipe", "ignore", "ignore"], env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home } });
+    spawned.push(child);
+    await pause(1500);
+    const item = track(child.pid!);
+    expect(statOf(item.pid), "precondition not reached: the native runtime did not start").not.toBeNull();
+    signal(item.pid, "SIGKILL");
+    const trace = observe(item, (seen) => seen.confirmed.length >= 3, 15_000);
+    expect(trace.violations, "a confirmed exit was read while a thread ran").toEqual([]);
+    expect(trace.confirmed.length, "the runtime ended in a confirmed kind").toBeGreaterThanOrEqual(1);
+    process.stderr.write(`SECURITY-THREAD-EXIT row=TH3 kinds=${trace.kinds.join(">")} violations=${trace.violations.length}\n`);
   });
 });
 
