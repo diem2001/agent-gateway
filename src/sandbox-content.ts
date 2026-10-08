@@ -137,7 +137,7 @@ function readRegularFileBounded(p: string, maxBytes: number): BoundedRead {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || !ownedByGatewayUser(stat)) return { reason: "unreadable" };
     if (stat.size > maxBytes) return { reason: "too_large" };
-    const scratch = Buffer.allocUnsafe(Math.max(1, Math.min(SCAN_CHUNK_BYTES, stat.size + 1)));
+    let scratch = Buffer.allocUnsafe(Math.max(1, Math.min(SCAN_CHUNK_BYTES, stat.size + 1)));
     const chunks: Buffer[] = [];
     let total = 0;
     while (total <= maxBytes) {
@@ -145,6 +145,8 @@ function readRegularFileBounded(p: string, maxBytes: number): BoundedRead {
       if (n === 0) break;
       chunks.push(Buffer.from(scratch.subarray(0, n)));
       total += n;
+      // The file is larger than `fstat` said: read the rest in full chunks, not in steps of the first size.
+      if (n === scratch.length && total <= maxBytes) scratch = Buffer.allocUnsafe(Math.min(SCAN_CHUNK_BYTES, maxBytes + 1 - total));
     }
     return total > maxBytes ? { reason: "too_large" } : { data: Buffer.concat(chunks, total) };
   } catch {
