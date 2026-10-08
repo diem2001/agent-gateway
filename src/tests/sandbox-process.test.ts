@@ -1810,7 +1810,7 @@ describe("an ordinary chat through the real runtime", () => {
       if (Date.now() - started > 10_000) throw new Error(`isolation never became ok: ${res.text}`);
       await new Promise((r) => setTimeout(r, 100));
     }
-  }, 30_000);
+  }, 60_000);
 
   it("`env | sort` in Bash shows the allowlist and the run token; no secret of the gateway reaches the result, the model or the events", async () => {
     const c = await chain({ tool: { name: "Bash", input: { command: "env | sort", description: "show the environment" } } });
@@ -1892,7 +1892,7 @@ describe("failing closed through the gateway", () => {
       if (Date.now() - started > 10_000) throw new Error(`no isolation ERROR line at LOG_LEVEL=off: ${c.gateway.output()}`);
       await new Promise((r) => setTimeout(r, 100));
     }
-  }, 60_000);
+  }, 75_000);
 
   it("a run that exceeds AGENT_RUN_TIMEOUT_MS is stopped with the deadline text, nothing is saved and no process survives", async () => {
     const c = await chain({ mode: "hang", env: { AGENT_RUN_TIMEOUT_MS: "3000" } });

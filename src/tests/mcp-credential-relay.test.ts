@@ -4,9 +4,10 @@
  * revocation, and the fail-closed run assembly when the relay is not listening.
  */
 import http, { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
-import net, { type AddressInfo } from "node:net";
+import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CredentialRelay, RELAY_MAX_IN_FLIGHT_PER_BINDING, type RelayGrant } from "../mcp-credential-relay.js";
+import { reserveGatewayPort } from "./helpers/git-process-gateway.js";
 import { startOAuthMcpStub, type OAuthMcpStub, type OAuthStubOptions } from "./helpers/oauth-mcp-stub.js";
 
 const ALLOW_ALL: RelayGrant = { allowsTool: () => true, coversServer: true };
@@ -257,10 +258,7 @@ describe("credential relay: an upstream refusal never reaches the runtime", () =
   });
 
   it("an unreachable upstream answers unavailable", async () => {
-    const closed = net.createServer();
-    await new Promise<void>((resolve) => closed.listen(0, "127.0.0.1", () => resolve()));
-    const port = (closed.address() as AddressInfo).port;
-    await new Promise<void>((resolve) => closed.close(() => resolve()));
+    const port = await reserveGatewayPort();
     const r = await relay();
     const { url } = r.register({ grant: ALLOW_ALL, serverName: "records", url: `http://127.0.0.1:${port}/mcp`, headers: {} });
 
