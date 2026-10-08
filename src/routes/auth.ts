@@ -22,9 +22,10 @@ export function bundledCliCommand(): string {
   return command;
 }
 
-// The bundled CLI (2.0.77) has no `auth status` subcommand: the words would be
-// taken as a prompt and start a model call. The state comes from the trusted
-// files instead (model-proxy.ts readAuthStatus).
+// The state comes from the trusted files (model-proxy.ts readAuthStatus), not from the bundled CLI (the runtime of the
+// agent runs, SDK 0.3.292, Claude Code 2.1.292): a runtime inside a sandbox never sees a subscription login, only the
+// run token of the model proxy. Claude Code 2.0.77 had no `auth status` subcommand (the words started a model call);
+// the bundled 2.1.292 was not checked for it.
 router.get("/v1/auth/status", (_req, res) => {
   try { res.json(readAuthStatus(HOME)); }
   catch { res.json({ loggedIn: false, tokenExpired: false, expiresAt: null }); }

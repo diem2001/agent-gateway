@@ -38,8 +38,26 @@ import {
   type PresenceKey,
   type ProcessSample,
   redactArgv,
+  PENDING_BOUND_MS,
+  createReferenceTracker,
+  readExitReadingOf,
+  runtimeEndingPending,
+  runtimeLeaderExited,
+  currentRowId,
+  deriveRowId,
   describeRecords,
+  endedNow,
+  exitConfirmed,
+  exitKind,
+  exitProofClears,
+  flagAfterProofFailure,
+  referenceEndedPending,
+  referenceSymptom,
+  resolvePending,
+  sameNamespace,
   sampleProblems,
+  type ExitReading,
+  type ReferenceIo,
   type ProcessRecord,
   type MatrixRow,
   type Surface,
@@ -405,6 +423,8 @@ describe("host-side samplers", () => {
       fate: "exited",
     };
     expect(describeRecords([record], { marker })).toContain("pid 1 comm sh exe sh");
+    const failed = describeRecords([{ ...record, proofFailure: { failedWhile: "exiting", ownProof: false, launcherProof: true, escapeEvidence: false, ownUnreadable: "mnt", reference: "cached", chain: "broken", referenceEnded: true, referenceExit: "Z1", runtimeExit: "Z1", pending: "waiting" }, clearedBy: "reference-ended", provedReferenceCached: 2 }], { marker });
+    expect(failed).toContain("proof-failure [failed-while=exiting own-proof=false launcher-proof=true escape-evidence=false own-unreadable=mnt reference=cached chain=broken reference-ended=true reference-exit=Z1 runtime-exit=Z1 pending=waiting] cleared-by=reference-ended proved-reference-cached=2");
     expect(describeRecords([{ ...record, argvShape: `leak ${marker}` }], { marker })).toBe("[process records withheld: a marker was detected]");
     // A process name that is not on the allowlist (a comm or an ancestor) is printed as `other`, with or without markers.
     const named = describeRecords([{ ...record, comms: [marker.slice(0, 15)], ancestors: [marker.slice(0, 15), "gateway"] }], {});
@@ -541,7 +561,26 @@ describe("process sampler launcher exemption", () => {
   const BWRAP = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc"];
   const children: ChildProcess[] = [];
   const dirs: string[] = [];
+  const stoppedPids: number[] = [];
+  /** Processes a row recorded to be killed at the end, besides the descendants of its children (the reference's whole thread group). */
+  const recordedPids: number[] = [];
   afterEach(() => {
+    // A holder the exit seam stopped is continued first, then every recorded process and every process of the fixture is killed.
+    for (const pid of recordedPids.splice(0)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+    // A holder the exit seam stopped is continued first, then every process of the fixture is killed.
+    for (const pid of stoppedPids.splice(0)) {
+      try {
+        process.kill(pid, "SIGCONT");
+      } catch {
+        // Already gone.
+      }
+    }
     for (const child of children.splice(0)) {
       for (const pid of [...descendants(child.pid!), child.pid!]) {
         try {
@@ -586,8 +625,14 @@ describe("process sampler launcher exemption", () => {
   type Stage = { name: string; until: (sample: ProcessSample) => boolean; settleMs?: number };
 
   /** Runs the sampler beside `start()`, takes a snapshot when each stage is reached (undefined when it never was), and returns the final sample and the audit lines `stop(markers)` printed. */
-  async function stages(start: () => ChildProcess, steps: Stage[], markers: Record<string, string> = {}): Promise<{ snapshots: (ProcessSample | undefined)[]; final: ProcessSample; audit: string[]; summary: string[] }> {
-    const sampler = startProcessSampler(() => process.pid, []);
+  async function stages(
+    start: () => ChildProcess,
+    steps: Stage[],
+    markers: Record<string, string> = {},
+    seam: (pid: number) => void = () => {},
+    referencePid: () => number = () => process.pid,
+  ): Promise<{ snapshots: (ProcessSample | undefined)[]; final: ProcessSample; audit: string[]; summary: string[] }> {
+    const sampler = startProcessSampler(referencePid, [], 20, { afterStableReading: seam });
     const child = start();
     children.push(child);
     const snapshots: (ProcessSample | undefined)[] = [];
@@ -765,7 +810,931 @@ describe("process sampler launcher exemption", () => {
       for (const line of audit) expect(line.includes(marker), "an audit line carried the synthetic name").toBe(false);
       expect(audit.some((line) => line.includes("comm sh exe") && line.includes("verdict=launcher")), "the allowlisted process lost its detail").toBe(true);
       expect(summary, "one summary line of counts per window").toHaveLength(1);
-      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+$/);
+      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+ failed_exiting=\d+ failed_alive=\d+ failed_own_proof=\d+ failed_launcher_proof=\d+ failed_escape_evidence=\d+ exit_cleared_own=\d+ exit_cleared_launcher=\d+ exit_cleared_reference=\d+ exit_cleared_runtime_ending=\d+ pending_expired=\d+ proved_reference_cached=\d+ failed_reference_cached=\d+ failed_reference_missing=\d+ failed_own_unreadable=\d+ failed_chain_broken=\d+ reference_changed=\d+ row=(none|withheld|[A-Za-z0-9().,_-]+-[0-9a-f]{10}) flagged=\d+$/);
     }
+  });
+
+  /*  The exit rule (MVP-8090): real processes whose exit is forced between the stable reading and the proof  */
+
+  /** What the exit seam did for the one candidate under test: every flag is read back by the row before it asserts anything else. */
+  interface ExitState {
+    pid?: number;
+    readings: number;
+    forced: boolean;
+    reached: boolean;
+  }
+  const newExitState = (): ExitState => ({ readings: 0, forced: false, reached: false });
+
+  /** Sleeps without releasing the event loop: the seam runs inside a sampler tick and must hold it until the exit shape is reached. */
+  const sleepSync = (ms: number): void => void Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  const waitSync = (condition: () => boolean, boundMs = 2000): boolean => {
+    for (const end = Date.now() + boundMs; !condition(); sleepSync(2)) if (Date.now() > end) return false;
+    return true;
+  };
+  const statOf = (pid: number): { state: string; ppid: number } | null => {
+    try {
+      const fields = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const rest = fields.slice(fields.lastIndexOf(")") + 2).split(" ");
+      return { state: rest[0], ppid: Number(rest[1]) };
+    } catch {
+      return null;
+    }
+  };
+  const threadsOf = (pid: number): number => {
+    try {
+      return Number(/^Threads:\s*(\d+)/m.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"))?.[1] ?? 1);
+    } catch {
+      return 0;
+    }
+  };
+  const isGone = (pid: number): boolean => statOf(pid) === null;
+  const isZombie = (pid: number): boolean => statOf(pid)?.state === "Z" && threadsOf(pid) <= 1;
+
+  /**
+   * The seam of one control: on the `atReading`-th stable reading of its candidate it kills the candidate and holds the tick
+   * until the exit shape exists (bound 2 s; a missed bound leaves `reached` false and the row fails as a precondition).
+   * `zombie` stops the parent first, so the candidate stays a zombie whose namespaces still read (pid and user, not mnt);
+   * `reaped` waits until the parent has reaped it; `reaped-with-launcher` also waits until the candidate's parent is gone.
+   * Only a pid the test itself spawned below the worker is ever signalled.
+   */
+  const forceExit =
+    (state: ExitState, shape: "zombie" | "reaped" | "reaped-with-launcher", atReading = 1) =>
+    (pid: number): void => {
+      state.pid ??= pid;
+      if (pid !== state.pid || state.forced) return;
+      state.readings += 1;
+      if (state.readings < atReading) return;
+      state.forced = true;
+      const parent = statOf(pid)?.ppid ?? 0;
+      if (shape === "zombie") {
+        process.kill(parent, "SIGSTOP");
+        stoppedPids.push(parent);
+        // SIGSTOP is delivered asynchronously: a parent that has not stopped yet would reap the runtime at once and leave no zombie.
+        waitSync(() => statOf(parent)?.state === "T");
+      }
+      process.kill(pid, "SIGKILL");
+      state.reached = waitSync(() => (shape === "zombie" ? isZombie(pid) : isGone(pid) && (shape === "reaped" || isGone(parent))));
+    };
+
+  const standIn = `exec -a claude ${quote(process.execPath)} -e ${quote(IDLE)}`;
+  /** A `bwrap`-named bash script (outside any sandbox) that runs `body`. */
+  function renamedLauncher(body: string): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp8090-"));
+    dirs.push(dir);
+    fs.mkdirSync(path.join(dir, "w"));
+    const file = path.join(dir, "w", "bwrap");
+    fs.writeFileSync(file, `#!/bin/bash\n${body}\n:\n`, { mode: 0o755 });
+    return file;
+  }
+  const sandboxed = (args: string[]): ChildProcess => spawn(BWRAP[0], [...BWRAP.slice(1), ...args], { stdio: "ignore" });
+  const unshared = `unshare --user --map-root-user --pid --mount --fork /bin/bash -c ${quote(`(${standIn}) & wait`)}`;
+
+  const forcedStages = (state: ExitState): Stage[] => [
+    { name: "runtime recorded", until: (seen) => seen.runtimesSeen > 0 },
+    { name: "exit forced", until: () => state.forced, settleMs: 100 },
+  ];
+  const outcomeOf = (state: ExitState, snapshots: (ProcessSample | undefined)[], what: string): ProcessRecord => {
+    expect(state.forced && state.reached, `precondition not reached: the exit shape of ${what} was not reached within its bound`).toBe(true);
+    return recorded(snapshots[1], `${what} was not recorded`);
+  };
+  const reported = (final: ProcessSample, record: ProcessRecord): void => {
+    expect(final.unsandboxedRuntimes).toContain(record.pid);
+    expect(record.clearedBy).toBeUndefined();
+    const text = sampleProblems(final, {}).join("\n");
+    expect(text).toContain("ran without a sandbox ancestor");
+    expect(text).toContain(`pid ${record.pid}`);
+  };
+
+  it("E1: a sandboxed runtime that exits after two proven ticks, with its launchers gone (reaped), is cleared by its own proof and audited", async () => {
+    requireHost(["bwrap"]);
+    const state = newExitState();
+    const { snapshots, final, audit } = await stages(() => sandboxed(["/bin/bash", "-c", standIn]), forcedStages(state), {}, forceExit(state, "reaped-with-launcher", 3));
+    const record = outcomeOf(state, snapshots, "the sandboxed runtime");
+    expect(record.verdict).toBe("runtime");
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: true, launcherProof: false, escapeEvidence: false });
+    expect(record.clearedBy).toBe("own");
+    expect(record.unsandboxed).toBe(false);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("exiting after a proof read while alive (own)"))).toHaveLength(1);
+  });
+
+  it("E2: a sandboxed runtime that is a zombie at its first reading is cleared by the live real bwrap above it, which has the full proof itself", async () => {
+    requireHost(["bwrap"]);
+    const state = newExitState();
+    const { snapshots, final, audit, summary } = await stages(() => sandboxed(["/bin/bash", "-c", `(${standIn}) & wait`]), forcedStages(state), {}, forceExit(state, "zombie"));
+    const record = outcomeOf(state, snapshots, "the sandboxed runtime");
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: false, launcherProof: true, escapeEvidence: false });
+    expect(record.clearedBy).toBe("launcher");
+    expect(record.unsandboxed).toBe(false);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("exiting after a proof read while alive (launcher)"))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_launcher=1");
+  });
+
+  it.each(["zombie", "reaped"] as const)("E3 (%s): a runtime titled claude below a script named bwrap, outside any sandbox, is reported when its exit is forced at the first reading", async (shape) => {
+    const launcher = renamedLauncher(`(${standIn})`);
+    const state = newExitState();
+    const { snapshots, final } = await stages(() => spawn(launcher, [], { stdio: "ignore" }), forcedStages(state), {}, forceExit(state, shape));
+    const record = outcomeOf(state, snapshots, "the renamed runtime");
+    expect(record.verdict).toBe("runtime");
+    // A zombie still reads the gateway's pid and user namespaces (positive evidence of no sandbox); a reaped one reads nothing.
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: false, launcherProof: false, escapeEvidence: shape === "zombie" });
+    reported(final, record);
+  });
+
+  it("E4a: a runtime in new pid, user and mount namespaces without the real bwrap, a zombie at its first reading, is reported", async () => {
+    const launcher = renamedLauncher(unshared);
+    const state = newExitState();
+    const { snapshots, final } = await stages(() => spawn(launcher, [], { stdio: "ignore" }), forcedStages(state), {}, forceExit(state, "zombie"));
+    const record = outcomeOf(state, snapshots, "the runtime in new namespaces");
+    expect(record.sameNamespaces.pid, "precondition not reached: the namespaces did not differ").toBe(false);
+    expect(record.sameNamespaces.user, "precondition not reached: the namespaces did not differ").toBe(false);
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: false, launcherProof: false, escapeEvidence: false });
+    reported(final, record);
+  });
+
+  it("E4b: the same tree held for two stable ticks before its exit is forced is reported: namespaces that differ never become an own proof", async () => {
+    const launcher = renamedLauncher(unshared);
+    const state = newExitState();
+    const { snapshots, final } = await stages(() => spawn(launcher, [], { stdio: "ignore" }), forcedStages(state), {}, forceExit(state, "zombie", 3));
+    const record = outcomeOf(state, snapshots, "the runtime in new namespaces");
+    expect(state.readings, "precondition not reached: fewer than three stable readings").toBeGreaterThanOrEqual(3);
+    expect(record.firstMissingProof, "the first proof attempt had a real bwrap").toContain("chain-complete real-bwrap=false");
+    expect(record.proofFailure?.ownProof).toBe(false);
+    reported(final, record);
+  });
+
+  // E5 keeps its holder (and so the real bwrap above it) alive after it reaped the runtime: the control is the launcher route, so the launcher must still be there.
+  it("E5: a runtime below a real bwrap that has no pid namespace of its own (so no full proof) and is reaped at its first reading is reported", async () => {
+    requireHost(["bwrap"]);
+    const state = newExitState();
+    const withoutPidNamespace = BWRAP.slice(1).filter((argument) => argument !== "--unshare-pid");
+    const { snapshots, final } = await stages(() => spawn(BWRAP[0], [...withoutPidNamespace, "/bin/bash", "-c", `(${standIn}) & wait; sleep 5`], { stdio: "ignore" }), forcedStages(state), {}, forceExit(state, "reaped"));
+    const record = outcomeOf(state, snapshots, "the runtime below the real bwrap");
+    expect(record.proofFailure).toMatchObject({ failedWhile: "exiting", ownProof: false, launcherProof: false, escapeEvidence: false });
+    reported(final, record);
+  });
+
+  /*  The reference ends (MVP-8090 rev 3): the gateway stand-in is killed while the runtime below it is still alive  */
+
+  interface ChainState extends ExitState {
+    runtime?: { pid: number; startTicks: string };
+    holder?: number;
+  }
+  const ppidOf = (pid: number): number => statOf(pid)?.ppid ?? 0;
+  const startOf = (pid: number): string | null => {
+    try {
+      const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      return text.slice(text.lastIndexOf(")") + 2).split(" ")[19];
+    } catch {
+      return null;
+    }
+  };
+  const mntLinkDenied = (pid: number): boolean => {
+    try {
+      fs.readlinkSync(`/proc/${pid}/ns/mnt`);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EACCES";
+    }
+  };
+  const safeKill = (pid: number | undefined, signal: NodeJS.Signals): void => {
+    if (pid === undefined) return;
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Already gone.
+    }
+  };
+  /** A reference stand-in that keeps running (so it never ends by itself) and makes itself non-dumpable on SIGUSR1: its namespace links then fail with EACCES while it lives. */
+  const NON_DUMPABLE_REFERENCE = "import ctypes, signal, subprocess, sys, time\nlibc = ctypes.CDLL(None)\nsignal.signal(signal.SIGUSR1, lambda *_: libc.prctl(4, 0, 0, 0, 0))\nchild = subprocess.Popen(sys.argv[1:])\nwhile True:\n    time.sleep(0.05)";
+  const pythonReference = (argv: string[]): ChildProcess => spawn("python3", ["-c", NON_DUMPABLE_REFERENCE, ...argv], { stdio: "ignore" });
+  /** H: the process that holds the real bwrap around the stand-in runtime; R: the bash reference above H. */
+  const holderScript = `${BWRAP.map(quote).join(" ")} /bin/bash -c ${quote(standIn)}; :`;
+  const referenceScript = `/bin/bash -c ${quote(holderScript)}; :`;
+
+  /**
+   * The seam of a reference-end control. On the `atReading`-th stable reading of the runtime it records the runtime, finds the holder
+   * `holderHops` parents above it and kills the holder's parent (the reference, or a middle process below a live reference), then
+   * holds the tick until that process is a zombie or gone and the holder has a new parent. `before` runs first. The holder or the
+   * runtime is then ended from the event loop, `endAfterMs` later, when the row needs the runtime to end within the bound.
+   */
+  const chainSeam =
+    (state: ChainState, options: { atReading: number; holderHops: number; before?: () => boolean; end?: "holder" | "runtime"; endAfterMs?: number }) =>
+    (pid: number): void => {
+      state.pid ??= pid;
+      if (pid !== state.pid || state.forced) return;
+      state.readings += 1;
+      if (state.readings < options.atReading) return;
+      state.forced = true;
+      state.runtime = { pid, startTicks: startOf(pid) ?? "" };
+      let holder = pid;
+      for (let hop = 0; hop < options.holderHops; hop++) holder = ppidOf(holder);
+      state.holder = holder;
+      const victim = ppidOf(holder);
+      const prepared = options.before?.() ?? true;
+      process.kill(victim, "SIGKILL");
+      state.reached = prepared && waitSync(() => (isZombie(victim) || isGone(victim)) && ppidOf(holder) !== victim);
+      if (options.end) setTimeout(() => safeKill(options.end === "holder" ? holder : pid, "SIGKILL"), options.endAfterMs ?? 100);
+    };
+  const runtimeEnded = (state: ChainState): boolean => state.runtime !== undefined && endedNow(state.runtime.pid, state.runtime.startTicks).ended;
+  const referenceStages = (state: ChainState, last: Stage): Stage[] => [...forcedStages(state), last];
+  const flaggedNever = (final: ProcessSample, record: ProcessRecord, what: string): void => {
+    reported(final, record);
+    expect(record.pending, `${what} was never pending`).toBeUndefined();
+    expect(record.proofFailure?.pending, `${what} was never pending`).toBe("none");
+  };
+
+  it("R0: a reference that turns non-dumpable while alive (its namespace links fail with EACCES) is read from the cache: the proof holds, nothing is flagged or cleared", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const seam = (pid: number): void => {
+      state.pid ??= pid;
+      if (pid !== state.pid || state.forced) return;
+      state.readings += 1;
+      if (state.readings < 3) return;
+      state.forced = true;
+      process.kill(reference!.pid!, "SIGUSR1");
+      state.reached = waitSync(() => mntLinkDenied(reference!.pid!));
+    };
+    const { snapshots, final } = await stages(
+      () => (reference = pythonReference([BWRAP[0], ...BWRAP.slice(1), "/bin/bash", "-c", standIn])),
+      [...forcedStages(state), { name: "proofs on the cache", until: (seen) => seen.records.some((record) => (record.provedReferenceCached ?? 0) > 0) }],
+      {},
+      seam,
+      () => reference?.pid ?? 0,
+    );
+    const record = outcomeOf(state, snapshots, "the runtime below the non-dumpable reference");
+    expect(record.proofFailure, "the proof failed").toBeUndefined();
+    expect(record.unsandboxed).toBe(false);
+    expect(record.clearedBy).toBeUndefined();
+    expect(record.provedReferenceCached ?? 0).toBeGreaterThan(0);
+    expect(final.referenceChanged).toBe(0);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(endedNow(reference!.pid!, startOf(reference!.pid!)!).ended, "a live non-dumpable reference is not an ended one").toBe(false);
+  });
+
+  it("R1: the reference ends (a zombie, chain broken) after the runtime's own proof: the record waits, the runtime ends within the bound, and it is cleared and audited", async () => {
+    requireHost(["bwrap"]);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const { snapshots, final, audit, summary } = await stages(
+      () => (reference = spawn("/bin/bash", ["-c", referenceScript], { stdio: "ignore" })),
+      referenceStages(state, { name: "cleared", until: (seen) => seen.records.some((record) => record.pending?.state === "cleared") }),
+      {},
+      chainSeam(state, { atReading: 3, holderHops: 3, end: "holder" }),
+      () => reference?.pid ?? 0,
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the reference did not end as a zombie within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    expect(record!.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, referenceEnded: true, chain: "broken", reference: "cached", runtimeExit: "alive", pending: "cleared" });
+    expect(record!.clearedBy).toBe("reference-ended");
+    expect(record!.unsandboxed).toBe(false);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("reference ended after the runtime's own proof read while alive; runtime exit confirmed"))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_reference=1");
+  });
+
+  it("R1-alive: the same record whose runtime outlives the bound is flagged for good (pending expired)", async () => {
+    requireHost(["bwrap"]);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const { snapshots, final, summary } = await stages(
+      () => (reference = spawn("/bin/bash", ["-c", referenceScript], { stdio: "ignore" })),
+      referenceStages(state, { name: "expired", until: (seen) => seen.records.some((record) => record.pending?.state === "expired") }),
+      {},
+      chainSeam(state, { atReading: 3, holderHops: 3 }),
+      () => reference?.pid ?? 0,
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the reference did not end as a zombie within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    expect(record!.proofFailure).toMatchObject({ referenceEnded: true, chain: "broken", runtimeExit: "alive", pending: "expired" });
+    expect(endedNow(record!.pid, record!.startTicks).ended, "the runtime outlived the bound by construction").toBe(false);
+    reported(final, record!);
+    expect(summary[0]).toContain("pending_expired=1");
+  });
+
+  it("R2: a runtime below a script named bwrap, in the reference's namespaces, whose reference ends is reported (escape evidence against the cache), and its exit is confirmed before the window closes", async () => {
+    const launcher = renamedLauncher(`(${standIn})`);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const { snapshots, final } = await stages(
+      () => (reference = spawn("/bin/bash", ["-c", `${launcher}; :`], { stdio: "ignore" })),
+      referenceStages(state, { name: "runtime ended", until: () => runtimeEnded(state) }),
+      {},
+      chainSeam(state, { atReading: 1, holderHops: 1, end: "runtime" }),
+      () => reference?.pid ?? 0,
+    );
+    const record = outcomeOf(state, snapshots, "the renamed runtime");
+    expect(record.proofFailure).toMatchObject({ ownProof: false, escapeEvidence: true, referenceEnded: true });
+    expect(runtimeEnded(state), "the runtime's exit was not confirmed before the window closed").toBe(true);
+    flaggedNever(final, record, "the renamed runtime");
+  });
+
+  it("R3: the reference ends on the runtime's first stable reading, before any own proof: reported, never pending", async () => {
+    requireHost(["bwrap"]);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const { snapshots, final } = await stages(
+      () => (reference = spawn("/bin/bash", ["-c", referenceScript], { stdio: "ignore" })),
+      referenceStages(state, { name: "runtime ended", until: () => runtimeEnded(state) }),
+      {},
+      chainSeam(state, { atReading: 1, holderHops: 3, end: "holder" }),
+      () => reference?.pid ?? 0,
+    );
+    const record = outcomeOf(state, snapshots, "the runtime on its first reading");
+    expect(record.proofFailure).toMatchObject({ ownProof: false, referenceEnded: true });
+    expect(runtimeEnded(state), "the runtime's exit was not confirmed before the window closed").toBe(true);
+    flaggedNever(final, record, "the runtime on its first reading");
+  });
+
+  it("R4: a middle process dies below a reference that is still alive (non-dumpable, read from the cache): the chain breaks, the runtime is reported, never pending", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: ChainState = newExitState();
+    let reference: ChildProcess | undefined;
+    const { snapshots, final } = await stages(
+      () => (reference = pythonReference(["/bin/bash", "-c", referenceScript])),
+      referenceStages(state, { name: "runtime ended", until: () => runtimeEnded(state) }),
+      {},
+      chainSeam(state, {
+        atReading: 3,
+        holderHops: 3,
+        end: "holder",
+        before: () => {
+          process.kill(reference!.pid!, "SIGUSR1");
+          return waitSync(() => mntLinkDenied(reference!.pid!));
+        },
+      }),
+      () => reference?.pid ?? 0,
+    );
+    const record = outcomeOf(state, snapshots, "the runtime below the live reference");
+    expect(record.proofFailure).toMatchObject({ ownProof: true, chain: "broken", reference: "cached", referenceEnded: false, runtimeExit: "alive" });
+    expect(runtimeEnded(state), "the runtime's exit was not confirmed before the window closed").toBe(true);
+    flaggedNever(final, record, "the runtime below the live reference");
+  });
+
+  /*  The reference ends in two steps (MVP-8090 rev 3.1): its main thread first, its other thread later or never  */
+
+  /** A reference whose main thread ends alone with the raw `exit` syscall on SIGUSR1 (one thread, unlike exit_group) while a background thread keeps it a zombie that still counts threads. */
+  const LEADER_ONLY_REFERENCE =
+    "import ctypes, platform, signal, subprocess, sys, threading, time\nlibc = ctypes.CDLL(None)\nexit_thread = 60 if platform.machine() == 'x86_64' else 93\nsignal.signal(signal.SIGUSR1, lambda *_: libc.syscall(exit_thread, 0))\nchild = subprocess.Popen(sys.argv[1:])\ndef spin():\n    while True:\n        time.sleep(0.05)\nthreading.Thread(target=spin).start()\nwhile True:\n    time.sleep(0.05)";
+  /** P (sh, stopped before the reference ends) -> reference R (python, a background thread) -> M -> H -> real bwrap -> stand-in runtime. */
+  const leaderOnlyTree = (): ChildProcess => spawn("/bin/sh", ["-c", `python3 -c ${quote(LEADER_ONLY_REFERENCE)} /bin/bash -c ${quote(referenceScript)}; :`], { stdio: "ignore" });
+  const firstChildOf = (parent: ChildProcess): number => {
+    try {
+      return Number(fs.readFileSync(`/proc/${parent.pid}/task/${parent.pid}/children`, "utf8").trim().split(" ")[0]) || 0;
+    } catch {
+      return 0;
+    }
+  };
+  const threadsNow = (pid: number): number => threadsOf(pid);
+
+  interface LeaderOnlyState extends ChainState {
+    reference?: number;
+  }
+  /**
+   * On the `atReading`-th stable reading: stops P, ends R's main thread (R becomes `Z` with threads still showing), kills M so the
+   * chain breaks and holds the tick until both are done; then ends H after 100 ms (the runtime's exit is confirmed inside the bound)
+   * and, with `endReferenceAfterMs`, kills R's whole thread group (a group exit: `Z` with one thread behind the stopped P).
+   */
+  const leaderOnlySeam =
+    (state: LeaderOnlyState, parent: ChildProcess, endReferenceAfterMs?: number) =>
+    (pid: number): void => {
+      state.pid ??= pid;
+      if (pid !== state.pid || state.forced) return;
+      state.readings += 1;
+      if (state.readings < 3) return;
+      state.forced = true;
+      state.runtime = { pid, startTicks: startOf(pid) ?? "" };
+      let holder = pid;
+      for (let hop = 0; hop < 3; hop++) holder = ppidOf(holder);
+      state.holder = holder;
+      const middle = ppidOf(holder);
+      const reference = ppidOf(middle);
+      state.reference = reference;
+      recordedPids.push(reference);
+      process.kill(parent.pid!, "SIGSTOP");
+      stoppedPids.push(parent.pid!);
+      waitSync(() => statOf(parent.pid!)?.state === "T");
+      process.kill(reference, "SIGUSR1");
+      const zombieWithThreads = waitSync(() => statOf(reference)?.state === "Z" && threadsNow(reference) >= 2);
+      process.kill(middle, "SIGKILL");
+      state.reached = zombieWithThreads && waitSync(() => (isZombie(middle) || isGone(middle)) && ppidOf(holder) !== middle);
+      setTimeout(() => safeKill(holder, "SIGKILL"), 100);
+      if (endReferenceAfterMs !== undefined) setTimeout(() => safeKill(reference, "SIGKILL"), endReferenceAfterMs);
+    };
+
+  it("R5: a reference that is a zombie leader whose other thread keeps running past the bound (Zn) is pending at first, then flagged for good (expired on the reference), although the runtime's exit is confirmed", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: LeaderOnlyState = newExitState();
+    let parent: ChildProcess | undefined;
+    const { snapshots, final, summary } = await stages(
+      () => (parent = leaderOnlyTree()),
+      referenceStages(state, { name: "expired on the reference", until: (seen) => seen.records.some((record) => record.pending?.state === "expired-reference") }),
+      {},
+      (pid) => leaderOnlySeam(state, parent!)(pid),
+      () => (parent ? firstChildOf(parent) : 0),
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the reference did not become a zombie leader with threads, or the chain did not break, within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    expect(record!.proofFailure).toMatchObject({ ownProof: true, chain: "broken", reference: "cached", referenceEnded: false, referenceExit: "Zn", pending: "expired-reference" });
+    expect(runtimeEnded(state), "the runtime's exit was not confirmed before the window closed").toBe(true);
+    expect(statOf(state.reference!)?.state, "the reference stayed a zombie leader").toBe("Z");
+    expect(threadsNow(state.reference!), "the reference still counted threads").toBeGreaterThanOrEqual(2);
+    reported(final, record!);
+    expect(summary[0]).toContain("pending_expired=1");
+  });
+
+  it("R5-ends: the same reference whose last thread ends inside the bound (Zn, then Z1) is cleared, and the failing tick was pending with the reference still Zn", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: LeaderOnlyState = newExitState();
+    let parent: ChildProcess | undefined;
+    const { snapshots, final, audit, summary } = await stages(
+      () => (parent = leaderOnlyTree()),
+      referenceStages(state, { name: "cleared", until: (seen) => seen.records.some((record) => record.pending?.state === "cleared") }),
+      {},
+      (pid) => leaderOnlySeam(state, parent!, 600)(pid),
+      () => (parent ? firstChildOf(parent) : 0),
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the reference did not become a zombie leader with threads, or the chain did not break, within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    // On the failing tick the reference was still Zn and the record went pending; it can only have been cleared from that state.
+    expect(record!.proofFailure).toMatchObject({ ownProof: true, chain: "broken", reference: "cached", referenceExit: "Zn", pending: "cleared" });
+    expect(record!.clearedBy).toBe("reference-ended");
+    expect(record!.unsandboxed).toBe(false);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("reference ended after the runtime's own proof read while alive; runtime exit confirmed"))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_reference=1");
+  });
+
+  /*  The runtime's leader exits first (MVP-8090 rev 3.2): a multi-threaded runtime is a zombie leader while its other threads finish  */
+
+  /**
+   * A runtime stand-in (started with `exec -a claude`) whose main thread ends alone with the raw `exit` syscall on SIGUSR1 (one
+   * thread, unlike exit_group) while another thread keeps the process a zombie that still counts threads. `LEAVE=timed`: a 300 ms
+   * thread, so the process ends by itself; `LEAVE=stdin`: the thread blocks reading stdin and the process ends when the write end
+   * is closed. Handlers run on the main thread only, so the thread is started in the handler and never ended by a signal.
+   */
+  const LEADER_FIRST_RUNTIME =
+    "import ctypes, os, platform, signal, sys, threading, time\nlibc = ctypes.CDLL(None)\nexit_thread = 60 if platform.machine() == 'x86_64' else 93\ndef leave(*_):\n    if os.environ.get('LEAVE') == 'stdin':\n        threading.Thread(target=lambda: sys.stdin.buffer.read(1)).start()\n    else:\n        threading.Thread(target=lambda: time.sleep(0.3)).start()\n    libc.syscall(exit_thread, 0)\nsignal.signal(signal.SIGUSR1, leave)\nwhile True:\n    time.sleep(0.05)";
+  const leaderFirst = (leave: "timed" | "stdin"): string => `LEAVE=${leave} exec -a claude python3 -c ${quote(LEADER_FIRST_RUNTIME)}`;
+  const sandboxedLeaderFirst = (leave: "timed" | "stdin"): ChildProcess => spawn(BWRAP[0], [...BWRAP.slice(1), "/bin/bash", "-c", leaderFirst(leave)], { stdio: [leave === "stdin" ? "pipe" : "ignore", "ignore", "ignore"] });
+
+  /**
+   * The seam of a leader-first control: on the `atReading`-th stable reading it sends SIGUSR1 to the runtime and holds the tick
+   * until the runtime is a zombie leader that still counts threads (bound 2 s); the proof then runs on that state.
+   */
+  const leaderFirstSeam =
+    (state: ChainState, atReading: number) =>
+    (pid: number): void => {
+      state.pid ??= pid;
+      if (pid !== state.pid || state.forced) return;
+      state.readings += 1;
+      if (state.readings < atReading) return;
+      state.forced = true;
+      state.runtime = { pid, startTicks: startOf(pid) ?? "" };
+      // The stand-in installs its handler a moment after it starts: SIGUSR1 before that would kill it instead of ending its leader.
+      const handlerInstalled = (): boolean => {
+        try {
+          return (BigInt("0x" + /^SigCgt:\s*([0-9a-f]+)/m.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"))![1]) & 0x200n) !== 0n;
+        } catch {
+          return false;
+        }
+      };
+      if (!waitSync(handlerInstalled)) return;
+      process.kill(pid, "SIGUSR1");
+      state.reached = waitSync(() => statOf(pid)?.state === "Z" && threadsOf(pid) >= 2);
+    };
+  const neverPending = (record: ProcessRecord, what: string): void => {
+    expect(record.pending, `${what} was never pending`).toBeUndefined();
+    expect(record.proofFailure?.pending, `${what} was never pending`).toBe("none");
+  };
+
+  it("R6: a sandboxed runtime whose leader exits first (a zombie that still counts threads, mount link unreadable) after its own proof waits, and is cleared and audited once the last thread ends", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: ChainState = newExitState();
+    const { snapshots, final, audit, summary } = await stages(
+      () => sandboxedLeaderFirst("timed"),
+      referenceStages(state, { name: "cleared", until: (seen) => seen.records.some((record) => record.pending?.state === "cleared") }),
+      {},
+      leaderFirstSeam(state, 3),
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the runtime did not become a zombie leader that counts threads within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    expect(record!.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, escapeEvidence: false, runtimeExit: "Zn", pending: "cleared" });
+    expect(record!.proofFailure!.ownUnreadable).toContain("mnt");
+    expect(record!.pending?.route).toBe("runtime-ending");
+    expect(record!.clearedBy).toBe("runtime-ending");
+    expect(record!.unsandboxed).toBe(false);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("runtime exit confirmed after its own proof read while alive (leader exited first)"))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_runtime_ending=1");
+  });
+
+  it("R6-never: the same runtime whose last thread outlives the bound is flagged for good, although it fully ends before the window closes", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: ChainState = newExitState();
+    let child: ChildProcess | undefined;
+    const { snapshots, final, summary } = await stages(
+      () => (child = sandboxedLeaderFirst("stdin")),
+      [
+        ...forcedStages(state),
+        { name: "expired", until: (seen) => seen.records.some((record) => record.pending?.state === "expired") },
+        // The write end is held by this test only; closing it lets the thread read EOF and the process end.
+        { name: "last thread ended", until: () => (child!.stdin!.end(), runtimeEnded(state)) },
+      ],
+      {},
+      leaderFirstSeam(state, 3),
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the runtime did not become a zombie leader that counts threads within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    expect(record!.proofFailure).toMatchObject({ ownProof: true, runtimeExit: "Zn", pending: "expired" });
+    expect(record!.pending?.route).toBe("runtime-ending");
+    expect(runtimeEnded(state), "the runtime did not fully end before the window closed").toBe(true);
+    reported(final, record!);
+    expect(summary[0]).toContain("pending_expired=1");
+  });
+
+  it("R7: a leader-first runtime outside any sandbox, below a script named bwrap, is reported at once (no own proof, the gateway's namespaces) and never pending", async () => {
+    requireHost(["python3"]);
+    const launcher = renamedLauncher(`(${leaderFirst("timed")})`);
+    const state: ChainState = newExitState();
+    const { snapshots, final } = await stages(
+      () => spawn(launcher, [], { stdio: "ignore" }),
+      referenceStages(state, { name: "runtime ended", until: () => runtimeEnded(state) }),
+      {},
+      leaderFirstSeam(state, 1),
+    );
+    const record = outcomeOf(state, snapshots, "the leader-first runtime outside the sandbox");
+    expect(record.proofFailure).toMatchObject({ ownProof: false, escapeEvidence: true, runtimeExit: "Zn" });
+    expect(runtimeEnded(state), "the runtime did not fully end before the window closed").toBe(true);
+    neverPending(record, "the runtime outside the sandbox");
+    reported(final, record);
+  });
+
+  it("R8: a sandboxed leader-first runtime on its first stable reading (no own proof yet) is reported and never pending", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: ChainState = newExitState();
+    const { snapshots, final } = await stages(() => sandboxedLeaderFirst("timed"), referenceStages(state, { name: "runtime ended", until: () => runtimeEnded(state) }), {}, leaderFirstSeam(state, 1));
+    const record = outcomeOf(state, snapshots, "the sandboxed leader-first runtime");
+    expect(record.proofFailure).toMatchObject({ ownProof: false, escapeEvidence: false, runtimeExit: "Zn" });
+    expect(runtimeEnded(state), "the runtime did not fully end before the window closed").toBe(true);
+    neverPending(record, "the runtime without an own proof");
+    reported(final, record);
+  });
+
+  it("R9: a live sandboxed runtime with its own proof is never read as ending by the sampler's condition-2 classifier, has no pending and no clear, and fully ends when killed", async () => {
+    requireHost(["bwrap"]);
+    const state: ChainState = newExitState();
+    let classified: boolean | undefined;
+    const { snapshots, final } = await stages(
+      () => sandboxed(["/bin/bash", "-c", standIn]),
+      [
+        { name: "runtime recorded", until: (seen) => seen.runtimesSeen > 0 },
+        {
+          name: "classified while alive",
+          settleMs: 150,
+          until: (seen) => {
+            const live = seen.records[0];
+            state.runtime = { pid: live.pid, startTicks: live.startTicks };
+            classified = runtimeLeaderExited(readExitReadingOf(live.pid, live.startTicks));
+            return true;
+          },
+        },
+        { name: "killed and ended", until: () => (safeKill(state.runtime!.pid, "SIGKILL"), runtimeEnded(state)) },
+      ],
+    );
+    const record = snapshots[1]?.records[0];
+    expect(record, "precondition not reached: the runtime was not recorded while alive").toBeDefined();
+    expect(classified, "the exact exported classifier read a live process as a zombie leader").toBe(false);
+    expect(record!.pending).toBeUndefined();
+    expect(record!.clearedBy).toBeUndefined();
+    expect(record!.proofFailure, "the proof of a live sandboxed runtime failed").toBeUndefined();
+    expect(record!.unsandboxed).toBe(false);
+    expect(runtimeEnded(state), "the runtime did not fully end").toBe(true);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+  });
+});
+
+/**
+ * The decision table of the exit rule: the same functions the sampler runs. Expected values are written out here and do not
+ * come from the production table. Rows that no real process can produce (a runtime that loses its proof while alive) live here
+ * and nowhere else (MVP-8090: a stated exception to the real-process control rule of MVP-7992).
+ */
+describe("process sampler exit rule: decision table", () => {
+  const evidence = (exitConfirmed: boolean, escapeEvidence: boolean, ownProof: boolean, launcherProof: boolean) => ({ exitConfirmed, escapeEvidence, ownProof, launcherProof });
+
+  it.each([
+    ["own full proof at an earlier tick", evidence(true, false, true, false), "own"],
+    ["live real-bwrap ancestor with full proof in the same tick", evidence(true, false, false, true), "launcher"],
+    ["chain complete, real bwrap, pid and user differ, mnt unreadable, no other proof", evidence(true, false, false, false), null],
+    ["chain broken, all namespaces unreadable, names show bwrap (no proof of either kind)", evidence(true, false, false, false), null],
+    ["ancestor named bwrap whose executable is not the real bwrap (no launcher proof)", evidence(true, false, false, false), null],
+    ["T-live: alive with an earlier own proof, proof fails now", evidence(false, false, true, false), null],
+    ["T-live: alive with a live launcher proof", evidence(false, false, false, true), null],
+    ["alive without any proof", evidence(false, false, false, false), null],
+    ["T-escape: exiting, own proof, but the pid or user namespace read as the gateway's", evidence(true, true, true, false), null],
+    ["T-escape: exiting, launcher proof, but the pid or user namespace read as the gateway's", evidence(true, true, false, true), null],
+  ])("%s", (_name, given, expected) => {
+    expect(exitProofClears(given)).toBe(expected);
+  });
+
+  it("an own proof wins over a launcher proof when both exist", () => {
+    expect(exitProofClears(evidence(true, false, true, true))).toBe("own");
+  });
+
+  it.each([
+    ["a first failure that clears does not flag", false, "own", false],
+    ["a first failure that clears by the launcher does not flag", false, "launcher", false],
+    ["a first failure with no route flags", false, null, true],
+    ["T-reset: flagged on an alive tick, then exiting with an own proof, still flagged", true, "own", true],
+    ["T-reset: flagged on an alive tick, then exiting with a launcher proof, still flagged", true, "launcher", true],
+    ["a later failure with no route keeps the flag", true, null, true],
+  ] as const)("%s", (_name, prior, clearedBy, expected) => {
+    expect(flagAfterProofFailure(prior, clearedBy)).toBe(expected);
+  });
+
+  const reading = (partial: Partial<ExitReading>): ExitReading => ({ vanished: false, startChanged: false, state: "S", threads: 1, cmdline: "claude --print", exe: "readable", ...partial });
+
+  it.each([
+    ["alive and reading normally", reading({}), false],
+    ["a live process that blanked its command line keeps a readable executable", reading({ cmdline: "" }), false],
+    ["a live process whose executable cannot be read (EACCES) is not ending", reading({ cmdline: "", exe: "denied" }), false],
+    ["a live process with a missing executable but a command line", reading({ exe: "gone" }), false],
+    ["a thread-group leader that exited while other threads run", reading({ state: "Z", threads: 3, cmdline: "", exe: "gone" }), false],
+    ["a zombie with one thread", reading({ state: "Z", threads: 1, cmdline: "", exe: "gone" }), true],
+    ["state X (dead)", reading({ state: "X" }), true],
+    ["vanished", reading({ vanished: true }), true],
+    ["the pid now has another start time", reading({ startChanged: true }), true],
+    ["empty command line and missing executable together", reading({ cmdline: "", exe: "gone" }), true],
+  ])("exit classifier: %s", (_name, given, expected) => {
+    expect(exitConfirmed(given)).toBe(expected);
+  });
+
+  const reference = (partial: Partial<Parameters<typeof referenceEndedPending>[0]> = {}) => ({ ownProof: true, launcherProof: false, referenceEnding: true, symptom: true, escapeEvidence: false, cacheExists: true, ...partial });
+  const ending = (partial: Partial<ExitReading>): boolean => exitKind({ vanished: false, startChanged: false, state: "S", threads: 1, cmdline: "gateway", exe: "readable", ...partial }) !== "alive";
+
+  it.each([
+    ["T-ref: all four conditions hold", reference(), true],
+    ["T-ref: no own proof (first tick)", reference({ ownProof: false }), false],
+    ["T-ref: launcher proof only, no own proof", reference({ ownProof: false, launcherProof: true }), false],
+    ["T-ref: reference alive (S with a command line, not ending)", reference({ referenceEnding: ending({}) }), false],
+    ["T-ref: reference alive but non-dumpable (command line readable, exe denied)", reference({ referenceEnding: ending({ exe: "denied" }) }), false],
+    ["T-ref: reference a zombie leader whose threads still show (Zn) is ending, so the record is pending", reference({ referenceEnding: ending({ state: "Z", threads: 3, cmdline: "", exe: "gone" }) }), true],
+    ["T-ref: reference ended (Z1) is ending", reference({ referenceEnding: ending({ state: "Z", threads: 1, cmdline: "", exe: "gone" }) }), true],
+    ["T-ref: reference vanished is ending", reference({ referenceEnding: ending({ vanished: true }) }), true],
+    ["T-ref: no reference symptom (live readable reference, complete chain)", reference({ symptom: referenceSymptom("live", "complete") }), false],
+    ["T-ref-escape: the runtime's pid link equals the reference's", reference({ escapeEvidence: true }), false],
+    ["T-ref: no cache for the reference identity", reference({ cacheExists: false }), false],
+  ])("%s", (_name, given, expected) => {
+    expect(referenceEndedPending(given)).toBe(expected);
+  });
+
+  it.each([
+    ["live and complete: no symptom", "live", "complete", false],
+    ["cached reference: symptom", "cached", "complete", true],
+    ["missing reference: symptom", "missing", "complete", true],
+    ["broken chain: symptom", "live", "broken", true],
+  ] as const)("reference symptom: %s", (_name, source, chain, expected) => {
+    expect(referenceSymptom(source, chain)).toBe(expected);
+  });
+
+  it.each([
+    ["both confirmed within the bound clears", { elapsedMs: 100, exitConfirmed: true, referenceEnded: true, final: false }, "cleared"],
+    ["no exit yet inside the bound waits", { elapsedMs: 100, exitConfirmed: false, referenceEnded: true, final: false }, "waiting"],
+    ["the runtime's exit confirmed but the reference still Zn inside the bound waits", { elapsedMs: 100, exitConfirmed: true, referenceEnded: false, final: false }, "waiting"],
+    ["the runtime's exit confirmed and the reference still Zn at the bound expires on the reference", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: true, referenceEnded: false, final: false }, "expired-reference"],
+    ["the runtime's exit confirmed and the reference still Zn at stop() expires on the reference", { elapsedMs: 100, exitConfirmed: true, referenceEnded: false, final: true }, "expired-reference"],
+    ["no exit at the bound expires", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: false, referenceEnded: true, final: false }, "expired"],
+    ["an exit seen only after the bound does not clear", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: true, referenceEnded: true, final: false }, "expired"],
+    ["no exit at stop() expires", { elapsedMs: 100, exitConfirmed: false, referenceEnded: true, final: true }, "expired"],
+    ["neither confirmed at the bound expires", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: false, referenceEnded: false, final: false }, "expired"],
+  ] as const)("pending: %s", (_name, given, expected) => {
+    expect(resolvePending(given)).toBe(expected);
+  });
+
+
+  const runtimeRow = (partial: Partial<Parameters<typeof runtimeEndingPending>[0]> = {}) => ({ ownProof: true, zombieLeader: true, ownUnreadable: true, escapeEvidence: false, ...partial });
+  const zombieLeader = (partial: Partial<ExitReading>): boolean => runtimeLeaderExited({ vanished: false, startChanged: false, state: "S", threads: 1, cmdline: "claude", exe: "readable", ...partial });
+
+  it.each([
+    ["T-rt: a zombie leader that still counts threads, own proof, own link unreadable, no escape evidence", runtimeRow(), true],
+    ["T-rt: no own proof (first tick)", runtimeRow({ ownProof: false }), false],
+    ["T-rt-escape: the runtime's pid, user or mount link equals the reference's", runtimeRow({ escapeEvidence: true }), false],
+    ["T-rt: no runtime-side symptom (all own links readable)", runtimeRow({ ownUnreadable: false }), false],
+    ["T-rt: sleeping with its command line (T-live: alive stays flagged)", runtimeRow({ zombieLeader: zombieLeader({ state: "S" }) }), false],
+    ["T-rt: running with its command line (T-live: alive stays flagged)", runtimeRow({ zombieLeader: zombieLeader({ state: "R" }) }), false],
+    ["T-rt: a zombie with one thread is a confirmed exit, cleared by the own route, not pending", runtimeRow({ zombieLeader: zombieLeader({ state: "Z", threads: 1, cmdline: "", exe: "gone" }) }), false],
+    ["T-rt: a zombie with several threads is the leader-first shape", runtimeRow({ zombieLeader: zombieLeader({ state: "Z", threads: 4, cmdline: "", exe: "gone" }) }), true],
+    ["T-rt: vanished is a confirmed exit, not pending", runtimeRow({ zombieLeader: zombieLeader({ vanished: true }) }), false],
+  ])("%s", (_name, given, expected) => {
+    expect(runtimeEndingPending(given)).toBe(expected);
+  });
+
+  it.each([
+    ["the last thread ended inside the bound clears", { elapsedMs: 100, exitConfirmed: true, final: false }, "cleared"],
+    ["still Zn inside the bound waits", { elapsedMs: 100, exitConfirmed: false, final: false }, "waiting"],
+    ["still Zn at the bound expires", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: false, final: false }, "expired"],
+    ["still Zn at stop() expires", { elapsedMs: 100, exitConfirmed: false, final: true }, "expired"],
+  ] as const)("runtime-ending resolution: %s", (_name, given, expected) => {
+    expect(resolvePending({ ...given, referenceEnded: true })).toBe(expected);
+  });
+
+  it("exit kinds name how a process looked on the re-read", () => {
+    const base: ExitReading = { vanished: false, startChanged: false, state: "S", threads: 1, cmdline: "x", exe: "readable" };
+    expect(exitKind(base)).toBe("alive");
+    expect(exitKind({ ...base, vanished: true })).toBe("vanished");
+    expect(exitKind({ ...base, startChanged: true })).toBe("start-changed");
+    expect(exitKind({ ...base, state: "X" })).toBe("X");
+    expect(exitKind({ ...base, state: "Z" })).toBe("Z1");
+    expect(exitKind({ ...base, state: "Z", threads: 2 })).toBe("Zn");
+    expect(exitKind({ ...base, cmdline: "", exe: "gone" })).toBe("empty-gone");
+  });
+});
+
+/**
+ * The reference resolver (MVP-8090 rev 3) over a fake `/proc`: the cache of the reference's namespace links per identity,
+ * live-first comparison and the start-time bracket. The fake stands in for a reference that no unprivileged real process can
+ * be made to leave at a chosen moment; R0 and R1 run the same tracker against real processes.
+ */
+describe("process sampler reference resolver", () => {
+  const LINKS = { pid: "pid:[1]", user: "user:[2]", mnt: "mnt:[3]" };
+  function fake(initial: { startTicks?: string; state?: string; cmdline?: string; links?: Partial<Record<"pid" | "user" | "mnt", string | null>> } = {}) {
+    const proc = { startTicks: initial.startTicks ?? "100", state: initial.state ?? "S", cmdline: initial.cmdline ?? "gateway", links: { ...LINKS, ...initial.links } as Record<"pid" | "user" | "mnt", string | null>, gone: false, changeStartAfterInfoCalls: Infinity, infoCalls: 0 };
+    const io: ReferenceIo = {
+      info: () => {
+        proc.infoCalls += 1;
+        return proc.gone ? null : { startTicks: proc.infoCalls > proc.changeStartAfterInfoCalls ? "999" : proc.startTicks, state: proc.state, cmdline: proc.cmdline };
+      },
+      link: (_pid, kind) => (proc.gone ? null : proc.links[kind]),
+    };
+    return { proc, io };
+  }
+
+  it("a readable live link equal to the cache is used live, and nothing changed", () => {
+    const { io } = fake();
+    const tracker = createReferenceTracker(io);
+    const reference = tracker.begin(10);
+    expect(reference.hasCache).toBe(true);
+    expect(reference.link("mnt")).toEqual({ value: LINKS.mnt, source: "live" });
+    expect(tracker.changed()).toBe(0);
+  });
+
+  it("an unreadable live link falls back to the cache taken while the reference was healthy", () => {
+    const { proc, io } = fake();
+    const tracker = createReferenceTracker(io);
+    tracker.begin(10);
+    proc.links.mnt = null;
+    proc.state = "Z";
+    expect(tracker.begin(10).link("mnt")).toEqual({ value: LINKS.mnt, source: "cached" });
+    expect(tracker.begin(10).link("pid")).toEqual({ value: LINKS.pid, source: "live" });
+  });
+
+  it("without a cache an unreadable link stays unreadable", () => {
+    const { io } = fake({ state: "Z", links: { mnt: null } });
+    const tracker = createReferenceTracker(io);
+    const reference = tracker.begin(10);
+    expect(reference.hasCache).toBe(false);
+    expect(reference.link("mnt")).toEqual({ value: null, source: "missing" });
+  });
+
+  it("a readable live link that differs from the cache is counted and the live value is returned", () => {
+    const { proc, io } = fake();
+    const tracker = createReferenceTracker(io);
+    tracker.begin(10);
+    proc.links.mnt = "mnt:[99]";
+    expect(tracker.begin(10).link("mnt")).toEqual({ value: "mnt:[99]", source: "live" });
+    expect(tracker.changed()).toBe(1);
+  });
+
+  it("a new identity (another start time) gets no cache from the old one, and the old cache is not used for it", () => {
+    const { proc, io } = fake();
+    const tracker = createReferenceTracker(io);
+    tracker.begin(10);
+    proc.startTicks = "200";
+    proc.state = "Z";
+    proc.links.mnt = null;
+    const reference = tracker.begin(10);
+    expect(reference.hasCache).toBe(false);
+    expect(reference.link("mnt")).toEqual({ value: null, source: "missing" });
+  });
+
+  it.each([
+    ["a zombie", { state: "Z" }],
+    ["a dead process (X)", { state: "X" }],
+    ["an empty command line", { cmdline: "" }],
+  ])("no cache is captured while the reference is ending: %s", (_name, partial) => {
+    const { io } = fake(partial);
+    expect(createReferenceTracker(io).begin(10).hasCache).toBe(false);
+  });
+
+  it("no cache is captured when a link cannot be read, or when the start time changes during the capture", () => {
+    expect(createReferenceTracker(fake({ links: { user: null } }).io).begin(10).hasCache).toBe(false);
+    const { proc, io } = fake();
+    proc.changeStartAfterInfoCalls = 1;
+    expect(createReferenceTracker(io).begin(10).hasCache).toBe(false);
+  });
+
+  it("a live link read across a start-time change is not used", () => {
+    const { proc, io } = fake();
+    const tracker = createReferenceTracker(io);
+    const reference = tracker.begin(10);
+    proc.changeStartAfterInfoCalls = proc.infoCalls;
+    expect(reference.link("mnt")).toEqual({ value: LINKS.mnt, source: "cached" });
+  });
+
+  it("an unreadable reference has no identity, no cache and reads nothing", () => {
+    const { proc, io } = fake();
+    proc.gone = true;
+    const reference = createReferenceTracker(io).begin(10);
+    expect(reference.id).toBeNull();
+    expect(reference.link("pid")).toEqual({ value: null, source: "missing" });
+  });
+
+  it("the runtime's own side is never cached: a link that was readable once and is gone now is unreadable", async () => {
+    const { io } = fake();
+    const reference = createReferenceTracker(io).begin(10);
+    const child = spawn("sleep", ["5"], { stdio: "ignore" });
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    expect(sameNamespace(child.pid!, reference, "pid").result, "precondition not reached: the child's link was not readable").not.toBe("unreadable");
+    child.kill("SIGKILL");
+    await exited;
+    expect(sameNamespace(child.pid!, reference, "pid")).toMatchObject({ result: "unreadable", ownUnreadable: true });
+  });
+});
+
+/** Row attribution (MVP-8090 rev 3): every summary line names its row by an id derived from the test's file and full name. */
+describe("process sampler row attribution", () => {
+  const FILE = "src/tests/example.test.ts";
+
+  it("the id is the plain leading token of the last segment plus a hash of file and full name; any other leading text gives the prefix t", () => {
+    expect(deriveRowId(`/work/tree/${FILE}`, "d > E1: a runtime")).toMatch(/^E1-[0-9a-f]{10}$/);
+    expect(deriveRowId(FILE, "d > control G1: a runtime")).toMatch(/^t-[0-9a-f]{10}$/);
+    expect(deriveRowId(FILE, `d > ${"x".repeat(60)}: long`)).toMatch(/^t-[0-9a-f]{10}$/);
+    expect(deriveRowId(FILE, "d > IF.detached-kill: SIGKILL of the gateway")).toMatch(/^IF\.detached-kill-[0-9a-f]{10}$/);
+  });
+
+  it("two names with the same prefix get different ids, and the same name in another file does too", () => {
+    expect(deriveRowId(FILE, "control: first")).not.toBe(deriveRowId(FILE, "control: second"));
+    expect(deriveRowId(FILE, "d > E1: same")).not.toBe(deriveRowId("src/tests/other.test.ts", "d > E1: same"));
+    expect(deriveRowId(`/a/${FILE}`, "d > E1: same")).toBe(deriveRowId(`/b/${FILE}`, "d > E1: same"));
+  });
+
+  it("the running test reads its own id through the global state, with the real describe nesting", () => {
+    const state = (globalThis as Record<symbol, { getState: () => { testPath: string } }>)[Symbol.for("expect-global")].getState();
+    expect(currentRowId()).toBe(deriveRowId(state.testPath, "process sampler row attribution > the running test reads its own id through the global state, with the real describe nesting"));
+  });
+
+  it("a window's summary line carries the row id of the test that started it and the number of flagged records", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "cli.js"], { stdio: "ignore" });
+    const sampler = startProcessSampler(() => process.pid, []);
+    const deadline = Date.now() + 10_000;
+    while (sampler.peek().runtimesSeen === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    try {
+      sampler.stop({});
+    } finally {
+      spy.mockRestore();
+      child.kill("SIGKILL");
+    }
+    const summary = lines.join("").split("\n").filter((line) => line.startsWith("SECURITY-PROCESS-SUMMARY"));
+    expect(summary, "precondition not reached: the runtime stand-in was not recorded").toHaveLength(1);
+    expect(summary[0]).toContain(`row=${currentRowId()} flagged=1`);
+  });
+
+  it("a row id that matches a run marker is withheld", async () => {
+    const sampler = startProcessSampler(() => process.pid, []);
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "cli.js"], { stdio: "ignore" });
+    const deadline = Date.now() + 10_000;
+    while (sampler.peek().runtimesSeen === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    try {
+      sampler.stop({ synthetic: currentRowId() });
+    } finally {
+      spy.mockRestore();
+      child.kill("SIGKILL");
+    }
+    expect(lines.join("")).toContain("row=withheld");
+    expect(lines.join("").includes(currentRowId())).toBe(false);
   });
 });

@@ -128,7 +128,7 @@ async function rig(options: RigOptions): Promise<Rig> {
   const api = await startFakeAnthropicApi({
     toolName: "unused-8106",
     exactTool: options.scripts,
-    ...(options.beforeAnswer ? { beforeAnswer: (info) => options.beforeAnswer!(info, () => self!) } : {}),
+    ...(options.beforeAnswer ? { beforeScriptedAnswer: (info) => options.beforeAnswer!(info, () => self!) } : {}),
   });
   cleanups.push(() => api.close());
   const gateway = await spawnGateway(cleanups, {

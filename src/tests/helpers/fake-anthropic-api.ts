@@ -203,7 +203,13 @@ export async function startFakeAnthropicApi(options: {
    * `resultsAfterLatestPrompt` how many tool results followed its latest prompt, so a test can hold the "model" between
    * two turns of a run and change the world meanwhile.
    */
-  beforeAnswer?: (info: { prompt: string; resultsAfterLatestPrompt: number }) => Promise<void> | void;
+  beforeScriptedAnswer?: (info: { prompt: string; resultsAfterLatestPrompt: number }) => Promise<void> | void;
+  /**
+   * Called with every request after it is recorded and before the answer is computed; the answer waits for it, so a test can
+   * change host state between a tool result and the next scripted call (MVP-8107). A throw answers HTTP 500. Absent: the answer
+   * is computed in the same tick, as before.
+   */
+  beforeAnswer?: (request: RecordedMessagesRequest) => void | Promise<void>;
 }): Promise<FakeAnthropicApi> {
   const mode = options.mode ?? "normal";
   const exactTools: ExactToolScript[] = options.exactTool === undefined ? [] : Array.isArray(options.exactTool) ? options.exactTool : [options.exactTool];
@@ -295,6 +301,15 @@ export async function startFakeAnthropicApi(options: {
         body: bodyText,
       };
       requests.push(record);
+      if (options.beforeAnswer) {
+        try {
+          await options.beforeAnswer(record);
+        } catch {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "beforeAnswer hook failed" } }));
+          return;
+        }
+      }
       const latestText = userTexts.at(-1) ?? "";
       const exact = exactTools.find((script) => latestText.includes(script.prompt));
       const main = exactTools.length > 0 ? exact !== undefined && !warmup : tools.length > 0 && !warmup;
@@ -321,7 +336,7 @@ export async function startFakeAnthropicApi(options: {
       if (mode === "hang-after-tool" && tools.length > 0 && toolResults.length > 0) return;
       if (mode === "hang" && tools.length > 0) return;
 
-      if (exact && main && options.beforeAnswer) await options.beforeAnswer({ prompt: exact.prompt, resultsAfterLatestPrompt });
+      if (exact && main && options.beforeScriptedAnswer) await options.beforeScriptedAnswer({ prompt: exact.prompt, resultsAfterLatestPrompt });
 
       const target = tools.find((name) => name.endsWith(`__${options.toolName}`));
       type Block = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } | { type: "text"; text: string };
