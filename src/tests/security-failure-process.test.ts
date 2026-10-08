@@ -802,7 +802,12 @@ function refusalProblems(rig: SecurityRig, observed: RefusalObservation): { prob
   const v = rig.markers.values;
   const { user, shared, countersBefore, withUser, withShared } = observed;
   const toolCallRequests = (stub: OAuthStub) => stub.requests.filter((request) => request.rpcMethods.includes("tools/call"));
-  const problems = [...turnProblems(withUser.turn), ...turnProblems(withShared.turn), ...fallbackProblems(rig, withUser.window, { runtimes: "some", modelRequests: "some" })];
+  const problems = [
+    ...turnProblems(withUser.turn),
+    ...turnProblems(withShared.turn),
+    ...fallbackProblems(rig, withUser.window, { runtimes: "some", modelRequests: "some" }),
+    ...fallbackProblems(rig, withShared.window, { runtimes: "some", modelRequests: "some" }),
+  ];
   const controls: string[] = [];
   const userText = `TOOL_AUTH_UNAVAILABLE: "refuseduser" did not accept the user's credential. Ask the user to reconnect their account; retrying will not help.`;
   const sharedText = `TOOL_AUTH_UNAVAILABLE: "refusedshared" did not accept the gateway's credential. Ask your gateway administrator to check this tool's credential; retrying will not help.`;
@@ -856,7 +861,7 @@ describe("trusted mediation failures", () => {
     if (omitted.result?.isError && omitted.result.text.includes("No such tool available") && /mcp\.server\.omitted serverName=needsuser reason=missing_user_credential/.test(rig.log())) controls.push("required_credential_server_left_out_and_call_refused");
     else problems.push("the server that requires the user's credential was not left out of the run");
     if (upstream.toolCalls.length !== callsBefore) problems.push("a tools/call reached the upstream through the omitted server");
-    problems.push(...turnProblems(omitted.turn));
+    problems.push(...turnProblems(omitted.turn), ...fallbackProblems(rig, omitted.window, { runtimes: "some", modelRequests: "some" }));
     finishRow(recorder, rig, { id: "IF.cred-missing", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS, surfaces: surfacesOf(rig, [turn, omitted.turn]), controls, problems, floors: { "tool-results": 50 } });
   });
 
