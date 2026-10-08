@@ -566,6 +566,12 @@ describe("process sampler launcher exemption", () => {
   const stoppedPids: number[] = [];
   /** Processes a row recorded to be killed at the end, besides the descendants of its children (the reference's whole thread group). */
   const recordedPids: number[] = [];
+  /**
+   * The runtime, its bwrap processes and the holder of a reference-end control, with their start times. The control kills the
+   * reference, so the holder is reparented to the user's init and `--die-with-parent` only ties bwrap to the holder: nothing
+   * would end the idle stand-in. `afterEach` ends each recorded tree, but only a process whose start time still matches.
+   */
+  const reapRoots: { pid: number; startTicks: string }[] = [];
   afterEach(() => {
     // A holder the exit seam stopped is continued first, then every recorded process and every process of the fixture is killed.
     for (const pid of recordedPids.splice(0)) {
@@ -581,6 +587,16 @@ describe("process sampler launcher exemption", () => {
         process.kill(pid, "SIGCONT");
       } catch {
         // Already gone.
+      }
+    }
+    for (const root of reapRoots.splice(0)) {
+      if (root.startTicks === "" || startOf(root.pid) !== root.startTicks) continue;
+      for (const pid of [...descendants(root.pid), root.pid]) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
       }
     }
     for (const child of children.splice(0)) {
@@ -986,6 +1002,15 @@ describe("process sampler launcher exemption", () => {
     holder?: number;
   }
   const ppidOf = (pid: number): number => statOf(pid)?.ppid ?? 0;
+  /** Records the processes from `runtime` up to `holder` (the bwrap processes between them included) for `afterEach` to end. */
+  const recordTree = (runtime: number, holder: number): void => {
+    const seen = new Set<number>();
+    for (let pid = runtime; pid > 1 && !seen.has(pid); pid = ppidOf(pid)) {
+      seen.add(pid);
+      reapRoots.push({ pid, startTicks: startOf(pid) ?? "" });
+      if (pid === holder) break;
+    }
+  };
   const startOf = (pid: number): string | null => {
     try {
       const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -1035,6 +1060,7 @@ describe("process sampler launcher exemption", () => {
       let holder = pid;
       for (let hop = 0; hop < options.holderHops; hop++) holder = ppidOf(holder);
       state.holder = holder;
+      recordTree(pid, holder);
       const victim = ppidOf(holder);
       const prepared = options.before?.() ?? true;
       process.kill(victim, "SIGKILL");
@@ -1217,6 +1243,7 @@ describe("process sampler launcher exemption", () => {
       let holder = pid;
       for (let hop = 0; hop < 3; hop++) holder = ppidOf(holder);
       state.holder = holder;
+      recordTree(pid, holder);
       const middle = ppidOf(holder);
       const reference = ppidOf(middle);
       state.reference = reference;
