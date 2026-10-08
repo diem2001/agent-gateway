@@ -26,6 +26,9 @@ let capturedOptions: Record<string, unknown>[] = [];
 let sdkServers: { name: string; tools: SdkTool[] }[] = [];
 let tempDir: string;
 let logs: string[];
+/** The options of every SandboxRun and the arguments of every materializeUserSkills call of the run under test (MVP-8106). */
+let sandboxOptions: Record<string, unknown>[] = [];
+let skillCalls: { userId: unknown; options: unknown }[] = [];
 
 const INIT = { type: "system", subtype: "init", claude_code_version: "2.0.77", skills: [] };
 const RESULT = { type: "result", subtype: "success", is_error: false, result: "fine", session_id: "sdk-s", usage: { input_tokens: 1, output_tokens: 1 }, total_cost_usd: 0 };
@@ -54,6 +57,8 @@ beforeEach(() => {
   capturedOptions = [];
   sdkServers = [];
   logs = [];
+  sandboxOptions = [];
+  skillCalls = [];
   vi.spyOn(console, "log").mockImplementation((...args) => {
     logs.push(args.map(String).join(" "));
   });
@@ -68,6 +73,29 @@ beforeEach(() => {
       }
     },
   }));
+  // Recording wrappers around the real sandbox run and skill bundle: they only observe what agent.ts hands over.
+  vi.doMock("../sandbox.js", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("../sandbox.js")>();
+    return {
+      ...actual,
+      SandboxRun: class extends actual.SandboxRun {
+        constructor(options: ConstructorParameters<typeof actual.SandboxRun>[0]) {
+          super(options);
+          sandboxOptions.push(options as unknown as Record<string, unknown>);
+        }
+      },
+    };
+  });
+  vi.doMock("../user-skills.js", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("../user-skills.js")>();
+    return {
+      ...actual,
+      materializeUserSkills: (userId: string | undefined, options?: Parameters<typeof actual.materializeUserSkills>[1]) => {
+        skillCalls.push({ userId, options });
+        return actual.materializeUserSkills(userId, options);
+      },
+    };
+  });
   vi.doMock("@anthropic-ai/claude-agent-sdk", () => ({
     query: vi.fn(({ options }) => {
       capturedOptions.push(options as Record<string, unknown>);
@@ -83,6 +111,8 @@ afterEach(async () => {
   const { credentialRelay } = await import("../mcp-credential-relay.js");
   await credentialRelay.close();
   vi.doUnmock("@anthropic-ai/claude-agent-sdk");
+  vi.doUnmock("../sandbox.js");
+  vi.doUnmock("../user-skills.js");
   vi.doUnmock("@modelcontextprotocol/sdk/server/mcp.js");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -485,5 +515,94 @@ describe("the event cache is keyed by label and query id", () => {
     const stranger = await replay("someone-else");
     expect(stranger.status).toBe(404);
     expect(stranger.body).toEqual({ error: "Query not found or expired" });
+  });
+});
+
+describe("command settings of skill and agent files follow the same Bash grant as the request-server gate (MVP-8106)", () => {
+  const neutralized = () => sandboxOptions[0]?.neutralizeCommands;
+  const commandServerAttached = () => Object.keys((capturedOptions[0].mcpServers as object | undefined) ?? {}).includes("runner");
+
+  async function run(policy: unknown, body: Record<string, unknown> = {}, label = "reqlift") {
+    sandboxOptions = [];
+    skillCalls = [];
+    capturedOptions = [];
+    vi.resetModules();
+    const app = await createApp(policy);
+    await post(app, { mcpServers: { runner: { command: "node", args: [] } }, ...body }, label);
+  }
+
+  it("a policy that denies Bash for the label: the run is told to neutralize, with the label, and the per-user bundle is asked for the same", async () => {
+    await run({ labels: { reqlift: { deny: ["Bash"] } } });
+    expect(sandboxOptions).toHaveLength(1);
+    expect(neutralized()).toBe(true);
+    expect(sandboxOptions[0].label).toBe("reqlift");
+    expect(skillCalls).toEqual([{ userId: "user-1", options: { neutralizeCommands: true, label: "reqlift" } }]);
+  });
+
+  it("no policy, or a policy that leaves Bash granted: nothing is neutralized, in the sandbox run and in the bundle", async () => {
+    for (const policy of [undefined, { labels: { reqlift: { deny: ["Write"] } } }, { labels: { reqlift: { allow: ["Bash", "Read"] } } }, { default: { deny: ["Write"] } }]) {
+      await run(policy);
+      expect(neutralized(), JSON.stringify(policy)).toBe(false);
+      expect(skillCalls, JSON.stringify(policy)).toEqual([{ userId: "user-1", options: { neutralizeCommands: false, label: "reqlift" } }]);
+    }
+  });
+
+  it("an allow list without Bash neutralizes; so does a default entry that denies Bash, for a label that has no entry of its own", async () => {
+    await run({ labels: { reqlift: { allow: ["Read", "Grep"] } } });
+    expect(neutralized()).toBe(true);
+    await run({ default: { deny: ["Bash"] } }, {}, "diemcrm");
+    expect(neutralized()).toBe(true);
+  });
+
+  it("another label that the policy leaves alone is not neutralized, whatever a different label is denied", async () => {
+    await run({ labels: { reqlift: { deny: ["Bash"] } } }, {}, "diemcrm");
+    expect(neutralized()).toBe(false);
+    expect(sandboxOptions[0].label).toBe("diemcrm");
+  });
+
+  it("the caller's own narrowing never decides it, in either direction", async () => {
+    await run(undefined, { allowedTools: ["Read"] });
+    expect(neutralized()).toBe(false);
+    await run({ labels: { reqlift: { deny: ["Bash"] } } }, { allowedTools: ["Bash", "Read"] });
+    expect(neutralized()).toBe(true);
+    await run(undefined, { enforcedTools: ["Read"] });
+    expect(neutralized()).toBe(false);
+    await run({ labels: { reqlift: { deny: ["Bash"] } } }, { enforcedTools: ["Read"] });
+    expect(neutralized()).toBe(true);
+  });
+
+  it("an enforced run still asks for no per-user bundle at all", async () => {
+    await run({ labels: { reqlift: { deny: ["Bash"] } } }, { enforcedTools: ["Read"] });
+    expect(skillCalls).toEqual([{ userId: undefined, options: undefined }]);
+  });
+
+  it("the request-server command gate is pinned: no policy attaches, deny Bash omits, an allow list without Bash omits, a policy that names the server attaches", async () => {
+    const rows: [string, unknown, boolean][] = [
+      ["no policy", undefined, true],
+      ["deny Bash", { labels: { reqlift: { deny: ["Bash"] } } }, false],
+      ["allow without Bash", { labels: { reqlift: { allow: ["Read"] } } }, false],
+      ["allow naming the server", { labels: { reqlift: { allow: ["Read", "mcp__runner__*"] } } }, true],
+    ];
+    for (const [row, policy, attached] of rows) {
+      await run(policy);
+      expect(commandServerAttached(), row).toBe(attached);
+    }
+  });
+
+  it("both gates read the same Bash grant: a command server is left out exactly when the run is neutralized, except where the policy names that server (an exception of the request-server gate only)", async () => {
+    const rows: [string, unknown][] = [
+      ["no policy", undefined],
+      ["deny Write", { labels: { reqlift: { deny: ["Write"] } } }],
+      ["deny Bash", { labels: { reqlift: { deny: ["Bash"] } } }],
+      ["allow without Bash", { labels: { reqlift: { allow: ["Read"] } } }],
+      ["allow with Bash and the server", { labels: { reqlift: { allow: ["Read", "Bash", "mcp__runner__*"] } } }],
+    ];
+    for (const [row, policy] of rows) {
+      await run(policy);
+      expect(commandServerAttached(), row).toBe(neutralized() === false);
+    }
+    await run({ labels: { reqlift: { allow: ["Read", "mcp__runner__*"] } } });
+    expect(commandServerAttached()).toBe(true);
+    expect(neutralized()).toBe(true);
   });
 });

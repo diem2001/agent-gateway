@@ -1,4 +1,4 @@
-import { describe, it, beforeEach, afterEach } from "vitest";
+import { describe, it, beforeEach, afterEach, vi } from "vitest";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -89,5 +89,88 @@ describe("materializeUserSkills (Gate B bundle + Gate C caps)", () => {
     if (res.pluginRoot) roots.push(res.pluginRoot);
     assert.deepEqual(res.dropped, ["b/SKILL.md"]);
     assert.equal(res.reason, "size_cap");
+  });
+});
+
+describe("materializeUserSkills for a run without Bash (MVP-8106)", () => {
+  const roots: string[] = [];
+  const HOOKED = "---\nname: probe\ndescription: d\nhooks:\n  Stop:\n    - hooks:\n        - type: command\n          command: touch /work/m-USERHOOK\n---\nUSER-INSTRUCTION\n";
+  const NEUTRAL = '---\nname: "probe"\ndescription: "d"\n---\nUSER-INSTRUCTION\n';
+  let logs: string[] = [];
+
+  beforeEach(() => {
+    fs.rmSync(path.join(TEST_WORKSPACE, "users"), { recursive: true, force: true });
+    delete process.env.USER_SKILLS_MAX_COUNT;
+    delete process.env.USER_SKILLS_MAX_BYTES;
+    logs = [];
+    vi.spyOn(console, "log").mockImplementation((...args) => {
+      logs.push(args.map(String).join(" "));
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const r of roots) cleanupUserSkillBundle(r);
+    roots.length = 0;
+  });
+
+  const skillOf = (root: string | null): string => {
+    assert.ok(root, "expected a plugin root");
+    roots.push(root!);
+    const slugs = fs.readdirSync(path.join(root!, "skills"));
+    return fs.readFileSync(path.join(root!, "skills", slugs[0], "SKILL.md"), "utf-8");
+  };
+
+  it("writes the rewritten text into the bundle and leaves the stored file as it was", () => {
+    writeUserSkill("dave", "probe/SKILL.md", HOOKED);
+    const res = materializeUserSkills("dave", { neutralizeCommands: true, label: "reqlift" });
+    assert.equal(skillOf(res.pluginRoot), NEUTRAL);
+    assert.equal(fs.readFileSync(path.join(getUserSkillsDir("dave")!, "probe", "SKILL.md"), "utf-8"), HOOKED);
+    assert.deepEqual(res.dropped, []);
+  });
+
+  it("copies the text verbatim without the option or with it false", () => {
+    writeUserSkill("erin", "probe/SKILL.md", HOOKED);
+    assert.equal(skillOf(materializeUserSkills("erin").pluginRoot), HOOKED);
+    assert.equal(skillOf(materializeUserSkills("erin", { neutralizeCommands: false }).pluginRoot), HOOKED);
+    assert.ok(!logs.join("\n").includes("command-settings"));
+  });
+
+  it("keeps the caps on the stored bytes, so the same skills are loaded and dropped as without the option", () => {
+    process.env.USER_SKILLS_MAX_COUNT = "2";
+    for (const name of ["a", "b", "c"]) writeUserSkill("frank", `${name}/SKILL.md`, HOOKED);
+    const plain = materializeUserSkills("frank");
+    roots.push(plain.pluginRoot!);
+    const neutral = materializeUserSkills("frank", { neutralizeCommands: true, label: "reqlift" });
+    roots.push(neutral.pluginRoot!);
+    assert.deepEqual(neutral.dropped, plain.dropped);
+    assert.equal(neutral.reason, plain.reason);
+    assert.deepEqual(fs.readdirSync(path.join(neutral.pluginRoot!, "skills")), fs.readdirSync(path.join(plain.pluginRoot!, "skills")));
+    // A skill whose rewrite is shorter than the stored file still counts its stored size against the byte cap.
+    process.env.USER_SKILLS_MAX_COUNT = "50";
+    process.env.USER_SKILLS_MAX_BYTES = String(HOOKED.length + 1);
+    const capped = materializeUserSkills("frank", { neutralizeCommands: true });
+    roots.push(capped.pluginRoot!);
+    assert.equal(capped.reason, "size_cap");
+    assert.equal(capped.dropped.length, 2);
+  });
+
+  it("logs one content-free line per rewritten file: label, source, name and the kind of setting", () => {
+    writeUserSkill("gina", "probe/SKILL.md", HOOKED);
+    writeUserSkill("gina", "clean/SKILL.md", "---\nname: clean\n---\nbody\n");
+    const res = materializeUserSkills("gina", { neutralizeCommands: true, label: "reqlift" });
+    roots.push(res.pluginRoot!);
+    const lines = logs.filter((line) => line.includes("command-settings"));
+    assert.deepEqual(lines, ["[audit] command-settings.ignored label=reqlift source=user-skills name=probe setting=hooks"]);
+    assert.ok(!logs.join("\n").includes("USERHOOK"));
+    assert.ok(!logs.join("\n").includes(TEST_WORKSPACE));
+  });
+
+  it("rewrites a file whose frontmatter cannot be read to an empty gateway block above the original text", () => {
+    const odd = "---\nname: a\nname: b\nhooks: x\n---\nbody\n";
+    writeUserSkill("hank", "odd/SKILL.md", odd);
+    const res = materializeUserSkills("hank", { neutralizeCommands: true, label: "reqlift" });
+    assert.equal(skillOf(res.pluginRoot), `---\n---\n${odd}`);
+    assert.ok(logs.some((line) => line.endsWith("name=odd setting=unparseable")));
   });
 });

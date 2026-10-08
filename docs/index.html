@@ -1675,7 +1675,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <tr><td><code>AGENT_RUN_TIMEOUT_MS</code></td><td><code>7200000</code> (120 min)</td><td>Lower to stop runaway agents sooner, raise for tasks that legitimately run longer. Covers the request including retries and backoff. Ends the request at most about 2 s after the limit even when the runtime does not stop.</td></tr>
       <tr><td><code>MODEL_PROXY_IDLE_TIMEOUT_MS</code></td><td><code>600000</code></td><td>Time a provider request may stay silent before it is cut.</td></tr>
       <tr><td><code>AGENT_MCP_TOOL_TIMEOUT_MS</code></td><td><code>600000</code></td><td>Overall deadline of one mediated MCP <code>tools/call</code> in an agent run (http, SSE, stdio); empty = default. Raise only for tools that legitimately run longer.</td></tr>
-      <tr><td><code>AGENT_TOOL_POLICY</code></td><td>unset</td><td>Tool grant per API-key label (JSON); empty or unset = every label gets the approved default built-in tools (12 tools) and every MCP server. See <a href="#tool-mediation">Tool Mediation</a>.</td></tr>
+      <tr><td><code>AGENT_TOOL_POLICY</code></td><td>unset</td><td>Tool grant per API-key label (JSON); empty or unset = every label gets the approved default built-in tools (12 tools) and every MCP server. A label not granted <code>Bash</code> also loses the command settings of skill and agent files. See <a href="#tool-mediation">Tool Mediation</a>.</td></tr>
       <tr><td><code>AGENT_SANDBOX_ROOT</code></td><td><code>$HOME/.agent-sandbox</code></td><td>Only to move the storage of the conversation homes: an absolute path to a private directory owned by the gateway user; never mounted as a whole.</td></tr>
       <tr><td><code>AGENT_SANDBOX_BWRAP</code></td><td><code>/usr/bin/bwrap</code></td><td>Only if the isolation runtime lives elsewhere.</td></tr>
     </tbody>
@@ -1801,7 +1801,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
     <li>Content planted before the deploy: the global-entry secret scan covers files up to 64 MiB, the <code>$HOME/.ssh</code> private-key lines and webhook URL credentials (MVP-7919), as verbatim copies only (the limits are listed in the sandbox content section). The gateway's own trusted <code>git</code> calls and <code>/v1/auth/login</code> still run with <code>HOME=/home/node</code> and read configuration planted there before the update (<code>~/.gitconfig</code>, repository hooks, <code>core.fsmonitor</code>, <code>~/.tmux.conf</code>); MVP-7679 closed the sandbox-side git reads, the gateway-side ones are owned by MVP-7948 and not fixed. The operator reviews or removes that content before the first deploy.</li>
     <li>Legacy webhook tools without an <code>owner</code> keep today's forwarding until they are registered again.</li>
     <li>A credential-free request MCP server runs inside the agent sandbox and is granted per server only: a grant that names only some of its tools is not enforced on the trusted side.</li>
-    <li>Global agents, skills and commands are trusted content (their frontmatter hooks and agent <code>mcpServers</code> execute commands): an agent cannot write them, but any API-key holder can write global agents and skills through <code>PUT /v1/agents</code> and <code>PUT /v1/skills</code>, and those load in ordinary runs. Reachable by callers, not by agent code; not fixed here.</li>
+    <li>Global agents, skills and commands are trusted content (their frontmatter hooks and agent <code>mcpServers</code> execute commands for a label that is granted <code>Bash</code>): an agent cannot write them, but any API-key holder can write global agents and skills through <code>PUT /v1/agents</code> and <code>PUT /v1/skills</code>, and those load in ordinary runs, so a file saved by one label runs its commands in the runs of every label that holds the <code>Bash</code> grant. A run whose label is not granted <code>Bash</code> ignores those settings (MVP-8106, see <a href="#tool-mediation">Tool Mediation</a>). Reachable by callers, not by agent code.</li>
     <li>A file an agent writes in its home is rebuilt away only at the next start, so a process of the same run (for example a shell the agent starts itself when Bash is granted) can still read it; no trusted step does.</li>
     <li>Conversation homes and work areas are never removed (MVP-7402), there is no size cap on a home or a private <code>/tmp</code>, and <code>pids_limit</code> is shared by all runs: an availability risk, not a credential exposure.</li>
     <li>An ownerless pre-update conversation id stays visible: a refusal versus a fresh conversation reveals that such an id exists.</li>
@@ -1833,6 +1833,15 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
     <li><strong>Built-in tools</strong> are enforced by what the runtime is offered (<code>tools</code> and <code>disallowedTools</code>): a built-in outside the grant is refused by the runtime itself for the main agent, a configured agent, a skill, a sub-agent and a resumed conversation, even under the permission-bypass mode the gateway always uses. The runtime's own text for such a refusal is <code>&lt;tool_use_error&gt;Error: No such tool available: &lt;name&gt;&lt;/tool_use_error&gt;</code> (not changeable).</li>
     <li><strong>Offered but not granted</strong> (a tool of an attached MCP server) is refused at call time with the <code>TOOL_DENIED</code> text, before any upstream request. A server with no granted tool is not attached.</li>
     <li>Credential-free request servers that run inside the agent sandbox are granted per server only; a grant naming only some of their tools is not enforced on the trusted side.</li>
+  </ul>
+
+  <h3 id="command-settings">A <code>Bash</code> denial also covers commands started by skill, agent and command files</h3>
+  <p>The runtime starts commands on its own from the settings at the top of a skill, agent or command file: <code>hooks</code>, and an agent's stdio <code>mcpServers</code> entry with a <code>command</code>. A tool list does not cover them. The key is the policy-only <code>Bash</code> grant of the caller's label (the caller's own narrowing never decides it), the same value as the request-server <code>command</code> gate.</p>
+  <ul>
+    <li><strong>Label not granted <code>Bash</code>:</strong> command settings in skill, agent and command files are ignored for the run. The run sees a copy of the <code>skills</code>, <code>agents</code> and <code>commands</code> directories taken when it starts, in which every markdown file begins with a block the gateway generated. The keys <code>name</code>, <code>description</code>, <code>model</code>, <code>argument-hint</code>, <code>when_to_use</code>, <code>permissionMode</code>, <code>tools</code>, <code>disallowedTools</code>, <code>allowed-tools</code>, <code>skills</code>, <code>user-invocable</code> and <code>disable-model-invocation</code> are kept; <code>hooks</code>, <code>mcpServers</code> and every other key are dropped. Instructions and an agent's own <code>tools</code> list keep working. The per-user skills of the request's <code>user_id</code> are written rewritten the same way. Stored files, operator-owned read-only files, delegated agents and resumed conversations are all covered; the stored files are never modified and saving them stays allowed with the existing reply.</li>
+    <li><strong>Label granted <code>Bash</code>:</strong> the live read-only directories and a verbatim per-user bundle, as before; hooks and stdio startup commands still run inside the isolated executor.</li>
+    <li>One log line per rewritten file and run: <code>command-settings.ignored label=&lt;label&gt; source=&lt;skills|agents|commands|user-skills&gt; name=&lt;name&gt; setting=&lt;hooks|mcpServers|other|unparseable&gt;</code>, never a path, a value or file content.</li>
+    <li><strong>Limits:</strong> a file whose settings block cannot be read (duplicate key, anchor, alias, tag, tab indentation, unterminated block) loses all of its settings, and an agent without a readable <code>name</code> is then not found. A file the gateway cannot copy safely is left out with an audit reason (<code>symlink</code>, <code>wrong_type</code>, <code>not_owned</code>, <code>unreadable</code>, or <code>too_large</code> beyond 2000 files or 64 MiB per directory). A file saved while a run is open is not seen by that run. Enforced runs load no skill or agent file. The global <code>plugins</code> directory is not loaded with the generated settings and is not copied.</li>
   </ul>
 
   <h3>Where credentials go</h3>
@@ -2100,7 +2109,7 @@ curl -s http://localhost:3001/health | jq .isolation</code></pre>
       <div class="vflow-num n-green">4</div>
       <div class="vflow-body">
         <h4 class="c-green">Agent SDK Execution</h4>
-        <p>Runs <code>query()</code> from Claude Agent SDK in the run's sandbox with the granted tools (default: Agent, Bash, Edit, Glob, Grep, NotebookEdit, Read, Skill, TodoWrite, WebFetch, WebSearch, Write, passed to the runtime as an explicit list on every run). Credential-bearing tools go through the trusted relay, bridge or webhook channel, which checks the grant before any upstream request. Streams events via NDJSON as the agent works.</p>
+        <p>Runs <code>query()</code> from Claude Agent SDK in the run's sandbox with the granted tools (default: Agent, Bash, Edit, Glob, Grep, NotebookEdit, Read, Skill, TodoWrite, WebFetch, WebSearch, Write, passed to the runtime as an explicit list on every run). Credential-bearing tools go through the trusted relay, bridge or webhook channel, which checks the grant before any upstream request. A run whose label is not granted <code>Bash</code> ignores the command settings (hooks, stdio startup commands) of skill, agent and command files: it sees a rewritten copy of them taken at the start; a run with the <code>Bash</code> grant still runs them inside the isolated executor. Streams events via NDJSON as the agent works.</p>
       </div>
     </div>
     <div class="vflow-step">
@@ -2137,6 +2146,11 @@ curl -s http://localhost:3001/health | jq .isolation</code></pre>
       <div class="seq-from sf-blue">Sessions</div>
       <div class="seq-msg"><div class="seq-line"></div><span class="seq-label">resolve/create</span><div class="seq-arrow">→</div></div>
       <div class="seq-to sf-green">Agent SDK</div>
+    </div>
+    <div class="seq-row">
+      <div class="seq-from sf-green">Agent SDK</div>
+      <div class="seq-msg"><div class="seq-line green"></div><span class="seq-label">run start, no Bash grant: skills, agents, commands copied without hooks and mcpServers commands (Bash granted: live files, commands run in the isolated executor)</span><div class="seq-arrow">→</div></div>
+      <div class="seq-to sf-slate">System</div>
     </div>
     <div class="seq-row">
       <div class="seq-from sf-green">Agent SDK</div>

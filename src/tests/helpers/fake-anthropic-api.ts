@@ -199,6 +199,12 @@ export async function startFakeAnthropicApi(options: {
   /** The address to listen on and to put in `baseUrl` (default 127.0.0.1; the Docker integration probe uses a bridge address). */
   host?: string;
   /**
+   * Awaited before a scripted main request is answered (MVP-8106): `prompt` is the script that matched and
+   * `resultsAfterLatestPrompt` how many tool results followed its latest prompt, so a test can hold the "model" between
+   * two turns of a run and change the world meanwhile.
+   */
+  beforeScriptedAnswer?: (info: { prompt: string; resultsAfterLatestPrompt: number }) => Promise<void> | void;
+  /**
    * Called with every request after it is recorded and before the answer is computed; the answer waits for it, so a test can
    * change host state between a tool result and the next scripted call (MVP-8107). A throw answers HTTP 500. Absent: the answer
    * is computed in the same tick, as before.
@@ -329,6 +335,8 @@ export async function startFakeAnthropicApi(options: {
       }
       if (mode === "hang-after-tool" && tools.length > 0 && toolResults.length > 0) return;
       if (mode === "hang" && tools.length > 0) return;
+
+      if (exact && main && options.beforeScriptedAnswer) await options.beforeScriptedAnswer({ prompt: exact.prompt, resultsAfterLatestPrompt });
 
       const target = tools.find((name) => name.endsWith(`__${options.toolName}`));
       type Block = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } | { type: "text"; text: string };
