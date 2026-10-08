@@ -57,6 +57,7 @@ import {
   exeReaderOver,
   isConfirmedExit,
   isReferenceEnding,
+  leaderExitSign,
   procMountHidesProcesses,
   readExitReadingFrom,
   EXIT_PAIRS,
@@ -2452,6 +2453,38 @@ describe("process sampler thread-safe exit: decision table (MVP-8130)", () => {
     throw Object.assign(new Error(code), { code });
   }
 
+  it("T-th2: the reader: a command line read failing with ENOENT after a readable stat is a race (unknown, read again) and the next stat decides vanished, after exactly two readings", () => {
+    let statReads = 0;
+    const given = doubleOf({
+      stat: () => (++statReads === 1 ? statText("Z", 1, "500") : errno("ENOENT")),
+      cmdline: () => errno("ENOENT"),
+      exe: () => "gone",
+    });
+    const { kind, readings } = exitBracket(() => readExitReadingFrom(given.source, 4242, "500"));
+    expect(kind).toBe("vanished");
+    expect(readings.length, "the race reading is read again, it does not decide").toBe(2);
+    expect(readings[0].unknown).toEqual({ file: "cmdline", errno: "ENOENT" });
+    // The same race that persists is unknown, never vanished by itself.
+    const persistent = doubleOf({ stat: () => statText("Z", 1, "500"), cmdline: () => errno("ESRCH"), exe: () => "gone" });
+    expect(exitBracket(() => readExitReadingFrom(persistent.source, 4242, "500")).kind).toBe("unknown");
+  });
+
+  it.each([
+    ["Zn: a zombie leader whose threads still run", READ.Zn, true],
+    ["empty-n: a leader that finished while other threads run", READ.emptyN, true],
+    ["X with a count of 2: the old leader of an exec", READ.X2, true],
+    ["Z with a count of 0: a task being released", READ.Z0, true],
+    ["X with a count of 0", READ.X0, true],
+    ["Z1: a single-thread zombie", READ.Z1, false],
+    ["X with a count of 1", READ.X1, false],
+    ["empty-gone", READ.emptyGone, false],
+    ["alive", READ.alive, false],
+    ["vanished", READ.vanished, false],
+    ["unknown", READ.unknownStat, false],
+  ] as const)("T-th2: the leader-exit signature (it sets the revival flag): %s", (_name, given, expected) => {
+    expect(leaderExitSign(given)).toBe(expected);
+  });
+
   it("T-th2: the thread count comes from the same stat text as the state: stat says Z with 3 threads and status says 1, the reading is Zn and status is never read", () => {
     const given = doubleOf({ stat: () => statText("Z", 3, "500"), cmdline: () => "", exe: () => "gone", status: () => "Name:\tclaude\nThreads:\t1\n" });
     const read = readExitReadingFrom(given.source, 4242, "500");
@@ -2563,6 +2596,11 @@ describe("process sampler thread-safe exit: decision table (MVP-8130)", () => {
     expect(run((pid, file) => (pid === process.pid && file === "stat" ? "EIO" : undefined))).toMatchObject({ kind: "unknown", unknownRead: "stat:EIO", injected: true, ended: false });
     expect(run((pid, file) => (pid === process.pid && file === "cmdline" ? "EMFILE" : undefined))).toMatchObject({ kind: "unknown", unknownRead: "cmdline:EMFILE", injected: true });
     expect(run((pid, file) => (pid === process.pid && file === "exe" ? "EPERM" : undefined))).toMatchObject({ kind: "unknown", unknownRead: "exe:EPERM", injected: true });
+    let statReads = 0;
+    expect(
+      run((pid, file) => (pid === process.pid && file === "stat" ? (++statReads === 2 ? "EIO" : undefined) : undefined)),
+      "a fault on the second full reading only: the decision takes two readings",
+    ).toMatchObject({ kind: "unknown", unknownRead: "stat:EIO", injected: true });
     expect(run(() => "ENOENT"), "ENOENT is refused: a test error, read as unknown").toMatchObject({ kind: "unknown", unknownRead: "stat:SEAM-INVALID", injected: true, ended: false });
     expect(run(() => "ESRCH")).toMatchObject({ kind: "unknown", unknownRead: "stat:SEAM-INVALID" });
     expect(run((_pid, file) => (file === "exe" ? "EACCES" : undefined)), "EACCES on exe would read as denied, which is alive: refused").toMatchObject({ kind: "unknown", unknownRead: "exe:SEAM-INVALID" });
@@ -3088,8 +3126,8 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
       exitReadFault: (pid, file) => (pid === state.pid && state.forced && file === "stat" ? (++statReads === 2 ? "EIO" : undefined) : undefined),
     });
     const { final, summary } = closeWindow(window.sampler);
-    expect(statReads, "precondition not reached: the exit read took two readings").toBeGreaterThanOrEqual(2);
     reportedUnknown(final, recordOf(final, state.runtime), "stat:EIO", summary);
+    expect(statReads, "precondition not reached: the exit read took two readings").toBeGreaterThanOrEqual(2);
   });
 
   it("E2-kind: a runtime that is a zombie at its first reading is cleared by the live real bwrap above it, audited with the confirming kind", async () => {

@@ -1187,12 +1187,15 @@ export function readExitReadingFrom(source: ExitSource, pid: number, startTicks:
   try {
     cmdline = source.cmdline(pid).replace(/\0/g, " ");
   } catch (error) {
-    return unknownReading("cmdline", errnoOf(error), { state, threads });
+    const code = errnoOf(error);
+    return exitReadOutcome("cmdline", code) === "vanished" ? { vanished: true, startChanged: false, state: "", threads: 0, cmdline: "", exe: "gone" } : unknownReading("cmdline", code, { state, threads });
   }
   try {
     return { vanished: false, startChanged: false, state, threads, cmdline, exe: source.exe(pid) };
   } catch (error) {
-    return unknownReading("exe", errnoOf(error), { state, threads, cmdline });
+    const code = errnoOf(error);
+    const outcome = exitReadOutcome("exe", code);
+    return outcome === "gone" || outcome === "denied" ? { vanished: false, startChanged: false, state, threads, cmdline, exe: outcome } : unknownReading("exe", code, { state, threads, cmdline });
   }
 }
 
@@ -1243,6 +1246,15 @@ export function exitBracket(read: () => ExitReading): { kind: ExitKind; readings
   }
 }
 
+/**
+ * Whether one reading shows that a thread-group leader finished while other threads run: `Zn`, `empty-n`, or `X` or `Z` with a count
+ * other than 1 (the old leader of an exec: the exec'ing thread takes over the pid while the old leader is dead).
+ */
+export function leaderExitSign(reading: ExitReading): boolean {
+  const kind = exitKind(reading);
+  return kind === "Zn" || kind === "empty-n" || (!reading.vanished && !reading.startChanged && reading.unknown === undefined && (reading.state === "X" || reading.state === "Z") && reading.threads !== 1);
+}
+
 /** What `endedNow` read: the bracket's decision and what the sampler prints or records about it. */
 export interface ExitNow {
   ended: boolean;
@@ -1267,10 +1279,7 @@ export function endedNow(pid: number, startTicks: string, fault?: ExitReadFault)
     ended: isConfirmedExit(kind),
     kind,
     zombieLeader: kind === "Zn" || kind === "empty-n",
-    leaderExitSeen: readings.some((reading) => {
-      const readKind = exitKind(reading);
-      return readKind === "Zn" || readKind === "empty-n" || (!reading.vanished && !reading.startChanged && reading.unknown === undefined && (reading.state === "X" || reading.state === "Z") && reading.threads !== 1);
-    }),
+    leaderExitSeen: readings.some(leaderExitSign),
     unknownRead: kind === "unknown" && failed !== undefined ? `${failed.file}:${failed.errno}` : undefined,
     injected: note.injected,
   };
