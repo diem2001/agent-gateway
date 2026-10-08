@@ -25,7 +25,7 @@ import os from "node:os";
 import path from "node:path";
 import { createBareRepo, startDumbHttpGitRemote, type DumbHttpGitRemote } from "./dumb-http-git-remote.js";
 import { startFakeAnthropicApi, type ExactToolScript, type FakeAnthropicApi, type RecordedMessagesRequest } from "./fake-anthropic-api.js";
-import { REPO_ROOT, descendants, gatewayRequest, spawnGateway, type Cleanup, type SpawnedGateway } from "./git-process-gateway.js";
+import { GATEWAY_READY_TIMEOUT_MS, REPO_ROOT, descendants, gatewayRequest, spawnGateway, type Cleanup, type SpawnedGateway } from "./git-process-gateway.js";
 import { startOAuthMcpStub, type OAuthMcpStub } from "./oauth-mcp-stub.js";
 import { startSseMcpStub, type SseMcpStub } from "./sse-mcp-stub.js";
 
@@ -2552,7 +2552,7 @@ export function shellQuote(value: string): string {
 }
 
 /** Waits until `/health` reports `isolation: "ok"` (the boot self-check of a new process takes a moment); returns the last state seen. */
-export async function waitForIsolation(rig: SecurityRig, timeoutMs = 20_000): Promise<string> {
+export async function waitForIsolation(rig: SecurityRig, timeoutMs = GATEWAY_READY_TIMEOUT_MS): Promise<string> {
   const end = Date.now() + timeoutMs;
   let state = "unknown";
   for (;;) {

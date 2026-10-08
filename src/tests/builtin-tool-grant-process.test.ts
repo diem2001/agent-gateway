@@ -16,7 +16,7 @@
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
-import net, { type AddressInfo } from "node:net";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
@@ -24,7 +24,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { buildSandboxEnv } from "../sandbox.js";
 import * as toolGrant from "../tool-grant.js";
 import { startFakeAnthropicApi, type ExactToolScript, type FakeAnthropicApi, type RecordedMessagesRequest } from "./helpers/fake-anthropic-api.js";
-import { REPO_ROOT, gatewayRequest, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
+import { REPO_ROOT, gatewayRequest, releaseGatewayPort, reserveGatewayPort, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
 
 vi.setConfig({ testTimeout: 240_000 });
 
@@ -421,13 +421,7 @@ async function startOnly(policy: unknown): Promise<{ code: number | null; output
   const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "mvp8088-start-"));
   cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
   for (const dir of ["home", "tmp", "persist"]) fs.mkdirSync(path.join(root, dir));
-  const port = await new Promise<number>((resolve) => {
-    const probe = net.createServer();
-    probe.listen(0, "127.0.0.1", () => {
-      const { port: free } = probe.address() as AddressInfo;
-      probe.close(() => resolve(free));
-    });
-  });
+  const port = await reserveGatewayPort();
   const child = spawn(process.execPath, [path.join(REPO_ROOT, "dist", "server.js")], {
     cwd: path.join(root, "home"),
     env: {
@@ -450,6 +444,7 @@ async function startOnly(policy: unknown): Promise<{ code: number | null; output
   child.stderr.on("data", (d: Buffer) => (output += d.toString("utf8")));
   cleanups.push(() => {
     if (child.exitCode === null) child.kill("SIGKILL");
+    releaseGatewayPort(port);
   });
   const code = await new Promise<number | null>((resolve) => {
     const timer = setTimeout(() => resolve(null), 20_000);

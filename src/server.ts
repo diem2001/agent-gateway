@@ -246,7 +246,13 @@ app.use(globalErrorHandler);
 const PORT = parseInt(process.env.PORT || "3001", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 
-export const server = app.listen(PORT, HOST, () => {
+export const server = app.listen(PORT, HOST, (error?: Error) => {
+  // Express 5 hands a listen error (a taken port) to this callback; without the exit the gateway would log
+  // "listening" and stay up without serving its port (MVP-8129).
+  if (error) {
+    logAlways("server", `FATAL listen host=${HOST} port=${PORT} code=${(error as NodeJS.ErrnoException).code ?? "unknown"} reason=the listen port could not be opened`);
+    process.exit(1);
+  }
   log("server", `Agent Gateway v${VERSION} listening on ${HOST}:${PORT}`);
   log("server", `Log level: ${getLogLevel()}`);
   log("server", `Sessions: ${getSessionCount()} active`);

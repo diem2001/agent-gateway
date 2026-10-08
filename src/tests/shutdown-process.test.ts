@@ -14,12 +14,13 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
-import net, { type AddressInfo } from "node:net";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { startFakeAnthropicApi, type FakeAnthropicApi } from "./helpers/fake-anthropic-api.js";
+import { releaseGatewayPort, reserveGatewayPort, waitForGatewayReady } from "./helpers/git-process-gateway.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(here, "..", "..");
@@ -28,7 +29,7 @@ const DIST_SERVER = path.join(REPO_ROOT, "dist", "server.js");
 const API_KEY = "proc-gateway-key-7616-stop";
 const IS_ROOT = process.getuid?.() === 0;
 const skipAsRoot = IS_ROOT ? "skipped: tests run as root, permission-based rows need a non-root user" : "";
-const TIMEOUT = { timeout: 40_000 };
+const TIMEOUT = { timeout: 90_000 };
 
 type Area = "sessions" | "tools" | "mcpServers";
 const AREAS: Area[] = ["sessions", "tools", "mcpServers"];
@@ -113,14 +114,6 @@ function fixture(): Fixture {
   return { root, home, dirs, file };
 }
 
-async function freePort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-  const { port } = server.address() as AddressInfo;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return port;
-}
-
 function childPids(pid: number): number[] {
   const result: number[] = [];
   let tasks: string[] = [];
@@ -167,7 +160,7 @@ function reapLater(pids: number[]): void {
 
 async function startGateway(fx: Fixture, extraEnv: Record<string, string> = {}): Promise<Gateway> {
   assertFreshBuild();
-  const port = await freePort();
+  const port = await reserveGatewayPort();
   const childEnv: NodeJS.ProcessEnv = {};
   for (const key of ALLOWED_ENV_KEYS) {
     if (process.env[key] !== undefined) childEnv[key] = process.env[key];
@@ -203,15 +196,10 @@ async function startGateway(fx: Fixture, extraEnv: Record<string, string> = {}):
       child.kill("SIGKILL");
       await exited;
     }
+    releaseGatewayPort(port);
   });
 
-  const started = Date.now();
-  for (;;) {
-    if (child.exitCode !== null) throw new Error(`gateway exited early: ${output}`);
-    if ((await request(port, "GET", "/health").catch(() => null))?.status === 200) break;
-    if (Date.now() - started > 15_000) throw new Error(`gateway not ready: ${output}`);
-    await delay(50);
-  }
+  await waitForGatewayReady({ child, port, output: () => output, env: childEnv });
   return gateway;
 }
 

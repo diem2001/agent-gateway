@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import http, { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import net, { type AddressInfo } from "node:net";
+import { reserveGatewayPort } from "./git-process-gateway.js";
 
 export const MiB = 1024 * 1024;
 
@@ -138,11 +139,7 @@ export async function startUploadStub(handler: StubHandler = answerCreated, host
 
 /** A port that refuses connections (bound, then released). */
 export async function closedPort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-  const { port } = server.address() as AddressInfo;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return port;
+  return reserveGatewayPort();
 }
 
 /* ------------------------------------------------------------------ */

@@ -21,6 +21,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { ANSWER_AFTER_RESET_MS } from "../mcp-upload-relay.js";
+import { releaseGatewayPort, reserveGatewayPort, waitForGatewayReady } from "./helpers/git-process-gateway.js";
 import {
   MiB,
   answerCreated,
@@ -98,14 +99,6 @@ afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()!();
 });
 
-async function freePort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-  const { port } = server.address() as AddressInfo;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return port;
-}
-
 async function stub(handler?: StubHandler): Promise<UploadStub> {
   const created = await startUploadStub(handler);
   cleanups.push(() => created.close());
@@ -145,7 +138,7 @@ function request(
 
 async function spawnGateway(env: Record<string, string>): Promise<SpawnedGateway> {
   assertFreshBuild();
-  const port = await freePort();
+  const port = await reserveGatewayPort();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7564-relay-"));
   const dirs = { home: path.join(root, "home"), tmp: path.join(root, "tmp"), cwd: path.join(root, "cwd"), persist: path.join(root, "persist") };
   for (const dir of Object.values(dirs)) fs.mkdirSync(dir);
@@ -181,23 +174,11 @@ async function spawnGateway(env: Record<string, string>): Promise<SpawnedGateway
       child.kill("SIGKILL");
       await exited;
     }
+    releaseGatewayPort(port);
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  const started = Date.now();
-  for (;;) {
-    if (child.exitCode !== null) throw new Error(`gateway exited early: ${output}`);
-    const healthy = await new Promise<boolean>((resolve) => {
-      const probe = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, (res) => {
-        res.resume();
-        resolve(res.statusCode === 200);
-      });
-      probe.on("error", () => resolve(false));
-    });
-    if (healthy) break;
-    if (Date.now() - started > 15_000) throw new Error(`gateway not ready: ${output}`);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+  await waitForGatewayReady({ child, port, output: () => output, env: childEnv });
   return { child, port, root, output: () => output };
 }
 
@@ -462,7 +443,7 @@ describe("upload relay in a real gateway process", () => {
     }
     expect(upstream.requests.at(-1)!.aborted).toBe(true);
     expect(gateway.output()).toContain("result=timeout");
-  }, 30_000);
+  }, 60_000);
 
   it.each([5 * MiB, 20 * MiB])(
     "an mcp-jira style refusal (answer at once, read at most 1 MiB, then close) reaches a fast %i-byte sender verbatim",
@@ -606,7 +587,7 @@ describe("upload relay in a real gateway process", () => {
     expect(gateway.child.exitCode).toBeNull();
     expect((await request(gateway.port, "GET", "/health")).status).toBe(200);
     expect(gateway.output()).toMatch(/mcp\.upload\.relayed serverName=jira status=502 bytes=\d+ result=upstream_failed/);
-  }, 20_000);
+  }, 60_000);
 
   it.each(["101", "600", "000"])(
     "an upstream answer with status %s followed at once by a reset becomes 502 'cannot relay' and the gateway keeps serving",
@@ -629,7 +610,7 @@ describe("upload relay in a real gateway process", () => {
       expect((await request(gateway.port, "GET", "/health")).status).toBe(200);
       expect(gateway.output()).not.toContain("ERR_HTTP_INVALID_STATUS_CODE");
     },
-    20_000,
+    75_000,
   );
 
   it("a 100 Continue followed at once by a reset is no answer: 502 'unconfirmed' within the wait bound", async () => {
@@ -648,7 +629,7 @@ describe("upload relay in a real gateway process", () => {
     expect(upstream.closed()).toBe(upstream.accepted());
     expect(gateway.child.exitCode).toBeNull();
     expect((await request(gateway.port, "GET", "/health")).status).toBe(200);
-  }, 20_000);
+  }, 60_000);
 
   it.each(["099", "000", "101", "600", "999"])(
     "an upstream answer with status %s becomes 502 UPLOAD_UPSTREAM_FAILED and the gateway keeps serving",
@@ -683,7 +664,7 @@ describe("upload relay in a real gateway process", () => {
       expect(gateway.output()).toContain("mcp.upload.relayed serverName=jira status=502 bytes=1000 result=upstream_failed");
       expect(gateway.output()).not.toContain("ERR_HTTP_INVALID_STATUS_CODE");
     },
-    20_000,
+    75_000,
   );
 
   it("a 50 MB sender without an API key gets a readable 401 and the socket closes within about 5 s", async () => {
@@ -704,5 +685,5 @@ describe("upload relay in a real gateway process", () => {
     expect(result.socketClosedAt()! - result.finishedAt).toBeLessThan(5500);
     expect(result.written()).toBeLessThan(FIFTY_MB);
     expect(upstream.connections()).toBe(0);
-  }, 20_000);
+  }, 60_000);
 });
