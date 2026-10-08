@@ -130,9 +130,11 @@ const LEGACY = "This conversation was started before a gateway security update a
  * nothing before it execs or exits: the sampler cannot tell a fork of this script, whose command line carries `cli.js`, from
  * a runtime, so the mode file, the time stamp and the `--disable-userns` strip use shell builtins only. `startup-exit` holds
  * 0.4 s on a FIFO (`read -t` on a builtin, no fork) before it exits: a process that ends before the sampler can read its
- * executable cannot be classified by it (a stated blind spot), so the double stays alive for several sampler ticks.
+ * executable cannot be classified by it (a stated blind spot), so the double stays alive for several sampler ticks. `keep-inner`
+ * (MVP-8125) removes only `--die-with-parent` from the arguments and execs the real bwrap: the sandbox is otherwise unchanged,
+ * but its inner bwrap survives the end of the outer one, which makes the launcher-ended window deterministic.
  */
-type WrapperMode = "pass" | "startup-exit" | "startup-hang" | "no-userns" | "mask-unshare" | "mask-true" | "bypass" | "bypass-ready" | "bypass-fork";
+type WrapperMode = "pass" | "startup-exit" | "startup-hang" | "no-userns" | "mask-unshare" | "mask-true" | "bypass" | "bypass-ready" | "bypass-fork" | "keep-inner";
 
 interface Wrapper {
   path: string;
@@ -163,6 +165,10 @@ case "$MODE" in
   no-userns)
     ARGS="$DIR/args.$$"
     while IFS= read -r -d '' ARG; do [ "$ARG" = --disable-userns ] || printf '%s\0' "$ARG"; done <&3 > "$ARGS"
+    exec /usr/bin/bwrap --args 4 "${"$"}{@:3}" 4< "$ARGS" ;;
+  keep-inner)
+    ARGS="$DIR/args.$$"
+    while IFS= read -r -d '' ARG; do [ "$ARG" = --die-with-parent ] || printf '%s\0' "$ARG"; done <&3 > "$ARGS"
     exec /usr/bin/bwrap --args 4 "${"$"}{@:3}" 4< "$ARGS" ;;
   mask-unshare|mask-true)
     ARGS="$DIR/args.$$"
@@ -1174,6 +1180,118 @@ describe("sampler and refusal-check controls", () => {
       expect(text).toContain(`pid ${record!.pid}`);
     } finally {
       exit.release();
+    }
+    void asked;
+  });
+
+  /**
+   * The seam of a launcher-stop control (MVP-8125): on the `atReading`-th stable reading of the native runtime (the executable
+   * `claude`) it records the runtime, its direct parent (the inner bwrap, pid 1 of the sandbox) and the gateway's own child that is
+   * the real outer bwrap, SIGTERMs only that outer bwrap and holds the sampler tick until the inner bwrap has a new parent, so the
+   * proof runs after the reparenting. The gateway stays alive. Everything it records carries its start time; only a recorded process
+   * whose start time still matches is ever signalled again.
+   */
+  function launcherStop(gatewayPid: number, atReading: number) {
+    interface Recorded {
+      pid: number;
+      startTicks: string;
+    }
+    const state = { pid: 0, readings: 0, forced: false, reached: false, outerIsRealBwrap: false, runtime: undefined as Recorded | undefined, inner: undefined as Recorded | undefined, outer: undefined as Recorded | undefined };
+    const statOf = (pid: number): { ppid: number; startTicks: string } | null => {
+      try {
+        const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+        const rest = text.slice(text.lastIndexOf(")") + 2).split(" ");
+        return { ppid: Number(rest[1]), startTicks: rest[19] };
+      } catch {
+        return null;
+      }
+    };
+    const recordedAs = (pid: number): Recorded => ({ pid, startTicks: statOf(pid)?.startTicks ?? "" });
+    const sameProcess = (item: Recorded | undefined): boolean => item !== undefined && statOf(item.pid)?.startTicks === item.startTicks;
+    const identityOf = (file: string): string | null => {
+      try {
+        const identity = fs.statSync(file, { bigint: true });
+        return `${identity.dev}:${identity.ino}`;
+      } catch {
+        return null;
+      }
+    };
+    const seam = (pid: number): void => {
+      let exe = "";
+      try {
+        exe = path.basename(fs.readlinkSync(`/proc/${pid}/exe`));
+      } catch {
+        return;
+      }
+      if (exe !== "claude" || state.forced || (state.pid !== 0 && state.pid !== pid)) return;
+      state.pid = pid;
+      state.readings += 1;
+      if (state.readings < atReading) return;
+      state.forced = true;
+      state.runtime = recordedAs(pid);
+      state.inner = recordedAs(statOf(pid)?.ppid ?? 0);
+      let top = state.inner.pid;
+      for (let hop = 0; hop < 8 && (statOf(top)?.ppid ?? 0) !== gatewayPid && (statOf(top)?.ppid ?? 0) > 1; hop++) top = statOf(top)?.ppid ?? 0;
+      state.outer = recordedAs(top);
+      const innerParent = statOf(state.inner.pid)?.ppid ?? 0;
+      state.outerIsRealBwrap = statOf(top)?.ppid === gatewayPid && identityOf(`/proc/${top}/exe`) === identityOf("/usr/bin/bwrap");
+      if (!state.outerIsRealBwrap) return;
+      process.kill(top, "SIGTERM");
+      for (const end = Date.now() + 3000; !(state.reached = (statOf(state.inner.pid)?.ppid ?? 0) !== innerParent) && Date.now() < end; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2));
+    };
+    /** Ends the sandbox's inner bwrap (its namespace teardown ends the runtime); a recorded process that is not the same one any more is left alone. */
+    const endInner = (): void => {
+      if (sameProcess(state.inner)) process.kill(state.inner!.pid, "SIGKILL");
+    };
+    const endAll = (): void => {
+      for (const item of [state.inner, state.runtime, state.outer]) {
+        if (!sameProcess(item)) continue;
+        try {
+          process.kill(item!.pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    };
+    return { state, seam, endInner, endAll };
+  }
+
+  it("control G5: the outer bwrap is stopped while the gateway lives (its sandbox keeps the inner bwrap): the native runtime is cleared by the launcher-ended route once its exit is confirmed, and audited, not reported", async () => {
+    const { rig, wrapper } = await wrapperRig();
+    wrapper.setMode("keep-inner");
+    const stop = launcherStop(rig.gateway.child.pid!, 3);
+    const prompt = "IF-CONTROL-LAUNCHER-ENDED";
+    rig.scripts.push(scriptOf(prompt, [bashStep("echo CONTROL")]));
+    const window = windowOf(rig, [], { afterStableReading: stop.seam });
+    const asked = rig.ask("reqlift", { queryId: "q-control-launcher-ended", sessionId: "conv-control-launcher-ended", prompt, user_id: "user-1", useSession: true, allowedTools: ["Bash"] }, 90_000).catch(() => undefined);
+    let closed: ReturnType<Window["close"]> | undefined;
+    try {
+      await waitFor(() => stop.state.forced, 60_000, "the sampler to stop the launcher");
+      expect(stop.state.outerIsRealBwrap, "precondition not reached: the gateway's own child above the runtime is not the real bwrap").toBe(true);
+      expect(stop.state.reached, "precondition not reached: the inner bwrap was not reparented within its bound").toBe(true);
+      await waitFor(() => window.peek().records.some((candidate) => candidate.pid === stop.state.runtime?.pid && candidate.proofFailure !== undefined), 10_000, "the failing tick");
+      const waiting = window.peek().records.find((candidate) => candidate.pid === stop.state.runtime?.pid)!;
+      expect(waiting.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, escapeEvidence: false, ownUnreadable: "none", referenceExit: "alive", runtimeExit: "alive", launcherIdentity: "verified", launcherExe: "real-bwrap", reparented: true, pending: "waiting" });
+      expect(waiting.pending?.route).toBe("launcher-ended");
+      stop.endInner();
+      await waitFor(() => endedNow(stop.state.runtime!.pid, stop.state.runtime!.startTicks).ended, 15_000, "the runtime to end after its inner bwrap");
+      await waitFor(() => window.peek().records.every((candidate) => candidate.pending?.state !== "waiting"), 10_000, "pending records to settle");
+      closed = window.close();
+      const { sample } = closed;
+      const record = sample.records.find((candidate) => candidate.pid === stop.state.runtime!.pid);
+      expect(record, "precondition not reached: the sampler did not record the runtime").toBeDefined();
+      expect(record!.exe).toBe("claude");
+      expect(record!.clearedBy).toBe("launcher-ended");
+      expect(record!.unsandboxed).toBe(false);
+      expect(sample.unsandboxedRuntimes).toEqual([]);
+      expect(sample.referenceChanged).toBe(0);
+      expect(sampleProblems(sample, rig.markers.values)).toEqual([]);
+      expect(sample.clears.filter((clear) => clear.record.pid === record!.pid && clear.explanation === "runtime exit confirmed after its own proof read while alive (launcher ended first, gateway alive)")).toHaveLength(1);
+    } finally {
+      // A failed row must not leave a real runtime under the user's subreaper.
+      stop.endAll();
+      if (stop.state.runtime) await waitFor(() => endedNow(stop.state.runtime!.pid, stop.state.runtime!.startTicks).ended, 15_000, "the runtime to end").catch(() => undefined);
+      closed ??= window.close();
     }
     void asked;
   });
