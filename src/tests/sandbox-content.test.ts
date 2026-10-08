@@ -994,7 +994,7 @@ describe("a snapshot of skills, agents and commands for a run without Bash (MVP-
       const realFstat = fs.fstatSync;
       const realRead = fs.readSync;
       const pathOf = new Map<number, string>();
-      const state = { targetFd: -1, grown: false, targetBytes: 0, bytesBeforeTarget: 0, acceptedBefore: -1, otherBytes: 0 };
+      const state = { targetFd: -1, grown: false, targetBytes: 0, targetCalls: 0, bytesBeforeTarget: 0, acceptedBefore: -1, otherBytes: 0 };
       vi.spyOn(fs, "openSync").mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
         const fd = (realOpen as (...args: unknown[]) => number)(p, ...rest);
         pathOf.set(fd, String(p));
@@ -1022,7 +1022,10 @@ describe("a snapshot of skills, agents and commands for a run without Bash (MVP-
       }) as typeof fs.closeSync);
       vi.spyOn(fs, "readSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
         const n = (realRead as (...args: unknown[]) => number)(fd, ...rest);
-        if (fd === state.targetFd) state.targetBytes += n;
+        if (fd === state.targetFd) {
+          state.targetBytes += n;
+          state.targetCalls++;
+        }
         else if ((pathOf.get(fd) ?? "").startsWith(path.join(wsRoot(), "skills"))) state.otherBytes += n;
         return n;
       }) as typeof fs.readSync);
@@ -1220,6 +1223,17 @@ describe("a snapshot of skills, agents and commands for a run without Bash (MVP-
       expect(readFileNoFollow(steady, 10)?.toString("utf8")).toBe("0123456789");
       expect(readFileNoFollow(steady, 9)).toBeNull();
     });
+
+    it("B23 a file that is empty at fstat and then grows by 1.5 MiB is read in few calls and returned whole", () => {
+      const grower = write("empty-then-grows.bin", "");
+      const growth = 1536 * 1024;
+      const state = growAtFstat(grower, growth);
+      const data = readFileNoFollow(grower, 10 * 1024 * 1024);
+      vi.restoreAllMocks();
+      expect(state.grown).toBe(true);
+      expect(data?.length).toBe(growth);
+      expect(state.targetCalls, "readSync calls for the growing file").toBeLessThanOrEqual(10);
+    }, 60_000);
 
     it("B16 an unlimited read and a copy still succeed for a small file", () => {
       const file = write("small.txt", "small content");
