@@ -17,7 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { FINAL_ANSWER, startFakeAnthropicApi, type FakeAnthropicApi, type FakeApiMode } from "./helpers/fake-anthropic-api.js";
-import { assertFreshBuild, gatewayRequest, spawnGateway, type Cleanup } from "./helpers/git-process-gateway.js";
+import { GATEWAY_READY_TIMEOUT_MS, assertFreshBuild, gatewayRequest, spawnGateway, type Cleanup } from "./helpers/git-process-gateway.js";
 import { bundledCliPath } from "../runtime-cli.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -77,8 +77,10 @@ async function startProxyProcess(options: { upstream: string; env: Record<string
   child.stderr!.on("data", (d: Buffer) => (err += d.toString("utf8")));
   const started = Date.now();
   while (!out.includes("\n")) {
-    if (child.exitCode !== null) throw new Error(`proxy process exited early: ${err}`);
-    if (Date.now() - started > 10_000) throw new Error(`proxy process not ready: ${err}`);
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`proxy process exited during startup: code=${child.exitCode ?? "null"} signal=${child.signalCode ?? "null"}: ${err}`);
+    }
+    if (Date.now() - started > GATEWAY_READY_TIMEOUT_MS) throw new Error(`proxy process not ready after ${GATEWAY_READY_TIMEOUT_MS} ms: ${err}`);
     await new Promise((r) => setTimeout(r, 25));
   }
   const { token, baseUrl } = JSON.parse(out.split("\n")[0]) as { token: string; baseUrl: string };

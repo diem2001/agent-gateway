@@ -13,12 +13,12 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
-import net, { type AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { FINAL_ANSWER, startFakeAnthropicApi, type FakeAnthropicApi } from "./helpers/fake-anthropic-api.js";
+import { releaseGatewayPort, reserveGatewayPort, waitForGatewayReady } from "./helpers/git-process-gateway.js";
 import { STUB_TOOL_NAME, framedToolText, startOAuthMcpStub, type OAuthMcpStub, type OAuthStubOptions } from "./helpers/oauth-mcp-stub.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -66,14 +66,6 @@ afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()!();
 });
 
-async function freePort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-  const { port } = server.address() as AddressInfo;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return port;
-}
-
 async function mcpStub(options: OAuthStubOptions): Promise<OAuthMcpStub> {
   const created = await startOAuthMcpStub(options);
   cleanups.push(() => created.close());
@@ -114,7 +106,7 @@ function request(port: number, method: string, urlPath: string, body?: unknown):
 
 async function spawnGateway(api: FakeAnthropicApi, env: Record<string, string> = {}): Promise<SpawnedGateway> {
   assertFreshBuild();
-  const port = await freePort();
+  const port = await reserveGatewayPort();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7667-login-"));
   const dirs = { home: path.join(root, "home"), tmp: path.join(root, "tmp"), cwd: path.join(root, "cwd"), persist: path.join(root, "persist") };
   for (const dir of Object.values(dirs)) fs.mkdirSync(dir);
@@ -162,23 +154,11 @@ async function spawnGateway(api: FakeAnthropicApi, env: Record<string, string> =
       child.kill("SIGKILL");
       await exited;
     }
+    releaseGatewayPort(port);
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  const started = Date.now();
-  for (;;) {
-    if (child.exitCode !== null) throw new Error(`gateway exited early: ${output}`);
-    const healthy = await new Promise<boolean>((resolve) => {
-      const probe = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, (res) => {
-        res.resume();
-        resolve(res.statusCode === 200);
-      });
-      probe.on("error", () => resolve(false));
-    });
-    if (healthy) break;
-    if (Date.now() - started > 15_000) throw new Error(`gateway not ready: ${output}`);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+  await waitForGatewayReady({ child, port, output: () => output, env: childEnv });
   return { child, port, dirs, output: () => output };
 }
 
@@ -708,7 +688,7 @@ describe("the relay carries a working MCP server (real runtime)", () => {
   it("an unreachable upstream still ends the run with a normal answer", async () => {
     const api = await fakeApi();
     const gateway = await spawnGateway(api);
-    const closedPort = await freePort();
+    const closedPort = await reserveGatewayPort();
     await registerServer(gateway, SERVER, { type: "http", url: `http://127.0.0.1:${closedPort}/mcp` });
 
     const outcome = await runAgent(gateway, {}, []);

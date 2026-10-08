@@ -15,11 +15,11 @@
  */
 import fs from "node:fs";
 import http from "node:http";
-import net, { type AddressInfo } from "node:net";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startFakeAnthropicApi, type ExactToolScript, type FakeAnthropicApi } from "./helpers/fake-anthropic-api.js";
-import { gatewayRequest, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
+import { gatewayRequest, reserveGatewayPort, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
 import { startOAuthMcpStub, type OAuthMcpStub, type OAuthStubOptions } from "./helpers/oauth-mcp-stub.js";
 import { startSseMcpStub, type SseMcpStub, type SseMcpStubOptions } from "./helpers/sse-mcp-stub.js";
 
@@ -360,10 +360,7 @@ describe("faults at the upstream do not end the gateway (real runtime)", () => {
   });
 
   it("an upstream port that refuses connections is TOOL_UNAVAILABLE", async () => {
-    const closed = net.createServer();
-    await new Promise<void>((resolve) => closed.listen(0, "127.0.0.1", () => resolve()));
-    const port = (closed.address() as AddressInfo).port;
-    await new Promise<void>((resolve) => closed.close(() => resolve()));
+    const port = await reserveGatewayPort();
     const r = await rig([call("F2-REFUSED", "mcp__feed__lookup_record")]);
     await registerServer(r, "feed", { type: "sse", url: `http://127.0.0.1:${port}/sse`, headers: { "X-Api-Key": FEED_KEY } });
     await ask(r, { prompt: "F2-REFUSED", useSession: false });

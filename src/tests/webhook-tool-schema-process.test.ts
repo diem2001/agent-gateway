@@ -19,6 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { releaseGatewayPort, reserveGatewayPort, waitForGatewayReady } from "./helpers/git-process-gateway.js";
 import { SCHEMA_FINAL_ANSWER, startToolSchemaApi, type RecordedToolDefinition, type ScriptStep, type ToolSchemaApi } from "./helpers/tool-schema-api.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -46,14 +47,6 @@ function assertFreshBuild(): void {
 
 /** Environment ALLOWLIST for the spawned gateway. Never turn this into a denylist. */
 const ALLOWED_ENV_KEYS = ["PATH", "LANG"] as const;
-
-async function freePort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-  const { port } = server.address() as AddressInfo;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return port;
-}
 
 function request(port: number, method: string, urlPath: string, body?: unknown): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
@@ -184,7 +177,7 @@ function descendants(pid: number): number[] {
 
 async function spawnGateway(apiBaseUrl: string): Promise<SpawnedGateway> {
   assertFreshBuild();
-  const port = await freePort();
+  const port = await reserveGatewayPort();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7697-schema-"));
   const dirs = { home: path.join(root, "home"), tmp: path.join(root, "tmp"), cwd: path.join(root, "cwd"), persist: path.join(root, "persist") };
   for (const dir of Object.values(dirs)) fs.mkdirSync(dir);
@@ -231,28 +224,15 @@ async function spawnGateway(apiBaseUrl: string): Promise<SpawnedGateway> {
       child.kill("SIGKILL");
       await exited;
     }
+    releaseGatewayPort(port);
     fs.rmSync(root, { recursive: true, force: true });
   };
 
-  const started = Date.now();
-  for (;;) {
-    if (child.exitCode !== null) {
-      await stop();
-      throw new Error(`gateway exited early: ${output}`);
-    }
-    const healthy = await new Promise<boolean>((resolve) => {
-      const probe = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, (res) => {
-        res.resume();
-        resolve(res.statusCode === 200);
-      });
-      probe.on("error", () => resolve(false));
-    });
-    if (healthy) break;
-    if (Date.now() - started > 15_000) {
-      await stop();
-      throw new Error(`gateway not ready: ${output}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+  try {
+    await waitForGatewayReady({ child, port, output: () => output, env: childEnv });
+  } catch (error) {
+    await stop();
+    throw error;
   }
   return { child, port, output: () => output, stop };
 }

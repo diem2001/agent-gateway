@@ -21,7 +21,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FINAL_ANSWER, startFakeAnthropicApi, type ExactToolScript, type FakeAnthropicApi, type RecordedMessagesRequest } from "./helpers/fake-anthropic-api.js";
-import { GATEWAY_API_KEY, REPO_ROOT, descendants, gatewayRequest, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
+import { GATEWAY_API_KEY, REPO_ROOT, descendants, gatewayRequest, releaseGatewayPort, reserveGatewayPort, spawnGateway, waitForGatewayReady, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -967,28 +967,23 @@ async function startGateway(env: Record<string, string>): Promise<StartResult> {
   const root = fs.mkdtempSync(path.join(fs.realpathSync(process.env.TMPDIR ?? "/tmp"), "mvp7679-start-"));
   cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
   for (const dir of ["home", "tmp", "persist"]) fs.mkdirSync(path.join(root, dir));
-  const port = await new Promise<number>((resolve) => {
-    const probe = net.createServer();
-    probe.listen(0, "127.0.0.1", () => {
-      const { port: free } = probe.address() as AddressInfo;
-      probe.close(() => resolve(free));
-    });
-  });
+  const port = await reserveGatewayPort();
+  const childEnv = {
+    PATH: process.env.PATH ?? "",
+    HOME: path.join(root, "home"),
+    TMPDIR: path.join(root, "tmp"),
+    PORT: String(port),
+    HOST: "127.0.0.1",
+    API_KEYS: `proc:${GATEWAY_API_KEY},other:SYNTH-OTHER-KEY-7679`,
+    SESSION_PERSIST_PATH: path.join(root, "persist", "sessions.json"),
+    TOOLS_PERSIST_PATH: path.join(root, "persist", "tools.json"),
+    MCP_SERVERS_PERSIST_PATH: path.join(root, "persist", "mcp-servers.json"),
+    WORKSPACE_ROOT: path.join(root, "home", ".claude"),
+    ...env,
+  };
   const child = spawn(process.execPath, [path.join(REPO_ROOT, "dist", "server.js")], {
     cwd: path.join(root, "home"),
-    env: {
-      PATH: process.env.PATH ?? "",
-      HOME: path.join(root, "home"),
-      TMPDIR: path.join(root, "tmp"),
-      PORT: String(port),
-      HOST: "127.0.0.1",
-      API_KEYS: `proc:${GATEWAY_API_KEY},other:SYNTH-OTHER-KEY-7679`,
-      SESSION_PERSIST_PATH: path.join(root, "persist", "sessions.json"),
-      TOOLS_PERSIST_PATH: path.join(root, "persist", "tools.json"),
-      MCP_SERVERS_PERSIST_PATH: path.join(root, "persist", "mcp-servers.json"),
-      WORKSPACE_ROOT: path.join(root, "home", ".claude"),
-      ...env,
-    },
+    env: childEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
@@ -996,29 +991,15 @@ async function startGateway(env: Record<string, string>): Promise<StartResult> {
   child.stderr.on("data", (d: Buffer) => (output += d.toString("utf8")));
   cleanups.push(() => {
     if (child.exitCode === null) child.kill("SIGKILL");
+    releaseGatewayPort(port);
   });
-  return await new Promise<StartResult>((resolve) => {
-    const finish = (code: number | null) => resolve({ code, output });
-    child.once("exit", (code) => finish(code));
-    const started = Date.now();
-    const poll = setInterval(() => {
-      http
-        .get({ host: "127.0.0.1", port, path: "/health", agent: false }, (res) => {
-          res.resume();
-          if (res.statusCode === 200) {
-            clearInterval(poll);
-            child.kill("SIGKILL");
-            finish(null);
-          }
-        })
-        .on("error", () => undefined);
-      if (Date.now() - started > 20_000) {
-        clearInterval(poll);
-        child.kill("SIGKILL");
-        finish(-1);
-      }
-    }, 100);
-  });
+  const outcome = await waitForGatewayReady({ child, port, output: () => output, env: childEnv }).then(
+    () => "ready" as const,
+    (error: Error) => (child.exitCode !== null || child.signalCode !== null ? ("exited" as const) : error),
+  );
+  if (outcome === "exited") return { code: child.exitCode, output };
+  child.kill("SIGKILL");
+  return outcome === "ready" ? { code: null, output } : { code: -1, output: `${output}\n${outcome.message}` };
 }
 
 describe("startup with the new configuration keys", () => {

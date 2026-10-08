@@ -17,11 +17,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
-import net, { type AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { releaseGatewayPort, reserveGatewayPort, waitForGatewayReady } from "./helpers/git-process-gateway.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(here, "..", "..");
@@ -145,35 +145,25 @@ function fixture(): Fixture {
   return { root, home, dirs, file, env };
 }
 
-async function freePort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-  const { port } = server.address() as AddressInfo;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return port;
-}
-
 async function startGateway(fx: Fixture): Promise<Gateway> {
   assertFreshBuild();
-  const port = await freePort();
+  const port = await reserveGatewayPort();
+  const childEnv = { ...fx.env(), PORT: String(port), HOST: "127.0.0.1" };
   const child = spawn(process.execPath, ["--expose-gc", DIST_SERVER], {
     cwd: fx.root,
-    env: { ...fx.env(), PORT: String(port), HOST: "127.0.0.1" },
+    env: childEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
   child.stdout!.on("data", (data: Buffer) => (output += data.toString("utf8")));
   child.stderr!.on("data", (data: Buffer) => (output += data.toString("utf8")));
   const gateway = { child, port, output: () => output };
-  cleanups.push(() => kill(gateway));
+  cleanups.push(async () => {
+    await kill(gateway);
+    releaseGatewayPort(port);
+  });
 
-  const started = Date.now();
-  for (;;) {
-    if (child.exitCode !== null) throw new Error(`gateway exited early: ${output}`);
-    if ((await request(port, "GET", "/health").catch(() => null))?.status === 200) break;
-    if (Date.now() - started > 15_000) throw new Error(`gateway not ready: ${output}`);
-    await delay(50);
-  }
+  await waitForGatewayReady({ child, port, output: () => output, env: childEnv });
   return gateway;
 }
 
@@ -362,7 +352,7 @@ describe("An interrupted write never damages the saved file", () => {
     expect(errorLines(gateway.output())).toEqual([]);
     // The start removed the leftover temp file of this area.
     expect(fs.existsSync(temp)).toBe(false);
-  }, 60_000);
+  }, 90_000);
 });
 
 /* ------------------------------------------------------------------ */
@@ -489,7 +479,7 @@ describe.skipIf(IS_ROOT)(`An unreadable file that cannot be moved aside is left 
     }
     report = await health(gateway);
     expect(report.persistenceIssues).toEqual([{ area, problem: "unreadable-not-preserved", file }]);
-  }, 60_000);
+  }, 75_000);
 });
 
 /* ------------------------------------------------------------------ */
@@ -509,7 +499,7 @@ describe("Several damaged areas are all reported", () => {
       { area: "mcpServers", problem: "corrupt-preserved", file: fx.file("mcpServers"), preservedAs: corruptCopies(fx, "mcpServers") },
     ]);
     expect(errorLines(gateway.output()).map((l) => l.split(" ")[2])).toEqual(["area=tools", "area=mcpServers"]);
-  }, 60_000);
+  }, 75_000);
 });
 
 /* ------------------------------------------------------------------ */
@@ -563,7 +553,7 @@ describe("A file with an entry that cannot be restored is kept aside and the gat
     await changeArea(gateway, area, "after-bad-entry");
     expect(fileHoldsChange(file, area, "after-bad-entry")).toBe(true);
     expect(fs.readFileSync(copies[0]).equals(originalBytes)).toBe(true);
-  }, 60_000);
+  }, 75_000);
 });
 
 /* ------------------------------------------------------------------ */
@@ -599,7 +589,7 @@ describe.skipIf(IS_ROOT)(`A failed save is reported until a later save succeeds 
     report = await health(gateway);
     expect(report.persistenceIssues).toEqual([]);
     expect(report.persistence).toBe("ok");
-  }, 60_000);
+  }, 75_000);
 });
 
 /* ------------------------------------------------------------------ */
