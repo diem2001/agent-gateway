@@ -588,7 +588,7 @@ export interface ProcessRecord {
     /**
      * Any reading of the runtime at the entry or at a settle showed the leader-exit signature (`Zn`, `empty-n`, or `X`/`Z` with a
      * count other than 1). Once set, a later `alive` reading of the same pid and start time is a revival (a surviving thread
-     * executed a new program); so is a stable tick reading whose executable differs from the one at the last proven tick.
+     * executed a new program); so is a live reading at a settle whose executable differs from the one at the last proven tick.
      */
     sawLeaderExit?: boolean;
     /** The record was expired at once because it was revived: it never clears and never ends a flag. */
@@ -596,7 +596,7 @@ export interface ProcessRecord {
   };
   /** What confirmed the exit when this record was cleared (kinds only): the runtime's, and the reference's on the reference-ended route. */
   exitConfirmed?: { runtime: ExitKind; reference?: ExitKind };
-  /** Device and inode of the executable at the last proven tick (never printed): a pending record whose stable reading differs was revived. */
+  /** Device and inode of the executable at the last proven tick (never printed): a pending record whose live process runs another one was revived. */
   provenExeId?: string;
   /**
    * The runtime's direct parent as of its last proven tick (MVP-8125): its pid and start time when that parent's executable is the
@@ -1650,7 +1650,12 @@ export function startProcessSampler(
       // The runtime-side and launcher-ended routes have no reference condition; the reference-ended route also needs the reference confirmed ended.
       const reference = record.pending.route === "reference-ended" ? endedNow(record.pending.reference!.pid, record.pending.reference!.startTicks, seam.exitReadFault) : null;
       // After a leader exit, a reading of the same pid and start time that is alive again means a surviving thread executed a new program: it was never ended.
-      const revived = record.pending.sawLeaderExit === true && runtime.kind === "alive";
+      const revivedByLeader = record.pending.sawLeaderExit === true && runtime.kind === "alive";
+      // So does a live process that runs another executable than at its last proven tick. The settle reads it by pid, because a runtime that
+      // left the gateway's tree (the launcher-ended route) is read by no tick any more.
+      const exeNow = runtime.kind === "alive" && record.provenExeId !== undefined ? readExe(record.pid) : null;
+      const revivedByExe = exeNow !== null && "id" in exeNow && exeNow.id !== record.provenExeId;
+      const revived = revivedByLeader || revivedByExe;
       const outcome = revived
         ? ("expired" as const)
         : resolvePending({ elapsedMs: at - record.pending.sinceMs, exitConfirmed: runtime.ended, referenceEnded: reference === null || reference.ended, final });
@@ -1723,12 +1728,6 @@ export function startProcessSampler(
             if (sandboxProof(info.pid, reference, known.bwraps).proven) proven.add(key);
           } else {
             verdict = "runtime";
-            // A pending record whose process now runs another executable than at its last proven tick was revived by a surviving thread's exec: it never clears.
-            if (prior?.pending?.state === "waiting" && prior.provenExeId !== undefined && read.reading.exeId !== prior.provenExeId) {
-              pending = { ...prior.pending, state: "expired", revived: true };
-              unsandboxed = true;
-              proofFailure = proofFailure ? { ...proofFailure, pending: "expired" } : proofFailure;
-            }
             // Test seam (default none): lets a control force the exit between the stable reading and the proof.
             try {
               seam.afterStableReading?.(info.pid);

@@ -2698,7 +2698,11 @@ describe("process sampler thread-safe exit: decision table (MVP-8130)", () => {
 describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
   const BWRAP_DIE = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc"];
   const KEEP_INNER = ["bwrap", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc"];
-  /** Fresh files the leader opens before it ends: its exit releases each one itself, after its namespaces are gone (A0 calibration, MVP-8130). */
+  /**
+   * Fresh files the leader opens before it ends: its exit releases each one itself, after its namespaces are gone, so the leader stays
+   * in `empty-n` for about as long as the release takes. The counts are calibrated (MVP-8130 A0): a hold of at least about 120 ms for
+   * 300000 files, of at least about 236 ms for 600000, also under load; the mount link goes after about a quarter of it.
+   */
   const HOLD_FILES = 300_000;
   /** The same for a reference stand-in, whose hold must outlast the runtime's end that follows the seam. */
   const REFERENCE_HOLD_FILES = 600_000;
@@ -3489,7 +3493,8 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
         signal(parent!.pid!, "SIGSTOP");
         stopped.push(parent!.pid!);
         waitSync(() => statOf(parent!.pid!)?.state === "T");
-        if (!endLeader(reference, () => (options.held ? held(reference) : zombieLeader(reference)))) return false;
+        // A held reference is read from the cache only once its mount namespace link is gone too (the hold outlasts that by far).
+        if (!endLeader(reference, () => (options.held ? held(reference) && linkGone(reference, "ns/mnt") : zombieLeader(reference)))) return false;
         if (options.execAtOnce) touch(trig, "exec");
         signal(middle, "SIGKILL");
         const reached = waitSync(() => (statOf(middle)?.state === "Z" || statOf(middle) === null) && ppidOf(holder) !== middle);
