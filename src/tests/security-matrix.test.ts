@@ -56,9 +56,11 @@ import {
   resolvePending,
   sameNamespace,
   sampleProblems,
+  taggedProcessProof,
   type ExitReading,
   type ReferenceIo,
   type ProcessRecord,
+  type TickProcess,
   type MatrixRow,
   type Surface,
 } from "./helpers/security-matrix.js";
@@ -565,6 +567,12 @@ describe("process sampler launcher exemption", () => {
   const stoppedPids: number[] = [];
   /** Processes a row recorded to be killed at the end, besides the descendants of its children (the reference's whole thread group). */
   const recordedPids: number[] = [];
+  /**
+   * The runtime, its bwrap processes and the holder of a reference-end control, with their start times. The control kills the
+   * reference, so the holder is reparented to the user's init and `--die-with-parent` only ties bwrap to the holder: nothing
+   * would end the idle stand-in. `afterEach` ends each recorded tree, but only a process whose start time still matches.
+   */
+  const reapRoots: { pid: number; startTicks: string }[] = [];
   afterEach(() => {
     // A holder the exit seam stopped is continued first, then every recorded process and every process of the fixture is killed.
     for (const pid of recordedPids.splice(0)) {
@@ -580,6 +588,16 @@ describe("process sampler launcher exemption", () => {
         process.kill(pid, "SIGCONT");
       } catch {
         // Already gone.
+      }
+    }
+    for (const root of reapRoots.splice(0)) {
+      if (root.startTicks === "" || startOf(root.pid) !== root.startTicks) continue;
+      for (const pid of [...descendants(root.pid), root.pid]) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
       }
     }
     for (const child of children.splice(0)) {
@@ -985,6 +1003,15 @@ describe("process sampler launcher exemption", () => {
     holder?: number;
   }
   const ppidOf = (pid: number): number => statOf(pid)?.ppid ?? 0;
+  /** Records the processes from `runtime` up to `holder` (the bwrap processes between them included) for `afterEach` to end. */
+  const recordTree = (runtime: number, holder: number): void => {
+    const seen = new Set<number>();
+    for (let pid = runtime; pid > 1 && !seen.has(pid); pid = ppidOf(pid)) {
+      seen.add(pid);
+      reapRoots.push({ pid, startTicks: startOf(pid) ?? "" });
+      if (pid === holder) break;
+    }
+  };
   const startOf = (pid: number): string | null => {
     try {
       const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -1034,6 +1061,7 @@ describe("process sampler launcher exemption", () => {
       let holder = pid;
       for (let hop = 0; hop < options.holderHops; hop++) holder = ppidOf(holder);
       state.holder = holder;
+      recordTree(pid, holder);
       const victim = ppidOf(holder);
       const prepared = options.before?.() ?? true;
       process.kill(victim, "SIGKILL");
@@ -1216,6 +1244,7 @@ describe("process sampler launcher exemption", () => {
       let holder = pid;
       for (let hop = 0; hop < 3; hop++) holder = ppidOf(holder);
       state.holder = holder;
+      recordTree(pid, holder);
       const middle = ppidOf(holder);
       const reference = ppidOf(middle);
       state.reference = reference;
@@ -2437,5 +2466,188 @@ describe("process sampler row attribution", () => {
     }
     expect(lines.join("")).toContain("row=withheld");
     expect(lines.join("").includes(currentRowId())).toBe(false);
+  });
+});
+
+/**
+ * The pieces the concurrent roles of the route matrix rest on (MVP-8118): the sandbox proof of the processes that carry a
+ * run-owned tag, the observer a caller can hang on a sampler tick, and the reference-changed mapping every window verdict
+ * now consumes. Every stand-in is a real process tree below this test worker (the reference); a row waits until its own
+ * observation shows the state under test.
+ */
+describe("tagged role processes and the sampler observer", () => {
+  const IDLE = "setInterval(() => {}, 1000)";
+  const BWRAP = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc"];
+  const children: ChildProcess[] = [];
+  afterEach(() => {
+    for (const child of children.splice(0)) {
+      for (const pid of [...descendants(child.pid!), child.pid!]) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    }
+  });
+
+  const newTag = (): string => `ROLE-T1-${randomBytes(4).toString("hex")}`;
+  const start = (command: string, args: string[]): ChildProcess => {
+    const child = spawn(command, args, { stdio: "ignore" });
+    children.push(child);
+    return child;
+  };
+  /** Polls until `done` holds (bounded); a slow host delays a row but never lets it pass without having looked. */
+  async function until(done: () => boolean, what: string): Promise<void> {
+    const deadline = Date.now() + 30_000;
+    while (!done() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(done(), `precondition not reached: ${what}`).toBe(true);
+  }
+
+  it("TP1: a tagged process below the real bwrap, in pid, user and mount namespaces of its own, is proven, and the real bwrap holding the tag is no holder", async () => {
+    requireHost(["bwrap"]);
+    const tag = newTag();
+    start(BWRAP[0], [...BWRAP.slice(1), process.execPath, "-e", IDLE, tag]);
+    await until(() => taggedProcessProof(process.pid, tag).holders >= 1, "the tagged process was not seen");
+    // The proof of a live holder is stable: read again until it is proven (a process in the middle of its start is read once more).
+    let proof = taggedProcessProof(process.pid, tag);
+    await until(() => (proof = taggedProcessProof(process.pid, tag)).proven >= 1, "the tagged process was never proven");
+    expect(proof.holders).toBe(1);
+    expect(proof.proven).toBe(1);
+    expect(proof.unproven).toEqual([]);
+    expect(proof.provenIds).toEqual(proof.holderIds);
+  });
+
+  it("TP2: a tagged process outside any sandbox is unproven with its pid; the result holds no tag, command line or marker", async () => {
+    requireHost(["bwrap"]);
+    const tag = newTag();
+    const child = start(process.execPath, ["-e", IDLE, tag]);
+    await until(() => taggedProcessProof(process.pid, tag).holders >= 1, "the tagged process was not seen");
+    const proof = taggedProcessProof(process.pid, tag);
+    expect(proof.proven).toBe(0);
+    expect(proof.unproven.map((failed) => failed.pid)).toEqual([child.pid]);
+    expect(proof.unproven[0].detail).toMatch(/real-bwrap=false same-ns pid=true user=true mnt=true/);
+    const printed = JSON.stringify(proof);
+    expect(printed.includes(tag) || printed.includes("setInterval")).toBe(false);
+    expect(detect([{ name: "proof", text: printed }], markers.values)).toEqual([]);
+  });
+
+  it("TP3: without a tagged process there is no holder and nothing is proven", async () => {
+    requireHost(["bwrap"]);
+    const proof = taggedProcessProof(process.pid, newTag());
+    expect(proof).toEqual({ holders: 0, proven: 0, unproven: [], holderIds: [], provenIds: [] });
+  });
+
+  it("TP4: only the real bwrap holds the tag (the process below it no longer does): no holder, nothing proven", async () => {
+    requireHost(["bwrap"]);
+    const tag = newTag();
+    // The shell holds the tag only until it execs `sleep`; the bwrap and its pid-1 copy keep it in their arguments.
+    const outer = start(BWRAP[0], [...BWRAP.slice(1), "/bin/bash", "-c", "exec sleep 60", "bash", tag]);
+    const commsBelow = (): string[] =>
+      descendants(outer.pid!).map((pid) => {
+        try {
+          return fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+        } catch {
+          return "";
+        }
+      });
+    await until(() => commsBelow().includes("sleep"), "the tagged shell did not exec sleep");
+    const bwrapsHoldingTheTag = descendants(outer.pid!).concat(outer.pid!).filter((pid) => {
+      try {
+        return fs.readFileSync(`/proc/${pid}/cmdline`).toString("latin1").includes(tag) && fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim() === "bwrap";
+      } catch {
+        return false;
+      }
+    });
+    expect(bwrapsHoldingTheTag.length, "precondition not reached: no bwrap holds the tag").toBeGreaterThanOrEqual(1);
+    const proof = taggedProcessProof(process.pid, tag);
+    expect(proof).toEqual({ holders: 0, proven: 0, unproven: [], holderIds: [], provenIds: [] });
+  });
+
+  it("AT1: afterTick delivers the tick's processes after the sampler has written their records and windows", async () => {
+    requireHost(["bwrap"]);
+    const tag = newTag();
+    let sampler: ReturnType<typeof startProcessSampler> | undefined;
+    let child: ChildProcess | undefined;
+    const firstSight: { record?: boolean; window?: boolean; fields?: boolean } = {};
+    sampler = startProcessSampler(() => process.pid, [tag], 20, {
+      afterTick: (processes) => {
+        const info = processes.find((candidate) => candidate.pid === child?.pid);
+        if (!info || firstSight.record !== undefined) return;
+        const seen = sampler!.peek();
+        firstSight.record = seen.records.some((record) => record.pid === info.pid);
+        firstSight.window = seen.windows[tag] !== undefined;
+        firstSight.fields = info.ppid === process.pid && info.cmdline.includes(tag) && info.comm.length > 0 && info.startTicks.length > 0;
+      },
+    });
+    child = start(process.execPath, ["-e", IDLE, "cli.js", tag]);
+    await until(() => firstSight.record !== undefined, "the observer never saw the stand-in");
+    const sample = sampler.stop({});
+    expect(firstSight).toEqual({ record: true, window: true, fields: true });
+    expect(sample.unsandboxedRuntimes).toContain(child.pid);
+  });
+
+  it("AT2: an observer that throws ends nothing and changes no verdict", async () => {
+    requireHost(["bwrap"]);
+    const tag = newTag();
+    let calls = 0;
+    const sampler = startProcessSampler(() => process.pid, [tag], 20, {
+      afterTick: () => {
+        calls += 1;
+        throw new Error("observer failure");
+      },
+    });
+    const child = start(process.execPath, ["-e", IDLE, "cli.js", tag]);
+    await until(() => sampler.peek().records.some((record) => record.pid === child.pid), "the stand-in was not recorded");
+    await until(() => calls >= 3, "the observer was not called on later ticks");
+    const sample = sampler.stop({});
+    expect(sample.unsandboxedRuntimes).toContain(child.pid);
+    expect(sample.windows[tag]).toBeDefined();
+  });
+
+  it("AT3: what the observer receives is frozen: a write to it throws, and the sampler's records are unchanged", async () => {
+    requireHost(["bwrap"]);
+    const tag = newTag();
+    const outcome: { frozen?: boolean; writeThrew?: boolean; pushThrew?: boolean; argvThrew?: boolean } = {};
+    const sampler = startProcessSampler(() => process.pid, [tag], 20, {
+      afterTick: (processes: readonly TickProcess[]) => {
+        if (outcome.frozen !== undefined || processes.length === 0) return;
+        const first = processes[0];
+        outcome.frozen = Object.isFrozen(processes) && Object.isFrozen(first) && Object.isFrozen(first.argv);
+        const attempt = (write: () => void): boolean => {
+          try {
+            write();
+            return false;
+          } catch {
+            return true;
+          }
+        };
+        outcome.writeThrew = attempt(() => {
+          (first as { cmdline: string }).cmdline = "changed";
+        });
+        outcome.pushThrew = attempt(() => {
+          (processes as TickProcess[]).push(first);
+        });
+        outcome.argvThrew = attempt(() => {
+          (first.argv as string[]).push("changed");
+        });
+        throw new Error("observer failure after mutating");
+      },
+    });
+    const child = start(process.execPath, ["-e", IDLE, "cli.js", tag]);
+    await until(() => outcome.frozen !== undefined && sampler.peek().records.some((record) => record.pid === child.pid), "the observer or the record was missing");
+    const sample = sampler.stop({});
+    expect(outcome).toEqual({ frozen: true, writeThrew: true, pushThrew: true, argvThrew: true });
+    const record = sample.records.find((candidate) => candidate.pid === child.pid)!;
+    expect(record.argvShape.includes("changed")).toBe(false);
+    expect(sample.unsandboxedRuntimes).toContain(child.pid);
+  });
+
+  it("Q8: a sample whose reference changed reports it, with the number of reads, and a sample without a change does not", () => {
+    requireHost(["bwrap"]);
+    const sample = (referenceChanged: number): ProcessSample => ({ referenceChanged, unsandboxedRuntimes: [], runtimesSeen: 0, windows: {}, records: [], clears: [] });
+    expect(sampleProblems(sample(1), {})).toEqual(["the reference process's namespaces changed during the window (1 read(s) differed from the cache)"]);
+    expect(sampleProblems(sample(3), {})).toEqual(["the reference process's namespaces changed during the window (3 read(s) differed from the cache)"]);
+    expect(sampleProblems(sample(0), {})).toEqual([]);
   });
 });

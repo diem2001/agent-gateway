@@ -1280,6 +1280,58 @@ export function sampleProblems(sample: ProcessSample, markers: Record<string, st
   return problems;
 }
 
+/** What the optional `afterTick` observer receives for one process of the tick: a frozen copy, never the sampler's own object. */
+export type TickProcess = Readonly<Omit<ProcInfo, "argv">> & { readonly argv: readonly string[] };
+
+/** The sandbox proof of the processes that carry one tag in their command line (see `taggedProcessProof`). */
+export interface TaggedProcessProof {
+  /** The live processes below the gateway whose command line holds the tag, except the real bwrap. */
+  holders: number;
+  /** The holders with the full sandbox proof, read while they were alive. */
+  proven: number;
+  /** The holders that were alive and lacked the proof: the pid, its start time and the proof's booleans (no command line). */
+  unproven: { pid: number; startTicks: string; detail: string }[];
+  /** `<pid>:<start time>` of every holder and of every proven one, so a caller can count a process once across scans. */
+  holderIds: string[];
+  provenIds: string[];
+}
+
+/**
+ * The same `sandboxProof` the window sampler uses, applied to the processes whose command line holds `tag` (a run-owned
+ * word that a role's own command carries). The real bwrap is no holder (by device and inode, like the sampler's launcher
+ * rule); an executable that cannot be read is a holder like any other, so it fails closed. Every holder needs a real bwrap
+ * ancestor and a pid, user and mount namespace that all differ from the gateway's; a holder is read once more when the
+ * first proof fails, and one that ended during the proof is neither proven nor unproven.
+ */
+export function taggedProcessProof(gatewayPid: number, tag: string, tracker: ReturnType<typeof createReferenceTracker> = createReferenceTracker()): TaggedProcessProof {
+  const known = knownExecutables();
+  const reference = tracker.begin(gatewayPid);
+  const result: TaggedProcessProof = { holders: 0, proven: 0, unproven: [], holderIds: [], provenIds: [] };
+  for (const pid of descendants(gatewayPid)) {
+    const info = readProc(pid);
+    if (!info || !info.cmdline.includes(tag)) continue;
+    const exe = readExe(pid);
+    if ("id" in exe && known.bwraps.has(exe.id)) continue;
+    const id = `${pid}:${info.startTicks}`;
+    result.holders += 1;
+    result.holderIds.push(id);
+    const attempt = (): { proof: ReturnType<typeof sandboxProof>; alive: boolean } => {
+      const proof = sandboxProof(pid, reference, known.bwraps);
+      const after = readProc(pid);
+      return { proof, alive: after !== null && after.startTicks === info.startTicks && !exiting(after, readExe(pid)) };
+    };
+    let read = attempt();
+    if (!(read.proof.proven && read.alive)) read = attempt();
+    if (read.proof.proven && read.alive) {
+      result.proven += 1;
+      result.provenIds.push(id);
+    } else if (read.alive) {
+      result.unproven.push({ pid, startTicks: info.startTicks, detail: read.proof.detail });
+    }
+  }
+  return result;
+}
+
 /**
  * Samples the processes below the gateway every `intervalMs` (20 ms by default). A runtime candidate is any process whose
  * command line names `cli.js` or whose process title is `claude`. Each tick reads a candidate (see `readTick`) and
@@ -1296,6 +1348,10 @@ export function sampleProblems(sample: ProcessSample, markers: Record<string, st
  * reason, so a sandbox failure can never be absorbed silently. `stop(markers)` prints those clears as
  * `SECURITY-PROCESS-AUDIT` lines with the run's markers checked and every name on an allowlist.
  *
+ * `seam.afterTick` (default none) is called after a tick's records and windows are written, inside its own try/catch, with a
+ * frozen snapshot of the tick's processes (pid, ppid, start time, command line, comm). It receives no record or verdict, reads
+ * nothing from `/proc` and changes no rule: a caller that wants to know which role a flagged record belonged to keeps its own map.
+ *
  * Blind spots: a runtime that lives less than one tick; a launcher that execs a runtime which ends before the next tick
  * (a process that vanished keeps its last stable verdict); a runtime with neither `cli.js` in its command line nor the
  * `claude` title; a process that left the gateway's process tree (`descendants` follows the children lists only).
@@ -1304,7 +1360,7 @@ export function startProcessSampler(
   gatewayPid: () => number,
   tags: string[] = [],
   intervalMs = 20,
-  seam: { afterStableReading?: (pid: number) => void; afterFailedProof?: (pid: number) => void } = {},
+  seam: { afterStableReading?: (pid: number) => void; afterFailedProof?: (pid: number) => void; afterTick?: (processes: readonly TickProcess[]) => void } = {},
 ): { stop: (markers: Record<string, string>) => ProcessSample; peek: () => ProcessSample } {
   const known = knownExecutables();
   const windows: ProcessSample["windows"] = {};
@@ -1535,6 +1591,13 @@ export function startProcessSampler(
         if (!info.cmdline.includes(tag)) continue;
         const window = windows[tag];
         windows[tag] = { first: window?.first ?? now, last: now };
+      }
+    }
+    if (seam.afterTick) {
+      try {
+        seam.afterTick(Object.freeze([...infos.values()].map((info): TickProcess => Object.freeze({ ...info, argv: Object.freeze([...info.argv]) }))));
+      } catch {
+        // An observer must not end the sampler or change a verdict.
       }
     }
   }, intervalMs);
