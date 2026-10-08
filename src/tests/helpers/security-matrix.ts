@@ -1119,14 +1119,8 @@ export function launcherExeOf(read: LauncherExeRead): LauncherExe {
   return read.error === "ENOENT" && read.cmdline === "" ? "gone" : "none";
 }
 
-/**
- * Whether a failed proof on a live runtime is explained by the launcher having ended first while the gateway lives (MVP-8125):
- * the runtime had its own full proof at an earlier tick; its direct parent is the very process recorded at a proven tick (the
- * real bwrap, pid and start time) and reads as the real bwrap or as that bwrap in its own exit; that parent is in the tick's
- * snapshot and has left the gateway's tree; the gateway is alive and has a cache; the runtime is alive and all three of its own
- * namespace links read; and nothing it reads equals the gateway's. A pending record is only cleared by `resolvePending`.
- */
-export function launcherEndedPending(evidence: {
+/** The input of the launcher-ended route, as `launcherEvidenceOf` builds it. */
+export interface LauncherEvidence {
   ownProof: boolean;
   identity: "verified" | "changed" | "none";
   exe: LauncherExe;
@@ -1136,7 +1130,19 @@ export function launcherEndedPending(evidence: {
   runtimeExit: ExitKind;
   ownUnreadable: boolean;
   escapeEvidence: boolean;
-}): boolean {
+}
+
+/**
+ * Whether a failed proof on a runtime that was alive at the proof is explained by the launcher having ended first while the
+ * gateway lives (MVP-8125): the runtime had its own full proof at an earlier tick; its direct parent is the very process recorded
+ * at a proven tick (the real bwrap, pid and start time) and reads as the real bwrap or as that bwrap in its own exit; that parent
+ * is in the tick's snapshot and has left the gateway's tree; the gateway is alive and has a cache; all three of the runtime's own
+ * namespace links read at the proof and nothing it reads equals the gateway's; and the exit read that follows the proof found
+ * it alive or a zombie leader whose threads still run (`Zn`: a multi-threaded runtime whose leader finished between the two
+ * reads; rev 2). Nothing here confirms an exit: a pending record is only cleared by `resolvePending`, and `Zn` is not a
+ * confirmed exit, so it waits like a live runtime does and expires flagged.
+ */
+export function launcherEndedPending(evidence: LauncherEvidence): boolean {
   return (
     evidence.ownProof &&
     evidence.identity === "verified" &&
@@ -1144,10 +1150,49 @@ export function launcherEndedPending(evidence: {
     evidence.reparented &&
     evidence.referenceExit === "alive" &&
     evidence.cacheExists &&
-    evidence.runtimeExit === "alive" &&
+    (evidence.runtimeExit === "alive" || evidence.runtimeExit === "Zn") &&
     !evidence.ownUnreadable &&
     !evidence.escapeEvidence
   );
+}
+
+/**
+ * Whether the runtime's direct parent left the gateway's tree: it is in the tick's snapshot with the same pid and start time, and
+ * its own parent now is neither the gateway nor a snapshot process (an orphan is reparented to a subreaper or init that already
+ * existed, never into the snapshot).
+ */
+export function launcherLeftTree(snapshot: ReadonlyMap<number, { startTicks: string }>, root: number, parent: { pid: number; startTicks: string; ppid: number } | null): boolean {
+  return parent !== null && snapshot.get(parent.pid)?.startTicks === parent.startTicks && parent.ppid !== root && !snapshot.has(parent.ppid);
+}
+
+/**
+ * The one builder of the launcher-ended route's input, used by the sampler itself: the escape evidence from the proof's three
+ * namespace comparisons, the gateway's state from its re-read after the proof (`null`: it could not be read), the cache from the
+ * tracker, the runtime's state from the exit read, and the launcher's identity, executable and position from the parent read.
+ */
+export function launcherEvidenceOf(input: {
+  ownProof: boolean;
+  recorded: LauncherIdentity | undefined;
+  parent: LauncherParent | null;
+  namespaces: { pid: boolean | "unreadable"; user: boolean | "unreadable"; mnt: boolean | "unreadable" };
+  ownUnreadable: boolean;
+  referenceExit: ExitKind | null;
+  cacheExists: boolean;
+  runtimeExit: ExitKind;
+  snapshot: ReadonlyMap<number, { startTicks: string }>;
+  root: number;
+}): LauncherEvidence {
+  return {
+    ownProof: input.ownProof,
+    identity: launcherIdentityOf(input.recorded, input.parent),
+    exe: input.parent === null ? "none" : launcherExeOf(input.parent.exe),
+    reparented: launcherLeftTree(input.snapshot, input.root, input.parent),
+    referenceExit: input.referenceExit ?? "vanished",
+    cacheExists: input.cacheExists,
+    runtimeExit: input.runtimeExit,
+    ownUnreadable: input.ownUnreadable,
+    escapeEvidence: input.namespaces.pid === true || input.namespaces.user === true || input.namespaces.mnt === true,
+  };
 }
 
 /**
@@ -1259,7 +1304,7 @@ export function startProcessSampler(
   gatewayPid: () => number,
   tags: string[] = [],
   intervalMs = 20,
-  seam: { afterStableReading?: (pid: number) => void } = {},
+  seam: { afterStableReading?: (pid: number) => void; afterFailedProof?: (pid: number) => void } = {},
 ): { stop: (markers: Record<string, string>) => ProcessSample; peek: () => ProcessSample } {
   const known = knownExecutables();
   const windows: ProcessSample["windows"] = {};
@@ -1359,6 +1404,12 @@ export function startProcessSampler(
               launcherIdentity = proof.parent !== null && launcherExeOf(proof.parent.exe) === "real-bwrap" ? { pid: proof.parent.pid, startTicks: proof.parent.startTicks } : "none";
             } else if (!belowProven) {
               firstMissingProof ??= proof.detail;
+              // Test seam (default none): lets a control place the runtime's exit between the proof and the exit read that follows it.
+              try {
+                seam.afterFailedProof?.(info.pid);
+              } catch {
+                // A failing control must not end the sampler; its own assertions report the precondition.
+              }
               // Was this failure read while the process was alive or ending, and which proof routes exist?
               const runtimeExit = endedNow(info.pid, info.startTicks);
               const failure = {
@@ -1389,25 +1440,20 @@ export function startProcessSampler(
                 pendingPossible &&
                 !referencePending &&
                 runtimeEndingPending({ ownProof: failure.ownProof, zombieLeader: runtimeExit.zombieLeader, ownUnreadable: proof.ownUnreadable.length > 0, escapeEvidence: failure.escapeEvidence });
-              // The launcher-ended route needs the gateway alive, so it cannot apply with the reference route; it needs every own link readable, so it cannot apply with the runtime-side route.
-              const launcherIdentityNow = launcherIdentityOf(launcherIdentity, proof.parent);
-              const launcherExe: LauncherExe = proof.parent === null ? "none" : launcherExeOf(proof.parent.exe);
-              const reparented = proof.parent !== null && infos.get(proof.parent.pid)?.startTicks === proof.parent.startTicks && proof.parent.ppid !== root && !infos.has(proof.parent.ppid);
-              const launcherPending =
-                pendingPossible &&
-                !referencePending &&
-                !runtimePending &&
-                launcherEndedPending({
-                  ownProof: failure.ownProof,
-                  identity: launcherIdentityNow,
-                  exe: launcherExe,
-                  reparented,
-                  referenceExit: referenceNow?.kind ?? "vanished",
-                  cacheExists: reference.hasCache,
-                  runtimeExit: runtimeExit.kind,
-                  ownUnreadable: proof.ownUnreadable.length > 0,
-                  escapeEvidence: failure.escapeEvidence,
-                });
+              // The launcher-ended route needs the gateway alive, so it cannot apply with the reference route; it needs every own link readable at the proof, so it cannot apply with the runtime-side route.
+              const launcher = launcherEvidenceOf({
+                ownProof: failure.ownProof,
+                recorded: launcherIdentity,
+                parent: proof.parent,
+                namespaces: proof.namespaces,
+                ownUnreadable: proof.ownUnreadable.length > 0,
+                referenceExit: referenceNow?.kind ?? null,
+                cacheExists: reference.hasCache,
+                runtimeExit: runtimeExit.kind,
+                snapshot: infos,
+                root,
+              });
+              const launcherPending = pendingPossible && !referencePending && !runtimePending && launcherEndedPending(launcher);
               pendingNow = referencePending || runtimePending || launcherPending;
               if (pendingNow) pending = prior?.pending ?? { state: "waiting", sinceMs: now, route: referencePending ? "reference-ended" : runtimePending ? "runtime-ending" : "launcher-ended", reference: referencePending ? { pid: root, startTicks: reference.startTicks! } : undefined };
               proofFailure = proofFailure
@@ -1428,9 +1474,9 @@ export function startProcessSampler(
                     referenceExit: referenceNow?.kind ?? "vanished",
                     runtimeExit: runtimeExit.kind,
                     pending: pending ? pending.state : "none",
-                    launcherIdentity: launcherIdentityNow,
-                    launcherExe,
-                    reparented,
+                    launcherIdentity: launcher.identity,
+                    launcherExe: launcher.exe,
+                    reparented: launcher.reparented,
                   };
             }
             // A flag stays: one tick without proof is a run outside the sandbox, whatever the next tick shows.
