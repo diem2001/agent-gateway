@@ -493,6 +493,85 @@ describe("a file saved or replaced while a run is open does not reach it (real r
 });
 
 /* ------------------------------------------------------------------ */
+/*  A store of thousands of empty folders (MVP-8126)                    */
+/* ------------------------------------------------------------------ */
+
+/** One query, timed to its first stream event (evidence only, never asserted). */
+function askTimed(r: Rig, label: string, body: Record<string, unknown>): Promise<{ events: Ndjson[]; firstEventMs: number }> {
+  const payload = Buffer.from(JSON.stringify({ queryId: `q-8126-${Date.now()}-${Math.floor(Math.random() * 1e6)}`, model: "claude-sonnet-4-5", useSession: true, ...body }), "utf8");
+  const started = Date.now();
+  return new Promise((resolve, reject) => {
+    let firstEventMs = -1;
+    const req = http.request(
+      { host: "127.0.0.1", port: r.gateway.port, method: "POST", path: "/v1/query", agent: false, headers: { Authorization: `Bearer ${keyOf(label)}`, "Content-Type": "application/json", "Content-Length": payload.length } },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => {
+          if (firstEventMs < 0) firstEventMs = Date.now() - started;
+          chunks.push(chunk);
+        });
+        res.on("end", () => {
+          const events = Buffer.concat(chunks)
+            .toString("utf8")
+            .split("\n")
+            .filter((line) => line.trim().startsWith("{"))
+            .map((line) => JSON.parse(line) as Ndjson);
+          resolve({ events, firstEventMs });
+        });
+      },
+    );
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
+describe("a very large skills store does not stop or slow a denied run (real runtime)", () => {
+  it("L1 a Bash-denied run with 2500 empty skill folders and a stdio-command agent completes, binds a copy of 2000 folders and logs one summary line", async () => {
+    const folders = 2500;
+    const seen = { runDirs: -1, folders: -1, files: -1 };
+    const r = await rig({
+      policy: DENY_BASH_FOR_REQLIFT,
+      scripts: [delegate("L1GO", "L1SUB go", "l1agent"), read("L1SUB")],
+      seed: (workspace) => {
+        for (let i = 0; i < folders; i++) fs.mkdirSync(path.join(workspace, "skills", `f${String(i).padStart(4, "0")}`), { recursive: true });
+        operatorFile(workspace, "agents/l1agent.md", agentOf("l1", stdioOf("l1")));
+      },
+      // The run is open here: count the copy the sandbox is bound to, on the host.
+      beforeAnswer: (info, self) => {
+        if (info.prompt !== "L1GO" || info.resultsAfterLatestPrompt !== 0 || seen.runDirs >= 0) return;
+        const runs = path.join(self().gateway.dirs.home, ".agent-sandbox", "runs");
+        const matching = fs.readdirSync(runs).filter((name) => name.startsWith("run-"));
+        seen.runDirs = matching.length;
+        if (matching.length !== 1) return;
+        const copy = path.join(runs, matching[0], "trusted", "neutralized", "skills");
+        const entries = fs.readdirSync(copy, { withFileTypes: true });
+        seen.folders = entries.filter((e) => e.isDirectory()).length;
+        seen.files = entries.filter((e) => !e.isDirectory()).length;
+      },
+    });
+    const { events, firstEventMs } = await askTimed(r, "reqlift", { prompt: "L1GO", sessionId: "l1" });
+    const lines = r.gateway.output().split("\n");
+    const limited = lines.filter((line) => line.includes("sandbox.content.limited"));
+    const skillsLimited = limited.filter((line) => line.includes("kind=snapshot-skills") && line.includes(" folders=2000 ") && line.includes(" stopped=true"));
+    const tooLarge = lines.filter((line) => line.includes("reason=too_large")).length;
+    const markers = await markersOf(r, "reqlift", "l1", "l1-");
+    const completed = events.at(-1)?.type === "done" && !events.some((e) => e.type === "error");
+    const tokenSeen = requestsWith(r, token("l1")) > 0;
+    const ok = completed && markers === 0 && tokenSeen && seen.runDirs === 1 && seen.folders === 2000 && seen.files === 0 && limited.length === 1 && skillsLimited.length === 1 && tooLarge === 0;
+    evidence("L1", { runDirs: seen.runDirs, copiedFolders: seen.folders, copiedFiles: seen.files, limitedLines: limited.length, skillsLimitedLines: skillsLimited.length, tooLargeLines: tooLarge, markers, completed, tokenSeen, runStartMs: firstEventMs }, ok);
+    expect(completed, "L1: the run completes").toBe(true);
+    expect(markers, "L1: markers after the run").toBe(0);
+    expect(tokenSeen, "L1: the agent's instruction reached the model").toBe(true);
+    expect(seen.runDirs, "L1: run folders on the host while the run was open").toBe(1);
+    expect(seen.folders, "L1: folders in the copy the sandbox sees").toBe(2000);
+    expect(seen.files, "L1: files in the copy the sandbox sees").toBe(0);
+    expect(limited.length, "L1: summary lines in the gateway output").toBe(1);
+    expect(skillsLimited.length, "L1: the summary line names the skills entry with folders=2000 and stopped=true").toBe(1);
+    expect(tooLarge, "L1: too_large lines").toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /*  Negative controls                                                   */
 /* ------------------------------------------------------------------ */
 
