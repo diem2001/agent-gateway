@@ -1687,6 +1687,8 @@ export function startProcessSampler(
       if (namesRuntime(info)) firstExes.set(pid, readExe(pid));
     }
     const now = Date.now();
+    /** The start of a pending bound: the tick's start, moved forward only by a test seam that held the tick (no seam by default, so never in a real run). */
+    let pendingClock = now;
     for (const info of infos.values()) {
       const oldCandidate = /(^|[ /])cli\.js( |$)/.test(info.cmdline);
       if (namesRuntime(info)) {
@@ -1731,6 +1733,7 @@ export function startProcessSampler(
             // Test seam (default none): lets a control force the exit between the stable reading and the proof.
             try {
               seam.afterStableReading?.(info.pid);
+              if (seam.afterStableReading) pendingClock = Date.now();
             } catch {
               // A failing control must not end the sampler; its own assertions report the precondition.
             }
@@ -1750,6 +1753,7 @@ export function startProcessSampler(
               // Test seam (default none): lets a control place the runtime's exit between the proof and the exit read that follows it.
               try {
                 seam.afterFailedProof?.(info.pid);
+                if (seam.afterFailedProof) pendingClock = Date.now();
               } catch {
                 // A failing control must not end the sampler; its own assertions report the precondition.
               }
@@ -1800,10 +1804,9 @@ export function startProcessSampler(
               const launcherPending = pendingPossible && !referencePending && !runtimePending && launcherEndedPending(launcher);
               pendingNow = referencePending || runtimePending || launcherPending;
               if (pendingNow) {
-                // The bound runs from the moment the record became pending, not from the start of the tick (a test seam can hold the tick for seconds).
                 pending = prior?.pending
                   ? { ...prior.pending, sawLeaderExit: prior.pending.sawLeaderExit === true || runtimeExit.leaderExitSeen }
-                  : { state: "waiting", sinceMs: Date.now(), route: referencePending ? "reference-ended" : runtimePending ? "runtime-ending" : "launcher-ended", reference: referencePending ? { pid: root, startTicks: reference.startTicks! } : undefined, sawLeaderExit: runtimeExit.leaderExitSeen };
+                  : { state: "waiting", sinceMs: pendingClock, route: referencePending ? "reference-ended" : runtimePending ? "runtime-ending" : "launcher-ended", reference: referencePending ? { pid: root, startTicks: reference.startTicks! } : undefined, sawLeaderExit: runtimeExit.leaderExitSeen };
               }
               proofFailure = proofFailure
                 ? {
