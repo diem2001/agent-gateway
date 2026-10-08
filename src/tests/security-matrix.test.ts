@@ -62,6 +62,7 @@ import {
   type MatrixRow,
   type Surface,
 } from "./helpers/security-matrix.js";
+import { launcherEndedPending, launcherExeOf, launcherIdentityOf, ownProofHeld, type LauncherExeRead } from "./helpers/security-matrix.js";
 import { descendants } from "./helpers/git-process-gateway.js";
 import { ROUTE_IDS, credentialSteps, entrypointRowIds, failureRowIds, registryRowIds, regressionRowIds, parseReport, routeSource, routeSteps, verifyRoute, type RouteContext, type RouteReport } from "./helpers/security-routes.js";
 
@@ -810,7 +811,7 @@ describe("process sampler launcher exemption", () => {
       for (const line of audit) expect(line.includes(marker), "an audit line carried the synthetic name").toBe(false);
       expect(audit.some((line) => line.includes("comm sh exe") && line.includes("verdict=launcher")), "the allowlisted process lost its detail").toBe(true);
       expect(summary, "one summary line of counts per window").toHaveLength(1);
-      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+ failed_exiting=\d+ failed_alive=\d+ failed_own_proof=\d+ failed_launcher_proof=\d+ failed_escape_evidence=\d+ exit_cleared_own=\d+ exit_cleared_launcher=\d+ exit_cleared_reference=\d+ exit_cleared_runtime_ending=\d+ pending_expired=\d+ proved_reference_cached=\d+ failed_reference_cached=\d+ failed_reference_missing=\d+ failed_own_unreadable=\d+ failed_chain_broken=\d+ reference_changed=\d+ row=(none|withheld|[A-Za-z0-9().,_-]+-[0-9a-f]{10}) flagged=\d+$/);
+      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+ failed_exiting=\d+ failed_alive=\d+ failed_own_proof=\d+ failed_launcher_proof=\d+ failed_escape_evidence=\d+ exit_cleared_own=\d+ exit_cleared_launcher=\d+ exit_cleared_reference=\d+ exit_cleared_runtime_ending=\d+ exit_cleared_launcher_ended=\d+ failed_launcher_reparented=\d+ pending_expired=\d+ proved_reference_cached=\d+ failed_reference_cached=\d+ failed_reference_missing=\d+ failed_own_unreadable=\d+ failed_chain_broken=\d+ reference_changed=\d+ row=(none|withheld|[A-Za-z0-9().,_-]+-[0-9a-f]{10}) flagged=\d+$/);
     }
   });
 
@@ -1425,6 +1426,514 @@ describe("process sampler launcher exemption", () => {
     expect(record!.unsandboxed).toBe(false);
     expect(runtimeEnded(state), "the runtime did not fully end").toBe(true);
     expect(final.unsandboxedRuntimes).toEqual([]);
+  });
+});
+
+/**
+ * The launcher ends first while the gateway lives (MVP-8125): the gateway stops the outer bwrap, the inner bwrap (pid 1 of the
+ * sandbox) is reparented to the user's subreaper and the runtime below it leaves the gateway's process tree, so the tick whose
+ * snapshot predates that reparenting proves a runtime through a broken chain. Real processes: a Node reference stand-in
+ * (`gatewayPid`) starts a real bwrap WITHOUT `--die-with-parent`, so the inner bwrap and the stand-in runtime survive the end of
+ * the outer one, as they do in the gateway's window. The row ids start with `LE` (apart from the `L1`/`L2` rows of the launcher
+ * exemption). Every negative row first asserts that the sampler recorded the candidate and then that every predicate other than
+ * the row's own one still holds, so a row isolates exactly one predicate, and it ends the runtime within the bound so that an
+ * expiry cannot mask a widening (MVP-8090 finding A). A missing host prerequisite fails the row.
+ */
+describe("process sampler launcher ended (MVP-8125)", () => {
+  const KEEP_INNER = ["bwrap", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc"];
+  const STAND_IN = "exec -a claude sleep 30";
+  const STAND_IN_FORK = `(${STAND_IN}) & wait`;
+  const REFERENCE_SOURCE = `
+    const { spawn } = require("node:child_process");
+    const [mode, argv] = [process.argv[1], JSON.parse(process.argv[2])];
+    const controller = new AbortController();
+    const m = spawn(argv[0], argv.slice(1), { stdio: "ignore", ...(mode === "abort" ? { signal: controller.signal } : {}) });
+    m.on("error", () => {});
+    if (mode === "exit") {
+      process.on("SIGUSR2", () => process.exit(0));
+      // The SDK's exit handler: SIGTERM to the launcher, then the gateway stays alive in its exit sequence.
+      process.on("exit", () => { m.kill("SIGTERM"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000); });
+    }
+    if (mode === "abort") process.on("SIGUSR2", () => controller.abort());
+    if (mode === "kill") process.on("SIGUSR2", () => m.kill("SIGKILL"));
+    setInterval(() => {}, 1000);
+  `;
+  type Trigger = "exit" | "abort" | "kill" | "none";
+  interface Tracked {
+    pid: number;
+    startTicks: string;
+  }
+  const tracked: Tracked[] = [];
+  const references: ChildProcess[] = [];
+  const dirs: string[] = [];
+  const quote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+
+  const sleepSync = (ms: number): void => void Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  /** The seam runs inside a sampler tick and must hold it until the shape exists: this waits without releasing the event loop. */
+  const waitSync = (condition: () => boolean, boundMs = 3000): boolean => {
+    for (const end = Date.now() + boundMs; !condition(); sleepSync(2)) if (Date.now() > end) return false;
+    return true;
+  };
+  const stat = (pid: number): { state: string; ppid: number; startTicks: string } | null => {
+    try {
+      const text = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const rest = text.slice(text.lastIndexOf(")") + 2).split(" ");
+      return { state: rest[0], ppid: Number(rest[1]), startTicks: rest[19] };
+    } catch {
+      return null;
+    }
+  };
+  const ppidOf = (pid: number): number => stat(pid)?.ppid ?? 0;
+  const signal = (pid: number, name: NodeJS.Signals): void => {
+    try {
+      process.kill(pid, name);
+    } catch {
+      // Already gone.
+    }
+  };
+  const exeId = (pid: number): string | null => {
+    try {
+      const identity = fs.statSync(`/proc/${pid}/exe`, { bigint: true });
+      return `${identity.dev}:${identity.ino}`;
+    } catch {
+      return null;
+    }
+  };
+  const REAL_BWRAP = ((): string => {
+    const identity = fs.statSync("/usr/bin/bwrap", { bigint: true });
+    return `${identity.dev}:${identity.ino}`;
+  })();
+  const isRealBwrap = (pid: number): boolean => exeId(pid) === REAL_BWRAP;
+  /** Records a process the row depends on with its start time, so that cleanup only ever kills the process it recorded. */
+  const track = (pid: number): Tracked => {
+    const item = { pid, startTicks: stat(pid)?.startTicks ?? "" };
+    tracked.push(item);
+    return item;
+  };
+  const sameProcess = (item: Tracked): boolean => stat(item.pid)?.startTicks === item.startTicks;
+  const endTracked = (item: Tracked): void => {
+    if (sameProcess(item)) signal(item.pid, "SIGKILL");
+  };
+  afterEach(() => {
+    for (const item of tracked.splice(0)) endTracked(item);
+    for (const reference of references.splice(0)) for (const pid of [...descendants(reference.pid!), reference.pid!]) signal(pid, "SIGKILL");
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const startReference = (trigger: Trigger, argv: string[]): ChildProcess => {
+    const reference = spawn(process.execPath, ["-e", REFERENCE_SOURCE, trigger, JSON.stringify(argv)], { stdio: "ignore" });
+    references.push(reference);
+    return reference;
+  };
+  const scratch = (): string => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp8125-"));
+    dirs.push(dir);
+    return dir;
+  };
+
+  /** What the seam did for the one candidate under test: the row reads every flag back before it asserts anything else. */
+  interface SeamState {
+    pid?: number;
+    readings: number;
+    forced: boolean;
+    reached: boolean;
+    runtime?: Tracked;
+  }
+  const newState = (): SeamState => ({ readings: 0, forced: false, reached: false });
+  /** On the `atReading`-th stable reading of the one candidate it runs `act`, which returns whether the shape was reached within its bound. */
+  const seamOf =
+    (state: SeamState, atReading: number, act: (pid: number) => boolean) =>
+    (pid: number): void => {
+      state.pid ??= pid;
+      if (pid !== state.pid || state.forced) return;
+      state.readings += 1;
+      if (state.readings < atReading) return;
+      state.forced = true;
+      state.runtime = track(pid);
+      state.reached = act(pid);
+    };
+
+  const until = async (condition: () => boolean, what: string, boundMs = 20_000): Promise<void> => {
+    for (const end = Date.now() + boundMs; !condition() && Date.now() < end; ) await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(condition(), `precondition not reached: ${what}`).toBe(true);
+  };
+  const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  const ended = (item: Tracked): boolean => endedNow(item.pid, item.startTicks).ended;
+
+  /** Closes the window and returns the final sample with the audit and summary lines `stop(markers)` printed. */
+  function closeWindow(sampler: { stop: (markers: Record<string, string>) => ProcessSample }): { final: ProcessSample; audit: string[]; summary: string[] } {
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    let final: ProcessSample;
+    try {
+      final = sampler.stop({});
+    } finally {
+      spy.mockRestore();
+    }
+    const printed = lines.join("").split("\n");
+    return { final, audit: printed.filter((line) => line.startsWith("SECURITY-PROCESS-AUDIT")), summary: printed.filter((line) => line.startsWith("SECURITY-PROCESS-SUMMARY")) };
+  }
+
+  /** The failing tick has run for the runtime under test: the record holds a proof failure. */
+  const failureRecorded = (sampler: { peek: () => ProcessSample }): boolean => sampler.peek().records.some((record) => record.proofFailure !== undefined);
+  const recordOf = (sample: ProcessSample, runtime: Tracked | undefined): ProcessRecord => {
+    const record = sample.records.find((candidate) => candidate.pid === runtime?.pid);
+    expect(record, "precondition not reached: the sampler did not record the runtime").toBeDefined();
+    return record!;
+  };
+
+  /** Every predicate holds; a negative row overrides exactly its own one. */
+  const ALL_HOLD = { failedWhile: "alive", ownProof: true, escapeEvidence: false, ownUnreadable: "none", referenceExit: "alive", runtimeExit: "alive", chain: "broken", launcherIdentity: "verified", launcherExe: "real-bwrap", reparented: true } as const;
+  /** A negative row: the record was flagged, never pending, and every predicate but the row's own one is as in `ALL_HOLD`. */
+  const flaggedWith = (final: ProcessSample, record: ProcessRecord, own: Partial<Record<keyof typeof ALL_HOLD, string | boolean>>): void => {
+    expect(record.proofFailure).toMatchObject({ ...ALL_HOLD, ...own });
+    expect(record.pending, "the record was never pending").toBeUndefined();
+    expect(record.proofFailure?.pending, "the record was never pending").toBe("none");
+    expect(record.clearedBy).toBeUndefined();
+    expect(record.fate, "the runtime ended within the bound").toBe("exited");
+    expect(final.unsandboxedRuntimes).toContain(record.pid);
+    const text = sampleProblems(final, {}).join("\n");
+    expect(text).toContain("ran without a sandbox ancestor");
+    expect(text).toContain(`pid ${record.pid}`);
+  };
+
+  /** Reference -> M (no `--die-with-parent`) -> I (inner bwrap, pid 1 of the sandbox) -> C (stand-in titled claude). */
+  const launcherTree = [...KEEP_INNER, "/bin/bash", "-c", STAND_IN];
+  /** The seam of the rows that stop the launcher through the reference: on the third reading it triggers the stop and holds the tick until I's parent is no longer M. */
+  const stopThroughReference = (state: SeamState, reference: () => ChildProcess | undefined, record: (inner: Tracked) => void) =>
+    seamOf(state, 3, (pid) => {
+      const inner = track(ppidOf(pid));
+      const monitor = track(ppidOf(inner.pid));
+      record(inner);
+      signal(reference()!.pid!, "SIGUSR2");
+      return waitSync(() => ppidOf(inner.pid) !== monitor.pid);
+    });
+
+  it.each([
+    ["LE1-exit", "SIGTERM from the gateway's exit handler (restart-term path)", "exit"],
+    ["LE1-abort", "SIGTERM from the spawn abort signal (cancel path)", "abort"],
+    ["LE1-kill", "SIGKILL (deadline stop, dispose timeout)", "kill"],
+  ] as const)("%s: the launcher is stopped by %s while the gateway lives; the runtime is pending, counts as flagged, and is cleared when its exit is confirmed", async (_id, _by, trigger) => {
+    requireHost(["bwrap", "unshare"]);
+    const state = newState();
+    let inner: Tracked | undefined;
+    let reference: ChildProcess | undefined;
+    const sampler = startProcessSampler(() => reference?.pid ?? 0, [], 20, {
+      afterStableReading: stopThroughReference(state, () => reference, (found) => (inner = found)),
+    });
+    reference = startReference(trigger, launcherTree);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the inner bwrap was not reparented within its bound").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    const waiting = sampler.peek();
+    const record = recordOf(waiting, state.runtime);
+    expect(record.proofFailure).toMatchObject({ ...ALL_HOLD, pending: "waiting" });
+    expect(record.pending).toMatchObject({ state: "waiting", route: "launcher-ended" });
+    expect(describeRecords([record])).toContain("launcher-identity=verified launcher-exe=real-bwrap reparented=true");
+    // A waiting record counts as flagged (closes MVP-8090 QA note Q6); only after that is the sandbox ended.
+    expect(waiting.unsandboxedRuntimes).toContain(record.pid);
+    expect(inner && sameProcess(inner) && isRealBwrap(inner.pid), "precondition not reached: the inner bwrap was not alive with the real executable").toBe(true);
+    endTracked(inner!);
+    await until(() => ended(state.runtime!), "the runtime did not end after the inner bwrap");
+    await until(() => sampler.peek().records.every((candidate) => candidate.pending?.state !== "waiting"), "the pending record did not settle");
+    const { final, audit, summary } = closeWindow(sampler);
+    const cleared = recordOf(final, state.runtime);
+    expect(cleared.pending?.state).toBe("cleared");
+    expect(cleared.clearedBy).toBe("launcher-ended");
+    expect(cleared.unsandboxed).toBe(false);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("runtime exit confirmed after its own proof read while alive (launcher ended first, gateway alive)"))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_launcher_ended=1");
+    for (const other of ["exit_cleared_own", "exit_cleared_launcher", "exit_cleared_reference", "exit_cleared_runtime_ending"]) expect(summary[0], `only the new route cleared (${other})`).toContain(`${other}=0`);
+  });
+
+  it("LE2-alive: a runtime still alive 2.5 s after the break is flagged for good (the pending record expires), although it ends before the window closes", async () => {
+    requireHost(["bwrap", "unshare"]);
+    const state = newState();
+    let inner: Tracked | undefined;
+    let reference: ChildProcess | undefined;
+    const sampler = startProcessSampler(() => reference?.pid ?? 0, [], 20, {
+      afterStableReading: stopThroughReference(state, () => reference, (found) => (inner = found)),
+    });
+    reference = startReference("kill", launcherTree);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the inner bwrap was not reparented within its bound").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    // A fixed wait, never a stage: the bound is 2 s, and the runtime and its inner bwrap stay alive through it.
+    await pause(2500);
+    expect(ended(state.runtime!), "precondition not reached: the runtime ended before the bound passed").toBe(false);
+    const expired = recordOf(sampler.peek(), state.runtime);
+    expect(expired.proofFailure).toMatchObject({ ...ALL_HOLD, pending: "expired" });
+    expect(expired.unsandboxed).toBe(true);
+    endTracked(inner!);
+    await until(() => ended(state.runtime!), "the runtime did not end after the inner bwrap");
+    const { final, summary } = closeWindow(sampler);
+    const record = recordOf(final, state.runtime);
+    expect(record.fate).toBe("exited");
+    expect(record.pending?.state).toBe("expired");
+    expect(record.clearedBy).toBeUndefined();
+    expect(final.unsandboxedRuntimes).toContain(record.pid);
+    expect(sampleProblems(final, {}).join("\n")).toContain(`pid ${record.pid}`);
+    expect(summary[0]).toContain("pending_expired=1");
+    expect(summary[0]).toContain("exit_cleared_launcher_ended=0");
+  });
+
+  it("LE3-noproof: a runtime whose first stable reading falls on the break (no own proof, the start-failure shape) is flagged and never pending", async () => {
+    requireHost(["bwrap", "unshare"]);
+    const state = newState();
+    let inner: Tracked | undefined;
+    let reference: ChildProcess | undefined;
+    const sampler = startProcessSampler(() => reference?.pid ?? 0, [], 20, {
+      afterStableReading: seamOf(state, 1, (pid) => {
+        inner = track(ppidOf(pid));
+        const monitor = track(ppidOf(inner.pid));
+        signal(monitor.pid, "SIGKILL");
+        return waitSync(() => ppidOf(inner!.pid) !== monitor.pid);
+      }),
+    });
+    reference = startReference("none", launcherTree);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the inner bwrap was not reparented within its bound").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    endTracked(inner!);
+    await until(() => ended(state.runtime!), "the runtime did not end within the bound");
+    const { final } = closeWindow(sampler);
+    flaggedWith(final, recordOf(final, state.runtime), { ownProof: false, launcherIdentity: "none" });
+  });
+
+  // LE4: a copy of `unshare` named `bwrap` sits directly above the runtime, in new pid, user and mount namespaces below a real bwrap.
+  it("LE4-forged: a forged bwrap (not the real executable) directly above the break is no launcher: the identity stays none and the runtime is flagged", async () => {
+    requireHost(["bwrap", "unshare"]);
+    const forged = path.join(scratch(), "bwrap");
+    fs.copyFileSync("/usr/bin/unshare", forged);
+    fs.chmodSync(forged, 0o755);
+    const state = newState();
+    let reference: ChildProcess | undefined;
+    const sampler = startProcessSampler(() => reference?.pid ?? 0, [], 20, {
+      afterStableReading: seamOf(state, 3, (pid) => {
+        const forgedParent = track(ppidOf(pid));
+        const holder = track(ppidOf(forgedParent.pid));
+        signal(holder.pid, "SIGKILL");
+        return waitSync(() => ppidOf(forgedParent.pid) !== holder.pid);
+      }),
+    });
+    reference = startReference("none", [
+      "bwrap", "--unshare-user", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+      "/bin/sh", "-c", `${quote(forged)} --user --map-root-user --pid --fork /bin/bash -c ${quote(STAND_IN)} & wait`,
+    ]);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the forged bwrap was not reparented within its bound").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    signal(state.runtime!.pid, "SIGKILL");
+    await until(() => ended(state.runtime!), "the runtime did not end within the bound");
+    const { final } = closeWindow(sampler);
+    flaggedWith(final, recordOf(final, state.runtime), { launcherIdentity: "none", launcherExe: "other" });
+  });
+
+  // LE5: nothing is sandboxed; a copy of bash named `bwrap` sits above the runtime in the reference's namespaces (escape evidence).
+  it("LE5-combined: an unsandboxed runtime below a forged bwrap whose holder is killed is flagged on its escape evidence, never pending", async () => {
+    requireHost(["bwrap", "unshare"]);
+    const forged = path.join(scratch(), "bwrap");
+    fs.copyFileSync("/bin/bash", forged);
+    fs.chmodSync(forged, 0o755);
+    const forgedStat = fs.statSync(forged, { bigint: true });
+    const state = newState();
+    let directParentIsForged = false;
+    let reference: ChildProcess | undefined;
+    const sampler = startProcessSampler(() => reference?.pid ?? 0, [], 20, {
+      afterStableReading: seamOf(state, 1, (pid) => {
+        const forgedParent = track(ppidOf(pid));
+        const holder = track(ppidOf(forgedParent.pid));
+        directParentIsForged = exeId(forgedParent.pid) === `${forgedStat.dev}:${forgedStat.ino}` && !isRealBwrap(forgedParent.pid);
+        signal(holder.pid, "SIGKILL");
+        return waitSync(() => ppidOf(forgedParent.pid) !== holder.pid);
+      }),
+    });
+    reference = startReference("none", ["/bin/sh", "-c", `${quote(forged)} -c ${quote(STAND_IN_FORK)} & wait`]);
+    await until(() => state.forced, "the seam did not run");
+    expect(directParentIsForged, "precondition not reached: the runtime's direct parent is not the forged bwrap").toBe(true);
+    expect(state.reached, "precondition not reached: the forged bwrap was not reparented within its bound").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    signal(state.runtime!.pid, "SIGKILL");
+    await until(() => ended(state.runtime!), "the runtime did not end within the bound");
+    const { final } = closeWindow(sampler);
+    flaggedWith(final, recordOf(final, state.runtime), { ownProof: false, escapeEvidence: true, launcherIdentity: "none", launcherExe: "other" });
+  });
+
+  // LE6: M -> I -> holder X (bash) -> C. The proven ticks record no identity (the direct parent is the holder); once X dies C is I's child.
+  it("LE6-identity-none: a real bwrap that became the runtime's parent only after the proven ticks is no recorded launcher: flagged, never pending", async () => {
+    requireHost(["bwrap", "unshare"]);
+    const state = newState();
+    let reference: ChildProcess | undefined;
+    let innerIsRealBwrap = false;
+    const sampler = startProcessSampler(() => reference?.pid ?? 0, [], 20, {
+      afterStableReading: seamOf(state, 3, (pid) => {
+        const holder = track(ppidOf(pid));
+        const inner = track(ppidOf(holder.pid));
+        const monitor = track(ppidOf(inner.pid));
+        signal(holder.pid, "SIGKILL");
+        if (!waitSync(() => ppidOf(pid) === inner.pid)) return false;
+        innerIsRealBwrap = sameProcess(inner) && isRealBwrap(inner.pid);
+        signal(monitor.pid, "SIGKILL");
+        return waitSync(() => ppidOf(inner.pid) !== monitor.pid);
+      }),
+    });
+    reference = startReference("none", [...KEEP_INNER, "/bin/bash", "-c", STAND_IN_FORK]);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the runtime did not become the inner bwrap's child, or the inner bwrap was not reparented, within the bounds").toBe(true);
+    expect(innerIsRealBwrap, "precondition not reached: the inner bwrap was not alive with the real executable").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    endTracked(tracked.find((item) => item.pid === ppidOf(state.runtime!.pid))!);
+    await until(() => ended(state.runtime!), "the runtime did not end within the bound");
+    const { final } = closeWindow(sampler);
+    flaggedWith(final, recordOf(final, state.runtime), { launcherIdentity: "none", launcherExe: "real-bwrap" });
+  });
+
+  // LE7: X (sh) -> M -> I -> C. X dies: M leaves the gateway's line, but I keeps its parent M, which is still a snapshot process.
+  it("LE7-not-reparented: a launcher whose parent is still on the gateway's line (a snapshot process) is not reparented: flagged, never pending", async () => {
+    requireHost(["bwrap", "unshare"]);
+    const state = newState();
+    let reference: ChildProcess | undefined;
+    const sampler = startProcessSampler(() => reference?.pid ?? 0, [], 20, {
+      afterStableReading: seamOf(state, 3, (pid) => {
+        const inner = track(ppidOf(pid));
+        const monitor = track(ppidOf(inner.pid));
+        const holder = track(ppidOf(monitor.pid));
+        signal(holder.pid, "SIGKILL");
+        return waitSync(() => ppidOf(monitor.pid) !== holder.pid);
+      }),
+    });
+    reference = startReference("none", ["/bin/sh", "-c", `${KEEP_INNER.map(quote).join(" ")} /bin/bash -c ${quote(STAND_IN)} & wait`]);
+    await until(() => state.forced, "the seam did not run");
+    expect(state.reached, "precondition not reached: the monitor was not reparented within its bound").toBe(true);
+    await until(() => failureRecorded(sampler), "the failing tick did not run");
+    endTracked(tracked.find((item) => item.pid === ppidOf(state.runtime!.pid))!);
+    await until(() => ended(state.runtime!), "the runtime did not end within the bound");
+    const { final } = closeWindow(sampler);
+    flaggedWith(final, recordOf(final, state.runtime), { reparented: false });
+  });
+});
+
+/**
+ * The decision table of the launcher-ended route: the same exported functions the sampler runs, with expected values written out
+ * here. Stated exceptions to the real-process rule (MVP-7992), each with its reason in `docs/architecture.md`: pid reuse (an
+ * unprivileged test cannot force it), escape together with an own proof (no real process can have both), the inner bwrap in its own
+ * exit (microseconds to milliseconds, cannot be held), EACCES on the launcher (a real bwrap never execs and EACCES would need a
+ * setuid bwrap), an unreadable own link while alive (measured unreachable in MVP-8090), and the reference ending (rows R1 to R5).
+ */
+describe("process sampler launcher ended: decision table (MVP-8125)", () => {
+  const holds = (partial: Partial<Parameters<typeof launcherEndedPending>[0]> = {}): Parameters<typeof launcherEndedPending>[0] => ({
+    ownProof: true,
+    identity: "verified",
+    exe: "real-bwrap",
+    reparented: true,
+    referenceExit: "alive",
+    cacheExists: true,
+    runtimeExit: "alive",
+    ownUnreadable: false,
+    escapeEvidence: false,
+    ...partial,
+  });
+
+  it.each([
+    ["T-le: every condition holds (the inner bwrap alive with its executable)", holds(), true],
+    ["T-le: every condition holds (the inner bwrap in its own exit: ENOENT with an empty command line)", holds({ exe: "gone" }), true],
+    ["T-le: ownProof=false with the identity verified", holds({ ownProof: false }), false],
+    ["T-le: launcher identity changed (the pid was reused)", holds({ identity: "changed" }), false],
+    ["T-le: no recorded launcher identity", holds({ identity: "none" }), false],
+    ["T-le: the launcher's executable is another one", holds({ exe: "other" }), false],
+    ["T-le: EACCES on the launcher is no identity", holds({ exe: "denied" }), false],
+    ["T-le: ESRCH or any other error on the launcher", holds({ exe: "none" }), false],
+    ["T-le: not reparented (the launcher's parent is on the gateway's line)", holds({ reparented: false }), false],
+    ["T-le: no cache for the reference", holds({ cacheExists: false }), false],
+    ["T-le: an own link unreadable while alive", holds({ ownUnreadable: true }), false],
+    ["T-le: escape evidence on pid, user or mnt", holds({ escapeEvidence: true }), false],
+  ])("%s", (_name, given, expected) => {
+    expect(launcherEndedPending(given)).toBe(expected);
+  });
+
+  it.each(["Zn", "Z1", "X", "vanished", "start-changed", "empty-gone"] as const)("T-le: reference %s / ended is no route (the reference-ended route takes it)", (kind) => {
+    expect(launcherEndedPending(holds({ referenceExit: kind }))).toBe(false);
+  });
+
+  it.each(["Zn", "Z1", "X", "vanished", "start-changed", "empty-gone"] as const)("T-le: runtime %s is not alive (no route)", (kind) => {
+    expect(launcherEndedPending(holds({ runtimeExit: kind }))).toBe(false);
+  });
+
+  // The reference and runtime routes already share ticks (the sampler resolves them by precedence); the launcher route shares none with either.
+  it("T-le: the launcher-ended route never applies to a tick where the reference-ended or the runtime-ending route applies", () => {
+    const kinds = ["alive", "Zn", "Z1", "X", "vanished", "start-changed", "empty-gone"] as const;
+    for (const referenceExit of kinds) for (const runtimeExit of kinds) for (const ownUnreadable of [false, true]) {
+      const reference = referenceEndedPending({ ownProof: true, launcherProof: false, referenceEnding: referenceExit !== "alive", symptom: true, escapeEvidence: false, cacheExists: true });
+      const runtime = runtimeEndingPending({ ownProof: true, zombieLeader: runtimeExit === "Zn", ownUnreadable, escapeEvidence: false });
+      const launcher = launcherEndedPending(holds({ referenceExit, runtimeExit, ownUnreadable }));
+      expect(launcher && (reference || runtime), `reference=${referenceExit} runtime=${runtimeExit} own-unreadable=${ownUnreadable}`).toBe(false);
+    }
+  });
+
+  it.each([
+    ["own proof, same pid and start time", 100, "55", true],
+    ["own proof, other start time (a reused pid)", 100, "56", false],
+    ["own proof, other pid", 101, "55", false],
+  ])("T-le: %s", (_name, pid, startTicks, expected) => {
+    expect(ownProofHeld(new Set(["100:55"]), pid, startTicks)).toBe(expected);
+  });
+
+  it.each([
+    ["verified: the same pid and start time", { pid: 7, startTicks: "9" }, { pid: 7, startTicks: "9" }, "verified"],
+    ["launcher identity changed: the same pid, another start time", { pid: 7, startTicks: "9" }, { pid: 7, startTicks: "10" }, "changed"],
+    ["another pid", { pid: 7, startTicks: "9" }, { pid: 8, startTicks: "9" }, "none"],
+    ["nothing recorded", undefined, { pid: 7, startTicks: "9" }, "none"],
+    ["the recorded parent was not the real bwrap", "none", { pid: 7, startTicks: "9" }, "none"],
+    ["the parent cannot be read now", { pid: 7, startTicks: "9" }, null, "none"],
+  ] as const)("T-le: %s", (_name, recorded, current, expected) => {
+    expect(launcherIdentityOf(recorded, current)).toBe(expected);
+  });
+
+  const exeRead = (partial: Partial<LauncherExeRead>): LauncherExeRead => ({ error: null, realBwrap: true, cmdline: "bwrap --unshare-user", ...partial });
+  it.each([
+    ["the real bwrap executable", exeRead({}), "real-bwrap"],
+    ["another executable", exeRead({ realBwrap: false }), "other"],
+    ["ENOENT with an empty command line (the inner bwrap in its own exit)", exeRead({ error: "ENOENT", realBwrap: false, cmdline: "" }), "gone"],
+    ["ENOENT with a command line", exeRead({ error: "ENOENT", realBwrap: false }), "none"],
+    ["EACCES", exeRead({ error: "EACCES", realBwrap: false, cmdline: "" }), "denied"],
+    ["ESRCH", exeRead({ error: "ESRCH", realBwrap: false, cmdline: "" }), "none"],
+    ["any other error", exeRead({ error: "EIO", realBwrap: false, cmdline: "" }), "none"],
+  ] as const)("T-le: launcher executable: %s", (_name, given, expected) => {
+    expect(launcherExeOf(given)).toBe(expected);
+  });
+
+  it("T-le: the record shape prints names, booleans and the route only, never the launcher's pid or start time", () => {
+    const record: ProcessRecord = {
+      pid: 4242,
+      startTicks: "1111",
+      comms: ["claude"],
+      argvShape: "claude",
+      exe: "other",
+      ancestors: ["bwrap", "other"],
+      sameNamespaces: { pid: false, user: false, mnt: false },
+      firstMs: 0,
+      lastMs: 10,
+      oldCounted: false,
+      oldUnsandboxed: false,
+      verdict: "runtime",
+      unsandboxed: false,
+      inconsistentReads: 0,
+      proofFailure: { failedWhile: "alive", ownProof: true, launcherProof: false, escapeEvidence: false, ownUnreadable: "none", reference: "live", chain: "broken", referenceEnded: false, referenceExit: "alive", runtimeExit: "alive", pending: "cleared", launcherIdentity: "verified", launcherExe: "real-bwrap", reparented: true },
+      pending: { state: "cleared", sinceMs: 5, route: "launcher-ended" },
+      clearedBy: "launcher-ended",
+      launcherIdentity: { pid: 424242, startTicks: "987654321" },
+      fate: "exited",
+    };
+    const text = describeRecords([record]);
+    expect(text).toContain("launcher-identity=verified launcher-exe=real-bwrap reparented=true");
+    expect(text).toContain("pending-route=launcher-ended");
+    expect(text).toContain("cleared-by=launcher-ended");
+    expect(text.includes("424242") || text.includes("987654321")).toBe(false);
   });
 });
 
