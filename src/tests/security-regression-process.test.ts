@@ -11,7 +11,9 @@
  * - `RT.<route>.<mode>`: the eight secret routes of the outline in fresh, resumed and restarted execution. Every
  *   route run carries the request-scoped credentials live, and the doubles confirm they received them in that run.
  *   Concurrent roles overlap the process and session scans: a conversation of another label and one of the same
- *   label with another user (each holding its marker in `/work`), a stdio tool sandbox and a slow trusted git clone.
+ *   label with another user (each holding its marker in `/work`), a stdio tool sandbox and a slow trusted git clone. Those two rows
+ *   also fail on the roles' own sandbox verdict (MVP-8118): the window sampler, a proof of every tagged process of the three
+ *   sandboxed roles, and, for the clone (a host process by design), any agent runtime in its process tree; a failure names the role.
  * - `NC.*.<mode>`: the exact normal-chat route: three turns of `env | sort` in one ordinary conversation, then an
  *   allowed workspace command, an alternate interpreter environment read and a built-in Read of a credential file.
  * - `X.*`: rows for leftovers of an earlier version in a conversation home, writes into the read-only extension
@@ -52,7 +54,10 @@ import {
   conversationDirs,
   conversationText,
   createMarkers,
+  createReferenceTracker,
   createRig,
+  currentRowId,
+  detect,
   emit,
   evidenceLine,
   finishRow,
@@ -66,18 +71,22 @@ import {
   resultsFor,
   runChild,
   runLeftoversText,
+  sampleProblems,
   scriptOf,
   shellQuote,
   startProcessSampler,
   surfacesOf,
+  taggedProcessProof,
   turnProblems,
   credentialProblems,
   waitForIsolation,
+  type ProcessSample,
   type RowInput,
   type SecurityMarkers,
   type SecurityRig,
   type Surface,
   type ToolStep,
+  type TickProcess,
   type TurnObservation,
 } from "./helpers/security-matrix.js";
 import { ROUTE_IDS, credentialSteps, regressionRowIds, routeTurn, type RouteId, type RouteTurn } from "./helpers/security-routes.js";
@@ -160,22 +169,47 @@ async function warmTurn(rig: SecurityRig, prompt: string, sessionId: string): Pr
 /*  Concurrent roles                                                    */
 /* ------------------------------------------------------------------ */
 
+/** The concurrent roles by the key of their tag; the names are what a failure text and the overlap check print. */
+const ROLE_NAMES = { b1: "another-label conversation", b2: "same-label conversation", stdio: "stdio tool sandbox", git: "trusted git clone" } as const;
+type RoleKey = keyof typeof ROLE_NAMES;
+/** The roles whose processes run in a sandbox of their own and are proven one by one; the clone runs on the host by design. */
+const SANDBOXED_ROLES: Exclude<RoleKey, "git">[] = ["b1", "b2", "stdio"];
+
+/** What the roles window concluded: the sampler's last sample and every problem to attach to the rows that ran beside the roles. */
+interface RolesVerdict {
+  sample: ProcessSample;
+  problems: string[];
+}
+
 interface Roles {
   tags: { b1: string; b2: string; stdio: string; git: string };
   b1Session: string;
   b2Session: string;
   sampler: ReturnType<typeof startProcessSampler>;
   fake: FakeGit;
-  stop: () => Promise<void>;
+  /** Proves every tagged process of the sandboxed roles now; the failures only surface through `stop()`. */
+  proofRound: () => void;
+  /** The rows of the process and session routes, held until `stop()` has judged the window (see `routeRow`). */
+  held: RowInput[];
+  stop: () => Promise<RolesVerdict>;
 }
 
 const waiterCommand = (marker: string, file: string, tag: string): string =>
   `python3 -c ${shellQuote(`import os, sys, time\nopen('/work/${file}', 'w').write(sys.argv[1])\nend = time.time() + 150\nwhile time.time() < end and not os.path.exists('/work/stop'):\n    time.sleep(0.2)`)} ${shellQuote(marker)} ${tag}`;
 
+/** A problem line with a marker detector pass: a hit withholds the text instead of printing it. */
+const safeText = (text: string, values: Record<string, string>): string => (detect([{ name: "roles-problem", text }], values).length > 0 ? "[roles problem withheld: a marker was detected]" : text);
+
 /**
  * Starts the concurrent roles: a conversation of another label (and user) holding its marker in `/work` with a stdio tool
  * sandbox attached, a conversation of the same label with another user, and a slow trusted git clone carrying a token
  * URL and an ssh key. They run until `stop()`; the process sampler records when each existed.
+ *
+ * `stop()` returns the window's verdict (MVP-8118): every runtime candidate the sampler flagged, named by the role it belongs to
+ * (a tagged process, an ancestor of one or a descendant of one) or reported as unattributed; the sandbox proof of each tagged
+ * process of the three sandboxed roles, taken when the roles were up, at every overlap scan and once more before they end; and
+ * a role that never showed one proven process. The git clone is a host process by design: only an agent runtime in its process
+ * tree is a failure. The caller fails the rows that ran beside the roles with these problems.
  */
 async function startRoles(rig: SecurityRig, fake: FakeGit): Promise<Roles> {
   const v = rig.markers.values;
@@ -183,7 +217,45 @@ async function startRoles(rig: SecurityRig, fake: FakeGit): Promise<Roles> {
   const tags = { b1: `ROLE-B1-${id}`, b2: `ROLE-B2-${id}`, stdio: `ROLE-STDIO-${id}`, git: `slow-clone-${id}` };
   const b1Session = `conv-B1-${id}`;
   const b2Session = `conv-B2-${id}`;
-  const sampler = startProcessSampler(() => rig.gateway.child.pid!, [tags.b1, tags.b2, tags.stdio, tags.git]);
+  const gatewayPid = (): number => rig.gateway.child.pid!;
+  const tracker = createReferenceTracker();
+  const accounts = Object.fromEntries(SANDBOXED_ROLES.map((key) => [key, { holders: new Set<string>(), proven: new Set<string>(), unproven: new Map<string, { pid: number; detail: string }>() }])) as Record<(typeof SANDBOXED_ROLES)[number], { holders: Set<string>; proven: Set<string>; unproven: Map<string, { pid: number; detail: string }> }>;
+  const proofRound = (): void => {
+    for (const key of SANDBOXED_ROLES) {
+      const proof = taggedProcessProof(gatewayPid(), tags[key], tracker);
+      for (const holder of proof.holderIds) accounts[key].holders.add(holder);
+      for (const holder of proof.provenIds) accounts[key].proven.add(holder);
+      for (const failed of proof.unproven) accounts[key].unproven.set(`${failed.pid}:${failed.startTicks}`, { pid: failed.pid, detail: failed.detail });
+    }
+  };
+  // Which role a process belongs to: the launch a tagged process runs in. A launch is the tree below one direct child of the
+  // gateway (a sandbox, the git wrapper), so the runtime above its waiter, its forks and the stdio server's launchers all belong
+  // to the role. Memoized by pid and start time, off the sampler's per-process path.
+  const roleOf = new Map<string, RoleKey>();
+  const attribute = (processes: readonly TickProcess[]): void => {
+    const byPid = new Map(processes.map((info) => [info.pid, info]));
+    const children = new Map<number, TickProcess[]>();
+    for (const info of processes) children.set(info.ppid, [...(children.get(info.ppid) ?? []), info]);
+    const launches = new Map<number, RoleKey>();
+    for (const info of processes) {
+      const key = (Object.keys(tags) as RoleKey[]).find((candidate) => info.cmdline.includes(tags[candidate]));
+      if (!key) continue;
+      let top = info;
+      for (let depth = 0; depth < 64 && byPid.has(top.ppid); depth++) top = byPid.get(top.ppid)!;
+      if (!launches.has(top.pid)) launches.set(top.pid, key);
+    }
+    for (const [pid, key] of launches) {
+      const queue = [byPid.get(pid)!];
+      const visited = new Set<number>();
+      for (let next = queue.shift(); next; next = queue.shift()) {
+        if (visited.has(next.pid)) continue;
+        visited.add(next.pid);
+        if (!roleOf.has(`${next.pid}:${next.startTicks}`)) roleOf.set(`${next.pid}:${next.startTicks}`, key);
+        queue.push(...(children.get(next.pid) ?? []));
+      }
+    }
+  };
+  const sampler = startProcessSampler(gatewayPid, [tags.b1, tags.b2, tags.stdio, tags.git], 20, { afterTick: attribute });
   rig.scripts.push(scriptOf(`ROLE-B1 ${v.sessionBTurn}`, [{ name: "mcp__bstdio__echo", input: {} }, { name: "Bash", input: { command: waiterCommand(v.sessionBFile, "b-secret.txt", tags.b1), description: "role" } }]));
   rig.scripts.push(scriptOf(`ROLE-B2 ${v.sessionBTurn}`, [{ name: "Bash", input: { command: waiterCommand(v.sessionB2File, "b2-secret.txt", tags.b2), description: "role" } }]));
   const b1 = rig.ask(
@@ -215,39 +287,80 @@ async function startRoles(rig: SecurityRig, fake: FakeGit): Promise<Roles> {
     if (Date.now() > seen) throw new Error(`a concurrent role was not seen by the process sampler: ${[tags.b1, tags.b2, tags.stdio].filter((tag) => !sampler.peek().windows[tag]).join(", ")}`);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  proofRound();
+  const held: RowInput[] = [];
   return {
     tags,
     b1Session,
     b2Session,
     sampler,
     fake,
+    proofRound,
+    held,
     stop: async () => {
-      for (const session of [b1Session, b2Session]) {
-        const dir = conversationDirs(rig.gateway, [session])[0];
-        if (dir) fs.writeFileSync(path.join(dir, "work", "stop"), "stop");
-      }
-      // The clone sleeps well past any scan (a loaded host stretches the scans): end it now by stopping its wrapper.
-      const running = fake.invocations().find((inv) => inv.subcommand === "clone" && inv.argv.some((arg) => arg.includes(tags.git)) && inv.end === undefined);
-      if (running) {
-        for (const pid of [...descendants(running.pid), running.pid]) {
-          try {
-            process.kill(pid, "SIGKILL");
-          } catch {
-            // Already gone.
+      const failures: string[] = [];
+      let sample: ProcessSample | undefined;
+      try {
+        // The last proof round runs while the holders still live: the stop files below end them.
+        proofRound();
+        for (const session of [b1Session, b2Session]) {
+          const dir = conversationDirs(rig.gateway, [session])[0];
+          if (dir) fs.writeFileSync(path.join(dir, "work", "stop"), "stop");
+        }
+        // The clone sleeps well past any scan (a loaded host stretches the scans): end it now by stopping its wrapper.
+        const running = fake.invocations().find((inv) => inv.subcommand === "clone" && inv.argv.some((arg) => arg.includes(tags.git)) && inv.end === undefined);
+        if (running) {
+          for (const pid of [...descendants(running.pid), running.pid]) {
+            try {
+              process.kill(pid, "SIGKILL");
+            } catch {
+              // Already gone.
+            }
           }
         }
+        const settled = await Promise.allSettled([b1, b2, clone]);
+        for (const [index, outcome] of settled.entries()) {
+          if (outcome.status === "rejected") failures.push(`concurrent role ${[ROLE_NAMES.b1, ROLE_NAMES.b2, ROLE_NAMES.git][index]}: its request did not complete (${String(outcome.reason instanceof Error ? outcome.reason.message : outcome.reason).slice(0, 160)})`);
+        }
+      } catch (error) {
+        failures.push(`ending the roles failed (${error instanceof Error ? error.name : "unknown"})`);
+      } finally {
+        sample = sampler.stop(v);
       }
-      await Promise.all([b1, b2, clone]);
-      sampler.stop(rig.markers.values);
+      const problems = [...failures];
+      const flagged = sample.records.filter((record) => record.unsandboxed);
+      let gitFlagged = 0;
+      let unattributed = 0;
+      for (const record of flagged) {
+        const key = roleOf.get(`${record.pid}:${record.startTicks}`);
+        if (key === undefined) {
+          unattributed += 1;
+          problems.push(`an agent runtime ran without the sandbox and belongs to no concurrent role [pid ${record.pid}]`);
+        } else {
+          if (key === "git") gitFlagged += 1;
+          problems.push(`concurrent role ${ROLE_NAMES[key]}: an agent runtime ran without the sandbox in its process tree [pid ${record.pid}]`);
+        }
+      }
+      for (const key of SANDBOXED_ROLES) {
+        const account = accounts[key];
+        for (const failed of account.unproven.values()) problems.push(`concurrent role ${ROLE_NAMES[key]}: ran without the sandbox [pid ${failed.pid} ${failed.detail}]`);
+        if (account.unproven.size === 0 && (account.holders.size === 0 || account.proven.size === 0)) problems.push(`concurrent role ${ROLE_NAMES[key]}: precondition not reached (holders ${account.holders.size}, proven ${account.proven.size})`);
+      }
+      const rolesFlagged = problems.length;
+      const row = detect([{ name: "row-id", text: currentRowId() }], v).length > 0 ? "withheld" : currentRowId();
+      const counts = (key: (typeof SANDBOXED_ROLES)[number]): string => `holders:${accounts[key].holders.size},proven:${accounts[key].proven.size},unproven:${accounts[key].unproven.size}`;
+      emit(`SECURITY-ROLES row=${row} b1=${counts("b1")} b2=${counts("b2")} stdio=${counts("stdio")} git_flagged=${gitFlagged} unattributed=${unattributed} roles_flagged=${rolesFlagged}`);
+      return { sample, problems: [...sampleProblems(sample, v), ...problems].map((problem) => safeText(problem, v)) };
     },
   };
 }
 
-/** Host-side proof that every concurrent role existed for the whole scan of the probe (R2-4). */
+/** Host-side proof that every concurrent role existed for the whole scan of the probe (R2-4). Also takes a sandbox proof round of the roles. */
 function overlapProblems(roles: Roles, report: { t0: number; t1: number }): string[] {
+  roles.proofRound();
   const windows = roles.sampler.peek().windows;
   const problems: string[] = [];
-  for (const [role, tag] of Object.entries({ "another-label conversation": roles.tags.b1, "same-label conversation": roles.tags.b2, "stdio tool sandbox": roles.tags.stdio })) {
+  for (const [role, tag] of Object.entries({ [ROLE_NAMES.b1]: roles.tags.b1, [ROLE_NAMES.b2]: roles.tags.b2, [ROLE_NAMES.stdio]: roles.tags.stdio })) {
     const window = windows[tag];
     if (!window || window.first > report.t0 || window.last < report.t1) problems.push(`the ${role} did not overlap the scan`);
   }
@@ -325,7 +438,7 @@ async function hostChecks(rig: SecurityRig, route: RouteId, turn: RouteTurn, rol
   return { problems, controls };
 }
 
-/** Records one route row from its turns and the host checks. */
+/** Records one route row from its turns and the host checks; a row beside the concurrent roles is held for `forEachRoute`. */
 async function routeRow(rig: SecurityRig, route: RouteId, mode: Mode, started: number, parts: { turns: RouteTurn[]; warm?: WarmTurn[]; problems?: string[]; roles?: Roles | null; deadlineMs?: number }): Promise<void> {
   const problems: string[] = [...(parts.problems ?? [])];
   const controls = new Set<string>();
@@ -341,7 +454,7 @@ async function routeRow(rig: SecurityRig, route: RouteId, mode: Mode, started: n
   // At debug level the gateway log carries the request text of every conversation: a concurrent conversation's own content may be in it.
   const debugLog = (parts.roles ?? null) !== null && rig.logLevel === "debug";
   if (debugLog) controls.add("debug_log_holds_concurrent_conversations_own_requests");
-  finishRow(recorder, rig, {
+  const input = frozenRow({
     id: `RT.${route}.${mode}`,
     mode,
     durationMs: Date.now() - started,
@@ -351,18 +464,49 @@ async function routeRow(rig: SecurityRig, route: RouteId, mode: Mode, started: n
     problems,
     ...(debugLog ? { allowedOn: { surface: "gateway-log", markers: ["sessionBTurn", "sessionBFile", "sessionB2File"] } } : {}),
   });
+  // A row beside the concurrent roles is recorded by `forEachRoute` after the roles' verdict exists; everything it captured is fixed here.
+  if (parts.roles) parts.roles.held.push(input);
+  else finishRow(recorder, rig, input);
 }
 
-/** Runs `body` for every route; the process and session routes run inside the concurrent roles. */
+/** The whole row input fixed at once (surfaces, duration, controls, exclusions), so a row recorded later holds only what was captured then. */
+function frozenRow(input: RowInput): RowInput {
+  return Object.freeze({
+    ...input,
+    surfaces: Object.freeze(input.surfaces.map((surface) => Object.freeze({ ...surface }))) as Surface[],
+    controls: Object.freeze([...(input.controls ?? [])]) as string[],
+    problems: Object.freeze([...input.problems]) as string[],
+    ...(input.allowedOn ? { allowedOn: Object.freeze({ surface: input.allowedOn.surface, markers: Object.freeze([...input.allowedOn.markers]) as string[] }) } : {}),
+  });
+}
+
+/**
+ * Runs `body` for every route; the process and session routes run inside the concurrent roles. Their rows are recorded after
+ * the roles ended, each with the roles' problems (prefix `concurrent roles: `), and one combined error carries every failure.
+ */
 async function forEachRoute(rig: SecurityRig, fake: FakeGit, body: (route: RouteId, roles: Roles | null) => Promise<void>): Promise<void> {
   for (const route of ROUTE_IDS.filter((r) => r !== "proc" && r !== "session")) await body(route, null);
   const roles = await startRoles(rig, fake);
+  const errors: unknown[] = [];
   try {
     await body("proc", roles);
     await body("session", roles);
-  } finally {
-    await roles.stop();
+  } catch (error) {
+    errors.push(error);
   }
+  const verdict = await roles.stop();
+  const rolesProblems = verdict.problems.map((problem) => `concurrent roles: ${problem}`);
+  for (const row of roles.held) {
+    try {
+      finishRow(recorder, rig, { ...row, problems: [...row.problems, ...rolesProblems] });
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  // A body that failed before its row was held leaves no row to carry the roles' problems: attach them to the failure.
+  if (errors.length > 0 && rolesProblems.length > 0 && roles.held.length < 2) errors.push(new Error(`security roles: ${rolesProblems.join("; ")}`));
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new Error(errors.map((error) => (error instanceof Error ? error.message : String(error))).join("\n"));
 }
 
 describe("route matrix", () => {
@@ -696,12 +840,14 @@ describe("leftovers of an earlier version and the read-only extension directorie
       },
     });
     const live = await chatTurn(liveRig, { prompt: "/qacmd LEFT-CONTROL", sessionId: "conv-live", steps: [{ name: "Read", input: { file_path: "/work/none.txt" } }], withCredentials: false, body: { allowedTools: undefined } });
+    problems.push(...turnProblems(live).map((problem) => `control turn: ${problem}`));
     const liveDir = await conversationDir(liveRig, "conv-live");
     await new Promise((resolve) => setTimeout(resolve, 1500));
     if (markerFiles(liveDir).includes("work/m-cmd-stop") && live.outcome.events.at(-1)?.type === "done") controls.push("control_the_same_command_in_the_trusted_workspace_runs_its_hooks");
     else problems.push("control: the command file in the trusted workspace did not run its hooks, so the vector is not shown live");
     const request = await chatTurn(liveRig, { prompt: "LEFT-REQUEST-SERVER", sessionId: "conv-live-server", steps: [{ name: "Read", input: { file_path: "/work/none.txt" } }], withCredentials: false, body: { allowedTools: undefined, mcpServers: { ctl: server("control") } } });
     await new Promise((resolve) => setTimeout(resolve, 1000));
+    problems.push(...turnProblems(request).map((problem) => `control turn: ${problem}`));
     const serverDir = await conversationDir(liveRig, "conv-live-server");
     if (markerFiles(serverDir).includes("work/m-control") && request.outcome.events.at(-1)?.type === "done") controls.push("control_a_server_a_request_asks_for_starts");
     else problems.push("control: a server a request asks for did not start, so a started server would not be detected");
