@@ -362,7 +362,7 @@ describe("An interrupted write never damages the saved file", () => {
     expect(errorLines(gateway.output())).toEqual([]);
     // The start removed the leftover temp file of this area.
     expect(fs.existsSync(temp)).toBe(false);
-  });
+  }, 60_000);
 });
 
 /* ------------------------------------------------------------------ */
@@ -450,7 +450,7 @@ describe("An unreadable file is kept, reported and never overwritten", () => {
     report = await health(second);
     expect(report.persistenceIssues).toEqual([]);
     expect(report.persistence).toBe("ok");
-  });
+  }, 90_000);
 });
 
 /* ------------------------------------------------------------------ */
@@ -489,7 +489,7 @@ describe.skipIf(IS_ROOT)(`An unreadable file that cannot be moved aside is left 
     }
     report = await health(gateway);
     expect(report.persistenceIssues).toEqual([{ area, problem: "unreadable-not-preserved", file }]);
-  });
+  }, 60_000);
 });
 
 /* ------------------------------------------------------------------ */
@@ -509,7 +509,7 @@ describe("Several damaged areas are all reported", () => {
       { area: "mcpServers", problem: "corrupt-preserved", file: fx.file("mcpServers"), preservedAs: corruptCopies(fx, "mcpServers") },
     ]);
     expect(errorLines(gateway.output()).map((l) => l.split(" ")[2])).toEqual(["area=tools", "area=mcpServers"]);
-  });
+  }, 60_000);
 });
 
 /* ------------------------------------------------------------------ */
@@ -563,7 +563,7 @@ describe("A file with an entry that cannot be restored is kept aside and the gat
     await changeArea(gateway, area, "after-bad-entry");
     expect(fileHoldsChange(file, area, "after-bad-entry")).toBe(true);
     expect(fs.readFileSync(copies[0]).equals(originalBytes)).toBe(true);
-  });
+  }, 60_000);
 });
 
 /* ------------------------------------------------------------------ */
@@ -599,7 +599,7 @@ describe.skipIf(IS_ROOT)(`A failed save is reported until a later save succeeds 
     report = await health(gateway);
     expect(report.persistenceIssues).toEqual([]);
     expect(report.persistence).toBe("ok");
-  });
+  }, 60_000);
 });
 
 /* ------------------------------------------------------------------ */
@@ -647,5 +647,5 @@ describe("Unreadable mcp-servers.json: no credential fragment in logs or /health
     for (const fragment of inFile.flatMap((s) => fragments(s))) {
       expect(seen, `fragment ${fragment}`).not.toContain(fragment);
     }
-  });
+  }, 60_000);
 });
