@@ -2726,10 +2726,19 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     "            return",
     "        time.sleep(0.001)",
     "def leave(*_):",
-    "    if fresh > 0:",
-    "        os.unshare(os.CLONE_FILES)",
-    "        for _ in range(fresh):",
-    "            os.open('/dev/null', os.O_RDONLY)",
+    "    sys.stderr.write('leave: start\\n')",
+    "    sys.stderr.flush()",
+    "    try:",
+    "        if fresh > 0:",
+    "            os.unshare(os.CLONE_FILES)",
+    "            for _ in range(fresh):",
+    "                os.open('/dev/null', os.O_RDONLY)",
+    "    except BaseException as error:",
+    "        sys.stderr.write('leave: failed %r\\n' % (error,))",
+    "        sys.stderr.flush()",
+    "        raise",
+    "    sys.stderr.write('leave: opened\\n')",
+    "    sys.stderr.flush()",
     "    libc.syscall(exit_thread, 0)",
     "signal.signal(signal.SIGUSR1, leave)",
     "child = subprocess.Popen(sys.argv[1:]) if len(sys.argv) > 1 else None",
@@ -2751,8 +2760,8 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   const sleepSync = (ms: number): void => void Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   /** The seam runs inside a sampler tick and must hold it until the shape exists: this waits without releasing the event loop. */
-  const waitSync = (condition: () => boolean, boundMs = 3000): boolean => {
-    for (const end = Date.now() + boundMs; !condition(); sleepSync(2)) if (Date.now() > end) return false;
+  const waitSync = (condition: () => boolean, boundMs = 3000, stepMs = 2): boolean => {
+    for (const end = Date.now() + boundMs; !condition(); sleepSync(stepMs)) if (Date.now() > end) return false;
     return true;
   };
   const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -2876,10 +2885,26 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     };
   /** Sends SIGUSR1 once the handler is installed and waits for `shape`; false when the handler never appeared or the shape was not reached. */
   const endLeader = (pid: number, shape: () => boolean, boundMs = 40_000): boolean => {
-    if (!waitSync(() => handlerInstalled(pid), 5000)) return false;
+    if (!waitSync(() => handlerInstalled(pid), 30_000)) return false;
     signal(pid, "SIGUSR1");
-    return waitSync(shape, boundMs);
+    // Fails at once when the process is gone or the leader already is a plain zombie leader (the held state was missed): nothing more can happen.
+    let reached = false;
+    waitSync(() => (reached = shape()) || statOf(pid) === null || zombieSingle(pid) || zombieLeader(pid), boundMs, 0.5);
+    return reached;
   };
+  /** What a precondition failure of a held leader exit reports: the process state and the fixture's stderr (names and counts only). */
+  const heldDiag = (pid: number | undefined, trig: string): string => {
+    const stat = pid === undefined ? null : statOf(pid);
+    let stderr = "";
+    try {
+      stderr = fs.readFileSync(path.join(trig, "stderr"), "utf8").replace(/\s+/g, " ").slice(-300);
+    } catch {
+      stderr = "no stderr file";
+    }
+    return `process ${stat === null ? "gone" : `state=${stat.state} threads=${stat.threads} cmdline-empty=${cmdlineEmpty(pid!)} exe-gone=${linkGone(pid!, "exe")} mnt-gone=${linkGone(pid!, "ns/mnt")} handler=${handlerInstalled(pid!)}`}; fixture stderr: ${stderr}`;
+  };
+  /** Spawns a fixture tree with its stderr in the trigger directory, for \`heldDiag\`. */
+  const spawnLogged = (file: string, args: string[], trig: string): ChildProcess => spawn(file, args, { stdio: ["ignore", "ignore", fs.openSync(path.join(trig, "stderr"), "w")] });
   /** The fixture's own reads right before the exit read (the failed proof's seam) and right after the tick that did it. */
   const holdChecks = (state: Seam) => ({
     before: (): void => {
@@ -2950,10 +2975,10 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
       ...plumb(options),
     });
     const command = fixtureCommand(trig, { FRESH: options.fresh ?? HOLD_FILES, SECS: options.secs ?? "6" });
-    const child = spawn(BWRAP_DIE[0], [...BWRAP_DIE.slice(1), "/bin/bash", "-c", command], { stdio: "ignore" });
+    const child = spawnLogged(BWRAP_DIE[0], [...BWRAP_DIE.slice(1), "/bin/bash", "-c", command], trig);
     spawned.push(child);
     await until(() => state.forced, "the seam did not run");
-    expect(state.reached, "precondition not reached: the leader exit was not held within its bound").toBe(true);
+    expect(state.reached, `precondition not reached: the leader exit was not held within its bound (${heldDiag(state.runtime?.pid, trig)})`).toBe(true);
     await until(() => failureRecorded(sampler), "the failing tick did not run");
     return { trig, sampler, child };
   }
@@ -3051,13 +3076,13 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   it("TH-own-revive-exit: the new program ends inside the bound: the record is still flagged, never cleared (the process was never ended in between)", async () => {
     const state = newSeam();
-    const run = await ownRevive(state, "0.4", true);
+    const run = await ownRevive(state, "0.25", true);
     assertRevived(state, run);
   });
 
   it("R6-revive-exit: the same, route verdict: no route clears a revived record whose new program fully ended", async () => {
     const state = newSeam();
-    const run = await ownRevive(state, "0.4", true);
+    const run = await ownRevive(state, "0.25", true);
     assertRevived(state, run);
     expect(run.audit, "nothing was cleared, so nothing is audited").toEqual([]);
     expect(run.summary[0]).toContain("pending_expired=1");
@@ -3167,10 +3192,10 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
       afterFailedProof: checks.before,
       afterTick: checks.afterTick,
     });
-    const child = spawn(BWRAP_DIE[0], [...BWRAP_DIE.slice(1), "/bin/bash", "-c", `(${fixtureCommand(trig, { FRESH: HOLD_FILES })}) & wait`], { stdio: "ignore" });
+    const child = spawnLogged(BWRAP_DIE[0], [...BWRAP_DIE.slice(1), "/bin/bash", "-c", `(${fixtureCommand(trig, { FRESH: HOLD_FILES })}) & wait`], trig);
     spawned.push(child);
     await until(() => state.forced, "the seam did not run");
-    expect(state.reached, "precondition not reached: the leader exit was not held within its bound").toBe(true);
+    expect(state.reached, `precondition not reached: the leader exit was not held within its bound (${heldDiag(state.runtime?.pid, trig)})`).toBe(true);
     await until(() => failureRecorded(sampler), "the failing tick did not run");
     touch(trig, "end");
     await until(() => ended(state.runtime!), "the runtime did not fully end after its last thread");
@@ -3226,7 +3251,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     expect(state.reached, "precondition not reached: the inner bwrap was not reparented within its bound").toBe(true);
     if (options.leaderAfterProof) {
       await until(() => outcome.done, "the failed proof did not reach the leader seam");
-      expect(outcome.reached, "precondition not reached: the leader exit was not held within its bound").toBe(true);
+      expect(outcome.reached, `precondition not reached: the leader exit was not held within its bound (${heldDiag(state.runtime?.pid, trig)})`).toBe(true);
     }
     await until(() => failureRecorded(sampler), "the failing tick did not run");
     return { trig, sampler, reference };
@@ -3296,7 +3321,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   it("LE8-revive-exit: the new program ends inside the bound: the record is still flagged, never cleared", async () => {
     const state = newSeam();
-    const run = await launcherRevive(state, "0.4", { leaderAfterProof: true, exitsInside: true });
+    const run = await launcherRevive(state, "0.25", { leaderAfterProof: true, exitsInside: true });
     expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
     expectHeldKind(state, run.record.proofFailure?.runtimeExit, "empty-n");
     expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
@@ -3306,7 +3331,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   it("LE8-revive-alive-entry: a record that entered alive and whose thread executes a different executable that then ends inside the bound is flagged (executable identity), never cleared", async () => {
     const state = newSeam();
-    const run = await launcherRevive(state, "0.4", { leaderAfterProof: false, exitsInside: true });
+    const run = await launcherRevive(state, "0.25", { leaderAfterProof: false, exitsInside: true });
     expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
     expect(run.record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, runtimeExit: "alive" });
     expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
@@ -3390,10 +3415,10 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
       ...plumb(options),
     });
     const command = options.runtime === "node" ? standIn : fixtureCommand(trig, { FRESH: options.heldLeader ? HOLD_FILES : 0, SECS: options.secs ?? "6" });
-    reference = spawn("/bin/bash", ["-c", referenceScriptOf(command)], { stdio: "ignore" });
+    reference = spawnLogged("/bin/bash", ["-c", referenceScriptOf(command)], trig);
     spawned.push(reference);
     await until(() => state.forced, "the seam did not run");
-    expect(state.reached, "precondition not reached: the reference did not end as a zombie within its bound, or the leader exit was not held").toBe(true);
+    expect(state.reached, `precondition not reached: the reference did not end as a zombie within its bound, or the leader exit was not held (${heldDiag(state.runtime?.pid, trig)})`).toBe(true);
     await until(() => failureRecorded(sampler), "the failing tick did not run");
     return { trig, sampler };
   }
@@ -3432,13 +3457,13 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   it("R1-revive-exit: the runtime's leader finishes after the entry, its thread executes a new program that ends inside the bound: flagged (revival), never cleared", async () => {
     const state = newSeam();
-    const window = await runtimeWindow(state, { runtime: "python", secs: "0.4" });
+    const window = await runtimeWindow(state, { runtime: "python", secs: "0.25" });
     const pid = state.runtime!.pid;
     expect(endLeader(pid, () => zombieLeader(pid) || held(pid)), "precondition not reached: the leader did not finish").toBe(true);
     // The sampler's settle reads register the leader exit before the thread executes the new program (the zombie leader persists until then).
     await pause(250);
     touch(window.trig, "exec");
-    await until(() => imageRuns(pid, "0.4"), "the surviving thread did not execute the new program");
+    await until(() => imageRuns(pid, "0.25"), "the surviving thread did not execute the new program");
     await until(() => ended(state.runtime!), "the new program did not end");
     const insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
     const { final, summary } = closeWindow(window.sampler);
@@ -3507,10 +3532,10 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
       ...plumb(options),
     });
     const env = { FRESH: options.held ? REFERENCE_HOLD_FILES : 0, SECS: options.secs ?? "6" };
-    parent = spawn("/bin/sh", ["-c", `${fixtureCommand(trig, env, "gateway", ` /bin/bash -c ${quote(referenceScriptOf(standIn))}`)}; :`], { stdio: "ignore" });
+    parent = spawnLogged("/bin/sh", ["-c", `${fixtureCommand(trig, env, "gateway", ` /bin/bash -c ${quote(referenceScriptOf(standIn))}`)}; :`], trig);
     spawned.push(parent);
     await until(() => state.forced, "the seam did not run");
-    expect(state.reached, "precondition not reached: the reference did not reach its leader-exit shape, or the chain did not break, within its bound").toBe(true);
+    expect(state.reached, `precondition not reached: the reference did not reach its leader-exit shape, or the chain did not break, within its bound (${heldDiag(state.holdPid, trig)})`).toBe(true);
     await until(() => failureRecorded(sampler), "the failing tick did not run");
     return { trig, sampler };
   }
