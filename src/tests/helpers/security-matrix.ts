@@ -574,13 +574,13 @@ export interface ProcessRecord {
    * same pid and start time had the full proof at an earlier tick) or `launcher` (a live real bwrap ancestor had it in the
    * same tick). Set only when that tick was what kept the record unflagged; it never resets a flag set earlier.
    */
-  clearedBy?: "own" | "launcher" | "reference-ended";
+  clearedBy?: "own" | "launcher" | "reference-ended" | "runtime-ending";
   /**
    * A failed proof whose only explanation is that the reference (the gateway) ended, after the runtime's own earlier proof:
    * not flagged yet, `waiting` until the runtime's own exit is confirmed (`cleared`) or the bound passes (`expired`, flagged for
    * good). A waiting record counts as flagged in every snapshot.
    */
-  pending?: { state: "waiting" | "cleared" | "expired" | "expired-reference"; sinceMs: number; reference: { pid: number; startTicks: string } };
+  pending?: { state: "waiting" | "cleared" | "expired" | "expired-reference"; sinceMs: number; route: "reference-ended" | "runtime-ending"; reference?: { pid: number; startTicks: string } };
   /** Ticks whose proof succeeded with a reference namespace read from the cache (the cache was used and the proof still held). */
   provedReferenceCached?: number;
   /** `running` when the same process still existed at `stop()`, else `exited`. */
@@ -617,6 +617,7 @@ export interface ProcessClear {
     | "exiting after a proof read while alive (own)"
     | "exiting after a proof read while alive (launcher)"
     | "reference ended after the runtime's own proof read while alive; runtime exit confirmed"
+    | "runtime exit confirmed after its own proof read while alive (leader exited first)"
     | "unexplained";
 }
 
@@ -944,9 +945,23 @@ export function exitKind(reading: ExitReading): ExitKind {
 }
 
 /** Whether the process with this pid and start time is confirmed to be ending (used for the reference and for a pending runtime). */
-export function endedNow(pid: number, startTicks: string): { ended: boolean; kind: ExitKind } {
-  const kind = exitKind(readExitReading(pid, startTicks));
-  return { ended: kind !== "alive" && kind !== "Zn", kind };
+export function endedNow(pid: number, startTicks: string): { ended: boolean; kind: ExitKind; zombieLeader: boolean } {
+  const reading = readExitReading(pid, startTicks);
+  const kind = exitKind(reading);
+  return { ended: kind !== "alive" && kind !== "Zn", kind, zombieLeader: runtimeLeaderExited(reading) };
+}
+
+/**
+ * Condition 2 of the runtime-side route: the process is a zombie thread-group leader whose other threads still show (`Z` with more
+ * than one thread). A live process (running or sleeping, with its command line) is never that; a confirmed exit (`Z` with one
+ * thread, vanished, `X`) is not that either and is cleared by the own-proof route at once.
+ */
+export function runtimeLeaderExited(reading: ExitReading): boolean {
+  return exitKind(reading) === "Zn";
+}
+
+export function readExitReadingOf(pid: number, startTicks: string): ExitReading {
+  return readExitReading(pid, startTicks);
 }
 
 /**
@@ -986,6 +1001,17 @@ export function referenceEndedPending(evidence: { ownProof: boolean; launcherPro
 /** The failed proof shows the reference's symptom: a namespace read from the cache or missing, or a chain that broke. */
 export function referenceSymptom(reference: ReferenceSource, chain: "complete" | "broken"): boolean {
   return reference !== "live" || chain === "broken";
+}
+
+/**
+ * Whether a failed proof on a runtime that is a zombie leader with threads still showing (the leader finished its exit first)
+ * makes the record pending: the runtime had its own full proof earlier, the failed proof is explained by the runtime's own
+ * release (one of its own namespace links is unreadable), and nothing the runtime reads equals the reference's. A launcher
+ * proof is not required (it is kept in the diagnostics): the own proof carries the soundness, and the launcher dies first in a
+ * cascade. A pending record is only cleared by `resolvePending` on the runtime's confirmed full exit.
+ */
+export function runtimeEndingPending(evidence: { ownProof: boolean; zombieLeader: boolean; ownUnreadable: boolean; escapeEvidence: boolean }): boolean {
+  return evidence.ownProof && evidence.zombieLeader && evidence.ownUnreadable && !evidence.escapeEvidence;
 }
 
 /**
@@ -1056,7 +1082,7 @@ export function describeRecords(records: ProcessRecord[], markers: Record<string
   const text = records
     .map((record) => {
       const ns = record.sameNamespaces;
-      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence} own-unreadable=${record.proofFailure.ownUnreadable} reference=${record.proofFailure.reference} chain=${record.proofFailure.chain} reference-ended=${record.proofFailure.referenceEnded} reference-exit=${record.proofFailure.referenceExit} runtime-exit=${record.proofFailure.runtimeExit} pending=${record.proofFailure.pending}]` : ""}${record.clearedBy ? ` cleared-by=${record.clearedBy}` : ""}${record.provedReferenceCached ? ` proved-reference-cached=${record.provedReferenceCached}` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
+      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence} own-unreadable=${record.proofFailure.ownUnreadable} reference=${record.proofFailure.reference} chain=${record.proofFailure.chain} reference-ended=${record.proofFailure.referenceEnded} reference-exit=${record.proofFailure.referenceExit} runtime-exit=${record.proofFailure.runtimeExit} pending=${record.proofFailure.pending}]` : ""}${record.pending ? ` pending-route=${record.pending.route}` : ""}${record.clearedBy ? ` cleared-by=${record.clearedBy}` : ""}${record.provedReferenceCached ? ` proved-reference-cached=${record.provedReferenceCached}` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
     })
     .join("; ");
   return detect([{ name: "process-records", text }], markers).length > 0 ? "[process records withheld: a marker was detected]" : text;
@@ -1114,14 +1140,15 @@ export function startProcessSampler(
       const outcome = resolvePending({
         elapsedMs: at - record.pending.sinceMs,
         exitConfirmed: endedNow(record.pid, record.startTicks).ended,
-        referenceEnded: endedNow(record.pending.reference.pid, record.pending.reference.startTicks).ended,
+        // The runtime-side route has no reference condition; the reference-ended route also needs the reference confirmed ended.
+        referenceEnded: record.pending.route === "runtime-ending" || endedNow(record.pending.reference!.pid, record.pending.reference!.startTicks).ended,
         final,
       });
       if (outcome === "waiting") continue;
       records.set(key, {
         ...record,
         unsandboxed: record.unsandboxed || outcome === "expired" || outcome === "expired-reference",
-        clearedBy: outcome === "cleared" ? "reference-ended" : record.clearedBy,
+        clearedBy: outcome === "cleared" ? record.pending.route : record.clearedBy,
         pending: { ...record.pending, state: outcome },
         proofFailure: record.proofFailure ? { ...record.proofFailure, pending: outcome } : record.proofFailure,
       });
@@ -1207,10 +1234,10 @@ export function startProcessSampler(
               const referenceEnded = referenceNow?.ended === true;
               const referenceEnding = referenceNow !== null && referenceNow.kind !== "alive";
               const chainState = proof.brokenChain ? ("broken" as const) : ("complete" as const);
-              pendingNow =
-                cleared === null &&
-                !unsandboxed &&
-                (prior?.pending === undefined || prior.pending.state === "waiting") &&
+              const pendingPossible = cleared === null && !unsandboxed && (prior?.pending === undefined || prior.pending.state === "waiting");
+              // The reference-ended route takes precedence when both apply: it needs more confirmations.
+              const referencePending =
+                pendingPossible &&
                 referenceEndedPending({
                   ownProof: failure.ownProof,
                   launcherProof: failure.launcherProof,
@@ -1219,7 +1246,12 @@ export function startProcessSampler(
                   escapeEvidence: failure.escapeEvidence,
                   cacheExists: reference.hasCache,
                 });
-              if (pendingNow) pending = prior?.pending ?? { state: "waiting", sinceMs: now, reference: { pid: root, startTicks: reference.startTicks! } };
+              const runtimePending =
+                pendingPossible &&
+                !referencePending &&
+                runtimeEndingPending({ ownProof: failure.ownProof, zombieLeader: runtimeExit.zombieLeader, ownUnreadable: proof.ownUnreadable.length > 0, escapeEvidence: failure.escapeEvidence });
+              pendingNow = referencePending || runtimePending;
+              if (pendingNow) pending = prior?.pending ?? { state: "waiting", sinceMs: now, route: referencePending ? "reference-ended" : "runtime-ending", reference: referencePending ? { pid: root, startTicks: reference.startTicks! } : undefined };
               proofFailure = proofFailure
                 ? {
                     ...proofFailure,
@@ -1312,6 +1344,7 @@ export function startProcessSampler(
     for (const record of all) {
       if (record.unsandboxed) continue;
       if (record.clearedBy === "reference-ended") clears.push({ record, explanation: "reference ended after the runtime's own proof read while alive; runtime exit confirmed" });
+      else if (record.clearedBy === "runtime-ending") clears.push({ record, explanation: "runtime exit confirmed after its own proof read while alive (leader exited first)" });
       else if (record.clearedBy) clears.push({ record, explanation: `exiting after a proof read while alive (${record.clearedBy})` });
       else if (record.oldCounted && record.verdict === "launcher") clears.push({ record, explanation: "known non-runtime executable at a stable reading" });
       else if (record.oldCounted && record.verdict === "descendant") clears.push({ record, explanation: "vanished before a stable reading below a process with the sandbox proof" });
@@ -1355,7 +1388,8 @@ export function startProcessSampler(
             failed_escape_evidence: count((record) => record.proofFailure?.escapeEvidence === true),
             exit_cleared_own: sample.clears.filter((clear) => clear.explanation.endsWith("(own)")).length,
             exit_cleared_launcher: sample.clears.filter((clear) => clear.explanation.endsWith("(launcher)")).length,
-            exit_cleared_reference: sample.clears.filter((clear) => clear.explanation.endsWith("runtime exit confirmed")).length,
+            exit_cleared_reference: sample.clears.filter((clear) => clear.explanation.endsWith("; runtime exit confirmed")).length,
+            exit_cleared_runtime_ending: sample.clears.filter((clear) => clear.explanation.endsWith("(leader exited first)")).length,
             pending_expired: count((record) => record.pending?.state === "expired" || record.pending?.state === "expired-reference"),
             proved_reference_cached: sample.records.reduce((sum, record) => sum + (record.provedReferenceCached ?? 0), 0),
             failed_reference_cached: count((record) => record.proofFailure?.reference === "cached"),

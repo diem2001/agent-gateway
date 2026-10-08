@@ -40,6 +40,9 @@ import {
   redactArgv,
   PENDING_BOUND_MS,
   createReferenceTracker,
+  readExitReadingOf,
+  runtimeEndingPending,
+  runtimeLeaderExited,
   currentRowId,
   deriveRowId,
   describeRecords,
@@ -807,7 +810,7 @@ describe("process sampler launcher exemption", () => {
       for (const line of audit) expect(line.includes(marker), "an audit line carried the synthetic name").toBe(false);
       expect(audit.some((line) => line.includes("comm sh exe") && line.includes("verdict=launcher")), "the allowlisted process lost its detail").toBe(true);
       expect(summary, "one summary line of counts per window").toHaveLength(1);
-      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+ failed_exiting=\d+ failed_alive=\d+ failed_own_proof=\d+ failed_launcher_proof=\d+ failed_escape_evidence=\d+ exit_cleared_own=\d+ exit_cleared_launcher=\d+ exit_cleared_reference=\d+ pending_expired=\d+ proved_reference_cached=\d+ failed_reference_cached=\d+ failed_reference_missing=\d+ failed_own_unreadable=\d+ failed_chain_broken=\d+ reference_changed=\d+ row=(none|withheld|[A-Za-z0-9().,_-]+-[0-9a-f]{10}) flagged=\d+$/);
+      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+ failed_exiting=\d+ failed_alive=\d+ failed_own_proof=\d+ failed_launcher_proof=\d+ failed_escape_evidence=\d+ exit_cleared_own=\d+ exit_cleared_launcher=\d+ exit_cleared_reference=\d+ exit_cleared_runtime_ending=\d+ pending_expired=\d+ proved_reference_cached=\d+ failed_reference_cached=\d+ failed_reference_missing=\d+ failed_own_unreadable=\d+ failed_chain_broken=\d+ reference_changed=\d+ row=(none|withheld|[A-Za-z0-9().,_-]+-[0-9a-f]{10}) flagged=\d+$/);
     }
   });
 
@@ -1269,6 +1272,157 @@ describe("process sampler launcher exemption", () => {
     expect(audit.filter((line) => line.includes("reference ended after the runtime's own proof read while alive; runtime exit confirmed"))).toHaveLength(1);
     expect(summary[0]).toContain("exit_cleared_reference=1");
   });
+
+  /*  The runtime's leader exits first (MVP-8090 rev 3.2): a multi-threaded runtime is a zombie leader while its other threads finish  */
+
+  /**
+   * A runtime stand-in (started with `exec -a claude`) whose main thread ends alone with the raw `exit` syscall on SIGUSR1 (one
+   * thread, unlike exit_group) while another thread keeps the process a zombie that still counts threads. `LEAVE=timed`: a 300 ms
+   * thread, so the process ends by itself; `LEAVE=stdin`: the thread blocks reading stdin and the process ends when the write end
+   * is closed. Handlers run on the main thread only, so the thread is started in the handler and never ended by a signal.
+   */
+  const LEADER_FIRST_RUNTIME =
+    "import ctypes, os, platform, signal, sys, threading, time\nlibc = ctypes.CDLL(None)\nexit_thread = 60 if platform.machine() == 'x86_64' else 93\ndef leave(*_):\n    if os.environ.get('LEAVE') == 'stdin':\n        threading.Thread(target=lambda: sys.stdin.buffer.read(1)).start()\n    else:\n        threading.Thread(target=lambda: time.sleep(0.3)).start()\n    libc.syscall(exit_thread, 0)\nsignal.signal(signal.SIGUSR1, leave)\nwhile True:\n    time.sleep(0.05)";
+  const leaderFirst = (leave: "timed" | "stdin"): string => `LEAVE=${leave} exec -a claude python3 -c ${quote(LEADER_FIRST_RUNTIME)}`;
+  const sandboxedLeaderFirst = (leave: "timed" | "stdin"): ChildProcess => spawn(BWRAP[0], [...BWRAP.slice(1), "/bin/bash", "-c", leaderFirst(leave)], { stdio: [leave === "stdin" ? "pipe" : "ignore", "ignore", "ignore"] });
+
+  /**
+   * The seam of a leader-first control: on the `atReading`-th stable reading it sends SIGUSR1 to the runtime and holds the tick
+   * until the runtime is a zombie leader that still counts threads (bound 2 s); the proof then runs on that state.
+   */
+  const leaderFirstSeam =
+    (state: ChainState, atReading: number) =>
+    (pid: number): void => {
+      state.pid ??= pid;
+      if (pid !== state.pid || state.forced) return;
+      state.readings += 1;
+      if (state.readings < atReading) return;
+      state.forced = true;
+      state.runtime = { pid, startTicks: startOf(pid) ?? "" };
+      // The stand-in installs its handler a moment after it starts: SIGUSR1 before that would kill it instead of ending its leader.
+      const handlerInstalled = (): boolean => {
+        try {
+          return (BigInt("0x" + /^SigCgt:\s*([0-9a-f]+)/m.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"))![1]) & 0x200n) !== 0n;
+        } catch {
+          return false;
+        }
+      };
+      if (!waitSync(handlerInstalled)) return;
+      process.kill(pid, "SIGUSR1");
+      state.reached = waitSync(() => statOf(pid)?.state === "Z" && threadsOf(pid) >= 2);
+    };
+  const neverPending = (record: ProcessRecord, what: string): void => {
+    expect(record.pending, `${what} was never pending`).toBeUndefined();
+    expect(record.proofFailure?.pending, `${what} was never pending`).toBe("none");
+  };
+
+  it("R6: a sandboxed runtime whose leader exits first (a zombie that still counts threads, mount link unreadable) after its own proof waits, and is cleared and audited once the last thread ends", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: ChainState = newExitState();
+    const { snapshots, final, audit, summary } = await stages(
+      () => sandboxedLeaderFirst("timed"),
+      referenceStages(state, { name: "cleared", until: (seen) => seen.records.some((record) => record.pending?.state === "cleared") }),
+      {},
+      leaderFirstSeam(state, 3),
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the runtime did not become a zombie leader that counts threads within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    expect(record!.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, escapeEvidence: false, runtimeExit: "Zn", pending: "cleared" });
+    expect(record!.proofFailure!.ownUnreadable).toContain("mnt");
+    expect(record!.pending?.route).toBe("runtime-ending");
+    expect(record!.clearedBy).toBe("runtime-ending");
+    expect(record!.unsandboxed).toBe(false);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+    expect(sampleProblems(final, {})).toEqual([]);
+    expect(audit.filter((line) => line.includes("runtime exit confirmed after its own proof read while alive (leader exited first)"))).toHaveLength(1);
+    expect(summary[0]).toContain("exit_cleared_runtime_ending=1");
+  });
+
+  it("R6-never: the same runtime whose last thread outlives the bound is flagged for good, although it fully ends before the window closes", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: ChainState = newExitState();
+    let child: ChildProcess | undefined;
+    const { snapshots, final, summary } = await stages(
+      () => (child = sandboxedLeaderFirst("stdin")),
+      [
+        ...forcedStages(state),
+        { name: "expired", until: (seen) => seen.records.some((record) => record.pending?.state === "expired") },
+        // The write end is held by this test only; closing it lets the thread read EOF and the process end.
+        { name: "last thread ended", until: () => (child!.stdin!.end(), runtimeEnded(state)) },
+      ],
+      {},
+      leaderFirstSeam(state, 3),
+    );
+    const record = snapshots.at(-1)?.records[0];
+    expect(state.forced && state.reached, "precondition not reached: the runtime did not become a zombie leader that counts threads within its bound").toBe(true);
+    expect(record, "precondition not reached: the runtime was not recorded").toBeDefined();
+    expect(record!.proofFailure).toMatchObject({ ownProof: true, runtimeExit: "Zn", pending: "expired" });
+    expect(record!.pending?.route).toBe("runtime-ending");
+    expect(runtimeEnded(state), "the runtime did not fully end before the window closed").toBe(true);
+    reported(final, record!);
+    expect(summary[0]).toContain("pending_expired=1");
+  });
+
+  it("R7: a leader-first runtime outside any sandbox, below a script named bwrap, is reported at once (no own proof, the gateway's namespaces) and never pending", async () => {
+    requireHost(["python3"]);
+    const launcher = renamedLauncher(`(${leaderFirst("timed")})`);
+    const state: ChainState = newExitState();
+    const { snapshots, final } = await stages(
+      () => spawn(launcher, [], { stdio: "ignore" }),
+      referenceStages(state, { name: "runtime ended", until: () => runtimeEnded(state) }),
+      {},
+      leaderFirstSeam(state, 1),
+    );
+    const record = outcomeOf(state, snapshots, "the leader-first runtime outside the sandbox");
+    expect(record.proofFailure).toMatchObject({ ownProof: false, escapeEvidence: true, runtimeExit: "Zn" });
+    expect(runtimeEnded(state), "the runtime did not fully end before the window closed").toBe(true);
+    neverPending(record, "the runtime outside the sandbox");
+    reported(final, record);
+  });
+
+  it("R8: a sandboxed leader-first runtime on its first stable reading (no own proof yet) is reported and never pending", async () => {
+    requireHost(["bwrap", "python3"]);
+    const state: ChainState = newExitState();
+    const { snapshots, final } = await stages(() => sandboxedLeaderFirst("timed"), referenceStages(state, { name: "runtime ended", until: () => runtimeEnded(state) }), {}, leaderFirstSeam(state, 1));
+    const record = outcomeOf(state, snapshots, "the sandboxed leader-first runtime");
+    expect(record.proofFailure).toMatchObject({ ownProof: false, escapeEvidence: false, runtimeExit: "Zn" });
+    expect(runtimeEnded(state), "the runtime did not fully end before the window closed").toBe(true);
+    neverPending(record, "the runtime without an own proof");
+    reported(final, record);
+  });
+
+  it("R9: a live sandboxed runtime with its own proof is never read as ending by the sampler's condition-2 classifier, has no pending and no clear, and fully ends when killed", async () => {
+    requireHost(["bwrap"]);
+    const state: ChainState = newExitState();
+    let classified: boolean | undefined;
+    const { snapshots, final } = await stages(
+      () => sandboxed(["/bin/bash", "-c", standIn]),
+      [
+        { name: "runtime recorded", until: (seen) => seen.runtimesSeen > 0 },
+        {
+          name: "classified while alive",
+          settleMs: 150,
+          until: (seen) => {
+            const live = seen.records[0];
+            state.runtime = { pid: live.pid, startTicks: live.startTicks };
+            classified = runtimeLeaderExited(readExitReadingOf(live.pid, live.startTicks));
+            return true;
+          },
+        },
+        { name: "killed and ended", until: () => (safeKill(state.runtime!.pid, "SIGKILL"), runtimeEnded(state)) },
+      ],
+    );
+    const record = snapshots[1]?.records[0];
+    expect(record, "precondition not reached: the runtime was not recorded while alive").toBeDefined();
+    expect(classified, "the exact exported classifier read a live process as a zombie leader").toBe(false);
+    expect(record!.pending).toBeUndefined();
+    expect(record!.clearedBy).toBeUndefined();
+    expect(record!.proofFailure, "the proof of a live sandboxed runtime failed").toBeUndefined();
+    expect(record!.unsandboxed).toBe(false);
+    expect(runtimeEnded(state), "the runtime did not fully end").toBe(true);
+    expect(final.unsandboxedRuntimes).toEqual([]);
+  });
 });
 
 /**
@@ -1366,6 +1520,33 @@ describe("process sampler exit rule: decision table", () => {
     ["neither confirmed at the bound expires", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: false, referenceEnded: false, final: false }, "expired"],
   ] as const)("pending: %s", (_name, given, expected) => {
     expect(resolvePending(given)).toBe(expected);
+  });
+
+
+  const runtimeRow = (partial: Partial<Parameters<typeof runtimeEndingPending>[0]> = {}) => ({ ownProof: true, zombieLeader: true, ownUnreadable: true, escapeEvidence: false, ...partial });
+  const zombieLeader = (partial: Partial<ExitReading>): boolean => runtimeLeaderExited({ vanished: false, startChanged: false, state: "S", threads: 1, cmdline: "claude", exe: "readable", ...partial });
+
+  it.each([
+    ["T-rt: a zombie leader that still counts threads, own proof, own link unreadable, no escape evidence", runtimeRow(), true],
+    ["T-rt: no own proof (first tick)", runtimeRow({ ownProof: false }), false],
+    ["T-rt-escape: the runtime's pid, user or mount link equals the reference's", runtimeRow({ escapeEvidence: true }), false],
+    ["T-rt: no runtime-side symptom (all own links readable)", runtimeRow({ ownUnreadable: false }), false],
+    ["T-rt: sleeping with its command line (T-live: alive stays flagged)", runtimeRow({ zombieLeader: zombieLeader({ state: "S" }) }), false],
+    ["T-rt: running with its command line (T-live: alive stays flagged)", runtimeRow({ zombieLeader: zombieLeader({ state: "R" }) }), false],
+    ["T-rt: a zombie with one thread is a confirmed exit, cleared by the own route, not pending", runtimeRow({ zombieLeader: zombieLeader({ state: "Z", threads: 1, cmdline: "", exe: "gone" }) }), false],
+    ["T-rt: a zombie with several threads is the leader-first shape", runtimeRow({ zombieLeader: zombieLeader({ state: "Z", threads: 4, cmdline: "", exe: "gone" }) }), true],
+    ["T-rt: vanished is a confirmed exit, not pending", runtimeRow({ zombieLeader: zombieLeader({ vanished: true }) }), false],
+  ])("%s", (_name, given, expected) => {
+    expect(runtimeEndingPending(given)).toBe(expected);
+  });
+
+  it.each([
+    ["the last thread ended inside the bound clears", { elapsedMs: 100, exitConfirmed: true, final: false }, "cleared"],
+    ["still Zn inside the bound waits", { elapsedMs: 100, exitConfirmed: false, final: false }, "waiting"],
+    ["still Zn at the bound expires", { elapsedMs: PENDING_BOUND_MS + 1, exitConfirmed: false, final: false }, "expired"],
+    ["still Zn at stop() expires", { elapsedMs: 100, exitConfirmed: false, final: true }, "expired"],
+  ] as const)("runtime-ending resolution: %s", (_name, given, expected) => {
+    expect(resolvePending({ ...given, referenceEnded: true })).toBe(expected);
   });
 
   it("exit kinds name how a process looked on the re-read", () => {
