@@ -380,6 +380,9 @@ export function buildSandboxEnv(input: SandboxEnvInput): Record<string, string> 
     ANTHROPIC_API_KEY: input.runToken,
     DISABLE_AUTOUPDATER: "1",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    // DEC-ISO-008: the runtime offers `TodoWrite` (reqlift's progress checklist parses only its input) instead of the four
+    // task tools. Fixed here, after the SDK environment, so the gateway's own environment cannot turn the task tools on.
+    CLAUDE_CODE_ENABLE_TASKS: "false",
     GIT_CONFIG_COUNT: String(GIT_TRUSTED_CONFIG.length),
   });
   GIT_TRUSTED_CONFIG.forEach(([key, value], i) => {
