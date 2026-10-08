@@ -131,6 +131,7 @@
       <li><a href="#session-mgmt">Session Management</a></li>
       <li><a href="#isolation">Agent Isolation</a></li>
       <li><a href="#tool-mediation">Tool Mediation</a></li>
+      <li><a href="#tool-result-limits">Tool Result Size Limits</a></li>
       <li><a href="#deployment">Deployment Guide</a> (<a href="#runbook">security acceptance and deployment runbook</a>)</li>
       <li><a href="#architecture">Architecture</a></li>
     </ol>
@@ -1526,7 +1527,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <div class="event-card">
     <h4>tool_result</h4>
-    <p>Tool execution completed. Output is truncated to 3000 characters. <code>durationMs</code> is null if timing data is unavailable. When the tool result is an error, the event carries the additive field <code>success: false</code>; it is absent otherwise, so successful events are unchanged.</p>
+    <p>Tool execution completed. Output is truncated to 3000 characters. A result above its size limit arrives as a notice that names a saved file, see <a href="#tool-result-limits">Tool Result Size Limits</a>. <code>durationMs</code> is null if timing data is unavailable. When the tool result is an error, the event carries the additive field <code>success: false</code>; it is absent otherwise, so successful events are unchanged.</p>
     <p><strong>Note:</strong> <code>success: false</code> marks a failed call: a refusal (<code>TOOL_DENIED</code>), a mediation failure (see <a href="#tool-errors">Tool errors</a>) or any other tool result flagged as an error. Consumers that counted every <code>tool_result</code> as a success must read the field (reqlift's admin tool success rate drops after the deploy because failed calls stop counting as successes).</p>
 <pre><code>{"seq": 3, "type": "tool_result", "toolName": "mcp__jira__get_issue", "toolUseId": "tu_def456", "output": "TOOL_AUTH_UNAVAILABLE: ...", "durationMs": 12, "success": false}</code></pre>
 <pre><code>{"seq": 2, "type": "tool_result", "toolName": "Bash", "toolUseId": "tu_abc123", "output": "/dev/sda1  50G  35G  15G  70% /var", "durationMs": 245}</code></pre>
@@ -1865,6 +1866,29 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
     </tbody>
   </table>
   <p>Webhook tools and http/SSE bindings can produce every row. For stdio the gateway can observe only <code>TOOL_DENIED</code>, <code>TOOL_UNAVAILABLE</code> (the server failed to start or exited), <code>TOOL_TIMEOUT</code> and <code>TOOL_RESPONSE_INVALID</code>; a stdio server's own authentication failure is its tool-level <code>isError</code> result. A tool's own answer is not a mediation failure: an MCP <code>isError</code> result passes through, and a webhook 4xx other than 401/403/408/429 reaches the model as <code>The tool rejected the request (HTTP &lt;status&gt;): &lt;message&gt;</code> (message: in order <code>error.message</code>, a string <code>error</code>, <code>message</code> of a JSON body, else a text/plain body; at most 500 characters, control characters removed, known secret values masked). Successful upstream answers pass through unmasked: an upstream that echoes its own credential in a success answer is outside the gateway's control.</p>
+
+  <!-- ============================================================ -->
+  <h2 id="tool-result-limits">Tool Result Size Limits</h2>
+  <p>The runtime decides how much of an MCP or webhook tool result the model receives. Sizes are text characters.</p>
+  <table class="param-table">
+    <thead><tr><th>Tool</th><th>Limit</th><th>Where it comes from</th></tr></thead>
+    <tbody>
+      <tr><td>Webhook tools, other registered MCP servers, request <code>mcpServers</code></td><td>50,000</td><td>The runtime default; the gateway declares nothing for these</td></tr>
+      <tr><td>The Jira server (mcp-jira, registered here as <code>jira</code>)</td><td>250,000</td><td>Every mcp-jira tool declares <code>_meta["anthropic/maxResultSizeChars"]: 250000</code>. It takes effect once the operator runs an mcp-jira build that carries it (see its <code>CHANGELOG.md</code>)</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li><strong>Up to the limit</strong> the model receives the whole result.</li>
+    <li><strong>Above the limit</strong> the runtime saves the result to a file in the conversation's private home (<code>projects/-work/&lt;session&gt;/tool-results/</code>) and the model receives a short notice instead. No gateway API exposes that file.
+      <ul>
+        <li>The notice is usually the saved-output preview: <code>&lt;persisted-output&gt;</code>, <code>Output too large (...)</code>, <code>Full output saved to: &lt;path&gt;</code> and the first 2 KB of the result. A Jira tool receives it at every size above 250,000 (3,145,728 characters measured).</li>
+        <li>A tool without the annotation receives a different notice far above its limit (3,145,728 characters measured): <code>Error: result (&lt;n&gt; characters across 1 line) exceeds maximum allowed tokens. Output has been saved to &lt;path&gt;</code> plus instructions to the model.</li>
+        <li>Both arrive as ordinary tool results: no error flag, and the <code>tool_result</code> event has no <code>success: false</code>. They are runtime texts and can change with a runtime upgrade.</li>
+      </ul>
+    </li>
+    <li><strong>Reaching a saved file.</strong> The model can read it with <code>Read</code> (in parts) or <code>Bash</code>. A run whose tool set has neither, such as an <a href="#ep-query">enforced tool set</a> of MCP tools only, cannot read it. For such a run the Jira limit is the only way to receive a result above 50,000 characters, and above 250,000 it receives only the notice.</li>
+    <li>The <code>tool_result</code> event shows at most the first 3,000 characters of any result, whatever its size.</li>
+  </ul>
 
   <!-- ============================================================ -->
   <h2 id="deployment">Deployment Guide</h2>

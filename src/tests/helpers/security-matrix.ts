@@ -17,7 +17,7 @@
  * Only case names, booleans and counts are ever printed. Needs `npm run build`, `bwrap` and user namespaces.
  */
 import { execFileSync, spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import net, { type AddressInfo } from "node:net";
@@ -562,8 +562,48 @@ export interface ProcessRecord {
   firstMissingProof?: string;
   /** Reads that disagreed with themselves (a process in the middle of an exec, or one that vanished) before the verdict. */
   inconsistentReads: number;
+  /**
+   * What the sampler saw at the tick(s) where a runtime's proof failed outside a proven ancestor: booleans and enums only.
+   * `failedWhile` is `alive` once any failing tick found the process not confirmed exiting; `ownProof` and `launcherProof`
+   * hold only when they held on every failing tick; `escapeEvidence` once any failing proof read the pid or user namespace
+   * as the gateway's.
+   */
+  proofFailure?: ProofFailure;
+  /**
+   * The proof route that kept a proof failure on an exiting tick from flagging the record (`exitProofClears`): `own` (the
+   * same pid and start time had the full proof at an earlier tick) or `launcher` (a live real bwrap ancestor had it in the
+   * same tick). Set only when that tick was what kept the record unflagged; it never resets a flag set earlier.
+   */
+  clearedBy?: "own" | "launcher" | "reference-ended" | "runtime-ending";
+  /**
+   * A failed proof whose only explanation is that the reference (the gateway) ended, after the runtime's own earlier proof:
+   * not flagged yet, `waiting` until the runtime's own exit is confirmed (`cleared`) or the bound passes (`expired`, flagged for
+   * good). A waiting record counts as flagged in every snapshot.
+   */
+  pending?: { state: "waiting" | "cleared" | "expired" | "expired-reference"; sinceMs: number; route: "reference-ended" | "runtime-ending"; reference?: { pid: number; startTicks: string } };
+  /** Ticks whose proof succeeded with a reference namespace read from the cache (the cache was used and the proof still held). */
+  provedReferenceCached?: number;
   /** `running` when the same process still existed at `stop()`, else `exited`. */
   fate: "running" | "exited";
+}
+
+/** What the first failing proof of a record looked like, as booleans, enums and counts only (see `ProcessRecord.proofFailure`). */
+export interface ProofFailure {
+  failedWhile: "alive" | "exiting";
+  ownProof: boolean;
+  launcherProof: boolean;
+  escapeEvidence: boolean;
+  /** Which of the runtime's own pid, user and mount links could not be read on that tick (`none` or a comma list). */
+  ownUnreadable: string;
+  /** The worst source of the reference namespaces that proof used. */
+  reference: ReferenceSource;
+  chain: "complete" | "broken";
+  /** The reference was confirmed ended when read right after the proof. */
+  referenceEnded: boolean;
+  /** How the reference looked on that re-read (`Zn` is a zombie leader whose threads still show). */
+  referenceExit: ExitKind;
+  runtimeExit: ExitKind;
+  pending: "none" | "waiting" | "cleared" | "expired" | "expired-reference";
 }
 
 /** A process the old rule counted or flagged that the current rule does not, and why that is acceptable (or not). */
@@ -574,10 +614,16 @@ export interface ProcessClear {
     | "settled into another process after an inconsistent read" // the old rule read the new `comm` with the old command line, mid-exec
     | "settled after an inconsistent read"
     | "vanished before a stable reading below a process with the sandbox proof"
+    | "exiting after a proof read while alive (own)"
+    | "exiting after a proof read while alive (launcher)"
+    | "reference ended after the runtime's own proof read while alive; runtime exit confirmed"
+    | "runtime exit confirmed after its own proof read while alive (leader exited first)"
     | "unexplained";
 }
 
 export interface ProcessSample {
+  /** Times a live reference namespace link differed from the cache taken for the same identity (fails the window). */
+  referenceChanged: number;
   /** Distinct pids of a runtime without proof of the sandbox (a runtime that was never read consistently counts here). */
   unsandboxedRuntimes: number[];
   /** Distinct runtime pids seen (sandboxed or not; never a launcher). */
@@ -649,10 +695,84 @@ function exeName(pid: number): string {
   return ARGV_NAMES.has(name) ? name : "other";
 }
 
-function sameNamespace(pid: number, root: number, kind: "pid" | "user" | "mnt"): boolean | "unreadable" {
+type NsKind = "pid" | "user" | "mnt";
+const NS_KINDS: NsKind[] = ["pid", "user", "mnt"];
+
+/** Where a reference namespace value came from: the live link, the cache taken while the reference was healthy, or nowhere. */
+export type ReferenceSource = "live" | "cached" | "missing";
+
+/** The reads the reference tracker needs from `/proc`; the real one reads the host, the resolver rows pass a fake. */
+export interface ReferenceIo {
+  info(pid: number): { startTicks: string; state: string; cmdline: string } | null;
+  link(pid: number, kind: NsKind): string | null;
+}
+
+const realReferenceIo: ReferenceIo = {
+  info: (pid) => {
+    const info = readProc(pid);
+    return info === null ? null : { startTicks: info.startTicks, state: info.state, cmdline: info.cmdline };
+  },
+  link: (pid, kind) => readlinkOrNull(`/proc/${pid}/ns/${kind}`),
+};
+
+/** The reference process (the gateway) as one tick sees it. */
+export interface Reference {
+  root: number;
+  /** `<pid>:<start time>` read at the start of the tick; null when the reference could not be read (no cache, no route). */
+  id: string | null;
+  startTicks: string | null;
+  /** A cache of the three links exists for this identity. */
+  hasCache: boolean;
+  /** One namespace link of the reference: live first, the cached value when the live link cannot be read. */
+  link(kind: NsKind): { value: string | null; source: ReferenceSource };
+}
+
+/**
+ * The reference's namespace identities, cached per `<pid>:<start time>`. The cache is taken only when all three links read
+ * while the reference is not ending (state not `Z` or `X`, a command line) and its start time is unchanged after the reads.
+ * Every comparison reads the live link first; it counts only when the start time read after it still equals the tick's.
+ * A live link that differs from the cache is counted (`changed`), never trusted over it silently. The runtime's own side
+ * is never cached.
+ */
+export function createReferenceTracker(io: ReferenceIo = realReferenceIo): { begin: (root: number) => Reference; changed: () => number } {
+  const caches = new Map<string, Record<NsKind, string>>();
+  let changed = 0;
+  return {
+    changed: () => changed,
+    begin: (root) => {
+      const first = io.info(root);
+      const id = first === null ? null : `${root}:${first.startTicks}`;
+      if (id !== null && first !== null && !caches.has(id) && first.state !== "Z" && first.state !== "X" && first.cmdline !== "") {
+        const links = { pid: io.link(root, "pid"), user: io.link(root, "user"), mnt: io.link(root, "mnt") };
+        if (links.pid !== null && links.user !== null && links.mnt !== null && io.info(root)?.startTicks === first.startTicks) caches.set(id, { pid: links.pid, user: links.user, mnt: links.mnt });
+      }
+      return {
+        root,
+        id,
+        startTicks: first?.startTicks ?? null,
+        hasCache: id !== null && caches.has(id),
+        link: (kind) => {
+          if (id === null || first === null) return { value: null, source: "missing" };
+          const cache = caches.get(id);
+          const live = io.link(root, kind);
+          if (live !== null && io.info(root)?.startTicks === first.startTicks) {
+            if (cache !== undefined && cache[kind] !== live) changed += 1;
+            return { value: live, source: "live" };
+          }
+          return cache === undefined ? { value: null, source: "missing" } : { value: cache[kind], source: "cached" };
+        },
+      };
+    },
+  };
+}
+
+const worseSource = (a: ReferenceSource, b: ReferenceSource): ReferenceSource => (a === "missing" || b === "missing" ? "missing" : a === "cached" || b === "cached" ? "cached" : "live");
+
+/** The runtime's own link against the reference's: `unreadable` when either side has no value (the runtime side is never cached). */
+export function sameNamespace(pid: number, reference: Reference, kind: NsKind): { result: boolean | "unreadable"; ownUnreadable: boolean; source: ReferenceSource } {
   const own = readlinkOrNull(`/proc/${pid}/ns/${kind}`);
-  const gateway = readlinkOrNull(`/proc/${root}/ns/${kind}`);
-  return own === null || gateway === null ? "unreadable" : own === gateway;
+  const ref = reference.link(kind);
+  return { result: own === null || ref.value === null ? "unreadable" : own === ref.value, ownUnreadable: own === null, source: ref.source };
 }
 
 /**
@@ -731,10 +851,24 @@ function readTick(first: ProcInfo, firstExe: ExeRead): TickRead {
 }
 
 /**
- * The sandbox proof for a runtime: an ancestor between it and the gateway is the real bwrap (by executable, not by
- * `comm`), and its pid, user and mount namespaces all differ from the gateway's. A link that cannot be read is no proof.
+ * The sandbox proof for a runtime: an ancestor between it and the reference (the gateway) is the real bwrap (by
+ * executable, not by `comm`), and its pid, user and mount namespaces all differ from the reference's (live, or the cache
+ * taken while it was healthy). A link that cannot be read is no proof. The chain must reach the reference with its
+ * recorded start time.
  */
-function sandboxProof(pid: number, root: number, bwraps: Set<string>): { proven: boolean; chain: string[]; detail: string } {
+function sandboxProof(
+  pid: number,
+  reference: Reference,
+  bwraps: Set<string>,
+): {
+  proven: boolean;
+  chain: string[];
+  detail: string;
+  namespaces: { pid: boolean | "unreadable"; user: boolean | "unreadable"; mnt: boolean | "unreadable" };
+  brokenChain: boolean;
+  ownUnreadable: NsKind[];
+  reference: ReferenceSource;
+} {
   const chain: string[] = [];
   let realBwrap = false;
   let current = pid;
@@ -745,8 +879,9 @@ function sandboxProof(pid: number, root: number, bwraps: Set<string>): { proven:
       broken = true;
       break;
     }
-    if (info.ppid === root) {
-      chain.push("gateway");
+    if (info.ppid === reference.root) {
+      if (reference.startTicks !== null && readProc(reference.root)?.startTicks === reference.startTicks) chain.push("gateway");
+      else broken = true;
       break;
     }
     const parent = readProc(info.ppid);
@@ -758,9 +893,187 @@ function sandboxProof(pid: number, root: number, bwraps: Set<string>): { proven:
     if (bwraps.has(fileId(`/proc/${parent.pid}/exe`) ?? "")) realBwrap = true;
     current = parent.pid;
   }
-  const namespaces = { pid: sameNamespace(pid, root, "pid"), user: sameNamespace(pid, root, "user"), mnt: sameNamespace(pid, root, "mnt") };
+  const reads = NS_KINDS.map((kind) => sameNamespace(pid, reference, kind));
+  const namespaces = { pid: reads[0].result, user: reads[1].result, mnt: reads[2].result };
   const proven = !broken && realBwrap && namespaces.pid === false && namespaces.user === false && namespaces.mnt === false;
-  return { proven, chain, detail: `chain-${broken ? "broken" : "complete"} real-bwrap=${realBwrap} same-ns pid=${namespaces.pid} user=${namespaces.user} mnt=${namespaces.mnt}` };
+  return {
+    proven,
+    chain,
+    namespaces,
+    brokenChain: broken,
+    ownUnreadable: NS_KINDS.filter((_, index) => reads[index].ownUnreadable),
+    reference: reads.reduce<ReferenceSource>((worst, read) => worseSource(worst, read.source), "live"),
+    detail: `chain-${broken ? "broken" : "complete"} real-bwrap=${realBwrap} same-ns pid=${namespaces.pid} user=${namespaces.user} mnt=${namespaces.mnt}`,
+  };
+}
+
+/** What one re-read of a process whose proof just failed showed (see `exitConfirmed`). */
+export interface ExitReading {
+  /** `/proc/<pid>` could not be read any more. */
+  vanished: boolean;
+  /** The pid now belongs to a process with another start time. */
+  startChanged: boolean;
+  /** Field 3 of `/proc/<pid>/stat`. */
+  state: string;
+  /** `Threads:` of `/proc/<pid>/status`. */
+  threads: number;
+  cmdline: string;
+  /** `/proc/<pid>/exe`: gone (ENOENT), unreadable while alive (EACCES) or readable. */
+  exe: "gone" | "denied" | "readable";
+}
+
+/**
+ * Whether a process is confirmed to be ending: vanished, a new start time, state `X`, state `Z` with at most one thread
+ * (a thread-group leader that exited while other threads run is not ending), or an empty command line and a missing
+ * executable together. A live process that blanks its own command line is not ending. Stricter than `exiting`, which
+ * only decides whether a reading is usable.
+ */
+export function exitConfirmed(reading: ExitReading): boolean {
+  const kind = exitKind(reading);
+  return kind !== "alive" && kind !== "Zn";
+}
+
+/** How a process looked on one re-read, as an enum for the diagnostics (`Zn` is a zombie leader whose threads still run). */
+export type ExitKind = "vanished" | "start-changed" | "X" | "Z1" | "Zn" | "empty-gone" | "alive";
+
+export function exitKind(reading: ExitReading): ExitKind {
+  if (reading.vanished) return "vanished";
+  if (reading.startChanged) return "start-changed";
+  if (reading.state === "X") return "X";
+  if (reading.state === "Z") return reading.threads <= 1 ? "Z1" : "Zn";
+  return reading.cmdline === "" && reading.exe === "gone" ? "empty-gone" : "alive";
+}
+
+/** Whether the process with this pid and start time is confirmed to be ending (used for the reference and for a pending runtime). */
+export function endedNow(pid: number, startTicks: string): { ended: boolean; kind: ExitKind; zombieLeader: boolean } {
+  const reading = readExitReading(pid, startTicks);
+  const kind = exitKind(reading);
+  return { ended: kind !== "alive" && kind !== "Zn", kind, zombieLeader: runtimeLeaderExited(reading) };
+}
+
+/**
+ * Condition 2 of the runtime-side route: the process is a zombie thread-group leader whose other threads still show (`Z` with more
+ * than one thread). A live process (running or sleeping, with its command line) is never that; a confirmed exit (`Z` with one
+ * thread, vanished, `X`) is not that either and is cleared by the own-proof route at once.
+ */
+export function runtimeLeaderExited(reading: ExitReading): boolean {
+  return exitKind(reading) === "Zn";
+}
+
+export function readExitReadingOf(pid: number, startTicks: string): ExitReading {
+  return readExitReading(pid, startTicks);
+}
+
+/**
+ * The route that lets a failed sandbox proof on one tick pass without flagging the runtime, or null. Only a process that is
+ * confirmed to be ending can pass, never one that leaks the gateway's pid or user namespace, and only on a proof that was
+ * read while a process was alive: the runtime's own full proof at an earlier tick, or a live real bwrap ancestor's own full
+ * proof in the same tick. An unreadable mount namespace, a broken chain, an unreadable executable or a `bwrap` name is no route.
+ */
+export function exitProofClears(evidence: { exitConfirmed: boolean; escapeEvidence: boolean; ownProof: boolean; launcherProof: boolean }): "own" | "launcher" | null {
+  if (!evidence.exitConfirmed || evidence.escapeEvidence) return null;
+  if (evidence.ownProof) return "own";
+  return evidence.launcherProof ? "launcher" : null;
+}
+
+/**
+ * The record's flag after a tick whose proof failed outside a proven ancestor: a flag set earlier stays, whatever this tick
+ * cleared or left pending.
+ */
+export function flagAfterProofFailure(prior: boolean, clearedBy: "own" | "launcher" | null, pending = false): boolean {
+  return prior || (clearedBy === null && !pending);
+}
+
+/** Longest a record may wait for its runtime's exit to be confirmed after the reference ended. */
+export const PENDING_BOUND_MS = 2000;
+
+/**
+ * Whether the reference ending makes a failed proof pending (not flagged yet): the runtime had its own full proof at an earlier
+ * tick, the reference is ending (confirmed ended, or a zombie leader whose threads still show: that must resolve to ended within
+ * the bound), the failure shows the reference's symptom, and nothing the runtime reads equals the cached reference (pid, user or
+ * mount) and a cache exists. A launcher proof is no route here: the launcher's own proof walks the same broken chain. A pending
+ * record is only cleared by `resolvePending`.
+ */
+export function referenceEndedPending(evidence: { ownProof: boolean; launcherProof: boolean; referenceEnding: boolean; symptom: boolean; escapeEvidence: boolean; cacheExists: boolean }): boolean {
+  return evidence.ownProof && evidence.referenceEnding && evidence.symptom && !evidence.escapeEvidence && evidence.cacheExists;
+}
+
+/** The failed proof shows the reference's symptom: a namespace read from the cache or missing, or a chain that broke. */
+export function referenceSymptom(reference: ReferenceSource, chain: "complete" | "broken"): boolean {
+  return reference !== "live" || chain === "broken";
+}
+
+/**
+ * Whether a failed proof on a runtime that is a zombie leader with threads still showing (the leader finished its exit first)
+ * makes the record pending: the runtime had its own full proof earlier, the failed proof is explained by the runtime's own
+ * release (one of its own namespace links is unreadable), and nothing the runtime reads equals the reference's. A launcher
+ * proof is not required (it is kept in the diagnostics): the own proof carries the soundness, and the launcher dies first in a
+ * cascade. A pending record is only cleared by `resolvePending` on the runtime's confirmed full exit.
+ */
+export function runtimeEndingPending(evidence: { ownProof: boolean; zombieLeader: boolean; ownUnreadable: boolean; escapeEvidence: boolean }): boolean {
+  return evidence.ownProof && evidence.zombieLeader && evidence.ownUnreadable && !evidence.escapeEvidence;
+}
+
+/**
+ * What becomes of a pending record: cleared only when, within the bound, the runtime's own exit is confirmed AND the reference is
+ * confirmed ended. Otherwise it waits inside the bound; at the bound or at `stop()` it expires (`expired-reference` when the
+ * runtime's exit was confirmed and only the reference stayed a zombie that still shows threads).
+ */
+export function resolvePending(evidence: { elapsedMs: number; exitConfirmed: boolean; referenceEnded: boolean; final: boolean }): "waiting" | "cleared" | "expired" | "expired-reference" {
+  const within = evidence.elapsedMs <= PENDING_BOUND_MS;
+  if (within && evidence.exitConfirmed && evidence.referenceEnded) return "cleared";
+  if (within && !evidence.final) return "waiting";
+  return evidence.exitConfirmed && !evidence.referenceEnded ? "expired-reference" : "expired";
+}
+
+/** `<prefix>-<first 10 hex of sha256(file + full name)>`: the prefix is the leading token (before `:`) of the last ` > ` segment when it is a plain token, else `t`. */
+export function deriveRowId(testPath: string, fullName: string): string {
+  const file = testPath.includes("/src/tests/") ? testPath.slice(testPath.lastIndexOf("/src/tests/") + 1) : testPath;
+  const last = fullName.split(" > ").at(-1) ?? "";
+  const token = last.split(":")[0].trim();
+  const prefix = /^[A-Za-z0-9().,_-]{1,48}$/.test(token) ? token : "t";
+  return `${prefix}-${createHash("sha256").update(file + fullName).digest("hex").slice(0, 10)}`;
+}
+
+/** The id of the test that is running now, read without importing the test runner (this helper is also loaded outside it); `none` outside a test. */
+export function currentRowId(): string {
+  try {
+    const state = (globalThis as Record<symbol, { getState?: () => { currentTestName?: string; testPath?: string } } | undefined>)[Symbol.for("expect-global")]?.getState?.();
+    return state?.currentTestName && state.testPath ? deriveRowId(state.testPath, state.currentTestName) : "none";
+  } catch {
+    return "none";
+  }
+}
+
+function readExitReading(pid: number, startTicks: string): ExitReading {
+  const info = readProc(pid);
+  if (info === null) return { vanished: true, startChanged: false, state: "", threads: 0, cmdline: "", exe: "gone" };
+  let threads = 1;
+  try {
+    threads = Number(/^Threads:\s*(\d+)/m.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"))?.[1] ?? 1);
+  } catch {
+    // Gone between the reads: the next field read decides.
+  }
+  const exe = readExe(pid);
+  return { vanished: false, startChanged: info.startTicks !== startTicks, state: info.state, threads, cmdline: info.cmdline, exe: "id" in exe ? "readable" : "denied" in exe ? "denied" : "gone" };
+}
+
+/**
+ * Whether an ancestor from the tick's snapshot is the real bwrap (by executable) and has the full sandbox proof itself:
+ * its own namespaces differ from the gateway's and a real bwrap sits above it. The real bwrap by executable alone is no
+ * proof (the outer one lives in the gateway's namespaces). The ancestor's start time and executable are checked around its proof.
+ */
+function liveLauncherProof(ancestorPids: number[], infos: Map<number, ProcInfo>, reference: Reference, bwraps: Set<string>): boolean {
+  for (const pid of ancestorPids) {
+    const info = infos.get(pid);
+    const before = readExe(pid);
+    if (!info || !("id" in before) || !bwraps.has(before.id) || readProc(pid)?.startTicks !== info.startTicks) continue;
+    if (!sandboxProof(pid, reference, bwraps).proven) continue;
+    const after = readProc(pid);
+    const exeAfter = readExe(pid);
+    if (after?.startTicks === info.startTicks && "id" in exeAfter && exeAfter.id === before.id) return true;
+  }
+  return false;
 }
 
 /** The text a problem line appends for the records, one entry per process. `redactArgv` and the name allowlist already keep
@@ -769,7 +1082,7 @@ export function describeRecords(records: ProcessRecord[], markers: Record<string
   const text = records
     .map((record) => {
       const ns = record.sameNamespaces;
-      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
+      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence} own-unreadable=${record.proofFailure.ownUnreadable} reference=${record.proofFailure.reference} chain=${record.proofFailure.chain} reference-ended=${record.proofFailure.referenceEnded} reference-exit=${record.proofFailure.referenceExit} runtime-exit=${record.proofFailure.runtimeExit} pending=${record.proofFailure.pending}]` : ""}${record.pending ? ` pending-route=${record.pending.route}` : ""}${record.clearedBy ? ` cleared-by=${record.clearedBy}` : ""}${record.provedReferenceCached ? ` proved-reference-cached=${record.provedReferenceCached}` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
     })
     .join("; ");
   return detect([{ name: "process-records", text }], markers).length > 0 ? "[process records withheld: a marker was detected]" : text;
@@ -780,6 +1093,7 @@ export function sampleProblems(sample: ProcessSample, markers: Record<string, st
   const problems: string[] = [];
   const unsandboxed = sample.records.filter((record) => record.unsandboxed);
   if (unsandboxed.length > 0) problems.push(`${unsandboxed.length} agent runtime(s) ran without a sandbox ancestor [${describeRecords(unsandboxed, markers)}]`);
+  if (sample.referenceChanged > 0) problems.push(`the reference process's namespaces changed during the window (${sample.referenceChanged} read(s) differed from the cache)`);
   const unexplained = sample.clears.filter((clear) => clear.explanation === "unexplained").map((clear) => clear.record);
   if (unexplained.length > 0) problems.push(`${unexplained.length} process(es) the old rule counted were cleared without an explanation [${describeRecords(unexplained, markers)}]`);
   return problems;
@@ -805,14 +1119,45 @@ export function sampleProblems(sample: ProcessSample, markers: Record<string, st
  * (a process that vanished keeps its last stable verdict); a runtime with neither `cli.js` in its command line nor the
  * `claude` title; a process that left the gateway's process tree (`descendants` follows the children lists only).
  */
-export function startProcessSampler(gatewayPid: () => number, tags: string[] = [], intervalMs = 20): { stop: (markers: Record<string, string>) => ProcessSample; peek: () => ProcessSample } {
+export function startProcessSampler(
+  gatewayPid: () => number,
+  tags: string[] = [],
+  intervalMs = 20,
+  seam: { afterStableReading?: (pid: number) => void } = {},
+): { stop: (markers: Record<string, string>) => ProcessSample; peek: () => ProcessSample } {
   const known = knownExecutables();
   const windows: ProcessSample["windows"] = {};
   const records = new Map<string, ProcessRecord>();
   /** Candidates (launchers and runtimes) that had the sandbox proof at a stable reading, by pid and start time. */
   const proven = new Set<string>();
+  const tracker = createReferenceTracker();
+  const rowId = currentRowId();
+  /** Settles pending records: cleared when the runtime's own exit is confirmed within the bound, expired at the bound or when `final`. */
+  const settlePending = (final: boolean): void => {
+    const at = Date.now();
+    for (const [key, record] of records) {
+      if (record.pending?.state !== "waiting") continue;
+      const outcome = resolvePending({
+        elapsedMs: at - record.pending.sinceMs,
+        exitConfirmed: endedNow(record.pid, record.startTicks).ended,
+        // The runtime-side route has no reference condition; the reference-ended route also needs the reference confirmed ended.
+        referenceEnded: record.pending.route === "runtime-ending" || endedNow(record.pending.reference!.pid, record.pending.reference!.startTicks).ended,
+        final,
+      });
+      if (outcome === "waiting") continue;
+      records.set(key, {
+        ...record,
+        unsandboxed: record.unsandboxed || outcome === "expired" || outcome === "expired-reference",
+        clearedBy: outcome === "cleared" ? record.pending.route : record.clearedBy,
+        pending: { ...record.pending, state: outcome },
+        proofFailure: record.proofFailure ? { ...record.proofFailure, pending: outcome } : record.proofFailure,
+      });
+    }
+  };
   const timer = setInterval(() => {
+    settlePending(false);
     const root = gatewayPid();
+    const reference = tracker.begin(root);
     const infos = new Map<number, ProcInfo>();
     const firstExes = new Map<number, ExeRead>();
     for (const pid of descendants(root)) {
@@ -844,6 +1189,10 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
         let verdict: ProcessRecord["verdict"] = prior?.verdict ?? "unresolved";
         let unsandboxed = prior?.unsandboxed ?? false;
         let firstMissingProof = prior?.firstMissingProof;
+        let proofFailure = prior?.proofFailure;
+        let clearedBy = prior?.clearedBy;
+        let pending = prior?.pending;
+        let provedReferenceCached = prior?.provedReferenceCached ?? 0;
         const comms = prior?.comms ?? [];
         let seen = info;
         let ancestors = chain.length > 0 ? [...chain, "gateway"] : ["gateway"];
@@ -853,15 +1202,80 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
             if (verdict !== "runtime") verdict = "other";
           } else if (known.launchers.has(read.reading.exeId) || known.bwraps.has(read.reading.exeId)) {
             if (verdict !== "runtime") verdict = "launcher";
-            if (sandboxProof(info.pid, root, known.bwraps).proven) proven.add(key);
+            if (sandboxProof(info.pid, reference, known.bwraps).proven) proven.add(key);
           } else {
             verdict = "runtime";
-            const proof = sandboxProof(info.pid, root, known.bwraps);
+            // Test seam (default none): lets a control force the exit between the stable reading and the proof.
+            try {
+              seam.afterStableReading?.(info.pid);
+            } catch {
+              // A failing control must not end the sampler; its own assertions report the precondition.
+            }
+            const proof = sandboxProof(info.pid, reference, known.bwraps);
             ancestors = proof.chain.length > 0 ? proof.chain : ancestors;
-            if (proof.proven) proven.add(key);
-            else if (!belowProven) firstMissingProof ??= proof.detail;
+            let cleared: "own" | "launcher" | null = null;
+            let pendingNow = false;
+            if (proof.proven) {
+              proven.add(key);
+              if (proof.reference !== "live") provedReferenceCached += 1;
+            } else if (!belowProven) {
+              firstMissingProof ??= proof.detail;
+              // Was this failure read while the process was alive or ending, and which proof routes exist?
+              const runtimeExit = endedNow(info.pid, info.startTicks);
+              const failure = {
+                failedWhile: runtimeExit.ended ? ("exiting" as const) : ("alive" as const),
+                ownProof: proven.has(key),
+                launcherProof: liveLauncherProof(ancestorPids, infos, reference, known.bwraps),
+                escapeEvidence: proof.namespaces.pid === true || proof.namespaces.user === true || proof.namespaces.mnt === true,
+              };
+              cleared = exitProofClears({ exitConfirmed: failure.failedWhile === "exiting", ...failure });
+              // The reference is read after the proof: if it ended, the failure may only say so (pending, never a clear by itself).
+              const referenceNow = reference.startTicks === null ? null : endedNow(root, reference.startTicks);
+              const referenceEnded = referenceNow?.ended === true;
+              const referenceEnding = referenceNow !== null && referenceNow.kind !== "alive";
+              const chainState = proof.brokenChain ? ("broken" as const) : ("complete" as const);
+              const pendingPossible = cleared === null && !unsandboxed && (prior?.pending === undefined || prior.pending.state === "waiting");
+              // The reference-ended route takes precedence when both apply: it needs more confirmations.
+              const referencePending =
+                pendingPossible &&
+                referenceEndedPending({
+                  ownProof: failure.ownProof,
+                  launcherProof: failure.launcherProof,
+                  referenceEnding,
+                  symptom: referenceSymptom(proof.reference, chainState),
+                  escapeEvidence: failure.escapeEvidence,
+                  cacheExists: reference.hasCache,
+                });
+              const runtimePending =
+                pendingPossible &&
+                !referencePending &&
+                runtimeEndingPending({ ownProof: failure.ownProof, zombieLeader: runtimeExit.zombieLeader, ownUnreadable: proof.ownUnreadable.length > 0, escapeEvidence: failure.escapeEvidence });
+              pendingNow = referencePending || runtimePending;
+              if (pendingNow) pending = prior?.pending ?? { state: "waiting", sinceMs: now, route: referencePending ? "reference-ended" : "runtime-ending", reference: referencePending ? { pid: root, startTicks: reference.startTicks! } : undefined };
+              proofFailure = proofFailure
+                ? {
+                    ...proofFailure,
+                    failedWhile: proofFailure.failedWhile === "alive" || failure.failedWhile === "alive" ? "alive" : "exiting",
+                    ownProof: proofFailure.ownProof && failure.ownProof,
+                    launcherProof: proofFailure.launcherProof && failure.launcherProof,
+                    escapeEvidence: proofFailure.escapeEvidence || failure.escapeEvidence,
+                    pending: pending ? pending.state : proofFailure.pending,
+                  }
+                : {
+                    ...failure,
+                    ownUnreadable: proof.ownUnreadable.length > 0 ? proof.ownUnreadable.join(",") : "none",
+                    reference: proof.reference,
+                    chain: chainState,
+                    referenceEnded,
+                    referenceExit: referenceNow?.kind ?? "vanished",
+                    runtimeExit: runtimeExit.kind,
+                    pending: pending ? pending.state : "none",
+                  };
+            }
             // A flag stays: one tick without proof is a run outside the sandbox, whatever the next tick shows.
-            unsandboxed = unsandboxed || !(proof.proven || belowProven);
+            const flaggedBefore = unsandboxed;
+            if (!proof.proven && !belowProven) unsandboxed = flagAfterProofFailure(unsandboxed, cleared, pendingNow);
+            if (cleared && !flaggedBefore && !unsandboxed) clearedBy = cleared;
           }
         } else {
           if (read.kind === "alive") {
@@ -890,9 +1304,9 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
           exe: exeNow !== "unreadable" ? exeNow : read.kind === "alive" && read.denied ? "unreadable" : (prior?.exe ?? "unreadable"),
           ancestors,
           sameNamespaces: {
-            pid: sticky(sameNamespace(info.pid, root, "pid"), prior?.sameNamespaces.pid),
-            user: sticky(sameNamespace(info.pid, root, "user"), prior?.sameNamespaces.user),
-            mnt: sticky(sameNamespace(info.pid, root, "mnt"), prior?.sameNamespaces.mnt),
+            pid: sticky(sameNamespace(info.pid, reference, "pid").result, prior?.sameNamespaces.pid),
+            user: sticky(sameNamespace(info.pid, reference, "user").result, prior?.sameNamespaces.user),
+            mnt: sticky(sameNamespace(info.pid, reference, "mnt").result, prior?.sameNamespaces.mnt),
           },
           firstMs: prior?.firstMs ?? now,
           lastMs: now,
@@ -901,6 +1315,10 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
           verdict,
           unsandboxed,
           firstMissingProof,
+          proofFailure,
+          clearedBy,
+          pending,
+          provedReferenceCached: provedReferenceCached > 0 ? provedReferenceCached : undefined,
           inconsistentReads: (prior?.inconsistentReads ?? 0) + (read.kind === "stable" ? 0 : read.torn),
           fate: "running",
         });
@@ -912,23 +1330,29 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
       }
     }
   }, intervalMs);
-  const snapshot = (): ProcessSample => {
+  const snapshot = (final = false): ProcessSample => {
+    settlePending(final);
     const all = [...records.values()].map((record) => {
       const alive = readProc(record.pid)?.startTicks === record.startTicks;
-      // A candidate that never had a stable reading is a runtime without proof: fail closed.
-      return { ...record, fate: alive ? ("running" as const) : ("exited" as const), unsandboxed: record.unsandboxed || record.verdict === "unresolved" };
+      // A candidate that never had a stable reading is a runtime without proof, and a record waiting for its runtime's exit
+      // is not cleared yet: fail closed.
+      return { ...record, fate: alive ? ("running" as const) : ("exited" as const), unsandboxed: record.unsandboxed || record.verdict === "unresolved" || record.pending?.state === "waiting" };
     });
     // A record flagged unreadable counts as a runtime whatever its last verdict is.
     const runtimes = all.filter((record) => record.verdict === "runtime" || record.verdict === "unresolved" || record.unsandboxed);
     const clears: ProcessClear[] = [];
     for (const record of all) {
       if (record.unsandboxed) continue;
-      if (record.oldCounted && record.verdict === "launcher") clears.push({ record, explanation: "known non-runtime executable at a stable reading" });
+      if (record.clearedBy === "reference-ended") clears.push({ record, explanation: "reference ended after the runtime's own proof read while alive; runtime exit confirmed" });
+      else if (record.clearedBy === "runtime-ending") clears.push({ record, explanation: "runtime exit confirmed after its own proof read while alive (leader exited first)" });
+      else if (record.clearedBy) clears.push({ record, explanation: `exiting after a proof read while alive (${record.clearedBy})` });
+      else if (record.oldCounted && record.verdict === "launcher") clears.push({ record, explanation: "known non-runtime executable at a stable reading" });
       else if (record.oldCounted && record.verdict === "descendant") clears.push({ record, explanation: "vanished before a stable reading below a process with the sandbox proof" });
       else if (record.oldCounted && record.verdict === "other") clears.push({ record, explanation: "settled into another process after an inconsistent read" });
       else if (record.oldUnsandboxed && record.verdict === "runtime") clears.push({ record, explanation: record.inconsistentReads > 0 || record.comms.length > 1 ? "settled after an inconsistent read" : "unexplained" });
     }
     return {
+      referenceChanged: tracker.changed(),
       unsandboxedRuntimes: runtimes.filter((record) => record.unsandboxed).map((record) => record.pid),
       runtimesSeen: runtimes.length,
       windows: { ...windows },
@@ -937,10 +1361,10 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
     };
   };
   return {
-    peek: snapshot,
+    peek: () => snapshot(false),
     stop: (markers) => {
       clearInterval(timer);
-      const sample = snapshot();
+      const sample = snapshot(true);
       for (const clear of sample.clears) emit(`SECURITY-PROCESS-AUDIT ${kv({ pid: clear.record.pid, explanation: clear.explanation, record: describeRecords([clear.record], markers) })}`);
       if (sample.records.length > 0) {
         const count = (match: (record: ProcessRecord) => boolean): number => sample.records.filter(match).length;
@@ -957,6 +1381,25 @@ export function startProcessSampler(gatewayPid: () => number, tags: string[] = [
             unresolved_torn: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads > 0),
             unresolved_unread: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads === 0),
             flagged_unreadable: count((record) => record.firstMissingProof?.startsWith("executable unreadable") === true),
+            failed_exiting: count((record) => record.proofFailure?.failedWhile === "exiting"),
+            failed_alive: count((record) => record.proofFailure?.failedWhile === "alive"),
+            failed_own_proof: count((record) => record.proofFailure?.ownProof === true),
+            failed_launcher_proof: count((record) => record.proofFailure?.launcherProof === true),
+            failed_escape_evidence: count((record) => record.proofFailure?.escapeEvidence === true),
+            exit_cleared_own: sample.clears.filter((clear) => clear.explanation.endsWith("(own)")).length,
+            exit_cleared_launcher: sample.clears.filter((clear) => clear.explanation.endsWith("(launcher)")).length,
+            exit_cleared_reference: sample.clears.filter((clear) => clear.explanation.endsWith("; runtime exit confirmed")).length,
+            exit_cleared_runtime_ending: sample.clears.filter((clear) => clear.explanation.endsWith("(leader exited first)")).length,
+            pending_expired: count((record) => record.pending?.state === "expired" || record.pending?.state === "expired-reference"),
+            proved_reference_cached: sample.records.reduce((sum, record) => sum + (record.provedReferenceCached ?? 0), 0),
+            failed_reference_cached: count((record) => record.proofFailure?.reference === "cached"),
+            failed_reference_missing: count((record) => record.proofFailure?.reference === "missing"),
+            failed_own_unreadable: count((record) => record.proofFailure !== undefined && record.proofFailure.ownUnreadable !== "none"),
+            failed_chain_broken: count((record) => record.proofFailure?.chain === "broken"),
+            reference_changed: sample.referenceChanged,
+            // The row this window belongs to and how many of its records stayed flagged: the evidence compares it with the row's expectation.
+            row: detect([{ name: "row-id", text: rowId }], markers).length > 0 ? "withheld" : rowId,
+            flagged: sample.unsandboxedRuntimes.length,
           })}`,
         );
       }

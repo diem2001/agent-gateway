@@ -32,6 +32,16 @@ export interface OAuthStubOptions {
   loseSessionOn?: string;
   /** The tools this stub lists (default: [`STUB_TOOL_NAME`]). MVP-7637 */
   toolNames?: string[];
+  /**
+   * `_meta` per tool name, listed as-is in `tools/list` (MVP-8089): `{ "anthropic/maxResultSizeChars": 250000 }`
+   * is what mcp-jira declares. A tool without an entry lists no `_meta`.
+   */
+  toolMeta?: Record<string, Record<string, unknown>>;
+  /**
+   * The text of a `tools/call` result is exactly this many characters, framed by
+   * `SIZE_START_MARKER` and `SIZE_END_MARKER` (see `framedToolText`). Takes precedence over `toolResultBytes`.
+   */
+  toolResultChars?: number;
   /** The address to listen on (default 127.0.0.1; the Docker integration probe uses a bridge address). */
   host?: string;
 }
@@ -63,6 +73,15 @@ export interface OAuthMcpStub {
 }
 
 export const STUB_TOOL_NAME = "lookup_record";
+export const SIZE_START_MARKER = "SIZE-8089-START|";
+export const SIZE_END_MARKER = "|SIZE-8089-END";
+
+/** Exactly `chars` ASCII characters: start marker, a filler of digits, end marker. */
+export function framedToolText(chars: number): string {
+  const fill = chars - SIZE_START_MARKER.length - SIZE_END_MARKER.length;
+  if (fill < 0) throw new Error(`a framed text needs at least ${SIZE_START_MARKER.length + SIZE_END_MARKER.length} characters`);
+  return SIZE_START_MARKER + "0123456789".repeat(Math.ceil(fill / 10)).slice(0, fill) + SIZE_END_MARKER;
+}
 export const STUB_TOOL_RESULT_PREFIX = "RECORD-7667-OK";
 const MCP_PATH = "/mcp";
 
@@ -123,13 +142,17 @@ export async function startOAuthMcpStub(options: OAuthStubOptions = {}): Promise
               name,
               description: "Look up a record by id.",
               inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+              ...(options.toolMeta?.[name] ? { _meta: options.toolMeta[name] } : {}),
             })),
           },
         };
       case "tools/call": {
         toolCalls.push(String(message.params?.name ?? ""));
         const size = options.toolResultBytes ?? 0;
-        const text = STUB_TOOL_RESULT_PREFIX + (size > 0 ? " " + "x".repeat(size) : "");
+        const text =
+          options.toolResultChars !== undefined
+            ? framedToolText(options.toolResultChars)
+            : STUB_TOOL_RESULT_PREFIX + (size > 0 ? " " + "x".repeat(size) : "");
         return { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text }] } };
       }
       case "ping":
