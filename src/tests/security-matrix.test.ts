@@ -1589,12 +1589,13 @@ describe("process sampler launcher ended (MVP-8125)", () => {
   const ALL_HOLD = { failedWhile: "alive", ownProof: true, escapeEvidence: false, ownUnreadable: "none", referenceExit: "alive", runtimeExit: "alive", chain: "broken", launcherIdentity: "verified", launcherExe: "real-bwrap", reparented: true } as const;
   /** A negative row: the record was flagged, never pending, and every predicate but the row's own one is as in `ALL_HOLD`. */
   const flaggedWith = (final: ProcessSample, record: ProcessRecord, own: Partial<Record<keyof typeof ALL_HOLD, string | boolean>>): void => {
-    expect(record.proofFailure).toMatchObject({ ...ALL_HOLD, ...own });
+    // The outcome first, so that a widened rule fails here and not on a field it changed on the way.
     expect(record.pending, "the record was never pending").toBeUndefined();
+    expect(record.clearedBy, "the record was never cleared").toBeUndefined();
+    expect(final.unsandboxedRuntimes, "the record stays flagged").toContain(record.pid);
     expect(record.proofFailure?.pending, "the record was never pending").toBe("none");
-    expect(record.clearedBy).toBeUndefined();
+    expect(record.proofFailure).toMatchObject({ ...ALL_HOLD, ...own });
     expect(record.fate, "the runtime ended within the bound").toBe("exited");
-    expect(final.unsandboxedRuntimes).toContain(record.pid);
     const text = sampleProblems(final, {}).join("\n");
     expect(text).toContain("ran without a sandbox ancestor");
     expect(text).toContain(`pid ${record.pid}`);
@@ -1667,6 +1668,7 @@ describe("process sampler launcher ended (MVP-8125)", () => {
     await pause(2500);
     expect(ended(state.runtime!), "precondition not reached: the runtime ended before the bound passed").toBe(false);
     const expired = recordOf(sampler.peek(), state.runtime);
+    expect(expired.pending?.state, "the record expired at the bound").toBe("expired");
     expect(expired.proofFailure).toMatchObject({ ...ALL_HOLD, pending: "expired" });
     expect(expired.unsandboxed).toBe(true);
     endTracked(inner!);
