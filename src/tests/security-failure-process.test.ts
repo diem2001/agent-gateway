@@ -1009,6 +1009,8 @@ describe("sampler and refusal-check controls", () => {
       const parent = statOf(pid)?.ppid ?? 0;
       process.kill(parent, "SIGSTOP");
       state.stopped.push(parent);
+      // SIGSTOP is delivered asynchronously: a parent that has not stopped yet would reap the runtime at once and leave no zombie.
+      for (const end = Date.now() + 2000; statOf(parent)?.state !== "T" && Date.now() < end; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2));
       process.kill(pid, "SIGKILL");
       for (const end = Date.now() + 2000; !(state.reached = isZombie(pid)) && Date.now() < end; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2));
     };

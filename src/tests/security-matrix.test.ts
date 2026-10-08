@@ -869,6 +869,8 @@ describe("process sampler launcher exemption", () => {
       if (shape === "zombie") {
         process.kill(parent, "SIGSTOP");
         stoppedPids.push(parent);
+        // SIGSTOP is delivered asynchronously: a parent that has not stopped yet would reap the runtime at once and leave no zombie.
+        waitSync(() => statOf(parent)?.state === "T");
       }
       process.kill(pid, "SIGKILL");
       state.reached = waitSync(() => (shape === "zombie" ? isZombie(pid) : isGone(pid) && (shape === "reaped" || isGone(parent))));
@@ -1219,6 +1221,7 @@ describe("process sampler launcher exemption", () => {
       recordedPids.push(reference);
       process.kill(parent.pid!, "SIGSTOP");
       stoppedPids.push(parent.pid!);
+      waitSync(() => statOf(parent.pid!)?.state === "T");
       process.kill(reference, "SIGUSR1");
       const zombieWithThreads = waitSync(() => statOf(reference)?.state === "Z" && threadsNow(reference) >= 2);
       process.kill(middle, "SIGKILL");
