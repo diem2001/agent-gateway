@@ -2,7 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { getUserSkillsDir, getWorkspaceRoot, listFiles } from "./workspace.js";
-import { checkTrusted, copyFileNoFollow } from "./sandbox-content.js";
+import { auditIgnoredCommandSettings, checkTrusted, copyFileNoFollow, readFileNoFollow, SAFE_NAME } from "./sandbox-content.js";
+import { neutralizeCommandSettings } from "./command-settings.js";
 import { log } from "./logging.js";
 
 /**
@@ -42,6 +43,13 @@ export function getUserSkillsMaxBytes(): number {
   return readPositiveIntEnv("USER_SKILLS_MAX_BYTES", DEFAULT_USER_SKILLS_MAX_BYTES);
 }
 
+export interface MaterializeOptions {
+  /** Write the skills without `hooks`, `mcpServers` and every other key outside the reviewed allowlist. */
+  neutralizeCommands?: boolean;
+  /** The caller's API-key label, for the audit line of a rewritten file. */
+  label?: string;
+}
+
 export type TruncationReason = "count_cap" | "size_cap";
 
 export interface MaterializedUserSkills {
@@ -73,11 +81,14 @@ function slugForStoredPath(storedPath: string): string {
  * for ONE query and return its root path (or null when there is nothing to load).
  * Applies the per-user caps and reports any deterministic truncation.
  *
+ * With `neutralizeCommands` (a run without the `Bash` grant, MVP-8106) every skill is written rewritten, without
+ * command settings, instead of verbatim; the caps still count the stored bytes and the stored file is not touched.
+ *
  * Caller is responsible for the lifecycle of the returned root only insofar as it
  * lives under the OS temp dir; it is safe to leave for the OS to reap, but
  * `cleanupUserSkillBundle` is provided for explicit removal after the query.
  */
-export function materializeUserSkills(userId: string | undefined): MaterializedUserSkills {
+export function materializeUserSkills(userId: string | undefined, options: MaterializeOptions = {}): MaterializedUserSkills {
   const empty: MaterializedUserSkills = { pluginRoot: null, dropped: [], reason: null };
   if (!userId) return empty;
 
@@ -153,7 +164,17 @@ export function materializeUserSkills(userId: string | undefined): MaterializedU
     const srcPath = path.join(baseDir, entry.path);
     const destDir = path.join(skillsDir, slug);
     fs.mkdirSync(destDir, { recursive: true });
-    if (!copyFileNoFollow(srcPath, path.join(destDir, "SKILL.md"))) {
+    const destFile = path.join(destDir, "SKILL.md");
+    if (options.neutralizeCommands === true) {
+      const content = readFileNoFollow(srcPath, maxBytes);
+      if (!content) {
+        log("audit", "user-skills.skipped reason=unreadable");
+        continue;
+      }
+      const rewritten = neutralizeCommandSettings(content);
+      fs.writeFileSync(destFile, rewritten.data, { flag: "wx", mode: 0o600 });
+      auditIgnoredCommandSettings(options.label, "user-skills", SAFE_NAME.test(slug) ? slug : "invalid", rewritten.ignored);
+    } else if (!copyFileNoFollow(srcPath, destFile)) {
       log("audit", "user-skills.skipped reason=unreadable");
     }
   }

@@ -26,6 +26,9 @@ let capturedOptions: Record<string, unknown>[] = [];
 let sdkServers: { name: string; tools: SdkTool[] }[] = [];
 let tempDir: string;
 let logs: string[];
+/** The options of every SandboxRun and the arguments of every materializeUserSkills call of the run under test (MVP-8106). */
+let sandboxOptions: Record<string, unknown>[] = [];
+let skillCalls: { userId: unknown; options: unknown }[] = [];
 
 const INIT = { type: "system", subtype: "init", claude_code_version: "2.0.77", skills: [] };
 const RESULT = { type: "result", subtype: "success", is_error: false, result: "fine", session_id: "sdk-s", usage: { input_tokens: 1, output_tokens: 1 }, total_cost_usd: 0 };
@@ -38,10 +41,11 @@ const ANSWER: Attempt = {
   ],
 };
 
-const ALL_BUILT_INS = [
-  "Agent", "AskUserQuestion", "Bash", "Edit", "EnterPlanMode", "ExitPlanMode", "Glob", "Grep", "KillShell", "LSP", "NotebookEdit",
-  "Read", "Skill", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskUpdate", "TodoWrite", "WebFetch", "WebSearch", "Write",
-];
+/** The decided default grant (DEC-ISO-008) and the rest of the inventory of the bundled runtime (MVP-8088, Gate A). */
+const APPROVED = ["Agent", "Bash", "Edit", "Glob", "Grep", "NotebookEdit", "Read", "Skill", "TodoWrite", "WebFetch", "WebSearch", "Write"];
+const NOT_DEFAULT = ["CronCreate", "CronDelete", "CronList", "EnterWorktree", "ExitWorktree", "ListAgents", "ReportFindings", "ScheduleWakeup", "SendMessage", "TaskStop", "Workflow"];
+const INVENTORY = [...APPROVED, ...NOT_DEFAULT].sort();
+const without = (names: readonly string[], ...drop: string[]): string[] => names.filter((name) => !drop.includes(name));
 
 beforeEach(() => {
   vi.resetModules();
@@ -53,6 +57,8 @@ beforeEach(() => {
   capturedOptions = [];
   sdkServers = [];
   logs = [];
+  sandboxOptions = [];
+  skillCalls = [];
   vi.spyOn(console, "log").mockImplementation((...args) => {
     logs.push(args.map(String).join(" "));
   });
@@ -67,6 +73,29 @@ beforeEach(() => {
       }
     },
   }));
+  // Recording wrappers around the real sandbox run and skill bundle: they only observe what agent.ts hands over.
+  vi.doMock("../sandbox.js", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("../sandbox.js")>();
+    return {
+      ...actual,
+      SandboxRun: class extends actual.SandboxRun {
+        constructor(options: ConstructorParameters<typeof actual.SandboxRun>[0]) {
+          super(options);
+          sandboxOptions.push(options as unknown as Record<string, unknown>);
+        }
+      },
+    };
+  });
+  vi.doMock("../user-skills.js", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("../user-skills.js")>();
+    return {
+      ...actual,
+      materializeUserSkills: (userId: string | undefined, options?: Parameters<typeof actual.materializeUserSkills>[1]) => {
+        skillCalls.push({ userId, options });
+        return actual.materializeUserSkills(userId, options);
+      },
+    };
+  });
   vi.doMock("@anthropic-ai/claude-agent-sdk", () => ({
     query: vi.fn(({ options }) => {
       capturedOptions.push(options as Record<string, unknown>);
@@ -82,6 +111,8 @@ afterEach(async () => {
   const { credentialRelay } = await import("../mcp-credential-relay.js");
   await credentialRelay.close();
   vi.doUnmock("@anthropic-ai/claude-agent-sdk");
+  vi.doUnmock("../sandbox.js");
+  vi.doUnmock("../user-skills.js");
   vi.doUnmock("@modelcontextprotocol/sdk/server/mcp.js");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -126,34 +157,54 @@ const post = (app: express.Express, body: Record<string, unknown>, label = "reql
   request(app).post("/v1/query").set("x-test-label", label).send({ queryId: `q-${Math.random()}`, prompt: "go", useSession: false, user_id: "user-1", ...body });
 
 describe("built-in layers from the trusted policy", () => {
-  it("no policy, no list: the options are what they were (no `tools`, no `disallowedTools`) with the user setting source only", async () => {
+  it("no policy, no list: the runtime is offered exactly the approved default set and the other inventory names are denied (MVP-8088)", async () => {
     const app = await createApp();
     expect((await post(app, {})).status).toBe(200);
     const options = capturedOptions[0];
-    expect(options.tools).toBeUndefined();
-    expect(options.disallowedTools).toBeUndefined();
+    expect(options.tools).toEqual(APPROVED);
+    expect(options.disallowedTools).toEqual(NOT_DEFAULT);
     expect(options.permissionMode).toBe("bypassPermissions");
     expect(options.settingSources).toEqual(["user"]);
     expect(Object.keys(options.mcpServers as object).sort()).toEqual(["agent-gateway-tools", "jira", "other"]);
   });
 
-  it("a policy that denies Bash and Write: the runtime is offered the other 16 and the two are named as denied", async () => {
+  it("a policy that denies Bash and Write: the runtime is offered the other 10 approved names and the rest of the inventory is named as denied", async () => {
     const app = await createApp({ labels: { reqlift: { deny: ["Bash", "Write"] } } });
     await post(app, {});
     const options = capturedOptions[0];
-    expect(options.tools).toEqual(ALL_BUILT_INS.filter((n) => n !== "Bash" && n !== "Write"));
-    expect(options.disallowedTools).toEqual(["Bash", "Write"]);
+    expect(options.tools).toEqual(without(APPROVED, "Bash", "Write"));
+    expect(options.disallowedTools).toEqual(["Bash", ...NOT_DEFAULT, "Write"].sort());
     expect(options.permissionMode).toBe("bypassPermissions");
     expect(options.allowedTools).not.toContain("Bash");
     expect(options.allowedTools).not.toContain("Write");
     expect(options.allowedTools).toContain("Read");
   });
 
-  it("the same policy for another label that has no entry changes nothing for that label", async () => {
+  it("the same policy for another label that has no entry leaves that label with the approved default set", async () => {
     const app = await createApp({ labels: { reqlift: { deny: ["Bash", "Write"] } } });
     await post(app, {}, "diemcrm");
-    expect(capturedOptions[0].tools).toBeUndefined();
-    expect(capturedOptions[0].disallowedTools).toBeUndefined();
+    expect(capturedOptions[0].tools).toEqual(APPROVED);
+    expect(capturedOptions[0].disallowedTools).toEqual(NOT_DEFAULT);
+  });
+
+  it("a label that allows one tool outside the default set gets exactly that tool, and it is pre-approved", async () => {
+    const app = await createApp({ labels: { reqlift: { allow: ["CronCreate"] } } });
+    await post(app, {});
+    expect(capturedOptions[0].tools).toEqual(["CronCreate"]);
+    expect(capturedOptions[0].disallowedTools).toEqual(without(INVENTORY, "CronCreate"));
+    expect((capturedOptions[0].allowedTools as string[]).filter((name) => !name.startsWith("mcp__") && !name.includes("_"))).toEqual(["CronCreate"]);
+  });
+
+  it("a resumed conversation carries the same explicit lists", async () => {
+    const app = await createApp();
+    await post(app, { sessionId: "resumed-1", useSession: true });
+    await post(app, { sessionId: "resumed-1", useSession: true });
+    expect(capturedOptions).toHaveLength(2);
+    expect(capturedOptions[1].resume).toBeDefined();
+    for (const options of capturedOptions) {
+      expect(options.tools).toEqual(APPROVED);
+      expect(options.disallowedTools).toEqual(NOT_DEFAULT);
+    }
   });
 
   it("a request naming the denied tool explicitly cannot widen it", async () => {
@@ -171,7 +222,7 @@ describe("built-in layers from the trusted policy", () => {
     const options = capturedOptions[0];
     expect(options.allowedTools).toEqual([]);
     expect(options.tools).toEqual([]);
-    expect(options.disallowedTools).toEqual(ALL_BUILT_INS);
+    expect(options.disallowedTools).toEqual(INVENTORY);
     expect(options.mcpServers).toBeUndefined();
   });
 
@@ -230,8 +281,8 @@ describe("built-in layers from the trusted policy", () => {
     await post(app, {});
     expect(capturedOptions).toHaveLength(2);
     for (const options of capturedOptions) {
-      expect(options.disallowedTools).toEqual(["Bash"]);
-      expect(options.tools).toEqual(ALL_BUILT_INS.filter((n) => n !== "Bash"));
+      expect(options.disallowedTools).toEqual(["Bash", ...NOT_DEFAULT].sort());
+      expect(options.tools).toEqual(without(APPROVED, "Bash"));
     }
   }, 15_000);
 });
@@ -464,5 +515,94 @@ describe("the event cache is keyed by label and query id", () => {
     const stranger = await replay("someone-else");
     expect(stranger.status).toBe(404);
     expect(stranger.body).toEqual({ error: "Query not found or expired" });
+  });
+});
+
+describe("command settings of skill and agent files follow the same Bash grant as the request-server gate (MVP-8106)", () => {
+  const neutralized = () => sandboxOptions[0]?.neutralizeCommands;
+  const commandServerAttached = () => Object.keys((capturedOptions[0].mcpServers as object | undefined) ?? {}).includes("runner");
+
+  async function run(policy: unknown, body: Record<string, unknown> = {}, label = "reqlift") {
+    sandboxOptions = [];
+    skillCalls = [];
+    capturedOptions = [];
+    vi.resetModules();
+    const app = await createApp(policy);
+    await post(app, { mcpServers: { runner: { command: "node", args: [] } }, ...body }, label);
+  }
+
+  it("a policy that denies Bash for the label: the run is told to neutralize, with the label, and the per-user bundle is asked for the same", async () => {
+    await run({ labels: { reqlift: { deny: ["Bash"] } } });
+    expect(sandboxOptions).toHaveLength(1);
+    expect(neutralized()).toBe(true);
+    expect(sandboxOptions[0].label).toBe("reqlift");
+    expect(skillCalls).toEqual([{ userId: "user-1", options: { neutralizeCommands: true, label: "reqlift" } }]);
+  });
+
+  it("no policy, or a policy that leaves Bash granted: nothing is neutralized, in the sandbox run and in the bundle", async () => {
+    for (const policy of [undefined, { labels: { reqlift: { deny: ["Write"] } } }, { labels: { reqlift: { allow: ["Bash", "Read"] } } }, { default: { deny: ["Write"] } }]) {
+      await run(policy);
+      expect(neutralized(), JSON.stringify(policy)).toBe(false);
+      expect(skillCalls, JSON.stringify(policy)).toEqual([{ userId: "user-1", options: { neutralizeCommands: false, label: "reqlift" } }]);
+    }
+  });
+
+  it("an allow list without Bash neutralizes; so does a default entry that denies Bash, for a label that has no entry of its own", async () => {
+    await run({ labels: { reqlift: { allow: ["Read", "Grep"] } } });
+    expect(neutralized()).toBe(true);
+    await run({ default: { deny: ["Bash"] } }, {}, "diemcrm");
+    expect(neutralized()).toBe(true);
+  });
+
+  it("another label that the policy leaves alone is not neutralized, whatever a different label is denied", async () => {
+    await run({ labels: { reqlift: { deny: ["Bash"] } } }, {}, "diemcrm");
+    expect(neutralized()).toBe(false);
+    expect(sandboxOptions[0].label).toBe("diemcrm");
+  });
+
+  it("the caller's own narrowing never decides it, in either direction", async () => {
+    await run(undefined, { allowedTools: ["Read"] });
+    expect(neutralized()).toBe(false);
+    await run({ labels: { reqlift: { deny: ["Bash"] } } }, { allowedTools: ["Bash", "Read"] });
+    expect(neutralized()).toBe(true);
+    await run(undefined, { enforcedTools: ["Read"] });
+    expect(neutralized()).toBe(false);
+    await run({ labels: { reqlift: { deny: ["Bash"] } } }, { enforcedTools: ["Read"] });
+    expect(neutralized()).toBe(true);
+  });
+
+  it("an enforced run still asks for no per-user bundle at all", async () => {
+    await run({ labels: { reqlift: { deny: ["Bash"] } } }, { enforcedTools: ["Read"] });
+    expect(skillCalls).toEqual([{ userId: undefined, options: undefined }]);
+  });
+
+  it("the request-server command gate is pinned: no policy attaches, deny Bash omits, an allow list without Bash omits, a policy that names the server attaches", async () => {
+    const rows: [string, unknown, boolean][] = [
+      ["no policy", undefined, true],
+      ["deny Bash", { labels: { reqlift: { deny: ["Bash"] } } }, false],
+      ["allow without Bash", { labels: { reqlift: { allow: ["Read"] } } }, false],
+      ["allow naming the server", { labels: { reqlift: { allow: ["Read", "mcp__runner__*"] } } }, true],
+    ];
+    for (const [row, policy, attached] of rows) {
+      await run(policy);
+      expect(commandServerAttached(), row).toBe(attached);
+    }
+  });
+
+  it("both gates read the same Bash grant: a command server is left out exactly when the run is neutralized, except where the policy names that server (an exception of the request-server gate only)", async () => {
+    const rows: [string, unknown][] = [
+      ["no policy", undefined],
+      ["deny Write", { labels: { reqlift: { deny: ["Write"] } } }],
+      ["deny Bash", { labels: { reqlift: { deny: ["Bash"] } } }],
+      ["allow without Bash", { labels: { reqlift: { allow: ["Read"] } } }],
+      ["allow with Bash and the server", { labels: { reqlift: { allow: ["Read", "Bash", "mcp__runner__*"] } } }],
+    ];
+    for (const [row, policy] of rows) {
+      await run(policy);
+      expect(commandServerAttached(), row).toBe(neutralized() === false);
+    }
+    await run({ labels: { reqlift: { allow: ["Read", "mcp__runner__*"] } } });
+    expect(commandServerAttached()).toBe(true);
+    expect(neutralized()).toBe(true);
   });
 });

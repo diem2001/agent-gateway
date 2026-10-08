@@ -380,6 +380,9 @@ export function buildSandboxEnv(input: SandboxEnvInput): Record<string, string> 
     ANTHROPIC_API_KEY: input.runToken,
     DISABLE_AUTOUPDATER: "1",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    // DEC-ISO-008: the runtime offers `TodoWrite` (reqlift's progress checklist parses only its input) instead of the four
+    // task tools. Fixed here, after the SDK environment, so the gateway's own environment cannot turn the task tools on.
+    CLAUDE_CODE_ENABLE_TASKS: "false",
     GIT_CONFIG_COUNT: String(GIT_TRUSTED_CONFIG.length),
   });
   GIT_TRUSTED_CONFIG.forEach(([key, value], i) => {
@@ -696,6 +699,12 @@ export interface SandboxRunOptions {
   /** This run's user-skill bundle (read-only at its own path), or null. */
   userSkillsDir?: string | null;
   /**
+   * The run has no `Bash` grant (MVP-8106): the skill, agent and command files it sees are a run-scoped copy without
+   * command settings. `label` is the caller's API-key label, for the audit line of a rewritten file.
+   */
+  neutralizeCommands?: boolean;
+  label?: string;
+  /**
    * The conversation's recorded sandbox home name: its home persists under `<root>/sessions/<name>/home`
    * between requests. Without one, the home is private to this run and removed with it.
    */
@@ -857,7 +866,7 @@ export class SandboxRun {
 
     const workspaceRoot = this.options.workspaceRoot ?? getWorkspaceRoot();
     const needles = gatewayKnownValues(workspaceRoot);
-    const plan: MountPlan = planTrustedContent({ workspaceRoot, trustedDir, needles, scanner: contentScanner });
+    const plan: MountPlan = planTrustedContent({ workspaceRoot, trustedDir, needles, scanner: contentScanner, neutralizeCommands: this.options.neutralizeCommands === true, label: this.options.label });
     if (plan.skipped > 0 || plan.hiddenCount > 0) log("audit", `sandbox.content skipped=${plan.skipped} hidden=${plan.hiddenCount}`);
 
     // The runtime and the trusted directories it needs, each validated without following links.

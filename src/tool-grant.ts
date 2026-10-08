@@ -1,49 +1,90 @@
 /**
- * The trusted tool grant of a run (MVP-7679).
+ * The trusted tool grant of a run (MVP-7679, MVP-8088).
  *
  * Effective grant = the trusted policy for the caller's API-key label (`AGENT_TOOL_POLICY`) intersected with
  * the caller's own narrowing (`enforcedTools`, an exact set, or `allowedTools`, names and `mcp__<server>__*`
  * patterns). A caller can only make a grant smaller: an omitted list uses the policy grant, an explicit empty
  * list grants nothing, and a configured agent, skill, prompt or sub-agent never adds authority.
  *
- * Built-in tools run inside the runtime, so their grant is enforced by what the runtime is offered (`tools`
- * and `disallowedTools`, pinned by the MVP-7679 Gate A spike on Claude Code 2.0.77). Mediated tools
- * (webhook and MCP) are checked again on the trusted side before any credential-bearing request.
+ * Built-in tools run inside the runtime, so their grant is enforced by what the runtime is offered: every run
+ * passes an explicit `tools` list and a `disallowedTools` list (MVP-8088), so a runtime update cannot widen the
+ * offered set by itself. Without a policy a label gets the approved default set (DEC-ISO-008), never "everything
+ * the runtime offers". Mediated tools (webhook and MCP) are checked again on the trusted side before any
+ * credential-bearing request.
  *
  * Policy format (one JSON object in the environment, never logged beyond tool names):
  *   { "default": { "allow": [...], "deny": [...] }, "labels": { "<label>": { "allow": [...], "deny": [...] } } }
  * A pattern is a built-in tool name, `mcp__<server>__*` or `mcp__<server>__<tool>`. Deny beats allow; an absent
- * `allow` means everything a run gets without a policy; `allow: []` means nothing; a label entry replaces `default`.
+ * `allow` means the approved default set for built-ins and every server; `allow: []` means nothing; a label entry
+ * replaces `default`.
  */
 
 import { log } from "./logging.js";
 
-/** Built-in tools supported by the bundled Claude Code runtime. */
-export const RUNTIME_BUILT_IN_TOOLS: readonly string[] = [
+/**
+ * Every built-in tool the bundled runtime (Claude Code 2.1.292, SDK 0.3.292) offers when the gateway starts it:
+ * `CLAUDE_CODE_ENABLE_TASKS=false` (so `TodoWrite` is offered and the four task tools are not) and
+ * `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (so `DesignSync`, `Monitor` and `PushNotification` are not), measured in
+ * MVP-8088 Gate A. The committed real-runtime inventory row (`builtin-tool-grant-process.test.ts`) fails when the
+ * runtime adds, removes or renames one: review the new tool before adding its name here. A policy may name any of
+ * these, so one of them can be enabled for a single label; none but the approved default set is offered otherwise.
+ */
+const RUNTIME_INVENTORY: readonly string[] = [
   "Agent",
-  "AskUserQuestion",
   "Bash",
+  "CronCreate",
+  "CronDelete",
+  "CronList",
   "Edit",
-  "EnterPlanMode",
-  "ExitPlanMode",
+  "EnterWorktree",
+  "ExitWorktree",
   "Glob",
   "Grep",
-  "KillShell",
-  "LSP",
+  "ListAgents",
+  "NotebookEdit",
+  "Read",
+  "ReportFindings",
+  "ScheduleWakeup",
+  "SendMessage",
+  "Skill",
+  "TaskStop",
+  "TodoWrite",
+  "WebFetch",
+  "WebSearch",
+  "Workflow",
+  "Write",
+];
+
+/** Names the runtime resolves to another tool (measured: `--tools Task` offers `Agent`, and each denies the other). */
+export const BUILT_IN_ALIASES: Readonly<Record<string, string>> = { Task: "Agent" };
+
+/** The built-in names `AGENT_TOOL_POLICY` may use: the runtime's inventory and its aliases. */
+export const RUNTIME_BUILT_IN_TOOLS: readonly string[] = [...RUNTIME_INVENTORY, ...Object.keys(BUILT_IN_ALIASES)].sort();
+
+/** The built-ins a label gets without a policy `allow` list (operator decision DEC-ISO-008, MVP-7676), canonical names. */
+export const APPROVED_DEFAULT_SET: readonly string[] = [
+  "Agent",
+  "Bash",
+  "Edit",
+  "Glob",
+  "Grep",
   "NotebookEdit",
   "Read",
   "Skill",
-  "Task",
-  "TaskCreate",
-  "TaskGet",
-  "TaskList",
-  "TaskOutput",
-  "TaskUpdate",
   "TodoWrite",
   "WebFetch",
   "WebSearch",
   "Write",
 ];
+
+/** The canonical tool a built-in name stands for (an alias resolves to its target). */
+function canonicalBuiltIn(name: string): string {
+  return Object.hasOwn(BUILT_IN_ALIASES, name) ? BUILT_IN_ALIASES[name] : name;
+}
+
+function canonicalBuiltIns(patterns: readonly string[]): Set<string> {
+  return new Set(patterns.filter((p) => !p.startsWith(MCP_PREFIX)).map(canonicalBuiltIn));
+}
 
 export const MCP_PREFIX = "mcp__";
 /** The reserved server that hosts the registered webhook tools. */
@@ -160,14 +201,15 @@ export function policyEntryFor(label: string): PolicyEntry | undefined {
   return (Object.hasOwn(activePolicy.labels, label) ? activePolicy.labels[label] : undefined) ?? activePolicy.default;
 }
 
-/** Startup: parses the environment value (throws `ToolPolicyConfigError`) and logs one line per label. */
+/**
+ * Startup: parses the environment value (throws `ToolPolicyConfigError`) and logs one line per label, with or
+ * without a policy, naming the built-ins the label actually gets (never "all").
+ */
 export function loadToolPolicy(env: NodeJS.ProcessEnv, labels: readonly string[]): void {
   activePolicy = parseToolPolicy(env.AGENT_TOOL_POLICY, labels);
-  if (!activePolicy) return;
   for (const label of labels) {
     const grant = computeToolGrant({ label });
-    const builtIns = grant.restrictsBuiltIns ? grant.builtIns().join(",") || "none" : "all";
-    log("audit", `tool.policy label=${label} builtIns=${builtIns} servers=${describeServers(policyEntryFor(label))}`);
+    log("audit", `tool.policy label=${label} builtIns=${grant.builtIns().join(",") || "none"} servers=${describeServers(policyEntryFor(label))}`);
   }
 }
 
@@ -212,13 +254,31 @@ export interface GrantRequest {
 }
 
 export class ToolGrant {
+  /** The canonical built-ins the policy (or, without an `allow` list, the approved default set) grants. */
+  private readonly builtInBase: ReadonlySet<string>;
+  private readonly builtInDeny: ReadonlySet<string>;
+  /** The caller's narrowing, canonical built-ins only; undefined = the caller named nothing. */
+  private readonly builtInNarrowing: ReadonlySet<string> | undefined;
+
   constructor(
     private readonly policy: PolicyEntry | undefined,
     private readonly narrowing: readonly string[] | undefined,
-  ) {}
+  ) {
+    this.builtInBase = policy?.allow !== undefined ? canonicalBuiltIns(policy.allow) : new Set(APPROVED_DEFAULT_SET);
+    this.builtInDeny = canonicalBuiltIns(policy?.deny ?? []);
+    this.builtInNarrowing = narrowing === undefined ? undefined : canonicalBuiltIns(narrowing);
+  }
 
-  /** Whether tool `name` (a built-in name or `mcp__<server>__<tool>`) is granted. */
+  /**
+   * Whether tool `name` (a built-in name or `mcp__<server>__<tool>`) is granted. A built-in is granted only when
+   * its canonical name is in the runtime inventory, in the base grant, not denied and inside the caller's
+   * narrowing; a name outside the inventory is never granted.
+   */
   allows(name: string): boolean {
+    if (!name.startsWith(MCP_PREFIX)) {
+      const tool = canonicalBuiltIn(name);
+      return RUNTIME_INVENTORY.includes(tool) && this.builtInBase.has(tool) && !this.builtInDeny.has(tool) && (this.builtInNarrowing === undefined || this.builtInNarrowing.has(tool));
+    }
     if (this.policy) {
       if (this.policy.deny && matchesAny(this.policy.deny, name)) return false;
       if (this.policy.allow && !matchesAny(this.policy.allow, name)) return false;
@@ -254,24 +314,19 @@ export class ToolGrant {
     return this.narrowing === undefined || this.narrowing.includes(whole);
   }
 
-  /** True when the policy or the caller restricts the built-in tools, so the runtime is given an explicit list. */
-  get restrictsBuiltIns(): boolean {
-    return this.narrowing !== undefined || this.policy?.allow !== undefined || (this.policy?.deny?.some((p) => !p.startsWith(MCP_PREFIX)) ?? false);
-  }
-
   /** True when anything restricts this run's tools (built-ins, servers or webhook tools). */
   get restricts(): boolean {
     return this.narrowing !== undefined || this.policy?.allow !== undefined || (this.policy?.deny?.length ?? 0) > 0;
   }
 
-  /** The built-in tools the run may use. */
+  /** The built-in tools the run may use (canonical names, sorted): the explicit `tools` list of every run. */
   builtIns(): string[] {
-    return RUNTIME_BUILT_IN_TOOLS.filter((name) => this.allows(name));
+    return RUNTIME_INVENTORY.filter((name) => this.allows(name));
   }
 
-  /** The built-in tools the run may not use. */
+  /** The built-in tools of the inventory the run may not use. */
   deniedBuiltIns(): string[] {
-    return RUNTIME_BUILT_IN_TOOLS.filter((name) => !this.allows(name));
+    return RUNTIME_INVENTORY.filter((name) => !this.allows(name));
   }
 }
 

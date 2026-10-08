@@ -197,8 +197,6 @@ function webhookBearer(tool: ToolDefinition, callerLabel: string, token: string 
   return undefined;
 }
 
-export const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "Agent", "TodoWrite", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
-
 /**
  * Build a fresh single-message AsyncIterable<SDKUserMessage> from the resolved
  * content blocks. The Claude Agent SDK's `query()` accepts
@@ -282,6 +280,12 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // The trusted grant of this run: policy for the caller's label intersected with the caller's own narrowing.
   const callerLabel = label ?? webhookContext?.api_key_label ?? "";
   const grant = givenGrant ?? computeToolGrant({ label: callerLabel, narrowing: enforcedTools ?? allowedTools });
+  // Whether this label may execute commands at all: the trusted policy alone decides, the caller's own narrowing never
+  // does. Both command gates of a run key on this one value: the request-server `command` gate below and the
+  // neutralization of command settings in skill, agent and command files (MVP-8106).
+  const policyGrant = computeToolGrant({ label: callerLabel });
+  const commandsGranted = policyGrant.allows("Bash");
+  const neutralizeCommands = !commandsGranted;
   // The set an enforced run is held to: what the caller named, minus what the trusted policy does not grant.
   const enforcedSet = enforced ? enforcedTools.filter((name) => grant.allows(name)) : undefined;
   // A run is offered only the registered tools of its own label plus legacy ownerless ones, and only granted ones.
@@ -324,11 +328,10 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     // A request-supplied `command` is code the caller picked: it is attached only when the trusted policy lets this
     // label execute commands (`Bash`) or names that server explicitly, so a policy that denies `Bash` cannot be
     // sidestepped with a request server. (The caller's own narrowing can only shrink the grant, never decide this.)
-    const policyGrant = computeToolGrant({ label: callerLabel });
     runRequestMcpServers = Object.fromEntries(
       Object.entries(runRequestMcpServers).filter(([name, config]) => {
         if (!grant.allowsServer(name)) return false;
-        if (typeof (config as { command?: unknown }).command === "string" && !policyGrant.allows("Bash") && !policyGrant.explicitlyAllowsServer(name)) {
+        if (typeof (config as { command?: unknown }).command === "string" && !commandsGranted && !policyGrant.explicitlyAllowsServer(name)) {
           log("audit", `mcp.server.omitted serverName=${name} reason=command_not_granted`);
           return false;
         }
@@ -341,7 +344,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // `allowedTools` is the runtime's pre-approval list; the caller's list is a narrowing and was applied to the grant.
   const effectiveTools = allowedTools
     ? allowedTools.filter((name) => grant.allows(name))
-    : [...DEFAULT_TOOLS.filter((name) => grant.allows(name)), ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
+    : [...grant.builtIns(), ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
   const options: Record<string, unknown> = {
     allowedTools: effectiveTools,
     permissionMode: "bypassPermissions",
@@ -364,10 +367,11 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     options.tools = builtInTools(enforcedSet!);
     options.hooks = { PreToolUse: [{ hooks: [createToolPolicyHook(enforcedSet!, queryId)] }] };
     log("query", `enforced tool set: ${enforcedSet!.length} tool(s)`);
-  } else if (grant.restrictsBuiltIns) {
-    // The policy or the caller restricts the built-ins: the runtime is offered only the granted ones, and the others
-    // are named as denied. A built-in that is not offered is refused by the runtime itself, for the main agent, a
-    // configured agent, a skill, a sub-agent and a resumed conversation alike (Gate A).
+  } else {
+    // Every run names its built-ins (MVP-8088): the runtime is offered only the granted ones, never its own default
+    // set, so a runtime update cannot widen it by itself; the other inventory names are denied by name as a second
+    // layer. A built-in that is not offered is refused by the runtime itself, for the main agent, a configured agent,
+    // a skill, a sub-agent and a resumed conversation alike (MVP-7679 Gate A).
     options.tools = grant.builtIns();
     options.disallowedTools = grant.deniedBuiltIns();
   }
@@ -379,7 +383,8 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // load, byte-for-byte unchanged. Caps overflow is reported here and surfaced as a
   // `skills_truncated` event below (DEC-GW-004) before the query proceeds.
   // An enforced run loads no plugin bundle (tool-policy.ts).
-  const userSkills = enforced ? materializeUserSkills(undefined) : materializeUserSkills(userId);
+  // Without the `Bash` grant the bundle is written without command settings (hooks, stdio startup commands).
+  const userSkills = enforced ? materializeUserSkills(undefined) : materializeUserSkills(userId, { neutralizeCommands, label: callerLabel });
   if (userSkills.pluginRoot) {
     options.plugins = [{ type: "local", path: userSkills.pluginRoot }];
     log("query", `user skills: loading plugin bundle for userId=${userId} at ${userSkills.pluginRoot}`);
@@ -424,6 +429,8 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     runLogDir: runLogs.dir,
     runLogEnv: runLogs.env,
     userSkillsDir: userSkills.pluginRoot,
+    neutralizeCommands,
+    label: callerLabel,
     sessionDirId: sandboxDirId,
     signal: abortController.signal,
   });
