@@ -804,21 +804,30 @@ describe("a snapshot of skills, agents and commands for a run without Bash (MVP-
     expect(fs.existsSync(path.join(trusted(), "neutralized", "skills", "probe", "SKILL.md"))).toBe(true);
   });
 
-  it("leaves files out above the count cap and above the byte cap, audited as too_large, and reads each file with an explicit limit", () => {
+  it("stops at the file limit and leaves a file above the byte limit out, each only counted in the one summary line, never as a too_large line per file", () => {
     for (let i = 0; i < 5; i++) write(`ws/skills/s${i}/SKILL.md`, `---\nname: s${i}\n---\nbody\n`);
     plan({ neutralize: true, limits: { maxFiles: 3, maxBytes: 1_000_000 } });
-    const names = fs.readdirSync(path.join(trusted(), "neutralized", "skills"));
-    expect(names).toEqual(["s0", "s1", "s2", "s3", "s4"]);
-    const copied = names.filter((name) => fs.existsSync(path.join(trusted(), "neutralized", "skills", name, "SKILL.md")));
-    expect(copied).toEqual(["s0", "s1", "s2"]);
-    expect(audits().match(/reason=too_large/g)?.length).toBe(2);
+    const snapshot = path.join(trusted(), "neutralized", "skills");
+    const folders = fs.readdirSync(snapshot);
+    const copied = folders.filter((name) => fs.existsSync(path.join(snapshot, name, "SKILL.md")));
+    // The walk creates the folder of the fourth file and stops at that file: the order of the folders is the filesystem's.
+    expect(folders.length).toBe(4);
+    expect(copied.length).toBe(3);
+    for (const name of copied) expect(fs.existsSync(path.join(root, "ws", "skills", name, "SKILL.md"))).toBe(true);
+    const limited = logs.filter((l) => l.includes("sandbox.content.limited"));
+    expect(limited).toHaveLength(1);
+    expect(limited[0]).toMatch(/kind=snapshot-skills files=3 folders=4 examined=\d+ bytes=\d+ left_out=1 stopped=true$/);
+    expect(audits()).not.toMatch(/reason=too_large/);
     fs.rmSync(trusted(), { recursive: true, force: true });
+    fs.rmSync(path.join(root, "ws"), { recursive: true, force: true });
     logs.length = 0;
     write("ws/skills/big/SKILL.md", `---\nname: big\n---\n${"x".repeat(600)}\n`);
-    plan({ neutralize: true, limits: { maxFiles: 100, maxBytes: 640 } });
-    const afterBig = ["big", "s0", "s1", "s2", "s3", "s4"].filter((name) => fs.existsSync(path.join(trusted(), "neutralized", "skills", name, "SKILL.md")));
-    expect(afterBig).toEqual(["big"]);
-    expect(audits()).toMatch(/reason=too_large/);
+    plan({ neutralize: true, limits: { maxFiles: 100, maxBytes: 100 } });
+    expect(fs.existsSync(path.join(trusted(), "neutralized", "skills", "big", "SKILL.md"))).toBe(false);
+    const afterBig = logs.filter((l) => l.includes("sandbox.content.limited"));
+    expect(afterBig).toHaveLength(1);
+    expect(afterBig[0]).toMatch(/kind=snapshot-skills files=0 folders=1 examined=2 bytes=0 left_out=1 stopped=false$/);
+    expect(audits()).not.toMatch(/reason=too_large/);
   });
 
   it("fails closed when an entry cannot be copied: it is seen as empty, nothing of it is left in the copy and the live entry is not bound", () => {
@@ -1001,10 +1010,16 @@ describe("a snapshot of skills, agents and commands for a run without Bash (MVP-
           state.grown = true;
           const extra = realOpen(target, "a");
           fs.writeSync(extra, Buffer.alloc(grow, 0x78));
-          fs.closeSync(extra);
+          realClose(extra);
         }
         return stat;
       }) as typeof fs.fstatSync);
+      const realClose = fs.closeSync;
+      vi.spyOn(fs, "closeSync").mockImplementation(((fd: number) => {
+        // A closed descriptor number is handed out again to the next file.
+        if (fd === state.targetFd) state.targetFd = -1;
+        return realClose(fd);
+      }) as typeof fs.closeSync);
       vi.spyOn(fs, "readSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
         const n = (realRead as (...args: unknown[]) => number)(fd, ...rest);
         if (fd === state.targetFd) state.targetBytes += n;
@@ -1247,6 +1262,8 @@ describe("a snapshot of skills, agents and commands for a run without Bash (MVP-
     it("B20 a listing that fails part-way gives the empty stand-in and closes every handle it opened", () => {
       write("ws/skills/a/SKILL.md", HOOK_SKILL);
       write("ws/skills/probe/SKILL.md", HOOK_SKILL);
+      // Node loads its recursive remover on first use and keeps the `readdirSync` it finds then: load it before the spies.
+      fs.rmSync(path.join(root, "warm-up"), { recursive: true, force: true });
       const handles = trackDirs(path.join(wsRoot(), "skills"), path.join(wsRoot(), "skills", "probe"));
       const realReaddir = fs.readdirSync;
       vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
@@ -1282,17 +1299,26 @@ describe("a snapshot of skills, agents and commands for a run without Bash (MVP-
       fs.mkdirSync(chain, { recursive: true });
       write("ws/skills/top.md", HOOK_SKILL);
       const handles = trackDirs(sourceBase);
-      const p = plan({ neutralize: true });
-      vi.restoreAllMocks();
-      const src = mountOf(p, "skills")!.src;
-      expect([snapOf("skills"), path.join(trusted(), "empty-dir")]).toContain(src);
-      expect(p.mounts.some((m) => m.src === sourceBase)).toBe(false);
-      if (src === snapOf("skills")) {
-        expect(expectSnapshotInvariant("skills").folders).toBeLessThanOrEqual(2000);
-      } else {
-        expect(fs.existsSync(snapOf("skills"))).toBe(false);
+      try {
+        const p = plan({ neutralize: true });
+        vi.restoreAllMocks();
+        const src = mountOf(p, "skills")!.src;
+        expect([snapOf("skills"), path.join(trusted(), "empty-dir")]).toContain(src);
+        expect(p.mounts.some((m) => m.src === sourceBase)).toBe(false);
+        if (src === snapOf("skills")) {
+          expect(expectSnapshotInvariant("skills").folders).toBeLessThanOrEqual(2000);
+        } else {
+          expect(fs.existsSync(snapOf("skills"))).toBe(false);
+        }
+        expect(handles.closed).toBe(handles.opened);
+      } finally {
+        // The recursive remover of the test's own cleanup overflows its stack on a chain this deep: remove it from the bottom up.
+        for (const base of [sourceBase, snapOf("skills")]) {
+          let deepest = base;
+          while (fs.existsSync(deepest + "/d")) deepest += "/d";
+          for (let at = deepest; at !== base; at = path.dirname(at)) fs.rmdirSync(at);
+        }
       }
-      expect(handles.closed).toBe(handles.opened);
     }, 60_000);
   });
 });

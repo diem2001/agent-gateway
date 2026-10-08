@@ -122,19 +122,42 @@ export function checkTrusted(p: string, kind: "file" | "dir", root: string): Tru
   return { ok: true, stat };
 }
 
-/** Reads a regular file owned by the gateway user without following a final symlink; null otherwise. */
-export function readFileNoFollow(p: string, maxBytes: number = CONFIG_MAX_BYTES): Buffer | null {
+type BoundedRead = { data: Buffer } | { reason: "too_large" | "unreadable" };
+
+/**
+ * Reads a regular file owned by the gateway user without following a final symlink. It never takes more than
+ * `maxBytes + 1` bytes from the descriptor, whatever the file grows to after `fstat`: more than `maxBytes` is
+ * `too_large`, never a truncated buffer. The open is non-blocking, so a FIFO swapped in after a listing cannot stall the
+ * (synchronous) caller; the type check that follows rejects it.
+ */
+function readRegularFileBounded(p: string, maxBytes: number): BoundedRead {
   let fd: number | undefined;
   try {
-    fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || !ownedByGatewayUser(stat) || stat.size > maxBytes) return null;
-    return fs.readFileSync(fd);
+    if (!stat.isFile() || !ownedByGatewayUser(stat)) return { reason: "unreadable" };
+    if (stat.size > maxBytes) return { reason: "too_large" };
+    const scratch = Buffer.allocUnsafe(Math.max(1, Math.min(SCAN_CHUNK_BYTES, stat.size + 1)));
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (total <= maxBytes) {
+      const n = fs.readSync(fd, scratch, 0, Math.min(scratch.length, maxBytes + 1 - total), null);
+      if (n === 0) break;
+      chunks.push(Buffer.from(scratch.subarray(0, n)));
+      total += n;
+    }
+    return total > maxBytes ? { reason: "too_large" } : { data: Buffer.concat(chunks, total) };
   } catch {
-    return null;
+    return { reason: "unreadable" };
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
   }
+}
+
+/** Reads a regular file owned by the gateway user without following a final symlink; null when it is none or holds more than `maxBytes`. */
+export function readFileNoFollow(p: string, maxBytes: number = CONFIG_MAX_BYTES): Buffer | null {
+  const read = readRegularFileBounded(p, maxBytes);
+  return "data" in read ? read.data : null;
 }
 
 export interface RegularFileEntry {
@@ -732,8 +755,20 @@ export const contentScanner = new KnownValueScanner();
  */
 export const COMMAND_SETTING_ENTRIES: readonly string[] = ["skills", "agents", "commands"];
 
-/** Caps of one snapshot (per entry): a file above either is left out, with the audit reason `too_large`. */
+/**
+ * Caps of one snapshot (per entry). The walk stops at the first file or folder above `maxFiles` / `maxFolders` and at the
+ * entry after the `maxExamined`th one it looked at (every entry counts, whatever it is); a file that would take the
+ * accepted bytes above `maxBytes` is left out and the walk goes on.
+ */
+export interface SnapshotLimits {
+  maxFiles: number;
+  maxFolders: number;
+  maxExamined: number;
+  maxBytes: number;
+}
 export const SNAPSHOT_MAX_FILES = 2000;
+export const SNAPSHOT_MAX_FOLDERS = 2000;
+export const SNAPSHOT_MAX_EXAMINED = 10_000;
 export const SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
 
 export interface PlanOptions {
@@ -751,8 +786,8 @@ export interface PlanOptions {
   neutralizeCommands?: boolean;
   /** The caller's API-key label, for the audit line of a rewritten file. */
   label?: string;
-  /** Tests: caps of one snapshot other than `SNAPSHOT_MAX_FILES` and `SNAPSHOT_MAX_BYTES`. */
-  snapshotLimits?: { maxFiles: number; maxBytes: number };
+  /** Tests: caps of one snapshot other than the defaults; a limit left out keeps its default. */
+  snapshotLimits?: Partial<SnapshotLimits>;
 }
 
 /** An empty read-only stand-in below the trusted directory (created once per start, shared by every entry of that kind). */
@@ -840,57 +875,96 @@ export function auditIgnoredCommandSettings(label: string | undefined, source: s
  * the gateway user are copied (no link is followed or entered); every file is read with an explicit size limit;
  * every `.md` file is rewritten by `neutralizeCommandSettings`. A file that cannot be copied is left out with an
  * audit reason, never copied raw. The stored files are not touched, and later changes to them do not reach the copy.
+ *
+ * The walk is bounded by `limits`: it lists one folder entry at a time (never a whole folder), in the order the
+ * filesystem gives, so a store of any size costs at most `maxExamined` entries. Past a limit it stops and the copy is
+ * partial; one content-free summary line says so. An exception ends the walk without that line (the caller fails closed).
  */
-function snapshotEntry(source: string, target: string, entryName: string, label: string | undefined, limits: { maxFiles: number; maxBytes: number }): void {
+function snapshotEntry(source: string, target: string, entryName: string, label: string | undefined, limits: SnapshotLimits): void {
   fs.mkdirSync(target, { recursive: true, mode: 0o700 });
-  let files = 0;
-  let bytes = 0;
-  const leave = (rel: string, reason: SkipReason | "too_large"): void => audit(`snapshot-${entryName}`, settingFileName(rel), reason);
+  const count = { files: 0, folders: 0, examined: 0, bytes: 0, leftOut: 0 };
+  let stopped = false;
+  const leave = (rel: string, reason: SkipReason): void => audit(`snapshot-${entryName}`, settingFileName(rel), reason);
   const walk = (dir: string, targetDir: string, relDir: string): void => {
-    for (const name of fs.readdirSync(dir).sort()) {
-      const rel = relDir ? `${relDir}/${name}` : name;
-      const full = path.join(dir, name);
-      const stat = lstatOrNull(full);
-      if (!stat) continue;
-      if (stat.isSymbolicLink()) {
-        leave(rel, "symlink");
-      } else if (stat.isDirectory()) {
-        if (!ownedByGatewayUser(stat)) {
-          leave(rel, "not_owned");
-          continue;
+    const handle = fs.opendirSync(dir);
+    try {
+      while (!stopped) {
+        const next = handle.readSync();
+        if (next === null) return;
+        // One more name exists past the limit: the copy is partial. That name is not looked at.
+        if (count.examined >= limits.maxExamined) {
+          stopped = true;
+          return;
         }
-        const copy = path.join(targetDir, name);
-        fs.mkdirSync(copy, { mode: 0o700 });
-        walk(full, copy, rel);
-      } else if (stat.isFile()) {
-        if (!ownedByGatewayUser(stat)) {
-          leave(rel, "not_owned");
-          continue;
+        count.examined++;
+        const name = next.name;
+        const rel = relDir ? `${relDir}/${name}` : name;
+        const full = path.join(dir, name);
+        // The type comes from `lstat` only, never from the directory entry.
+        const stat = lstatOrNull(full);
+        if (!stat) continue;
+        if (stat.isSymbolicLink()) {
+          leave(rel, "symlink");
+        } else if (stat.isDirectory()) {
+          if (!ownedByGatewayUser(stat)) {
+            leave(rel, "not_owned");
+            continue;
+          }
+          if (count.folders >= limits.maxFolders) {
+            count.leftOut++;
+            stopped = true;
+            return;
+          }
+          count.folders++;
+          const copy = path.join(targetDir, name);
+          fs.mkdirSync(copy, { mode: 0o700 });
+          walk(full, copy, rel);
+        } else if (stat.isFile()) {
+          if (!ownedByGatewayUser(stat)) {
+            leave(rel, "not_owned");
+            continue;
+          }
+          if (count.files >= limits.maxFiles) {
+            count.leftOut++;
+            stopped = true;
+            return;
+          }
+          if (count.bytes + stat.size > limits.maxBytes) {
+            count.leftOut++;
+            continue;
+          }
+          const read = readRegularFileBounded(full, limits.maxBytes - count.bytes);
+          if ("reason" in read) {
+            if (read.reason === "too_large") count.leftOut++;
+            else leave(rel, "unreadable");
+            continue;
+          }
+          const content = read.data;
+          count.files++;
+          count.bytes += content.length;
+          let data = content;
+          if (/\.md$/i.test(name)) {
+            const rewritten = neutralizeCommandSettings(content);
+            data = rewritten.data;
+            auditIgnoredCommandSettings(label, entryName, settingFileName(rel), rewritten.ignored);
+          }
+          fs.writeFileSync(path.join(targetDir, name), data, { flag: "wx", mode: 0o600 | (stat.mode & 0o100) });
+        } else {
+          leave(rel, "wrong_type");
         }
-        if (files >= limits.maxFiles || bytes + stat.size > limits.maxBytes) {
-          leave(rel, "too_large");
-          continue;
-        }
-        const content = readFileNoFollow(full, limits.maxBytes - bytes);
-        if (!content) {
-          leave(rel, "unreadable");
-          continue;
-        }
-        files++;
-        bytes += content.length;
-        let data = content;
-        if (/\.md$/i.test(name)) {
-          const rewritten = neutralizeCommandSettings(content);
-          data = rewritten.data;
-          auditIgnoredCommandSettings(label, entryName, settingFileName(rel), rewritten.ignored);
-        }
-        fs.writeFileSync(path.join(targetDir, name), data, { flag: "wx", mode: 0o600 | (stat.mode & 0o100) });
-      } else {
-        leave(rel, "wrong_type");
+      }
+    } finally {
+      try {
+        handle.closeSync();
+      } catch {
+        // Nothing left to release.
       }
     }
   };
   walk(source, target, "");
+  if (count.leftOut > 0 || stopped) {
+    log("audit", `sandbox.content.limited kind=snapshot-${entryName} files=${count.files} folders=${count.folders} examined=${count.examined} bytes=${count.bytes} left_out=${count.leftOut} stopped=${stopped}`);
+  }
 }
 
 /**
@@ -940,7 +1014,13 @@ export function planTrustedContent(options: PlanOptions): MountPlan {
       const dest = `${SANDBOX_CLAUDE_DIR}/${entry.name}`;
       const snapshot = path.join(options.trustedDir, "neutralized", entry.name);
       try {
-        snapshotEntry(source, snapshot, entry.name, options.label, options.snapshotLimits ?? { maxFiles: SNAPSHOT_MAX_FILES, maxBytes: SNAPSHOT_MAX_BYTES });
+        snapshotEntry(source, snapshot, entry.name, options.label, {
+          maxFiles: SNAPSHOT_MAX_FILES,
+          maxFolders: SNAPSHOT_MAX_FOLDERS,
+          maxExamined: SNAPSHOT_MAX_EXAMINED,
+          maxBytes: SNAPSHOT_MAX_BYTES,
+          ...options.snapshotLimits,
+        });
       } catch {
         // Fail closed: an entry that cannot be copied is seen as empty, never bound live.
         fs.rmSync(snapshot, { recursive: true, force: true });
