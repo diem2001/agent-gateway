@@ -1559,6 +1559,8 @@ describe("process sampler launcher ended (MVP-8125)", () => {
   };
   const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
   const ended = (item: Tracked): boolean => endedNow(item.pid, item.startTicks).ended;
+  /** Reaped: a zombie still reads as `running` in a snapshot's `fate`, so a row that asserts `exited` waits for its parent to reap the runtime. */
+  const reaped = (item: Tracked): boolean => !sameProcess(item);
 
   /** Closes the window and returns the final sample with the audit and summary lines `stop(markers)` printed. */
   function closeWindow(sampler: { stop: (markers: Record<string, string>) => ProcessSample }): { final: ProcessSample; audit: string[]; summary: string[] } {
@@ -1673,6 +1675,7 @@ describe("process sampler launcher ended (MVP-8125)", () => {
     expect(expired.unsandboxed).toBe(true);
     endTracked(inner!);
     await until(() => ended(state.runtime!), "the runtime did not end after the inner bwrap");
+    await until(() => reaped(state.runtime!), "the runtime was not reaped");
     const { final, summary } = closeWindow(sampler);
     const record = recordOf(final, state.runtime);
     expect(record.fate).toBe("exited");
@@ -1703,6 +1706,7 @@ describe("process sampler launcher ended (MVP-8125)", () => {
     await until(() => failureRecorded(sampler), "the failing tick did not run");
     endTracked(inner!);
     await until(() => ended(state.runtime!), "the runtime did not end within the bound");
+    await until(() => reaped(state.runtime!), "the runtime was not reaped");
     const { final } = closeWindow(sampler);
     flaggedWith(final, recordOf(final, state.runtime), { ownProof: false, launcherIdentity: "none" });
   });
@@ -1732,6 +1736,7 @@ describe("process sampler launcher ended (MVP-8125)", () => {
     await until(() => failureRecorded(sampler), "the failing tick did not run");
     signal(state.runtime!.pid, "SIGKILL");
     await until(() => ended(state.runtime!), "the runtime did not end within the bound");
+    await until(() => reaped(state.runtime!), "the runtime was not reaped");
     const { final } = closeWindow(sampler);
     flaggedWith(final, recordOf(final, state.runtime), { launcherIdentity: "none", launcherExe: "other" });
   });
@@ -1762,6 +1767,7 @@ describe("process sampler launcher ended (MVP-8125)", () => {
     await until(() => failureRecorded(sampler), "the failing tick did not run");
     signal(state.runtime!.pid, "SIGKILL");
     await until(() => ended(state.runtime!), "the runtime did not end within the bound");
+    await until(() => reaped(state.runtime!), "the runtime was not reaped");
     const { final } = closeWindow(sampler);
     flaggedWith(final, recordOf(final, state.runtime), { ownProof: false, escapeEvidence: true, launcherIdentity: "none", launcherExe: "other" });
   });
@@ -1791,6 +1797,7 @@ describe("process sampler launcher ended (MVP-8125)", () => {
     await until(() => failureRecorded(sampler), "the failing tick did not run");
     endTracked(tracked.find((item) => item.pid === ppidOf(state.runtime!.pid))!);
     await until(() => ended(state.runtime!), "the runtime did not end within the bound");
+    await until(() => reaped(state.runtime!), "the runtime was not reaped");
     const { final } = closeWindow(sampler);
     flaggedWith(final, recordOf(final, state.runtime), { launcherIdentity: "none", launcherExe: "real-bwrap" });
   });
@@ -1815,6 +1822,7 @@ describe("process sampler launcher ended (MVP-8125)", () => {
     await until(() => failureRecorded(sampler), "the failing tick did not run");
     endTracked(tracked.find((item) => item.pid === ppidOf(state.runtime!.pid))!);
     await until(() => ended(state.runtime!), "the runtime did not end within the bound");
+    await until(() => reaped(state.runtime!), "the runtime was not reaped");
     const { final } = closeWindow(sampler);
     flaggedWith(final, recordOf(final, state.runtime), { reparented: false });
   });
