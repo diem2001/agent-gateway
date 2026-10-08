@@ -1324,6 +1324,15 @@ export function flagAfterProofFailure(prior: boolean, clearedBy: "own" | "launch
 export const PENDING_BOUND_MS = 2000;
 
 /**
+ * Where the pending bound starts: the start of the tick, always, unless a test seam returned in that tick (a seam holds the tick for
+ * seconds in the held-exit rows, and the record could not have been pending before it returned). No seam is set in a real run, so
+ * the origin is the tick's start there.
+ */
+export function pendingBoundOrigin(tickStart: number, seamReturnedAt: number | null): number {
+  return seamReturnedAt ?? tickStart;
+}
+
+/**
  * Whether the reference ending makes a failed proof pending (not flagged yet): the runtime had its own full proof at an earlier
  * tick, the reference is ending (confirmed ended, or a zombie leader whose threads still show: that must resolve to ended within
  * the bound), the failure shows the reference's symptom, and nothing the runtime reads equals the cached reference (pid, user or
@@ -1687,8 +1696,8 @@ export function startProcessSampler(
       if (namesRuntime(info)) firstExes.set(pid, readExe(pid));
     }
     const now = Date.now();
-    /** The start of a pending bound: the tick's start, moved forward only by a test seam that held the tick (no seam by default, so never in a real run). */
-    let pendingClock = now;
+    /** When a test seam last returned in this tick (null: no seam ran, which is every real run). */
+    let seamReturnedAt: number | null = null;
     for (const info of infos.values()) {
       const oldCandidate = /(^|[ /])cli\.js( |$)/.test(info.cmdline);
       if (namesRuntime(info)) {
@@ -1733,7 +1742,7 @@ export function startProcessSampler(
             // Test seam (default none): lets a control force the exit between the stable reading and the proof.
             try {
               seam.afterStableReading?.(info.pid);
-              if (seam.afterStableReading) pendingClock = Date.now();
+              if (seam.afterStableReading) seamReturnedAt = Date.now();
             } catch {
               // A failing control must not end the sampler; its own assertions report the precondition.
             }
@@ -1753,7 +1762,7 @@ export function startProcessSampler(
               // Test seam (default none): lets a control place the runtime's exit between the proof and the exit read that follows it.
               try {
                 seam.afterFailedProof?.(info.pid);
-                if (seam.afterFailedProof) pendingClock = Date.now();
+                if (seam.afterFailedProof) seamReturnedAt = Date.now();
               } catch {
                 // A failing control must not end the sampler; its own assertions report the precondition.
               }
@@ -1806,7 +1815,7 @@ export function startProcessSampler(
               if (pendingNow) {
                 pending = prior?.pending
                   ? { ...prior.pending, sawLeaderExit: prior.pending.sawLeaderExit === true || runtimeExit.leaderExitSeen }
-                  : { state: "waiting", sinceMs: pendingClock, route: referencePending ? "reference-ended" : runtimePending ? "runtime-ending" : "launcher-ended", reference: referencePending ? { pid: root, startTicks: reference.startTicks! } : undefined, sawLeaderExit: runtimeExit.leaderExitSeen };
+                  : { state: "waiting", sinceMs: pendingBoundOrigin(now, seamReturnedAt), route: referencePending ? "reference-ended" : runtimePending ? "runtime-ending" : "launcher-ended", reference: referencePending ? { pid: root, startTicks: reference.startTicks! } : undefined, sawLeaderExit: runtimeExit.leaderExitSeen };
               }
               proofFailure = proofFailure
                 ? {

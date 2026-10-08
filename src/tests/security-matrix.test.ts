@@ -40,6 +40,7 @@ import {
   type ProcessSample,
   redactArgv,
   PENDING_BOUND_MS,
+  pendingBoundOrigin,
   createReferenceTracker,
   readExitReadingOf,
   runtimeEndingPending,
@@ -2638,6 +2639,13 @@ describe("process sampler thread-safe exit: decision table (MVP-8130)", () => {
     expect(offenders).toEqual([]);
   });
 
+  it("PB-origin: the pending bound starts at the tick's start; only a test seam's return moves it", () => {
+    expect(pendingBoundOrigin(1000, null), "no seam ran (every real run): the tick's start").toBe(1000);
+    expect(pendingBoundOrigin(1000, 4200), "a seam held the tick and returned later: its return").toBe(4200);
+    expect(pendingBoundOrigin(1000, 1000)).toBe(1000);
+    expect(PENDING_BOUND_MS, "the bound itself is unchanged").toBe(2000);
+  });
+
   it("T-th2: the hidepid precondition reads the /proc mount options and refuses a mount that hides processes", () => {
     const line = (options: string, superOptions: string): string => `25 29 0:23 / /proc ${options} shared:12 - proc proc ${superOptions}`;
     expect(procMountHidesProcesses(line("rw,nosuid,nodev,noexec,relatime", "rw"))).toBe(false);
@@ -3335,6 +3343,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     const state = newSeam();
     const run = await launcherRevive(state, "0.1", { leaderAfterProof: false, exitsInside: true });
     expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
+    expect(run.record.pending?.sawLeaderExit, "precondition not reached: a leader exit was seen, so the executable-identity check is not what revived the record").not.toBe(true);
     expect(run.record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, runtimeExit: "alive" });
     expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
     flagged(run.final, run.record);
