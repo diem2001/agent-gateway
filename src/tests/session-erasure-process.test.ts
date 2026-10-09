@@ -363,6 +363,8 @@ describe("the operator outcome: a deleted conversation is erased from the gatewa
     for (let n = 0; n < 2; n++) expect((await del(g, KEY_ALPHA, "erase-1")).json).toEqual({ deleted: true });
     expect((await del(g, KEY_BETA, "erase-1")).status).toBe(404);
     expect((await del(g, KEY_ALPHA, "never-used")).status).toBe(404);
+    // The completed erasure is saved like every other change (debounced).
+    await until("the completed erasure is saved", () => readStore(g).erasedByLabel?.alpha?.["erase-1"] !== undefined, 10_000);
     expect(entryOf(g, "alpha", "erase-1")).toBeUndefined();
     expect(Object.keys(readStore(g).erasedByLabel?.alpha?.["erase-1"] ?? {})).toEqual(["erasedAt"]);
     expect(JSON.stringify(readStore(g))).not.toContain(dirId);

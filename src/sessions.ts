@@ -412,15 +412,21 @@ export function hasLegacyEntry(clientId: string): boolean {
 /** Set when the last flush of a new tombstone failed: the sweep saves again (it stays pending in memory meanwhile). */
 let pendingFlushFailed = false;
 
-/** Marks the caller's conversation erasure-pending (idempotent) and saves now. False when there is no such conversation. */
+/**
+ * Marks the caller's conversation erasure-pending (idempotent), in memory: the caller of the erase path saves it
+ * (`persistTombstonesNow`) before it answers 503, so every tombstone a caller was told about survives a restart. A
+ * delete that completes at once never needs the tombstone on disk. False when there is no such conversation.
+ */
 export function markErasePending(label: string, clientId: string): boolean {
   const entry = labelEntry(label, clientId);
   if (!entry?.sandboxDirId) return false;
-  if (live(entry)) {
-    entry.erasePendingSince = Date.now();
-    pendingFlushFailed = !flushSessions();
-  }
+  if (live(entry)) entry.erasePendingSince = Date.now();
   return true;
+}
+
+/** Saves now, because a caller was told "pending". A failed save is repeated by every sweep until it succeeds. */
+export function persistTombstonesNow(): void {
+  pendingFlushFailed = !flushSessions();
 }
 
 /** Saves again after a failed save of a tombstone; a no-op otherwise. */
@@ -435,19 +441,19 @@ export function folderSharedWithOther(label: string, clientId: string, sandboxDi
 }
 
 /**
- * The folder is gone: in one step the entry is removed and the label's marker written, then saved. Returns whether
- * the save succeeded (the outcome of the erasure itself does not depend on it). Nothing happens when the entry is gone
+ * The folder is gone: in one step the entry is removed and the label's marker written, then saved like every other
+ * change (debounced, flushed at shutdown). The erasure itself does not depend on the save: a restart that finds the
+ * entry still on disk as a tombstone finds its folder absent and completes it. Nothing happens when the entry is gone
  * or no longer names that folder.
  */
-export function completeErasure(label: string, clientId: string, sandboxDirId: string): { completed: boolean; saved: boolean } {
+export function completeErasure(label: string, clientId: string, sandboxDirId: string): boolean {
   const map = labelMap(label, false);
   const entry = map?.get(clientId);
-  if (!map || !entry || entry.sandboxDirId !== sandboxDirId) return { completed: false, saved: true };
+  if (!map || !entry || entry.sandboxDirId !== sandboxDirId) return false;
   map.delete(clientId);
   markerMap(label, true)!.set(clientId, { erasedAt: Date.now() });
-  const saved = flushSessions();
-  pendingFlushFailed = pendingFlushFailed && !saved;
-  return { completed: true, saved };
+  persistSessions();
+  return true;
 }
 
 /** Every tombstone, for the sweep. */

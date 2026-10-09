@@ -350,6 +350,7 @@ describe("DELETE /v1/sessions/:id (the contract table)", () => {
     expect(imageHits(path.join(root, "sessions"))).toBe(0);
     expect(sessions.getSessionCount()).toBe(0);
     expect(sessions.listSessions("reqlift")).toEqual([]);
+    expect(sessions.flushSessions()).toBe(true);
     const saved = readStore();
     expect(saved.sessionsByLabel.reqlift?.c1).toBeUndefined();
     expect(Object.keys(saved.erasedByLabel!.reqlift.c1)).toEqual(["erasedAt"]);

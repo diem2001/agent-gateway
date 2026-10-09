@@ -14,6 +14,7 @@ import {
   logId,
   markErasePending,
   ownedConversation,
+  persistTombstonesNow,
   pendingConversationForDir,
   pendingConversations,
   reflushPending,
@@ -187,7 +188,7 @@ async function runAttempt(label: string, clientId: string, dirId: string): Promi
     failed(clientId, result.code);
     return false;
   }
-  // Entry out and marker in, in one step; the answer does not depend on whether the save succeeded.
+  // Entry out and marker in, in one step.
   completeErasure(label, clientId, dirId);
   log("sessions", `sessions.erasure.done id=${logId(clientId)}`);
   return true;
@@ -239,7 +240,10 @@ export async function deleteConversation(clientId: string, label: string | undef
   if (label !== undefined) {
     if (ownedConversation(label, clientId)) {
       markErasePending(label, clientId);
-      return (await withinBound(eraseOwnedConversation(label, clientId))) ? "deleted" : "pending";
+      if (await withinBound(eraseOwnedConversation(label, clientId))) return "deleted";
+      // The caller is told "pending": the tombstone is on disk before the answer, so a restart still blocks the conversation.
+      persistTombstonesNow();
+      return "pending";
     }
     if (hasErasedMarker(label, clientId)) return "deleted";
   }
