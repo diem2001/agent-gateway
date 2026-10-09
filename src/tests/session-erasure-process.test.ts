@@ -17,7 +17,7 @@ import http from "node:http";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startFakeAnthropicApi, type ExactToolScript, type FakeAnthropicApi, type FakeApiMode } from "./helpers/fake-anthropic-api.js";
-import { spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
+import { descendants, killGatewayGroup, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
 
 vi.setConfig({ testTimeout: 240_000, hookTimeout: 60_000 });
 
@@ -260,8 +260,8 @@ async function rig(options: { mode?: FakeApiMode; scripts?: ExactToolScript[]; e
 }
 
 /** A gateway without a model stand-in: for rows that never start a run. */
-async function bareGateway(options: { env?: Record<string, string>; seed?: (dirs: SpawnedGateway["dirs"]) => void } = {}): Promise<SpawnedGateway> {
-  return spawnGateway(cleanups, { rootPrefix: "mvp7402-gw-", env: GATEWAY_ENV(null, options.env), seed: options.seed, distServer: DIST });
+async function bareGateway(options: { env?: Record<string, string>; seed?: (dirs: SpawnedGateway["dirs"]) => void; detached?: boolean } = {}): Promise<SpawnedGateway> {
+  return spawnGateway(cleanups, { rootPrefix: "mvp7402-gw-", env: GATEWAY_ENV(null, options.env), seed: options.seed, distServer: DIST, detached: options.detached });
 }
 
 async function restart(old: SpawnedGateway, env: Record<string, string>): Promise<SpawnedGateway> {
@@ -312,7 +312,7 @@ function seedStore(
     handFolder(dirs, o.dirId, `SYNTH-CONTENT-${o.id}`);
   }
   for (const dirId of options.orphans ?? []) handFolder(dirs, dirId, "SYNTH-ORPHAN");
-  fs.writeFileSync(path.join(dirs.persist, "sessions.json"), JSON.stringify({ sessions: options.legacy ?? {}, sessionsByLabel: byLabel, settings: { sessionIdleTimeoutMs: 0, ...options.settings } }));
+  fs.writeFileSync(path.join(dirs.persist, "sessions.json"), JSON.stringify({ sessions: options.legacy ?? {}, sessionsByLabel: byLabel, settings: { sessionIdleTimeoutMs: 0, ...options.settings } }));  // the saved key is ignored by the gateway (MVP-7402 R1); old files carry it
 }
 
 const failedLines = (g: SpawnedGateway): string[] => g.output().split("\n").filter((l) => l.includes("sessions.erasure.failed"));
@@ -587,7 +587,7 @@ describe("idle expiry", () => {
   it("erases the folder of a conversation that has been idle longer than SESSION_IDLE_TIMEOUT_MS, and the owner's late delete answers 200", async () => {
     const g = await bareGateway({
       env: { SESSION_IDLE_TIMEOUT_MS: "2000", SESSION_ERASURE_RETRY_MS: "500" },
-      seed: (dirs) => seedStore(dirs, { owned: [{ label: "alpha", id: "idle-1", dirId: DIR_C }], orphans: [DIR_O], settings: { sessionIdleTimeoutMs: 2000 } }),
+      seed: (dirs) => seedStore(dirs, { owned: [{ label: "alpha", id: "idle-1", dirId: DIR_C }], orphans: [DIR_O] }),
     });
     const orphanBefore = snapshot(folderOf(g, DIR_O));
     await until("the idle conversation is erased", () => gone(folderOf(g, DIR_C)), 30_000);
@@ -670,5 +670,265 @@ describe("configuration and state files", () => {
     expect(fs.readdirSync(g.dirs.persist).some((f) => f.startsWith("sessions.json.corrupt-"))).toBe(true);
     // The folder is an orphan now (MVP-8166 owns that cleanup): it is not touched by anything here.
     expect(fs.existsSync(folderOf(g, DIR_C))).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Rework R1: the idle timeout comes from the environment only          */
+/* ------------------------------------------------------------------ */
+
+/** A request with a JSON body and a verbatim path. */
+function sendAs(port: number, key: string, method: "PUT" | "GET", urlPath: string, body?: unknown): Promise<{ status: number; json: Record<string, unknown> | null }> {
+  return new Promise((resolve, reject) => {
+    const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
+    const headers: Record<string, string | number> = { Authorization: `Bearer ${key}` };
+    if (payload) {
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = payload.length;
+    }
+    const req = http.request({ host: "127.0.0.1", port, method, path: urlPath, agent: false, headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => {
+        let json: Record<string, unknown> | null = null;
+        try {
+          json = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+        } catch {
+          // Not JSON.
+        }
+        resolve({ status: res.statusCode ?? 0, json });
+      });
+    });
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
+describe("R1: no API key can change the idle timeout, and the sweep stays live for the operator's value", () => {
+  /** Alpha's conversation with a canary file in its folder, beta's none: the two-label scenario of the QA finding B1. */
+  const seedAlpha = (lastUsed: number) => (dirs: SpawnedGateway["dirs"]): void => {
+    seedStore(dirs, { owned: [{ label: "alpha", id: "alpha-chat", dirId: DIR_C, extra: { lastUsed } }], orphans: [DIR_O] });
+    fs.writeFileSync(path.join(sessionsDir(dirs), DIR_C, "work", "canary.txt"), "SYNTH-CANARY-7402-ALPHA\n");
+  };
+  const canarySha = (g: SpawnedGateway): string => createHash("sha256").update(fs.readFileSync(path.join(folderOf(g, DIR_C), "work", "canary.txt"))).digest("hex");
+  const CANARY_SHA = createHash("sha256").update("SYNTH-CANARY-7402-ALPHA\n").digest("hex");
+
+  async function expectAlphaIntact(g: SpawnedGateway): Promise<void> {
+    // The folder check comes first: this is the data the finding showed to be erased.
+    expect(fs.existsSync(folderOf(g, DIR_C)), `alpha's folder must still exist\n${tail(g)}`).toBe(true);
+    expect(canarySha(g)).toBe(CANARY_SHA);
+    expect(entryOf(g, "alpha", "alpha-chat")?.sandboxDirId).toBe(DIR_C);
+    expect(entryOf(g, "alpha", "alpha-chat")?.erasePendingSince).toBeUndefined();
+    const settings = await sendAs(g.port, KEY_BETA, "GET", "/v1/settings");
+    expect([settings.status, settings.json]).toEqual([200, { sessionIdleTimeoutMs: 0 }]);
+    const stored = readStore(g) as { settings?: { sessionIdleTimeoutMs?: number } };
+    expect(stored.settings?.sessionIdleTimeoutMs).not.toBe(1);
+  }
+
+  it("R1-T1: label beta sets the timeout to 1 ms with logging off: the PUT answers 400, alpha's folder, entry and canary are unchanged for 6 sweep intervals and after a restart", async () => {
+    const g = await bareGateway({ env: { SESSION_ERASURE_RETRY_MS: "500" }, seed: seedAlpha(Date.now() - 60_000) });
+    const orphanBefore = snapshot(folderOf(g, DIR_O));
+    const logging = await sendAs(g.port, KEY_BETA, "PUT", "/v1/logging", { level: "off" });
+    expect(logging.status).toBe(200);
+    const put = await sendAs(g.port, KEY_BETA, "PUT", "/v1/settings", { sessionIdleTimeoutMs: 1 });
+    await sleep(3200);
+    // The folder check comes before the status check: the data is what the finding showed to be erased.
+    await expectAlphaIntact(g);
+    expect([put.status, put.json]).toEqual([400, { error: "setting_read_only" }]);
+    expect(snapshot(folderOf(g, DIR_O))).toEqual(orphanBefore);
+    // The refusal is logged although logging is off; the old success line never appears.
+    const refused = g.output().split("\n").filter((l) => l.includes("settings.refused"));
+    expect(refused).toEqual(["[audit] settings.refused key=sessionIdleTimeoutMs label=beta"]);
+    expect(g.output()).not.toContain("Idle timeout updated");
+
+    const again = await restart(g, GATEWAY_ENV(null, { SESSION_ERASURE_RETRY_MS: "500" }));
+    await sleep(1600);
+    await expectAlphaIntact(again);
+    expect((await health(again)).erasurePending).toBe(0);
+  });
+
+  it("R1-T2 (control): with SESSION_IDLE_TIMEOUT_MS=1500 the same sweep is live: the idle conversation is erased, the marker is saved and the expiry line is logged", async () => {
+    // lastUsed a few seconds ahead so that the load-time rule cannot take it; the sweep takes it once it is 1.5 s old.
+    const g = await bareGateway({ env: { SESSION_IDLE_TIMEOUT_MS: "1500", SESSION_ERASURE_RETRY_MS: "500" }, seed: seedAlpha(Date.now() + 3000) });
+    expect(fs.existsSync(folderOf(g, DIR_C)), "the folder exists at the first check").toBe(true);
+    expect(canarySha(g)).toBe(CANARY_SHA);
+    await until("the idle conversation is erased", () => gone(folderOf(g, DIR_C)), 15_000);
+    await until("the entry is gone and the marker saved", () => entryOf(g, "alpha", "alpha-chat") === undefined && readStore(g).erasedByLabel?.alpha?.["alpha-chat"] !== undefined, 15_000);
+    expect(g.output()).toContain("Expired 1 idle session(s)");
+    expect(g.output()).toContain("sessions.idle_timeout ms=1500");
+    expect((await sendAs(g.port, KEY_BETA, "GET", "/v1/settings")).json).toEqual({ sessionIdleTimeoutMs: 1500 });
+  });
+
+  it("R1-T4 (process): a timeout saved by an earlier version is ignored after a restart", async () => {
+    const g = await bareGateway({
+      env: { SESSION_ERASURE_RETRY_MS: "500" },
+      seed: (dirs) => {
+        seedAlpha(Date.now() - 3_600_000)(dirs);
+        const file = path.join(dirs.persist, "sessions.json");
+        const data = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+        data.settings = { sessionIdleTimeoutMs: 1 };
+        fs.writeFileSync(file, JSON.stringify(data));
+      },
+    });
+    await sleep(2000);
+    await expectAlphaIntact(g);
+    expect(g.output().split("\n").filter((l) => l.includes("sessions.settings.ignored"))).toEqual(["[sessions] sessions.settings.ignored key=sessionIdleTimeoutMs"]);
+  });
+
+  it.each(["30m", "1h", "1e6", "-5", "0x10"])("R1-T9: SESSION_IDLE_TIMEOUT_MS=%s stops startup with the fixed line, and a seeded idle folder is unchanged", async (value) => {
+    let seeded: SpawnedGateway["dirs"] | undefined;
+    const store = (dirs: SpawnedGateway["dirs"]): string => path.join(dirs.persist, "sessions.json");
+    let storeBefore = "";
+    await expect(
+      spawnGateway(cleanups, {
+        rootPrefix: "mvp7402-gw-",
+        env: GATEWAY_ENV(null, { SESSION_IDLE_TIMEOUT_MS: value, SESSION_ERASURE_RETRY_MS: "500" }),
+        seed: (dirs) => {
+          seeded = dirs;
+          seedAlpha(1)(dirs);
+          storeBefore = fs.readFileSync(store(dirs), "utf8");
+        },
+        readyTimeoutMs: 15_000,
+        distServer: DIST,
+      }),
+    ).rejects.toThrow(/FATAL config key=SESSION_IDLE_TIMEOUT_MS reason=must be a whole number of milliseconds \(0 = disabled\)/);
+    // Nothing was erased or rewritten by the process that did not start.
+    expect(fs.existsSync(path.join(sessionsDir(seeded!), DIR_C))).toBe(true);
+    expect(fs.readFileSync(path.join(sessionsDir(seeded!), DIR_C, "work", "canary.txt"), "utf8")).toBe("SYNTH-CANARY-7402-ALPHA\n");
+    expect(fs.readFileSync(store(seeded!), "utf8")).toBe(storeBefore);
+  });
+
+  it.each([
+    ["", 0],
+    ["0", 0],
+    ["86400000", 86_400_000],
+  ])("R1-T9: SESSION_IDLE_TIMEOUT_MS=%j starts and reports %i", async (value, expected) => {
+    const g = await bareGateway({ env: { SESSION_IDLE_TIMEOUT_MS: value } });
+    expect((await sendAs(g.port, KEY_ALPHA, "GET", "/v1/settings")).json).toEqual({ sessionIdleTimeoutMs: expected });
+    expect(g.output()).toContain(`sessions.idle_timeout ms=${expected}`);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Rework R1: the tombstone is on disk before the removal starts        */
+/* ------------------------------------------------------------------ */
+
+describe("R1-T7: a hard kill of the gateway and its children in the middle of a delete is finished after the restart", () => {
+  const FILES_PER_DIR = 100;
+  const DIRS = 100;
+
+  /** About 10,000 small files in 100 `work/` directories plus one directory at mode 0, so `chmod -R` has work to do. */
+  function fatFolder(dirs: SpawnedGateway["dirs"], dirId: string): void {
+    handFolder(dirs, dirId, "SYNTH-FAT");
+    const work = path.join(sessionsDir(dirs), dirId, "work");
+    for (let d = 0; d < DIRS; d++) {
+      const dir = path.join(work, `d${d}`);
+      fs.mkdirSync(dir);
+      for (let f = 0; f < FILES_PER_DIR; f++) fs.writeFileSync(path.join(dir, `f${f}.txt`), `SYNTH-FAT ${d} ${f}\n`);
+    }
+    fs.mkdirSync(path.join(work, "locked"));
+    fs.writeFileSync(path.join(work, "locked", "inner.txt"), "locked\n");
+    fs.chmodSync(path.join(work, "locked"), 0o000);
+  }
+
+  /** The `chmod -R` or `rm -rf` child of the gateway whose arguments name that folder, or null. */
+  function removalChild(gatewayPid: number, folder: string): number | null {
+    for (const pid of descendants(gatewayPid)) {
+      let args: string[];
+      try {
+        args = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+      } catch {
+        continue;
+      }
+      const tool = path.basename(args[0] ?? "");
+      if ((tool === "chmod" || tool === "rm") && args.slice(1).some((a) => a === folder)) return pid;
+    }
+    return null;
+  }
+
+  const groupGone = (pgid: number): boolean => {
+    try {
+      process.kill(-pgid, 0);
+      return false;
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  };
+
+  it("R1-T7: the tombstone is on disk before the first removal child runs; after a SIGKILL of the whole group and a restart the gateway finishes the erasure on its own", async () => {
+    const g = await bareGateway({
+      seed: (dirs) => {
+        seedStore(dirs, { owned: [{ label: "alpha", id: "fat-1", dirId: DIR_C }, { label: "alpha", id: "timing-1", dirId: DIR_O }, { label: "beta", id: "live-b", dirId: DIR_B }] });
+        fatFolder(dirs, DIR_C);
+        fatFolder(dirs, DIR_O);
+      },
+      detached: true,
+    });
+    // The recorded tree is made readable again before the fixture goes, whatever the outcome.
+    cleanups.push(() => {
+      for (const dir of [g.root]) {
+        try {
+          execFileSync("/usr/bin/chmod", ["-R", "u+rwx", "--", dir], { stdio: "ignore" });
+        } catch {
+          // Gone already.
+        }
+      }
+    });
+    const liveBefore = snapshot(folderOf(g, DIR_B));
+
+    // Control and measurement: the same kind of folder is removed by an ordinary DELETE (200), so the fixture is erasable and the time is known.
+    const timing = Date.now();
+    expect((await del(g, KEY_ALPHA, "timing-1")).status).toBe(200);
+    const removalMs = Date.now() - timing;
+    expect(gone(folderOf(g, DIR_O))).toBe(true);
+    console.log(`R1-T7 measured removal time of ${DIRS * FILES_PER_DIR} files: ${removalMs} ms (DELETE answered 200)`);
+
+    const folder = folderOf(g, DIR_C);
+    expect(fs.existsSync(folder)).toBe(true);
+    expect(entryOf(g, "alpha", "fat-1")?.erasePendingSince).toBeUndefined();
+
+    // DELETE, then look for the removal child every 10 ms and kill the recorded group the moment it is seen.
+    const answer = del(g, KEY_ALPHA, "fat-1").then(
+      (r) => ({ answered: r }),
+      (error: unknown) => ({ dropped: String(error) }),
+    );
+    let seen: number | null = null;
+    const deadline = Date.now() + 10_000;
+    while (seen === null && Date.now() < deadline) {
+      seen = removalChild(g.child.pid!, folder);
+      if (seen === null) await sleep(10);
+    }
+    expect(seen, `a chmod or rm child for the conversation folder must appear within 10 s\n${tail(g)}`).not.toBeNull();
+    killGatewayGroup(g);
+    const outcome = await answer;
+    await new Promise<void>((resolve) => (g.child.exitCode !== null || g.child.signalCode !== null ? resolve() : g.child.once("exit", () => resolve())));
+    // Hard preconditions: each one that is not met fails the row.
+    expect(outcome, "the DELETE got no answer").toHaveProperty("dropped");
+    await until("the killed group is gone", () => groupGone(g.child.pid!), 10_000);
+    expect(fs.existsSync(folder), "the folder still exists after the kill").toBe(true);
+    // The tombstone was on disk before the removal started.
+    expect(typeof entryOf(g, "alpha", "fat-1")?.erasePendingSince, "sessions.json holds the entry with erasePendingSince before the restart").toBe("number");
+
+    // After the restart the gateway finishes the erasure by itself (startup sweep, sweep interval 500 ms).
+    const started = Date.now();
+    const again = await spawnGateway(cleanups, { reuse: g, env: GATEWAY_ENV(null, { SESSION_ERASURE_RETRY_MS: "500" }), distServer: DIST });
+    await sleep(600);
+    await until("the folder and the entry are gone", () => gone(folder) && entryOf(again, "alpha", "fat-1") === undefined, 30_000);
+    console.log(`R1-T7 restart to erased: ${Date.now() - started} ms`);
+    await until("the marker is saved", () => readStore(again).erasedByLabel?.alpha?.["fat-1"] !== undefined, 10_000);
+    const h = await health(again);
+    expect([h.erasurePending, h.sessions]).toEqual([0, 1]);
+    const repeat = await del(again, KEY_ALPHA, "fat-1");
+    expect([repeat.status, repeat.json]).toEqual([200, { deleted: true }]);
+    expect(snapshot(folderOf(again, DIR_B))).toEqual(liveBefore);
+    expect(entryOf(again, "beta", "live-b")?.sandboxDirId).toBe(DIR_B);
+  });
+
+  it("the group kill refuses a gateway that was not spawned detached, and signals nothing", async () => {
+    const g = await bareGateway();
+    expect(() => killGatewayGroup(g)).toThrow(/not spawned detached/);
+    expect(g.child.exitCode).toBeNull();
+    expect(g.child.signalCode).toBeNull();
+    expect((await health(g)).persistence).toBeDefined();
   });
 });

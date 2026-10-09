@@ -21,7 +21,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { releaseGatewayPort, reserveGatewayPort, waitForGatewayReady } from "./helpers/git-process-gateway.js";
+import { startFakeAnthropicApi, type FakeAnthropicApi } from "./helpers/fake-anthropic-api.js";
+import { descendants, releaseGatewayPort, reserveGatewayPort, waitForGatewayReady } from "./helpers/git-process-gateway.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(here, "..", "..");
@@ -87,6 +88,8 @@ const ALLOWED_ENV_KEYS = ["PATH", "LANG"] as const;
 interface Fixture {
   root: string;
   home: string;
+  /** The scripted model API a session change talks to (started with the first gateway, closed after the test). */
+  api: FakeAnthropicApi | null;
   dirs: Record<Area, string>;
   file: (area: Area) => string;
   env: () => NodeJS.ProcessEnv;
@@ -110,6 +113,10 @@ function fixture(): Fixture {
   const tmp = path.join(root, "tmp");
   fs.mkdirSync(home);
   fs.mkdirSync(tmp);
+  // The trusted storage root with its sessions directory: a new conversation needs it (MVP-7402 R1).
+  fs.mkdirSync(path.join(home, ".agent-sandbox", "sessions"), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.join(home, ".agent-sandbox"), 0o700);
+  fs.chmodSync(path.join(home, ".agent-sandbox", "sessions"), 0o700);
   const dirs = {} as Record<Area, string>;
   for (const area of AREAS) {
     dirs[area] = path.join(root, `persist-${area}`);
@@ -139,16 +146,31 @@ function fixture(): Fixture {
       API_KEYS: `proc:${API_KEY}`,
       WORKSPACE_ROOT: path.join(home, ".claude"),
     });
+    if (fixtureObject.api) {
+      Object.assign(childEnv, {
+        ANTHROPIC_BASE_URL: fixtureObject.api.baseUrl,
+        ANTHROPIC_API_KEY: "sk-ant-fake-7616",
+        DISABLE_TELEMETRY: "1",
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+      });
+    }
     for (const area of AREAS) childEnv[ENV_KEY[area]] = file(area);
     return childEnv;
   };
-  return { root, home, dirs, file, env };
+  const fixtureObject: Fixture = { root, home, api: null, dirs, file, env };
+  return fixtureObject;
 }
 
-async function startGateway(fx: Fixture): Promise<Gateway> {
+async function startGateway(fx: Fixture, extraEnv: Record<string, string> = {}): Promise<Gateway> {
   assertFreshBuild();
+  if (!fx.api) {
+    // A session change is a conversation on a model that never answers (mode "hang"): it exists, and it is saved.
+    fx.api = await startFakeAnthropicApi({ toolName: "none", mode: "hang" });
+    const api = fx.api;
+    cleanups.push(() => api.close());
+  }
   const port = await reserveGatewayPort();
-  const childEnv = { ...fx.env(), PORT: String(port), HOST: "127.0.0.1" };
+  const childEnv = { ...fx.env(), ...extraEnv, PORT: String(port), HOST: "127.0.0.1" };
   const child = spawn(process.execPath, ["--expose-gc", DIST_SERVER], {
     cwd: fx.root,
     env: childEnv,
@@ -209,13 +231,58 @@ function request(port: number, method: string, urlPath: string, body?: unknown):
   });
 }
 
+/** Kills the processes the gateway started (runtime, sandbox) that outlive it. */
+function reapLater(pids: number[]): void {
+  cleanups.push(() => {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+  });
+}
+
+/** A new conversation `s-<tag>` on a model that never answers: the request is not awaited; the entry is listed at once. */
+async function startConversation(gateway: Gateway, tag: string): Promise<void> {
+  const id = `s-${tag}`;
+  const payload = Buffer.from(JSON.stringify({ queryId: `q-${tag}`, prompt: "Say hello.", sessionId: id, model: "claude-sonnet-4-5" }));
+  const req = http.request(
+    {
+      host: "127.0.0.1",
+      port: gateway.port,
+      method: "POST",
+      path: "/v1/query",
+      agent: false,
+      headers: { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json", "Content-Length": payload.length },
+    },
+    (res) => res.resume(),
+  );
+  req.on("error", () => undefined);
+  req.end(payload);
+  cleanups.push(() => {
+    req.destroy();
+  });
+  const started = Date.now();
+  for (;;) {
+    const ids = (await request(gateway.port, "GET", "/v1/sessions")).json().sessions.map((s: { id: string }) => s.id);
+    if (ids.includes(id)) break;
+    if (Date.now() - started > 10_000) throw new Error(`conversation ${id} did not start: ${gateway.output()}`);
+    await delay(20);
+  }
+  await delay(300);
+  reapLater(descendants(gateway.child.pid!));
+}
+
 /** One API change in the area; resolves after the 100 ms debounced save had time to land. */
 async function changeArea(gateway: Gateway, area: Area, tag: string): Promise<void> {
   let reply;
   switch (area) {
     case "sessions":
-      reply = await request(gateway.port, "PUT", "/v1/settings", { sessionIdleTimeoutMs: tagNumber(tag) });
-      break;
+      // The settings route no longer changes anything (MVP-7402 R1): a sessions change is a new conversation.
+      await startConversation(gateway, tag);
+      return;
     case "tools":
       reply = await request(gateway.port, "PUT", `/v1/tools/tool-${tag}`, {
         description: "d",
@@ -231,17 +298,12 @@ async function changeArea(gateway: Gateway, area: Area, tag: string): Promise<vo
   await delay(300);
 }
 
-/** A distinct idle-timeout value per tag, so a settings change is visible in sessions.json. */
-function tagNumber(tag: string): number {
-  return 100_000 + [...tag].reduce((sum, ch) => sum * 31 + ch.charCodeAt(0), 7) % 800_000;
-}
-
 /** Whether the saved file holds the change made by changeArea(tag). */
 function fileHoldsChange(file: string, area: Area, tag: string): boolean {
   const data = JSON.parse(fs.readFileSync(file, "utf8"));
   switch (area) {
     case "sessions":
-      return data.settings?.sessionIdleTimeoutMs === tagNumber(tag);
+      return data.sessionsByLabel?.proc?.[`s-${tag}`] !== undefined;
     case "tools":
       return data.some((t: { name: string }) => t.name === `tool-${tag}`);
     case "mcpServers":
@@ -249,7 +311,7 @@ function fileHoldsChange(file: string, area: Area, tag: string): boolean {
   }
 }
 
-/** Names the running gateway reports for the area (sessions: ids; settings are checked via the file). */
+/** Names the running gateway reports for the area (sessions: ids). */
 async function listNames(gateway: Gateway, area: Area): Promise<string[]> {
   switch (area) {
     case "sessions":
@@ -302,7 +364,7 @@ let flush;
 if (area === "sessions") {
   const m = await import(url("sessions.js"));
   m.loadSessions();
-  m.updateSettings({ sessionIdleTimeoutMs: 424242 });
+  m.getSession("never-saved", "", "m", true, { label: "proc", userId: null });
   flush = m.flushSessions;
 } else if (area === "tools") {
   const m = await import(url("tools.js"));
@@ -507,21 +569,23 @@ describe("Several damaged areas are all reported", () => {
 /* ------------------------------------------------------------------ */
 
 /** Valid JSON whose entries the gateway cannot restore; before the fix, rows 1, 3 and 5 stopped start-up. */
-const UNRESTORABLE_ROWS: [area: Area, label: string, content: () => unknown][] = [
+const UNRESTORABLE_ROWS: [area: Area, label: string, content: () => unknown, env?: Record<string, string>][] = [
   ["tools", "null entry", () => [null]],
   ["tools", "entry without name", () => [{ description: "d", input_schema: { type: "object" }, webhook_url: "http://127.0.0.1:9/hook" }]],
   ["mcpServers", "null entry", () => [null]],
   ["mcpServers", "entry without name", () => [{ description: "", enabled: true, type: "http", url: "http://127.0.0.1:9/mcp", createdAt: "x", updatedAt: "x" }]],
-  ["sessions", "null session, idle timeout on", () => ({ sessions: { "earlier-session": null }, settings: { sessionIdleTimeoutMs: 60_000 } })],
+  // The idle timeout is on through the environment (the saved key is only kept in the file, where it is ignored).
+  ["sessions", "null session, idle timeout on", () => ({ sessions: { "earlier-session": null }, settings: { sessionIdleTimeoutMs: 60_000 } }), { SESSION_IDLE_TIMEOUT_MS: "60000" }],
   [
     "sessions",
     "session without lastUsed, idle timeout on",
     () => ({ sessions: { "earlier-session": { sessionId: "sdk-earlier", systemPrompt: "", model: "m" } }, settings: { sessionIdleTimeoutMs: 60_000 } }),
+    { SESSION_IDLE_TIMEOUT_MS: "60000" },
   ],
 ];
 
 describe("A file with an entry that cannot be restored is kept aside and the gateway keeps serving", () => {
-  it.each(UNRESTORABLE_ROWS)("%s, %s", async (area, _label, content) => {
+  it.each(UNRESTORABLE_ROWS)("%s, %s", async (area, _label, content, env) => {
     const fx = fixture();
     const file = fx.file(area);
     const originalBytes = Buffer.from(JSON.stringify(content(), null, 2));
@@ -530,7 +594,7 @@ describe("A file with an entry that cannot be restored is kept aside and the gat
     const other: Area = area === "tools" ? "mcpServers" : "tools";
     fs.writeFileSync(fx.file(other), JSON.stringify(earlierState(other), null, 2));
 
-    const gateway = await startGateway(fx);
+    const gateway = await startGateway(fx, env);
     const copies = corruptCopies(fx, area);
     expect(copies).toHaveLength(1);
     expect(fs.readFileSync(copies[0]).equals(originalBytes)).toBe(true);
@@ -585,7 +649,8 @@ describe.skipIf(IS_ROOT)(`A failed save is reported until a later save succeeds 
     fs.chmodSync(fx.dirs[area], 0o755);
     await changeArea(gateway, area, "later-save");
     expect(fileHoldsChange(file, area, "later-save")).toBe(true);
-    expect(fileHoldsChange(file, area, "lost-save")).toBe(area !== "sessions");
+    // Both changes are in memory and the later save writes them together, whatever the area.
+    expect(fileHoldsChange(file, area, "lost-save")).toBe(true);
     report = await health(gateway);
     expect(report.persistenceIssues).toEqual([]);
     expect(report.persistence).toBe("ok");
@@ -638,4 +703,21 @@ describe("Unreadable mcp-servers.json: no credential fragment in logs or /health
       expect(seen, `fragment ${fragment}`).not.toContain(fragment);
     }
   }, 60_000);
+});
+
+/* ------------------------------------------------------------------ */
+/*  The settings route changes nothing (MVP-7402 R1)                    */
+/* ------------------------------------------------------------------ */
+
+describe("PUT /v1/settings with the idle timeout changes nothing", () => {
+  it("answers 400 setting_read_only and leaves sessions.json byte-identical", async () => {
+    const fx = fixture();
+    for (const a of AREAS) fs.writeFileSync(fx.file(a), JSON.stringify(earlierState(a), null, 2));
+    const gateway = await startGateway(fx);
+    const before = fs.readFileSync(fx.file("sessions"));
+    const reply = await request(gateway.port, "PUT", "/v1/settings", { sessionIdleTimeoutMs: 1 });
+    expect([reply.status, reply.json()]).toEqual([400, { error: "setting_read_only" }]);
+    await delay(400);
+    expect(fs.readFileSync(fx.file("sessions")).equals(before)).toBe(true);
+  }, 75_000);
 });
