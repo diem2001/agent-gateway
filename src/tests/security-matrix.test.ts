@@ -4951,7 +4951,7 @@ describe("process sampler lost ticks (MVP-8139)", () => {
     expect(offenders, `offenders: ${offenders.join(" | ")}`).toEqual([]);
   });
 
-  it("LT-wiring: the setup file is registered, its afterEach asks lostTickVerdict, and the INVALID skip asks invalidSkipDecision with the lost ticks of the test (the call site is pinned exactly)", () => {
+  it("LT-wiring: the setup file is registered, its afterEach asks lostTickVerdict, and the INVALID skip asks invalidSkipDecision with the lost ticks of the test (the decision call's arguments, the lostTicks declaration and the skip branch are pinned)", () => {
     const root = path.resolve(testsDir, "..", "..");
     const config = fs.readFileSync(path.join(root, "vitest.config.ts"), "utf8");
     expect(config).toMatch(/setupFiles:\s*\["src\/tests\/setup\/sampler-verdict\.ts"\]/);
@@ -4973,7 +4973,8 @@ describe("process sampler lost ticks (MVP-8139)", () => {
     expect(wrapper).toContain("currentTestLostTicks({ stopRunning: true })");
     expect(wrapper).toMatch(/invalidSkipDecision\(\{[^}]*lostTicks/);
 
-    // The call site itself, exactly: a regex over the text accepts `lostTicks: 0`, a shadowing binding, a second wrapper or a skip that returns.
+    // The decision call's arguments, the `lostTicks` declaration and the skip branch: a regex over the text accepts `lostTicks: 0`, a shadowing binding, a second wrapper or a skip that returns.
+    // The rest of the wrapper (the try body, the rest of the catch block, the cap check) is not pinned.
     // The expected texts are assembled from parts, so that no line of this row is the verbatim text a falsification patch replaces.
     const self = sourceOf(fileURLToPath(import.meta.url));
     const norm = (text: string): string => text.replace(/\s+/g, " ").trim();
