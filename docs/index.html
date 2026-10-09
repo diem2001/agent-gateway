@@ -166,7 +166,7 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>POST</strong></td><td><code>/v1/query</code></td><td>Yes</td><td>Run agent query (NDJSON stream)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/query/:queryId/events</code></td><td>Yes</td><td>Replay/resume event stream; only the calling label's own query (another label's: 404)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/sessions</code></td><td>Yes</td><td>List the calling label's active sessions (raw ids)</td></tr>
-      <tr><td><strong>DELETE</strong></td><td><code>/v1/sessions/:id</code></td><td>Yes</td><td>Delete the calling label's own session with that id, else an ownerless legacy entry</td></tr>
+      <tr><td><strong>DELETE</strong></td><td><code>/v1/sessions/:id</code></td><td>Yes</td><td>Erase the calling label's own conversation (200 once its folder is gone, 503 <code>erasure_pending</code> while the gateway finishes it; 409 <code>legacy_not_erased</code> for a pre-update entry; 404 otherwise)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/settings</code></td><td>Yes</td><td>Get session settings</td></tr>
       <tr><td><strong>PUT</strong></td><td><code>/v1/settings</code></td><td>Yes</td><td>Update session settings</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/logging</code></td><td>Yes</td><td>Get log level</td></tr>
@@ -229,10 +229,13 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
   "version": "0.1.0",
   "uptime": 3600,
   "sessions": 2,
+  "erasurePending": 0,
   "isolation": "ok",
   "persistence": "ok",
   "persistenceIssues": []
 }</code></pre>
+
+    <p><code>erasurePending</code> (MVP-7402) is the number of deleted or expired conversations whose folder the gateway has not yet confirmed gone: a count only, no IDs. A value that stays above 0 means a folder cannot be removed (see the <code>sessions.erasure.failed</code> log lines).</p>
 
     <p><code>isolation</code> is <code>"ok"</code> once a sandbox has started and passed its check, <code>"unavailable"</code> after a permanent start problem (agent runs are refused until a later start succeeds) and <code>"starting"</code> while the boot self-check runs. The compose health check requires <code>"ok"</code>. See <a href="#isolation">Agent Isolation</a>.</p>
 
@@ -476,10 +479,16 @@ curl -N "http://localhost:3001/v1/query/q-001/events?after=5" \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Deletes the calling label's own session with that ID; if it has none, an ownerless legacy entry with that ID. Returns <code>404</code> if neither exists (another label's session is left in place). Sessions from before the isolation update can be deleted by every label. A conversation's sandbox home on disk is not removed by this call.</p>
+    <p>Erases the calling label's own conversation with that ID: its whole folder on the gateway host (runtime transcripts of every turn, tool results, uploaded images, the work area) is removed, and <code>200</code> is answered only when the folder is gone. The folder is reached only through the caller's own conversation, never through the ID.</p>
 
-    <h3>Response</h3>
-<pre><code>{"deleted": true}</code></pre>
+    <h3>Responses</h3>
+    <table>
+      <tr><th>Status</th><th>Body</th><th>Meaning</th></tr>
+      <tr><td><code>200</code></td><td><code>{"deleted": true}</code></td><td>The folder is gone. Repeats by the owning label also answer 200, also after a restart (a content-free marker of label, ID and time remains).</td></tr>
+      <tr><td><code>503</code></td><td><code>{"error": "erasure_pending"}</code></td><td>A run still holds the conversation or the folder cannot be removed right now. The conversation is blocked (queries get a fixed error before any run) and the gateway finishes the erasure itself when the run ends, on a sweep every <code>SESSION_ERASURE_RETRY_MS</code> and at startup; a repeated DELETE completes it as well. <code>/health</code> <code>erasurePending</code> counts it.</td></tr>
+      <tr><td><code>409</code></td><td><code>{"error": "legacy_not_erased"}</code></td><td>A conversation from before the isolation update: nothing is deleted or touched (its transcripts are in the old shared store, cleaned by MVP-8166).</td></tr>
+      <tr><td><code>404</code></td><td><code>{"error": "Session not found"}</code></td><td>Unknown ID, an ID the label never owned, or another label's conversation.</td></tr>
+    </table>
 
     <h3>Example</h3>
 <pre><code>curl -X DELETE http://localhost:3001/v1/sessions/session-1 \
@@ -1629,7 +1638,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <div class="vflow-num n-slate">4</div>
       <div class="vflow-body">
         <h4 class="c-slate">Idle cleanup (optional)</h4>
-        <p>If <code>SESSION_IDLE_TIMEOUT_MS &gt; 0</code>, a background timer runs every 5 minutes and removes sessions that have been idle longer than the timeout.</p>
+        <p>If <code>SESSION_IDLE_TIMEOUT_MS &gt; 0</code>, the erasure sweep (every <code>SESSION_ERASURE_RETRY_MS</code>, default 60 s) takes sessions that have been idle longer than the timeout: the conversation's folder is erased like a deleted one, an idle pre-update entry is dropped without touching any file.</p>
       </div>
     </div>
   </div>
@@ -1640,7 +1649,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
   <h3>Managing Sessions via API</h3>
   <ul>
     <li><code>GET /v1/sessions</code> -- list the calling label's active sessions (raw ids) with model and lastUsed timestamp</li>
-    <li><code>DELETE /v1/sessions/:id</code> -- remove the calling label's own session with that id, else an ownerless legacy entry (another label's answers 404)</li>
+    <li><code>DELETE /v1/sessions/:id</code> -- erase the calling label's own conversation with that id (200 once its folder is gone, 503 <code>erasure_pending</code> while pending, 409 <code>legacy_not_erased</code> for a pre-update entry, 404 otherwise)</li>
     <li><code>PUT /v1/settings</code> -- configure <code>sessionIdleTimeoutMs</code></li>
   </ul>
 
@@ -1661,11 +1670,11 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
     <li><strong>Extensions:</strong> <code>commands</code>, <code>agents</code>, <code>skills</code>, <code>output-styles</code>, <code>plugins</code>, <code>hooks</code> and <code>CLAUDE.md</code> are mounted read-only from the workspace, or from an empty trusted stand-in when it has none (their frontmatter hooks and agent <code>mcpServers</code> execute commands: trusted content only).</li>
     <li><strong>Repositories</strong> under <code>~/.claude/projects/</code> stay central, read-only and live. Read-only git commands work in them, for example <code>git -C ~/.claude/projects/&lt;repo&gt; show &lt;other-branch&gt;:&lt;path&gt;</code>; git's "dubious ownership" check does not block them (only repositories owned by the gateway user are mounted, and the sandbox keeps that user). A commit or new branch fails with a read-only file system.</li>
     <li><strong>Global <code>memory</code>:</strong> the workspace's <code>memory/</code> directory, written only through <code>PUT /v1/memory/*</code> (any API-key holder) and mounted read-only into every sandbox: no conversation can write it, so nothing one conversation writes reaches another through it.</li>
-    <li><strong>Run directories:</strong> the per-run directory under <code>&lt;root&gt;/runs/</code> is removed when the request ends, whatever its outcome; a crashed gateway's leftovers are swept at start. Conversation directories (home and work area) are not removed when a conversation is deleted (MVP-7402).</li>
+    <li><strong>Run directories:</strong> the per-run directory under <code>&lt;root&gt;/runs/</code> is removed when the request ends, whatever its outcome; a crashed gateway's leftovers are swept at start. A conversation's directory (home and work area) is removed when the conversation is deleted or expires (MVP-7402).</li>
   </ul>
 
   <h3>Conversations</h3>
-  <p>A conversation is keyed by the API-key label and the <code>sessionId</code>, and belongs to that label (DEC-ISO-007, MVP-8044): every request through the label that sends the id continues it, in its own home and work area, whatever its <code>user_id</code> (another person, none or the creator). The application decides who may write in a conversation, not the gateway. The request's <code>user_id</code> keeps its per-request jobs: it selects the writer's personal skills, it is the <code>user_id</code> of the webhook context, and the per-request credential overrides and <code>requireUserCredentials</code> apply to the person writing, never to the creator. The creator's <code>user_id</code> is stored with the conversation as information only and is never read for a decision. Another label using the same <code>sessionId</code> gets its own new conversation (no refusal, nothing learned). Ownerless entries from before the isolation update keep their raw id and are still refused for every label. One request at a time is processed per conversation, whoever sends it. <strong>Residual risk, accepted:</strong> the application alone decides who receives a conversation id, and everything a writer's tools returned and the text of any skill a writer invoked stays in the conversation, visible to later writers of the same label; successful relay replies are not masked. <code>GET /v1/sessions</code> and <code>DELETE /v1/sessions/:id</code> are scoped to the caller's label. Deleting a conversation leaves its home and work area on disk (retention: MVP-7402).</p>
+  <p>A conversation is keyed by the API-key label and the <code>sessionId</code>, and belongs to that label (DEC-ISO-007, MVP-8044): every request through the label that sends the id continues it, in its own home and work area, whatever its <code>user_id</code> (another person, none or the creator). The application decides who may write in a conversation, not the gateway. The request's <code>user_id</code> keeps its per-request jobs: it selects the writer's personal skills, it is the <code>user_id</code> of the webhook context, and the per-request credential overrides and <code>requireUserCredentials</code> apply to the person writing, never to the creator. The creator's <code>user_id</code> is stored with the conversation as information only and is never read for a decision. Another label using the same <code>sessionId</code> gets its own new conversation (no refusal, nothing learned). Ownerless entries from before the isolation update keep their raw id and are still refused for every label. One request at a time is processed per conversation, whoever sends it. <strong>Residual risk, accepted:</strong> the application alone decides who receives a conversation id, and everything a writer's tools returned and the text of any skill a writer invoked stays in the conversation, visible to later writers of the same label; successful relay replies are not masked. <code>GET /v1/sessions</code> and <code>DELETE /v1/sessions/:id</code> are scoped to the caller's label. Deleting a conversation erases its whole folder (MVP-7402): <code>200</code> only when it is gone; <code>503 erasure_pending</code> while a run holds it or removal fails (the entry stays as a blocked tombstone, hidden from the list, counted in <code>/health</code> <code>erasurePending</code>, and the gateway finishes the erasure itself when the run ends, on the sweep and at startup); <code>409 legacy_not_erased</code> for a conversation from before the isolation update (nothing is touched; MVP-8166 cleans the old store). A finished erasure leaves a content-free marker so the owner's late retry answers <code>200</code> every time. Links in the folder are removed, never followed, and no mount point is crossed.</p>
 
   <h3>Configuration</h3>
   <table>
@@ -1803,7 +1812,9 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
     <li>A credential-free request MCP server runs inside the agent sandbox and is granted per server only: a grant that names only some of its tools is not enforced on the trusted side.</li>
     <li>Global agents, skills and commands are trusted content (their frontmatter hooks and agent <code>mcpServers</code> execute commands for a label that is granted <code>Bash</code>): an agent cannot write them, but any API-key holder can write global agents and skills through <code>PUT /v1/agents</code> and <code>PUT /v1/skills</code>, and those load in ordinary runs, so a file saved by one label runs its commands in the runs of every label that holds the <code>Bash</code> grant. A run whose label is not granted <code>Bash</code> ignores those settings (MVP-8106, see <a href="#tool-mediation">Tool Mediation</a>). Reachable by callers, not by agent code.</li>
     <li>A file an agent writes in its home is rebuilt away only at the next start, so a process of the same run (for example a shell the agent starts itself when Bash is granted) can still read it; no trusted step does.</li>
-    <li>Conversation homes and work areas are never removed (MVP-7402), there is no size cap on a home or a private <code>/tmp</code>, and <code>pids_limit</code> is shared by all runs: an availability risk, not a credential exposure.</li>
+    <li>A conversation's home and work area are removed only when the conversation is deleted or expires; there is no size cap on a home or a private <code>/tmp</code>, and <code>pids_limit</code> is shared by all runs: an availability risk, not a credential exposure.</li>
+    <li>Erasure removes the conversation's folder (MVP-7402). It does not reach the in-memory event replay cache (the owner can replay a finished query's output for <code>EVENT_CACHE_TTL_MS</code>), runtime output at <code>LOG_LEVEL=debug</code>, <code>sessions.json.corrupt-*</code> copies of a set-aside state file, or run-log directories a crashed gateway left (swept at the next start).</li>
+    <li>A set-aside <code>sessions.json</code> (MVP-7616) loses its erasure-pending entries and erased markers: their folders become orphans (MVP-8166) and <code>/health</code> shows <code>persistence: degraded</code>. Erased markers (label, client id, time) are never removed, so <code>sessions.json</code> grows slowly. Chats from before the isolation update and folders without an entry are not erased (MVP-8166); a DELETE answers 503 while <code>&lt;root&gt;/sessions</code> does not exist, because a missing directory is never read as erased.</li>
     <li>An ownerless pre-update conversation id stays visible: a refusal versus a fresh conversation reveals that such an id exists.</li>
     <li>A conversation belongs to its API-key label, not to a person (DEC-ISO-007, MVP-8044): the application alone decides who receives a conversation id and may write in it, and everything a writer's tools returned and the text of any skill a writer invoked stays in the conversation and is visible to later writers of the same label. Successful relay replies are not masked. Per-person skills, webhook identity and credentials follow the request, never the stored creator.</li>
     <li>A client that closes its connection while a hook or an in-process tool call is in flight stops only its own run (MVP-7866): a startup guard drops the SDK's late <code>AbortError</code> with one <code>[process] late abort rejection ignored</code> line, and any other unhandled rejection still ends the process. A webhook call already in flight still reaches its webhook and its answer is discarded. An aborted request is never retried.</li>
@@ -1933,7 +1944,8 @@ curl -s http://localhost:3001/health | jq .isolation</code></pre>
       <tr><td><code>ANTHROPIC_API_KEY</code></td><td>--</td><td>Anthropic API key (or use OAuth via <code>POST /v1/auth/login</code>)</td></tr>
       <tr><td><code>API_KEYS</code></td><td><code>default:changeme</code></td><td>Client auth keys (<code>label:secret,...</code>)</td></tr>
       <tr><td><code>LOG_LEVEL</code></td><td><code>info</code></td><td>Logging level (<code>off</code>, <code>info</code>, <code>debug</code>)</td></tr>
-      <tr><td><code>SESSION_IDLE_TIMEOUT_MS</code></td><td><code>0</code></td><td>Auto-expire idle sessions (0 = disabled)</td></tr>
+      <tr><td><code>SESSION_IDLE_TIMEOUT_MS</code></td><td><code>0</code></td><td>Auto-expire idle sessions (0 = disabled); an expired conversation is erased like a deleted one</td></tr>
+      <tr><td><code>SESSION_ERASURE_RETRY_MS</code></td><td><code>60000</code></td><td>Interval of the sweep that finishes pending erasures and takes idle conversations; a positive whole number of ms, anything else stops startup (<code>FATAL config key=SESSION_ERASURE_RETRY_MS</code>)</td></tr>
       <tr><td><code>PORT</code></td><td><code>3001</code></td><td>HTTP listen port</td></tr>
       <tr><td><code>HOST</code></td><td><code>0.0.0.0</code></td><td>Bind address</td></tr>
       <tr><td><code>SESSION_PERSIST_PATH</code></td><td><code>/home/node/.claude/sessions.json</code></td><td>Session persistence file (inside agent_home bind-mount)</td></tr>
