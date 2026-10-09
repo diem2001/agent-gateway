@@ -167,8 +167,8 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>GET</strong></td><td><code>/v1/query/:queryId/events</code></td><td>Yes</td><td>Replay/resume event stream; only the calling label's own query (another label's: 404)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/sessions</code></td><td>Yes</td><td>List the calling label's active sessions (raw ids)</td></tr>
       <tr><td><strong>DELETE</strong></td><td><code>/v1/sessions/:id</code></td><td>Yes</td><td>Erase the calling label's own conversation (200 once its folder is gone, 503 <code>erasure_pending</code> while the gateway finishes it; 409 <code>legacy_not_erased</code> for a pre-update entry; 404 otherwise)</td></tr>
-      <tr><td><strong>GET</strong></td><td><code>/v1/settings</code></td><td>Yes</td><td>Get session settings</td></tr>
-      <tr><td><strong>PUT</strong></td><td><code>/v1/settings</code></td><td>Yes</td><td>Update session settings</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/settings</code></td><td>Yes</td><td>Read-only: the effective settings (<code>sessionIdleTimeoutMs</code> from <code>SESSION_IDLE_TIMEOUT_MS</code>)</td></tr>
+      <tr><td><strong>PUT</strong></td><td><code>/v1/settings</code></td><td>Yes</td><td>Read-only: a <code>sessionIdleTimeoutMs</code> field is refused with 400 <code>setting_read_only</code></td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/logging</code></td><td>Yes</td><td>Get log level</td></tr>
       <tr><td><strong>PUT</strong></td><td><code>/v1/logging</code></td><td>Yes</td><td>Set log level</td></tr>
       <tr><td><strong>POST</strong></td><td><code>/v1/ssh-keys</code></td><td>Yes</td><td>Upload SSH keys</td></tr>
@@ -479,13 +479,13 @@ curl -N "http://localhost:3001/v1/query/q-001/events?after=5" \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Erases the calling label's own conversation with that ID: its whole folder on the gateway host (runtime transcripts of every turn, tool results, uploaded images, the work area) is removed, and <code>200</code> is answered only when the folder is gone. The folder is reached only through the caller's own conversation, never through the ID.</p>
+    <p>Erases the calling label's own conversation with that ID: its whole folder on the gateway host (runtime transcripts of every turn, tool results, uploaded images, the work area) is removed, and <code>200</code> is answered only when the folder is gone. The folder is reached only through the caller's own conversation, never through the ID. The conversation is saved as an erasure-pending entry before the removal starts, so a gateway that is killed in the middle of it finishes the removal at the next start.</p>
 
     <h3>Responses</h3>
     <table>
       <tr><th>Status</th><th>Body</th><th>Meaning</th></tr>
       <tr><td><code>200</code></td><td><code>{"deleted": true}</code></td><td>The folder is gone. Repeats by the owning label also answer 200, also after a restart (a content-free marker of label, ID and time remains).</td></tr>
-      <tr><td><code>503</code></td><td><code>{"error": "erasure_pending"}</code></td><td>A run still holds the conversation or the folder cannot be removed right now. The conversation is blocked (queries get a fixed error before any run) and the gateway finishes the erasure itself when the run ends, on a sweep every <code>SESSION_ERASURE_RETRY_MS</code> and at startup; a repeated DELETE completes it as well. <code>/health</code> <code>erasurePending</code> counts it.</td></tr>
+      <tr><td><code>503</code></td><td><code>{"error": "erasure_pending"}</code></td><td>A run still holds the conversation, the folder cannot be removed right now, or the sessions file cannot be written (the tombstone is saved before any removal starts, so nothing is removed while that save fails; logged as <code>code=tombstone_unsaved</code>). The conversation is blocked (queries get a fixed error before any run) and the gateway finishes the erasure itself when the run ends, on a sweep every <code>SESSION_ERASURE_RETRY_MS</code> and at startup; a repeated DELETE completes it as well. <code>/health</code> <code>erasurePending</code> counts it.</td></tr>
       <tr><td><code>409</code></td><td><code>{"error": "legacy_not_erased"}</code></td><td>A conversation from before the isolation update: nothing is deleted or touched (its transcripts are in the old shared store, cleaned by MVP-8166).</td></tr>
       <tr><td><code>404</code></td><td><code>{"error": "Session not found"}</code></td><td>Unknown ID, an ID the label never owned, or another label's conversation.</td></tr>
     </table>
@@ -505,7 +505,7 @@ curl -N "http://localhost:3001/v1/query/q-001/events?after=5" \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Returns current session settings.</p>
+    <p>Returns the effective session settings: the value of <code>SESSION_IDLE_TIMEOUT_MS</code> read at start. Readable by any authenticated key; it is operator configuration, not conversation data.</p>
 
     <h3>Response</h3>
 <pre><code>{"sessionIdleTimeoutMs": 0}</code></pre>
@@ -522,7 +522,14 @@ curl -N "http://localhost:3001/v1/query/q-001/events?after=5" \
       <span class="auth-tag required">Auth Required</span>
     </p>
 
-    <p>Updates session settings. Currently supports <code>sessionIdleTimeoutMs</code>.</p>
+    <p>
+      Read-only. The idle timeout decides which conversations are erased, folder included and irreversibly, so no API key
+      can change it: set <code>SESSION_IDLE_TIMEOUT_MS</code> in the gateway's environment and restart. A body that contains a
+      <code>sessionIdleTimeoutMs</code> field, whatever its value, is refused with <code>400 {"error": "setting_read_only"}</code>;
+      nothing changes and nothing is saved. The refusal is logged at every log level with the caller's label and without the value
+      (<code>settings.refused key=sessionIdleTimeoutMs label=&lt;label&gt;</code>). Any other body answers <code>200</code> with the
+      same body as <code>GET /v1/settings</code>.
+    </p>
 
     <h3>Sessions</h3>
     <p>
@@ -532,41 +539,36 @@ curl -N "http://localhost:3001/v1/query/q-001/events?after=5" \
       Sessions are persisted to <code>SESSION_PERSIST_PATH</code> and survive server restarts.
     </p>
 
-    <h3>sessionIdleTimeoutMs</h3>
+    <h3>SESSION_IDLE_TIMEOUT_MS</h3>
     <table>
       <tr><th>Default</th><td><code>0</code> — disabled, sessions persist indefinitely</td></tr>
-      <tr><th>Cleanup granularity</th><td>5 minutes — a background timer runs every 5 minutes and evicts sessions that have been idle longer than the configured timeout. Sessions may therefore exist up to 5 minutes past their timeout.</td></tr>
+      <tr><th>Format</th><td>A whole number of milliseconds, read once at start. Anything else (<code>30m</code>, <code>1e6</code>, <code>-5</code>) stops startup with <code>FATAL config key=SESSION_IDLE_TIMEOUT_MS</code>. A value saved in <code>sessions.json</code> by an earlier version is ignored.</td></tr>
+      <tr><th>Cleanup granularity</th><td>The erasure sweep runs every <code>SESSION_ERASURE_RETRY_MS</code> (default 60 s); a conversation may exist up to one interval past its timeout.</td></tr>
     </table>
     <p>
-      When set to <code>0</code> (the default), no cleanup runs and every unique <code>sessionId</code> stays
-      in memory and on disk forever. This is convenient for long-lived conversational agents but means memory
-      usage grows unboundedly if many distinct session IDs are used.
+      When <code>0</code> (the default), no conversation expires and every unique <code>sessionId</code> stays on disk until
+      its label deletes it.
     </p>
     <p>
-      When set to a value greater than <code>0</code>, the cleanup timer is activated. Any session that has
-      not received a query within the configured duration is removed from memory and from disk.
-      The next query that arrives with that <code>sessionId</code> starts a <strong>fresh session</strong> —
-      all previous conversation context is lost.
+      When greater than <code>0</code>, any conversation that has not received a query within the configured duration is erased
+      like a deleted one (folder, transcripts and uploaded images included). The next query that arrives with that
+      <code>sessionId</code> starts a <strong>fresh session</strong> — all previous conversation context is lost.
     </p>
 
     <h3>Request Body</h3>
 <pre><code>{"sessionIdleTimeoutMs": 3600000}</code></pre>
 
     <h3>Response</h3>
-<pre><code>{"sessionIdleTimeoutMs": 3600000}</code></pre>
+<pre><code>400 {"error": "setting_read_only"}</code></pre>
 
     <h3>Example</h3>
-<pre><code># Set 1-hour idle timeout (sessions idle for &gt;1 h are evicted; check runs every 5 min)
+<pre><code># Refused: the idle timeout cannot be changed over the API
 curl -X PUT http://localhost:3001/v1/settings \
   -H "Authorization: Bearer sk-gw-abc123" \
   -H "Content-Type: application/json" \
   -d '{"sessionIdleTimeoutMs": 3600000}'
 
-# Disable cleanup — sessions live forever (default)
-curl -X PUT http://localhost:3001/v1/settings \
-  -H "Authorization: Bearer sk-gw-abc123" \
-  -H "Content-Type: application/json" \
-  -d '{"sessionIdleTimeoutMs": 0}'</code></pre>
+# Set it for the operator: SESSION_IDLE_TIMEOUT_MS=3600000 in the gateway environment, then restart</code></pre>
   </div>
 
   <!-- ============================================================ -->
@@ -1638,7 +1640,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <div class="vflow-num n-slate">4</div>
       <div class="vflow-body">
         <h4 class="c-slate">Idle cleanup (optional)</h4>
-        <p>If <code>SESSION_IDLE_TIMEOUT_MS &gt; 0</code>, the erasure sweep (every <code>SESSION_ERASURE_RETRY_MS</code>, default 60 s) takes sessions that have been idle longer than the timeout: the conversation's folder is erased like a deleted one, an idle pre-update entry is dropped without touching any file.</p>
+        <p>If <code>SESSION_IDLE_TIMEOUT_MS &gt; 0</code> (set by the operator in the environment only), the erasure sweep (every <code>SESSION_ERASURE_RETRY_MS</code>, default 60 s) takes sessions that have been idle longer than the timeout: the conversation's folder is erased like a deleted one, an idle pre-update entry is dropped without touching any file.</p>
       </div>
     </div>
   </div>
@@ -1650,7 +1652,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
   <ul>
     <li><code>GET /v1/sessions</code> -- list the calling label's active sessions (raw ids) with model and lastUsed timestamp</li>
     <li><code>DELETE /v1/sessions/:id</code> -- erase the calling label's own conversation with that id (200 once its folder is gone, 503 <code>erasure_pending</code> while pending, 409 <code>legacy_not_erased</code> for a pre-update entry, 404 otherwise)</li>
-    <li><code>PUT /v1/settings</code> -- configure <code>sessionIdleTimeoutMs</code></li>
+    <li><code>GET /v1/settings</code> / <code>PUT /v1/settings</code> -- read-only; <code>sessionIdleTimeoutMs</code> comes from <code>SESSION_IDLE_TIMEOUT_MS</code> and a <code>PUT</code> naming it answers 400 <code>setting_read_only</code></li>
   </ul>
 
   <!-- ============================================================ -->
@@ -1944,7 +1946,7 @@ curl -s http://localhost:3001/health | jq .isolation</code></pre>
       <tr><td><code>ANTHROPIC_API_KEY</code></td><td>--</td><td>Anthropic API key (or use OAuth via <code>POST /v1/auth/login</code>)</td></tr>
       <tr><td><code>API_KEYS</code></td><td><code>default:changeme</code></td><td>Client auth keys (<code>label:secret,...</code>)</td></tr>
       <tr><td><code>LOG_LEVEL</code></td><td><code>info</code></td><td>Logging level (<code>off</code>, <code>info</code>, <code>debug</code>)</td></tr>
-      <tr><td><code>SESSION_IDLE_TIMEOUT_MS</code></td><td><code>0</code></td><td>Auto-expire idle sessions (0 = disabled); an expired conversation is erased like a deleted one</td></tr>
+      <tr><td><code>SESSION_IDLE_TIMEOUT_MS</code></td><td><code>0</code></td><td>Auto-expire idle sessions (0 = disabled); an expired conversation is erased like a deleted one, irreversibly. Read once at start, a whole number of ms, anything else stops startup (<code>FATAL config key=SESSION_IDLE_TIMEOUT_MS</code>); not changeable over the API; a value saved by an earlier version is ignored</td></tr>
       <tr><td><code>SESSION_ERASURE_RETRY_MS</code></td><td><code>60000</code></td><td>Interval of the sweep that finishes pending erasures and takes idle conversations; a positive whole number of ms, anything else stops startup (<code>FATAL config key=SESSION_ERASURE_RETRY_MS</code>)</td></tr>
       <tr><td><code>PORT</code></td><td><code>3001</code></td><td>HTTP listen port</td></tr>
       <tr><td><code>HOST</code></td><td><code>0.0.0.0</code></td><td>Bind address</td></tr>
@@ -2251,7 +2253,7 @@ curl -s http://localhost:3001/health | jq .isolation</code></pre>
 
   <h3 id="state-recovery">State Files, Recovery and Shutdown</h3>
 
-  <p><code>sessions.json</code> (with the idle-timeout setting), <code>tools.json</code> and <code>mcp-servers.json</code> are written by <code>src/persistence.ts</code>: a temp file <code>&lt;file&gt;.tmp-*</code> (mode 0600, same directory) is written and flushed, then renamed over the file, so a kill, crash or full disk leaves either the complete old file or the complete new one. On start, a missing file is an empty start; a file that cannot be read or parsed, or that holds an entry the gateway cannot restore (<code>null</code>, a tool or MCP server without a string <code>name</code>, a session without a numeric <code>lastUsed</code>), is moved to <code>&lt;file&gt;.corrupt-&lt;UTC stamp&gt;</code> and reported, never overwritten. If it cannot be moved, it stays in place and saves for that area are switched off until a restart loads it. Each problem is reported by <a href="#ep-health"><code>/health</code></a> and logged, whatever the log level, as <code>ERROR persistence area=&lt;area&gt; problem=&lt;problem&gt; file=&lt;path&gt; [preservedAs=&lt;path&gt;] reason=&lt;fixed text&gt; [code=&lt;errno&gt;] (see /health)</code>; the line never contains file content.</p>
+  <p><code>sessions.json</code>, <code>tools.json</code> and <code>mcp-servers.json</code> are written by <code>src/persistence.ts</code>: a temp file <code>&lt;file&gt;.tmp-*</code> (mode 0600, same directory) is written and flushed, then renamed over the file, so a kill, crash or full disk leaves either the complete old file or the complete new one. On start, a missing file is an empty start; a file that cannot be read or parsed, or that holds an entry the gateway cannot restore (<code>null</code>, a tool or MCP server without a string <code>name</code>, a session without a numeric <code>lastUsed</code>), is moved to <code>&lt;file&gt;.corrupt-&lt;UTC stamp&gt;</code> and reported, never overwritten. If it cannot be moved, it stays in place and saves for that area are switched off until a restart loads it. Each problem is reported by <a href="#ep-health"><code>/health</code></a> and logged, whatever the log level, as <code>ERROR persistence area=&lt;area&gt; problem=&lt;problem&gt; file=&lt;path&gt; [preservedAs=&lt;path&gt;] reason=&lt;fixed text&gt; [code=&lt;errno&gt;] (see /health)</code>; the line never contains file content.</p>
 
   <h4>Shutdown sequence (<code>src/shutdown.ts</code>)</h4>
   <ol>
