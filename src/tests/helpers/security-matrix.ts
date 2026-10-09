@@ -213,16 +213,24 @@ export interface MatrixRow {
   surfaces: Surface[];
   /** Names of the controls that held (permitted operation ran, scanner canary found, ...). */
   controls?: string[];
+  /**
+   * Lost sampler ticks of the windows the row ran (MVP-8139). A row with a lost tick is not assessable whatever its expectation: it is never a
+   * pass, a negative control included. `MatrixRecorder.record` fills it from the ledger when the caller leaves it out.
+   */
+  lostTicks?: number;
 }
 
-/** `SECURITY-MATRIX`: one row. A negative control reads `expected=fail observed=fail result=pass`. */
+const notAssessable = (row: MatrixRow): boolean => (row.lostTicks ?? 0) > 0;
+
+/** `SECURITY-MATRIX`: one row. A negative control reads `expected=fail observed=fail result=pass`; a row with a lost tick reads `result=not-assessable`. */
 export function matrixLine(row: MatrixRow): string {
   return `SECURITY-MATRIX ${kv({
     id: row.id,
     mode: row.mode,
     expected: row.expected,
     observed: row.observed,
-    result: row.expected === row.observed ? "pass" : "fail",
+    result: notAssessable(row) ? "not-assessable" : row.expected === row.observed ? "pass" : "fail",
+    lost_ticks: notAssessable(row) ? row.lostTicks : undefined,
     hits: row.hits,
     duration_ms: Math.round(row.durationMs),
     deadline_ms: row.deadlineMs,
@@ -241,28 +249,40 @@ export class MatrixRecorder {
     private readonly out: (line: string) => void = emit,
   ) {}
 
-  /** Records and prints a row; returns the row's `result`. */
-  record(row: MatrixRow): "pass" | "fail" {
+  /** Records and prints a row; returns the row's `result` (a row with a lost tick is a fail here; its line says `not-assessable`). */
+  record(given: MatrixRow): "pass" | "fail" {
+    const row = given.lostTicks === undefined ? { ...given, lostTicks: currentTestLostTicks().lostTicks } : given;
     this.rows.push(row);
     this.out(matrixLine(row));
-    return row.expected === row.observed ? "pass" : "fail";
+    return row.expected === row.observed && !notAssessable(row) ? "pass" : "fail";
   }
 
   observedIds(): string[] {
     return this.rows.map((row) => row.id);
   }
 
-  summary(): { expected: number; observed: number; pass: number; fail: number; hits: number; missing: string[] } {
+  summary(): { expected: number; observed: number; pass: number; fail: number; hits: number; missing: string[]; lostTicks: number; notAssessable: number } {
     const observed = new Set(this.observedIds());
     const missing = this.expectedIds.filter((id) => !observed.has(id));
-    const pass = this.rows.filter((row) => row.expected === row.observed).length;
-    return { expected: this.expectedIds.length, observed: this.rows.length, pass, fail: this.rows.length - pass, hits: this.rows.reduce((sum, row) => sum + row.hits, 0), missing };
+    const pass = this.rows.filter((row) => row.expected === row.observed && !notAssessable(row)).length;
+    return {
+      expected: this.expectedIds.length,
+      observed: this.rows.length,
+      pass,
+      fail: this.rows.length - pass,
+      hits: this.rows.reduce((sum, row) => sum + row.hits, 0),
+      missing,
+      lostTicks: this.rows.reduce((sum, row) => sum + (row.lostTicks ?? 0), 0),
+      notAssessable: this.rows.filter(notAssessable).length,
+    };
   }
 
   /** Prints `SECURITY-SUMMARY` and returns it; the suite asserts `missing` is empty and `fail` is 0. */
   finish(): ReturnType<MatrixRecorder["summary"]> {
     const summary = this.summary();
-    this.out(`SECURITY-SUMMARY ${kv({ suite: this.suite, expected: summary.expected, observed: summary.observed, pass: summary.pass, fail: summary.fail, hits: summary.hits, missing: summary.missing.join(",") || "none" })}`);
+    this.out(
+      `SECURITY-SUMMARY ${kv({ suite: this.suite, expected: summary.expected, observed: summary.observed, pass: summary.pass, fail: summary.fail, hits: summary.hits, missing: summary.missing.join(",") || "none", lost_ticks: summary.lostTicks, not_assessable: summary.notAssessable })}`,
+    );
     return summary;
   }
 }
@@ -593,7 +613,14 @@ export interface ProcessRecord {
     sawLeaderExit?: boolean;
     /** The record was expired at once because it was revived: it never clears and never ends a flag. */
     revived?: boolean;
+    /**
+     * The record was expired at once because a revival check could not run (MVP-8139): the settle reading of the runtime was `unknown`, or the
+     * executable read of a live reading failed with an error that says nothing about the process. It never clears.
+     */
+    revivalUnchecked?: boolean;
   };
+  /** A tick that wrote or refreshed this record had a read failure injected by the `tickReadFault` seam (never set by a real run). */
+  tickReadInjected?: boolean;
   /** What confirmed the exit when this record was cleared (kinds only): the runtime's, and the reference's on the reference-ended route. */
   exitConfirmed?: { runtime: ExitKind; reference?: ExitKind };
   /** Device and inode of the executable at the last proven tick (never printed): a pending record whose live process runs another one was revived. */
@@ -669,6 +696,21 @@ export interface ProcessSample {
   records: ProcessRecord[];
   /** The old-versus-current audit: every process the old rule counted or flagged and the current rule clears. */
   clears: ProcessClear[];
+  /** The row this window belongs to (the id of the test that started it; `none` outside a test). */
+  row: string;
+  /** Identifies the window in the per-worker ledger (see `acknowledgeLostTicks`). */
+  windowId: number;
+  /**
+   * Ticks in which at least one counted read failed with an error that does not say "the process is gone" (MVP-8139), natural and injected
+   * together; a tick with several failed reads counts once. A window with a lost tick is not assessable.
+   */
+  lostTicks: number;
+  /** The lost ticks that only the `tickReadFault` seam caused. A tick with any natural failure counts as natural, never here. */
+  lostTicksInjected: number;
+  /** `<kind>:<file>:<errno>` (or `abort:<code>`) of the first failed counted read, names and codes only; `none` without a lost tick. */
+  firstLost: string;
+  /** Reads that failed with ENOENT or ESRCH (the process left between two reads): counted from the raw errno, never lost ticks. */
+  vanishedReads: number;
 }
 
 const ARGV_NAMES = new Set(["node", "cli.js", "sh", "dash", "bash", "bwrap", "unshare", "claude"]);
@@ -851,6 +893,223 @@ function readExe(pid: number): ExeRead {
 /** A process that is ending runs no code: its state is `Z` or `X`, its command line is already empty, or its executable link is gone. */
 const exiting = (info: ProcInfo, exe: ExeRead): boolean => info.state === "Z" || info.state === "X" || info.cmdline === "" || "gone" in exe;
 
+/* ------------------------------------------------------------------ */
+/*  Lost ticks (MVP-8139)                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The reads of one sampler tick whose failure is counted. A read that fails with ENOENT or ESRCH says "the process (or thread) is gone" and
+ * is no lost tick; EACCES on the executable link of a live process is the existing `denied` rule; any other error means the sampler could
+ * not observe something that may be alive, so the tick is lost and the window is not assessable.
+ */
+export type TickReadKind = "tree" | "snapshot" | "first-exe" | "reread";
+export type TickFile = "task" | "children" | "stat" | "comm" | "cmdline" | "exe" | "exe-id";
+
+/**
+ * The class of one failed tick read. It mirrors `exitReadOutcome` (the exit reading of MVP-8130) and differs only for `cmdline`: ENOENT or
+ * ESRCH there means the process left between two reads of the tick, which the tick drops as before, while the exit reading must let the stat
+ * decide. `FORMAT` (a stat that does not parse) and every other code are lost.
+ */
+export function tickReadOutcome(kind: TickReadKind, file: TickFile, errno: string): "vanished" | "denied" | "lost" {
+  if (errno === "ENOENT" || errno === "ESRCH") return "vanished";
+  if (errno === "EACCES" && file === "exe" && (kind === "first-exe" || kind === "reread")) return "denied";
+  return "lost";
+}
+
+/** The file calls of the tick path; a T1 row passes doubles. `statId` is `<dev>:<inode>` of the file a link points to. */
+export interface TickIo {
+  readdir(dir: string): string[];
+  readText(file: string, encoding: "utf8" | "latin1"): string;
+  readlink(file: string): string;
+  statId(file: string): string;
+}
+
+export const realTickIo: TickIo = {
+  readdir: (dir) => fs.readdirSync(dir),
+  readText: (file, encoding) => fs.readFileSync(file, encoding),
+  readlink: (file) => fs.readlinkSync(file),
+  statId: (file) => {
+    const stat = fs.statSync(file, { bigint: true });
+    return `${stat.dev}:${stat.ino}`;
+  },
+};
+
+/**
+ * Test seam of the sampler's tick reads (default none): called before each counted read with the kind, the pid and the file, and returns an
+ * errno code to fail that read with, or undefined. For the kind `abort` (file `tick`, called once per tick before the candidates are read) the
+ * only accepted value is `throw`. It can only push a window toward not assessable: only EIO, EMFILE, ENFILE, ENOMEM, EPERM and (on files other
+ * than `exe`) EACCES are accepted. Anything else (ENOENT and ESRCH would hide a process, EACCES on `exe` would read as `denied`) and a seam that
+ * throws count as a natural lost tick (`SEAM-INVALID`, `SEAM-THREW`), never as "no fault". It never injects content.
+ */
+export type TickReadFault = (kind: TickReadKind | "abort", pid: number, file: TickFile | "tick") => string | undefined;
+
+const TICK_SEAM_ERRNOS: ReadonlySet<string> = new Set(["EIO", "EMFILE", "ENFILE", "ENOMEM", "EPERM", "EACCES"]);
+
+export function tickFaultAllowed(kind: TickReadKind | "abort", file: TickFile | "tick", value: string): boolean {
+  if (kind === "abort") return value === "throw";
+  return TICK_SEAM_ERRNOS.has(value) && !(file === "exe" && value === "EACCES");
+}
+
+/** What the reads of one tick lost. `natural` wins over `injected`: a tick with any non-injected failure never counts as injected. */
+export interface TickLoss {
+  natural: boolean;
+  injected: boolean;
+  /** `<kind>:<file>:<errno>` of the first lost read of the tick. */
+  first?: string;
+  /** ENOENT and ESRCH reads of the tick, counted from the raw errno before any mapping. */
+  vanished: number;
+  /** The `abort` seam fired on this tick (the exception that follows is injected). */
+  abortInjected: boolean;
+}
+
+export const newTickLoss = (): TickLoss => ({ natural: false, injected: false, vanished: 0, abortInjected: false });
+
+function noteLost(loss: TickLoss, read: string, injected: boolean): void {
+  if (injected) loss.injected = true;
+  else loss.natural = true;
+  loss.first ??= read;
+}
+
+/** Everything one tick reads through. */
+export interface TickReads {
+  io: TickIo;
+  fault?: TickReadFault;
+  loss: TickLoss;
+}
+
+type Attempt<T> = { ok: true; value: T } | { ok: false; outcome: "vanished" | "denied" | "lost"; errno: string };
+
+/** One counted read: the seam first, then the call. A failure is classified by `tickReadOutcome` and noted on the tick when it is lost. */
+function tickAttempt<T>(reads: TickReads, kind: TickReadKind, pid: number, file: TickFile, op: () => T): Attempt<T> {
+  let injected = false;
+  try {
+    if (reads.fault !== undefined) {
+      let value: string | undefined;
+      try {
+        value = reads.fault(kind, pid, file);
+      } catch {
+        throw Object.assign(new Error("tick read fault seam threw"), { code: "SEAM-THREW" });
+      }
+      if (value !== undefined) {
+        if (!tickFaultAllowed(kind, file, value)) throw Object.assign(new Error("refused tick read fault"), { code: "SEAM-INVALID" });
+        injected = true;
+        throw Object.assign(new Error("injected tick read fault"), { code: value });
+      }
+    }
+    return { ok: true, value: op() };
+  } catch (error) {
+    const errno = errnoOf(error);
+    if (errno === "ENOENT" || errno === "ESRCH") reads.loss.vanished += 1;
+    const outcome = tickReadOutcome(kind, file, errno);
+    if (outcome === "lost") noteLost(reads.loss, `${kind}:${file}:${errno}`, injected);
+    return { ok: false, outcome, errno };
+  }
+}
+
+/**
+ * `readProc` for the tick path: the same fields, but every failed read is classified (kind `snapshot` for the discovery snapshot, `reread`
+ * for the reads of a candidate). A failed or unparsable read returns null exactly like `readProc`, so the tick drops the process as before.
+ */
+export function readProcOver(reads: TickReads, kind: "snapshot" | "reread", pid: number): ProcInfo | null {
+  const stat = tickAttempt(reads, kind, pid, "stat", () => reads.io.readText(`/proc/${pid}/stat`, "utf8"));
+  if (!stat.ok) return null;
+  const comm = tickAttempt(reads, kind, pid, "comm", () => reads.io.readText(`/proc/${pid}/comm`, "utf8"));
+  if (!comm.ok) return null;
+  const cmdline = tickAttempt(reads, kind, pid, "cmdline", () => reads.io.readText(`/proc/${pid}/cmdline`, "latin1"));
+  if (!cmdline.ok) return null;
+  const afterName = stat.value.slice(stat.value.lastIndexOf(")") + 2).split(" ");
+  const ppid = Number(afterName[1]);
+  if (!Number.isInteger(ppid) || !/^\d+$/.test(afterName[19] ?? "") || !/^[A-Za-z]$/.test(afterName[0] ?? "")) {
+    noteLost(reads.loss, `${kind}:stat:FORMAT`, false);
+    return null;
+  }
+  const raw = cmdline.value;
+  return {
+    pid,
+    ppid,
+    comm: comm.value.trim(),
+    cmdline: raw.replace(/\0/g, " "),
+    argv: raw.split("\0").filter((_, index, all) => index < all.length - 1 || all[index] !== ""),
+    startTicks: afterName[19],
+    state: afterName[0],
+  };
+}
+
+/** The executable read with its error: `{ error }` for a failure that says nothing about the process (not ENOENT, ESRCH, nor EACCES on the link). */
+export type ExeReadErrno = ExeRead | { error: string; file: "exe" | "exe-id" };
+
+/**
+ * The executable behind `/proc/<pid>/exe` with its errno: ENOENT and ESRCH (also from the identity stat after a readable link) are `gone`,
+ * EACCES on the link is `denied`, any other failure is `error`. The tick sites map `error` to `gone` as before and count it; the settle of a
+ * pending record passes it on (`settleRevival`).
+ */
+export function readExeErrno(reads: TickReads, kind: "first-exe" | "reread", pid: number): ExeReadErrno {
+  const link = tickAttempt(reads, kind, pid, "exe", () => reads.io.readlink(`/proc/${pid}/exe`));
+  if (!link.ok) return link.outcome === "denied" ? { denied: true } : link.outcome === "vanished" ? { gone: true } : { error: link.errno, file: "exe" };
+  const id = tickAttempt(reads, kind, pid, "exe-id", () => reads.io.statId(`/proc/${pid}/exe`));
+  return id.ok ? { id: id.value } : id.outcome === "vanished" ? { gone: true } : { error: id.errno, file: "exe-id" };
+}
+
+/** The executable read of a tick site: an `error` reads as `gone` (as before) and has been counted by `readExeErrno`. */
+function readExeTick(reads: TickReads, kind: "first-exe" | "reread", pid: number): ExeRead {
+  const read = readExeErrno(reads, kind, pid);
+  return "error" in read ? { gone: true } : read;
+}
+
+/**
+ * The executable read of the settle of a pending record (MVP-8139): the same errno-aware reader, over a scratch tick that nobody counts (the
+ * settle is not a tick read; an error here means no clear, see `settleRevival`).
+ */
+export function settleExeRead(io: TickIo, pid: number): ExeReadErrno {
+  return readExeErrno({ io, loss: newTickLoss() }, "reread", pid);
+}
+
+/** Every process below `root` (not `root` itself), through the counted reads: the walk of `descendants` with its errors classified. */
+export function walkDescendants(root: number, reads: TickReads): number[] {
+  const found: number[] = [];
+  const queue = [root];
+  while (queue.length > 0) {
+    const pid = queue.shift()!;
+    const tasks = tickAttempt(reads, "tree", pid, "task", () => reads.io.readdir(`/proc/${pid}/task`));
+    if (!tasks.ok) continue;
+    for (const tid of tasks.value) {
+      const children = tickAttempt(reads, "tree", pid, "children", () => reads.io.readText(`/proc/${pid}/task/${tid}/children`, "utf8"));
+      if (!children.ok) continue;
+      const text = children.value.trim();
+      if (!text) continue;
+      for (const child of text.split(/\s+/).map(Number)) {
+        found.push(child);
+        queue.push(child);
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * The `abort` seam: once per tick, after the discovery and before the candidates are read. `throw` raises an exception out of the tick callback
+ * (counted as an `abort` lost tick by the sampler); any other value, and a seam that throws, is a natural lost tick through the same exception.
+ */
+export function abortSeam(reads: TickReads, pid: number): void {
+  if (reads.fault === undefined) return;
+  let value: string | undefined;
+  try {
+    value = reads.fault("abort", pid, "tick");
+  } catch {
+    throw Object.assign(new Error("tick read fault seam threw"), { code: "SEAM-THREW" });
+  }
+  if (value === undefined) return;
+  if (!tickFaultAllowed("abort", "tick", value)) throw Object.assign(new Error("refused tick read fault"), { code: "SEAM-INVALID" });
+  reads.loss.abortInjected = true;
+  throw new Error("injected tick abort");
+}
+
+/** `abort:<code>` of an exception that left the tick callback: the error code when it is a plain code word, else `throw`. */
+export function abortRead(error: unknown): string {
+  const code = errnoOf(error);
+  return `abort:${code === "OTHER" ? "throw" : code}`;
+}
+
 type TickRead =
   /** The executable (read twice), command line and start time agreed. */
   | { kind: "stable"; reading: Reading }
@@ -867,14 +1126,14 @@ type TickRead =
  * again, up to three times, and otherwise left to the next tick. `comm` does not take part: the kernel changes it after the
  * command line and the executable at an exec. A process that has vanished or is exiting is `gone`.
  */
-function readTick(first: ProcInfo, firstExe: ExeRead): TickRead {
+function readTick(first: ProcInfo, firstExe: ExeRead, reads: TickReads): TickRead {
   let before = first;
   let exeBefore = firstExe;
   let torn = 0;
   let denied = false;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const after = readProc(first.pid);
-    const exeAfter = readExe(first.pid);
+    const after = readProcOver(reads, "reread", first.pid);
+    const exeAfter = readExeTick(reads, "reread", first.pid);
     if (after === null || after.startTicks !== first.startTicks || exiting(after, exeAfter)) return { kind: "gone", torn: torn + 1 };
     if ("denied" in exeBefore || "denied" in exeAfter) denied = true;
     if ("id" in exeBefore && "id" in exeAfter && exeBefore.id === exeAfter.id && after.cmdline === before.cmdline) return { kind: "stable", reading: { info: after, exeId: exeAfter.id } };
@@ -1513,13 +1772,132 @@ function liveLauncherProof(ancestorPids: number[], infos: Map<number, ProcInfo>,
 /** `<file>:<errno>` of a failed exit read: the file names and the error codes are fixed words, anything else is printed as `other`. */
 const safeExitRead = (value: string): string => (/^(stat|cmdline|exe|thread-field|start-field):[A-Z][A-Z0-9-]{1,23}$/.test(value) ? value : "other");
 
+/** `<kind>:<file>:<errno>` of a lost tick read, or `abort:<code>`: the words and codes are fixed, anything else is printed as `other`. */
+const safeFirstLost = (value: string): string =>
+  /^(?:(?:tree|snapshot|first-exe|reread):(?:task|children|stat|comm|cmdline|exe|exe-id):[A-Z][A-Z0-9-]{1,23}|abort:[A-Za-z][A-Za-z0-9-]{1,23})$/.test(value) ? value : "other";
+
+/** The one text of a window that cannot be assessed: the row, how many ticks were lost and the first lost read. It never contains "precondition not reached". */
+export function notAssessableText(row: string, lostTicks: number, first: string): string {
+  return `not assessable: row ${row}, lost ticks ${lostTicks}, first lost read ${first}`;
+}
+
+/* ------------------------------------------------------------------ */
+/*  The per-worker ledger of sampler windows (MVP-8139)                 */
+/* ------------------------------------------------------------------ */
+
+const LEDGER_SYMBOL = Symbol.for("agent-gateway.sampler-ledger");
+
+/** One sampler window as the verdict hooks see it: registered when the window starts, finalised when it stops. */
+export interface SamplerLedgerEntry {
+  id: number;
+  row: string;
+  /** The key the setup file's `beforeEach` held when the window started (`undefined`: outside a test). */
+  test: string | undefined;
+  running: boolean;
+  natural: number;
+  injected: number;
+  /** The injected lost ticks a row acknowledged after it asserted the exact result (see `acknowledgeLostTicks`). */
+  acknowledged: number;
+  first: string | undefined;
+  /** An `afterEach` or the `afterAll` of the setup file has decided on this window. */
+  drained: boolean;
+  /** Stops the window the way `stop({})` does (prints its lines); the hooks use it for a window a test left running. */
+  stop: () => void;
+}
+
+/**
+ * The ledger lives on `globalThis` under a registered symbol so that the setup file (`src/tests/setup/sampler-verdict.ts`) can read it without
+ * importing this module: a test file without a sampler never loads the helper. The setup file creates the same shape (`current` only) in its `beforeEach`.
+ */
+export interface SamplerLedger {
+  entries: SamplerLedgerEntry[];
+  current: string | undefined;
+  nextId: number;
+}
+
+export function samplerLedger(): SamplerLedger {
+  const holder = globalThis as Record<symbol, SamplerLedger | undefined>;
+  return (holder[LEDGER_SYMBOL] ??= { entries: [], current: undefined, nextId: 1 });
+}
+
+/** The windows that were started in the test that is running now (none outside a test). */
+export function currentTestWindows(): SamplerLedgerEntry[] {
+  const ledger = samplerLedger();
+  return ledger.current === undefined ? [] : ledger.entries.filter((entry) => entry.test === ledger.current);
+}
+
+/** Lost ticks of the windows started in the running test, stopped or not; `stopRunning` stops the running ones first so that no later tick can be lost unseen. */
+export function currentTestLostTicks(options: { stopRunning?: boolean } = {}): { lostTicks: number; first: string } {
+  const windows = currentTestWindows();
+  if (options.stopRunning) for (const entry of windows) if (entry.running) entry.stop();
+  return { lostTicks: windows.reduce((sum, entry) => sum + entry.natural + entry.injected, 0), first: windows.find((entry) => entry.first !== undefined)?.first ?? "none" };
+}
+
+export type VerdictEntry = Pick<SamplerLedgerEntry, "row" | "running" | "natural" | "injected" | "acknowledged" | "first">;
+
+/**
+ * The decision of the global `afterEach`: a window with a natural lost tick, with an injected lost tick that was not acknowledged exactly, or one that
+ * is still running with a lost tick, is not assessable.
+ */
+export function lostTickVerdict(entries: readonly VerdictEntry[]): { problems: string[] } {
+  const problems: string[] = [];
+  for (const entry of entries) {
+    const lost = entry.natural + entry.injected;
+    if (lost > 0 && (entry.running || entry.natural > 0 || entry.injected !== entry.acknowledged)) problems.push(notAssessableText(entry.row, lost, entry.first ?? "none"));
+  }
+  return { problems };
+}
+
+/**
+ * A row that injected lost ticks with `tickReadFault` and asserted the exact result acknowledges them, after the window was stopped. Only an exact
+ * count of injected ticks is accepted; a natural lost tick of the same window (and a seam failure, which counts as natural) stays not assessable.
+ */
+export function acknowledgeLostTicks(sample: Pick<ProcessSample, "windowId">, count: number): void {
+  const entry = samplerLedger().entries.find((candidate) => candidate.id === sample.windowId);
+  if (entry === undefined) throw new Error("acknowledgeLostTicks: no sampler window with this id");
+  if (entry.running) throw new Error("acknowledgeLostTicks: the window is still running");
+  if (count !== entry.injected) throw new Error(`acknowledgeLostTicks: acknowledged ${count} lost tick(s) but ${entry.injected} were injected`);
+  entry.acknowledged = count;
+}
+
+/** The most skipped INVALID rows a run of the file may hide; the next one fails. */
+export const INVALID_SKIP_CAP = 3;
+
+/**
+ * Whether a row whose fixture precondition was not reached may be skipped (and counted by `INVALID-SKIP <row>`): only in a full suite (the caller's
+ * variable), only for a "precondition not reached" message, never when a lost tick was observed in the test, never past the cap. Everything else is a
+ * failure: INVALID is never a pass.
+ */
+export function invalidSkipDecision(input: { fullSuite: boolean; message: string; skippedSoFar: number; lostTicks: number }): "skip" | "fail" {
+  if (!input.fullSuite || input.lostTicks > 0) return "fail";
+  if (!input.message.includes("precondition not reached") || input.message.includes("not assessable")) return "fail";
+  return input.skippedSoFar >= INVALID_SKIP_CAP ? "fail" : "skip";
+}
+
+/**
+ * What an `unknown` or failing revival check means at the settle of a pending record (MVP-8139, N1): a runtime whose settle reading is `unknown`
+ * cannot be checked for a revival (neither the leader-exit guard nor the executable identity can run), and neither can a live reading whose
+ * executable identity read failed with an error that says nothing about the process. Both are `unchecked`: the record expires flagged. A live
+ * reading after a leader exit, or one that runs another executable than at the last proven tick, is `revived`. EACCES (`denied`) and ENOENT/ESRCH
+ * (`gone`) on the executable keep the handling of MVP-8130.
+ */
+export function settleRevival(input: { kind: ExitKind; exeRead: ExeReadErrno | null; provenExeId: string | undefined; sawLeaderExit: boolean }): "revived" | "unchecked" | "none" {
+  if (input.kind === "unknown") return "unchecked";
+  if (input.kind !== "alive") return "none";
+  if (input.sawLeaderExit) return "revived";
+  const read = input.exeRead;
+  if (read === null) return "none";
+  if ("error" in read) return "unchecked";
+  return "id" in read && input.provenExeId !== undefined && read.id !== input.provenExeId ? "revived" : "none";
+}
+
 /** The text a problem line appends for the records, one entry per process. `redactArgv` and the name allowlist already keep
  * every value out; the marker detector is a second check, and a hit withholds the text instead of printing it. */
 export function describeRecords(records: ProcessRecord[], markers: Record<string, string> = {}): string {
   const text = records
     .map((record) => {
       const ns = record.sameNamespaces;
-      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence} own-unreadable=${record.proofFailure.ownUnreadable} reference=${record.proofFailure.reference} chain=${record.proofFailure.chain} reference-ended=${record.proofFailure.referenceEnded} reference-exit=${record.proofFailure.referenceExit} runtime-exit=${record.proofFailure.runtimeExit}${record.proofFailure.exitRead ? ` exit-read=${safeExitRead(record.proofFailure.exitRead)}` : ""}${record.proofFailure.referenceExitRead ? ` reference-exit-read=${safeExitRead(record.proofFailure.referenceExitRead)}` : ""}${record.proofFailure.exitReadInjected ? " exit-read-injected=true" : ""} pending=${record.proofFailure.pending}${record.proofFailure.launcherIdentity !== undefined ? ` launcher-identity=${record.proofFailure.launcherIdentity} launcher-exe=${record.proofFailure.launcherExe} reparented=${record.proofFailure.reparented}` : ""}]` : ""}${record.pending ? ` pending-route=${record.pending.route}` : ""}${record.pending?.revived ? " revived=true" : ""}${record.clearedBy ? ` cleared-by=${record.clearedBy}` : ""}${record.exitConfirmed ? ` exit-confirmed=${record.exitConfirmed.runtime}${record.exitConfirmed.reference ? ` reference-exit-confirmed=${record.exitConfirmed.reference}` : ""}` : ""}${record.provedReferenceCached ? ` proved-reference-cached=${record.provedReferenceCached}` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
+      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence} own-unreadable=${record.proofFailure.ownUnreadable} reference=${record.proofFailure.reference} chain=${record.proofFailure.chain} reference-ended=${record.proofFailure.referenceEnded} reference-exit=${record.proofFailure.referenceExit} runtime-exit=${record.proofFailure.runtimeExit}${record.proofFailure.exitRead ? ` exit-read=${safeExitRead(record.proofFailure.exitRead)}` : ""}${record.proofFailure.referenceExitRead ? ` reference-exit-read=${safeExitRead(record.proofFailure.referenceExitRead)}` : ""}${record.proofFailure.exitReadInjected ? " exit-read-injected=true" : ""} pending=${record.proofFailure.pending}${record.proofFailure.launcherIdentity !== undefined ? ` launcher-identity=${record.proofFailure.launcherIdentity} launcher-exe=${record.proofFailure.launcherExe} reparented=${record.proofFailure.reparented}` : ""}]` : ""}${record.pending ? ` pending-route=${record.pending.route}` : ""}${record.pending?.revived ? " revived=true" : ""}${record.pending?.revivalUnchecked ? " revival-unchecked=true" : ""}${record.tickReadInjected ? " tick-read-injected=true" : ""}${record.clearedBy ? ` cleared-by=${record.clearedBy}` : ""}${record.exitConfirmed ? ` exit-confirmed=${record.exitConfirmed.runtime}${record.exitConfirmed.reference ? ` reference-exit-confirmed=${record.exitConfirmed.reference}` : ""}` : ""}${record.provedReferenceCached ? ` proved-reference-cached=${record.provedReferenceCached}` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
     })
     .join("; ");
   return detect([{ name: "process-records", text }], markers).length > 0 ? "[process records withheld: a marker was detected]" : text;
@@ -1533,6 +1911,7 @@ export function sampleProblems(sample: ProcessSample, markers: Record<string, st
   if (sample.referenceChanged > 0) problems.push(`the reference process's namespaces changed during the window (${sample.referenceChanged} read(s) differed from the cache)`);
   const unexplained = sample.clears.filter((clear) => clear.explanation === "unexplained").map((clear) => clear.record);
   if (unexplained.length > 0) problems.push(`${unexplained.length} process(es) the old rule counted were cleared without an explanation [${describeRecords(unexplained, markers)}]`);
+  if (sample.lostTicks > 0) problems.push(notAssessableText(detect([{ name: "row-id", text: sample.row }], markers).length > 0 ? "withheld" : sample.row, sample.lostTicks, sample.firstLost));
   return problems;
 }
 
@@ -1640,8 +2019,8 @@ export function startProcessSampler(
   gatewayPid: () => number,
   tags: string[] = [],
   intervalMs = 20,
-  seam: { afterStableReading?: (pid: number) => void; afterFailedProof?: (pid: number) => void; afterTick?: (processes: readonly TickProcess[]) => void; exitReadFault?: ExitReadFault } = {},
-): { stop: (markers: Record<string, string>) => ProcessSample; peek: () => ProcessSample } {
+  seam: { afterStableReading?: (pid: number) => void; afterFailedProof?: (pid: number) => void; afterTick?: (processes: readonly TickProcess[]) => void; exitReadFault?: ExitReadFault; tickReadFault?: TickReadFault } = {},
+): { stop: (markers: Record<string, string>, stoppedBy?: "after-each") => ProcessSample; peek: () => ProcessSample } {
   assertProcVisible();
   const known = knownExecutables();
   const windows: ProcessSample["windows"] = {};
@@ -1650,6 +2029,22 @@ export function startProcessSampler(
   const proven = new Set<string>();
   const tracker = createReferenceTracker();
   const rowId = currentRowId();
+  /** Lost ticks of this window, counted once per tick (see `TickLoss`); mirrored into the ledger entry the verdict hooks read. */
+  const lost = { natural: 0, injected: 0, first: undefined as string | undefined, vanished: 0 };
+  const ledger = samplerLedger();
+  const entry: SamplerLedgerEntry = {
+    id: ledger.nextId++,
+    row: rowId,
+    test: ledger.current,
+    running: true,
+    natural: 0,
+    injected: 0,
+    acknowledged: 0,
+    first: undefined,
+    drained: false,
+    stop: () => void stopWindow({}, "after-each"),
+  };
+  ledger.entries.push(entry);
   /** Settles pending records: cleared when the runtime's own exit is confirmed within the bound, expired at the bound or when `final`. */
   const settlePending = (final: boolean): void => {
     const at = Date.now();
@@ -1659,13 +2054,14 @@ export function startProcessSampler(
       // The runtime-side and launcher-ended routes have no reference condition; the reference-ended route also needs the reference confirmed ended.
       const reference = record.pending.route === "reference-ended" ? endedNow(record.pending.reference!.pid, record.pending.reference!.startTicks, seam.exitReadFault) : null;
       // After a leader exit, a reading of the same pid and start time that is alive again means a surviving thread executed a new program: it was never ended.
-      const revivedByLeader = record.pending.sawLeaderExit === true && runtime.kind === "alive";
       // So does a live process that runs another executable than at its last proven tick. The settle reads it by pid, because a runtime that
-      // left the gateway's tree (the launcher-ended route) is read by no tick any more.
-      const exeNow = runtime.kind === "alive" && record.provenExeId !== undefined ? readExe(record.pid) : null;
-      const revivedByExe = exeNow !== null && "id" in exeNow && exeNow.id !== record.provenExeId;
-      const revived = revivedByLeader || revivedByExe;
-      const outcome = revived
+      // left the gateway's tree (the launcher-ended route) is read by no tick any more. A reading that is `unknown`, or an executable read that
+      // fails with an error that says nothing about the process, cannot be checked for a revival at all: the record expires flagged (N1).
+      const exeNow = runtime.kind === "alive" && record.provenExeId !== undefined ? settleExeRead(realTickIo, record.pid) : null;
+      const revival = settleRevival({ kind: runtime.kind, exeRead: exeNow, provenExeId: record.provenExeId, sawLeaderExit: record.pending.sawLeaderExit === true });
+      const revived = revival === "revived";
+      const unchecked = revival === "unchecked";
+      const outcome = revived || unchecked
         ? ("expired" as const)
         : resolvePending({ elapsedMs: at - record.pending.sinceMs, exitConfirmed: runtime.ended, referenceEnded: reference === null || reference.ended, final });
       const sawLeaderExit = record.pending.sawLeaderExit === true || runtime.leaderExitSeen;
@@ -1678,23 +2074,24 @@ export function startProcessSampler(
         unsandboxed: record.unsandboxed || outcome === "expired" || outcome === "expired-reference",
         clearedBy: outcome === "cleared" ? record.pending.route : record.clearedBy,
         exitConfirmed: outcome === "cleared" ? { runtime: runtime.kind, reference: reference?.kind } : record.exitConfirmed,
-        pending: { ...record.pending, state: outcome, sawLeaderExit, ...(revived ? { revived: true } : {}) },
+        pending: { ...record.pending, state: outcome, sawLeaderExit, ...(revived ? { revived: true } : {}), ...(unchecked ? { revivalUnchecked: true } : {}) },
         proofFailure: record.proofFailure ? { ...record.proofFailure, pending: outcome } : record.proofFailure,
       });
     }
   };
-  const timer = setInterval(() => {
+  const tick = (reads: TickReads): void => {
     settlePending(false);
     const root = gatewayPid();
     const reference = tracker.begin(root);
     const infos = new Map<number, ProcInfo>();
     const firstExes = new Map<number, ExeRead>();
-    for (const pid of descendants(root)) {
-      const info = readProc(pid);
+    for (const pid of walkDescendants(root, reads)) {
+      const info = readProcOver(reads, "snapshot", pid);
       if (!info) continue;
       infos.set(pid, info);
-      if (namesRuntime(info)) firstExes.set(pid, readExe(pid));
+      if (namesRuntime(info)) firstExes.set(pid, readExeTick(reads, "first-exe", pid));
     }
+    abortSeam(reads, root);
     const now = Date.now();
     /** When a test seam last returned in this tick (null: no seam ran, which is every real run). */
     let seamReturnedAt: number | null = null;
@@ -1712,7 +2109,7 @@ export function startProcessSampler(
         const oldCounted = oldCandidate && info.comm !== "bwrap";
         const key = `${info.pid}:${info.startTicks}`;
         const prior = records.get(key);
-        const read = readTick(info, firstExes.get(info.pid)!);
+        const read = readTick(info, firstExes.get(info.pid)!, reads);
         const ancestorPids: number[] = [];
         for (let up = infos.get(info.ppid); up; up = infos.get(up.ppid)) ancestorPids.push(up.pid);
         // A descendant inherits the namespaces of an ancestor that has the proof (it cannot leave them without capabilities).
@@ -1897,6 +2294,7 @@ export function startProcessSampler(
           launcherIdentity,
           provedReferenceCached: provedReferenceCached > 0 ? provedReferenceCached : undefined,
           inconsistentReads: (prior?.inconsistentReads ?? 0) + (read.kind === "stable" ? 0 : read.torn),
+          tickReadInjected: prior?.tickReadInjected === true || reads.loss.injected ? true : undefined,
           fate: "running",
         });
       }
@@ -1912,6 +2310,23 @@ export function startProcessSampler(
       } catch {
         // An observer must not end the sampler or change a verdict.
       }
+    }
+  };
+  const timer = setInterval(() => {
+    const loss = newTickLoss();
+    try {
+      tick({ io: realTickIo, fault: seam.tickReadFault, loss });
+    } catch (error) {
+      // An exception that left the tick callback before its records were written: the tick is lost (the window is not assessable) and the sampler goes on.
+      noteLost(loss, abortRead(error), loss.abortInjected);
+    } finally {
+      lost.vanished += loss.vanished;
+      if (loss.natural) lost.natural += 1;
+      else if (loss.injected) lost.injected += 1;
+      if (loss.natural || loss.injected) lost.first ??= safeFirstLost(loss.first!);
+      entry.natural = lost.natural;
+      entry.injected = lost.injected;
+      entry.first = lost.first;
     }
   }, intervalMs);
   const snapshot = (final = false): ProcessSample => {
@@ -1943,56 +2358,67 @@ export function startProcessSampler(
       windows: { ...windows },
       records: all,
       clears,
+      row: rowId,
+      windowId: entry.id,
+      lostTicks: lost.natural + lost.injected,
+      lostTicksInjected: lost.injected,
+      firstLost: lost.first ?? "none",
+      vanishedReads: lost.vanished,
     };
   };
-  return {
-    peek: () => snapshot(false),
-    stop: (markers) => {
-      clearInterval(timer);
-      const sample = snapshot(true);
-      for (const clear of sample.clears) emit(`SECURITY-PROCESS-AUDIT ${kv({ pid: clear.record.pid, explanation: clear.explanation, record: describeRecords([clear.record], markers) })}`);
-      if (sample.records.length > 0) {
-        const count = (match: (record: ProcessRecord) => boolean): number => sample.records.filter(match).length;
-        // Counts only: how the candidates of this window ended up, and why the unresolved ones are unresolved.
-        emit(
-          `SECURITY-PROCESS-SUMMARY ${kv({
-            records: sample.records.length,
-            runtime: count((record) => record.verdict === "runtime"),
-            launcher: count((record) => record.verdict === "launcher"),
-            other: count((record) => record.verdict === "other"),
-            descendant: count((record) => record.verdict === "descendant"),
-            unresolved: count((record) => record.verdict === "unresolved"),
-            unresolved_unreadable: count((record) => record.verdict === "unresolved" && record.firstMissingProof?.startsWith("executable unreadable") === true),
-            unresolved_torn: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads > 0),
-            unresolved_unread: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads === 0),
-            flagged_unreadable: count((record) => record.firstMissingProof?.startsWith("executable unreadable") === true),
-            failed_exiting: count((record) => record.proofFailure?.failedWhile === "exiting"),
-            failed_alive: count((record) => record.proofFailure?.failedWhile === "alive"),
-            failed_own_proof: count((record) => record.proofFailure?.ownProof === true),
-            failed_launcher_proof: count((record) => record.proofFailure?.launcherProof === true),
-            failed_escape_evidence: count((record) => record.proofFailure?.escapeEvidence === true),
-            exit_cleared_own: sample.clears.filter((clear) => clear.explanation.endsWith("(own)")).length,
-            exit_cleared_launcher: sample.clears.filter((clear) => clear.explanation.endsWith("(launcher)")).length,
-            exit_cleared_reference: sample.clears.filter((clear) => clear.explanation.endsWith("; runtime exit confirmed")).length,
-            exit_cleared_runtime_ending: sample.clears.filter((clear) => clear.explanation.endsWith("(leader exited first)")).length,
-            exit_cleared_launcher_ended: sample.clears.filter((clear) => clear.record.clearedBy === "launcher-ended").length,
-            failed_launcher_reparented: count((record) => record.proofFailure?.reparented === true),
-            pending_expired: count((record) => record.pending?.state === "expired" || record.pending?.state === "expired-reference"),
-            proved_reference_cached: sample.records.reduce((sum, record) => sum + (record.provedReferenceCached ?? 0), 0),
-            failed_reference_cached: count((record) => record.proofFailure?.reference === "cached"),
-            failed_reference_missing: count((record) => record.proofFailure?.reference === "missing"),
-            failed_own_unreadable: count((record) => record.proofFailure !== undefined && record.proofFailure.ownUnreadable !== "none"),
-            failed_chain_broken: count((record) => record.proofFailure?.chain === "broken"),
-            reference_changed: sample.referenceChanged,
-            // The row this window belongs to and how many of its records stayed flagged: the evidence compares it with the row's expectation.
-            row: detect([{ name: "row-id", text: rowId }], markers).length > 0 ? "withheld" : rowId,
-            flagged: sample.unsandboxedRuntimes.length,
-          })}`,
-        );
-      }
-      return sample;
-    },
+  const stopWindow = (markers: Record<string, string>, stoppedBy?: "after-each"): ProcessSample => {
+    clearInterval(timer);
+    entry.running = false;
+    const sample = snapshot(true);
+    for (const clear of sample.clears) emit(`SECURITY-PROCESS-AUDIT ${kv({ pid: clear.record.pid, explanation: clear.explanation, record: describeRecords([clear.record], markers) })}`);
+    // A window with a lost tick prints its line even without a record: a tree walk lost before the first discovery leaves none.
+    if (sample.records.length > 0 || sample.lostTicks > 0) {
+      const count = (match: (record: ProcessRecord) => boolean): number => sample.records.filter(match).length;
+      // Counts only: how the candidates of this window ended up, and why the unresolved ones are unresolved.
+      emit(
+        `SECURITY-PROCESS-SUMMARY ${kv({
+          records: sample.records.length,
+          runtime: count((record) => record.verdict === "runtime"),
+          launcher: count((record) => record.verdict === "launcher"),
+          other: count((record) => record.verdict === "other"),
+          descendant: count((record) => record.verdict === "descendant"),
+          unresolved: count((record) => record.verdict === "unresolved"),
+          unresolved_unreadable: count((record) => record.verdict === "unresolved" && record.firstMissingProof?.startsWith("executable unreadable") === true),
+          unresolved_torn: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads > 0),
+          unresolved_unread: count((record) => record.verdict === "unresolved" && record.firstMissingProof === undefined && record.inconsistentReads === 0),
+          flagged_unreadable: count((record) => record.firstMissingProof?.startsWith("executable unreadable") === true),
+          failed_exiting: count((record) => record.proofFailure?.failedWhile === "exiting"),
+          failed_alive: count((record) => record.proofFailure?.failedWhile === "alive"),
+          failed_own_proof: count((record) => record.proofFailure?.ownProof === true),
+          failed_launcher_proof: count((record) => record.proofFailure?.launcherProof === true),
+          failed_escape_evidence: count((record) => record.proofFailure?.escapeEvidence === true),
+          exit_cleared_own: sample.clears.filter((clear) => clear.explanation.endsWith("(own)")).length,
+          exit_cleared_launcher: sample.clears.filter((clear) => clear.explanation.endsWith("(launcher)")).length,
+          exit_cleared_reference: sample.clears.filter((clear) => clear.explanation.endsWith("; runtime exit confirmed")).length,
+          exit_cleared_runtime_ending: sample.clears.filter((clear) => clear.explanation.endsWith("(leader exited first)")).length,
+          exit_cleared_launcher_ended: sample.clears.filter((clear) => clear.record.clearedBy === "launcher-ended").length,
+          failed_launcher_reparented: count((record) => record.proofFailure?.reparented === true),
+          pending_expired: count((record) => record.pending?.state === "expired" || record.pending?.state === "expired-reference"),
+          proved_reference_cached: sample.records.reduce((sum, record) => sum + (record.provedReferenceCached ?? 0), 0),
+          failed_reference_cached: count((record) => record.proofFailure?.reference === "cached"),
+          failed_reference_missing: count((record) => record.proofFailure?.reference === "missing"),
+          failed_own_unreadable: count((record) => record.proofFailure !== undefined && record.proofFailure.ownUnreadable !== "none"),
+          failed_chain_broken: count((record) => record.proofFailure?.chain === "broken"),
+          reference_changed: sample.referenceChanged,
+          lost_ticks: sample.lostTicks,
+          lost_ticks_injected: sample.lostTicksInjected,
+          first_lost: sample.firstLost,
+          revival_unchecked: count((record) => record.pending?.revivalUnchecked === true),
+          // The row this window belongs to and how many of its records stayed flagged: the evidence compares it with the row's expectation.
+          row: detect([{ name: "row-id", text: rowId }], markers).length > 0 ? "withheld" : rowId,
+          flagged: sample.unsandboxedRuntimes.length,
+          stopped_by: stoppedBy,
+        })}`,
+      );
+    }
+    return sample;
   };
+  return { peek: () => snapshot(false), stop: stopWindow };
 }
 
 function ipv4FromHex(hex: string): string {
@@ -2852,7 +3278,10 @@ export function finishRow(recorder: MatrixRecorder, rig: SecurityRig, row: RowIn
   const problems = [...row.problems, ...(thin.length > 0 ? [`below the byte floor: [${thin.join(", ")}]`] : [])];
   const observed: RowExpectation = hits.length === 0 && problems.length === 0 ? "pass" : "fail";
   const expected = row.expected ?? "pass";
-  recorder.record({ id: row.id, mode: row.mode, expected, observed, hits: hits.length, durationMs: row.durationMs, deadlineMs: row.deadlineMs, surfaces: row.surfaces, controls: row.controls });
+  const lost = currentTestLostTicks();
+  recorder.record({ id: row.id, mode: row.mode, expected, observed, hits: hits.length, durationMs: row.durationMs, deadlineMs: row.deadlineMs, surfaces: row.surfaces, controls: row.controls, lostTicks: lost.lostTicks });
+  // A lost tick makes the row not assessable for any expectation: a negative control that did not observe its window proved nothing.
+  if (lost.lostTicks > 0) throw new Error(`security row ${row.id}: not assessable: lost ticks ${lost.lostTicks}, first lost read ${lost.first}`);
   if (observed === "fail" && expected === "pass") {
     throw new Error(`security row ${row.id}: hits=${hits.length}${hits.length > 0 ? ` [${hits.join(", ")}]` : ""}${problems.length > 0 ? `; ${problems.join("; ")}` : ""}`);
   }

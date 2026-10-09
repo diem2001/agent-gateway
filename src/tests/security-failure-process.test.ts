@@ -38,6 +38,7 @@ import { descendants, gatewayRequest, type Cleanup } from "./helpers/git-process
 import {
   MatrixRecorder,
   TURN_DEADLINE_MS,
+  acknowledgeLostTicks,
   chatTurn,
   conversationDirs,
   createMarkers,
@@ -234,7 +235,7 @@ async function wrapperRig(startupTimeoutMs: number = STARTUP_TIMEOUT_MS): Promis
 /* ------------------------------------------------------------------ */
 
 /** The failure window: a process sampler, an egress sampler and the counters every row compares afterwards. */
-function windowOf(rig: SecurityRig, tags: string[] = [], seam: { afterStableReading?: (pid: number) => void } = {}) {
+function windowOf(rig: SecurityRig, tags: string[] = [], seam: Parameters<typeof startProcessSampler>[3] = {}) {
   const processes = startProcessSampler(() => rig.gateway.child.pid!, tags, 20, seam);
   const egress = startEgressSampler(() => rig.gateway.child.pid!);
   return {
@@ -1359,6 +1360,55 @@ describe("sampler and refusal-check controls", () => {
     expect(problems).toEqual(expect.arrayContaining(["the user-credential refusal was not the exact fixed failure", "the gateway-credential refusal was not the exact fixed failure", "the relay's audit lines for the refusals are missing"]));
     // Two calls each waited the bound for a line that never came, so the poll ended and the absence was reported.
     expect(Date.now() - started).toBeGreaterThanOrEqual(AUDIT_WAIT_MS);
+  });
+});
+
+
+/* ------------------------------------------------------------------ */
+/*  The lost-tick verdict on the real gateway (MVP-8139)                */
+/* ------------------------------------------------------------------ */
+
+describe("lost-tick verdict (MVP-8139)", () => {
+  it("LT-gateway: a normal sandboxed run with the real gateway and the native runtime, one tick of the sampler loses its tree walk while the runtime is alive: the row fails as not assessable with its id, one lost tick and the read, and flags nothing", async () => {
+    const rig = await newRig();
+    const started = Date.now();
+    // The seam arms itself once a `claude` process was in a tick's snapshot and fails the next walk of the gateway's task listing, once.
+    const watch = { runtimeSeen: false, fired: false, firedAtMs: 0, aliveAfter: false };
+    const window = windowOf(rig, [], {
+      tickReadFault: (kind, pid, file) => {
+        if (!watch.runtimeSeen || watch.fired || kind !== "tree" || file !== "task" || pid !== rig.gateway.child.pid) return undefined;
+        watch.fired = true;
+        watch.firedAtMs = Date.now();
+        return "EMFILE";
+      },
+      afterTick: (processes) => {
+        if (!processes.some((candidate) => candidate.comm === "claude" || path.basename(candidate.argv[0] ?? "") === "claude")) return;
+        if (!watch.runtimeSeen) watch.runtimeSeen = true;
+        else if (watch.fired) watch.aliveAfter = true;
+      },
+    });
+    const turn = await chatTurn(rig, { prompt: "LT-GATEWAY", sessionId: "conv-lt-gateway", steps: [bashStep("sleep 3; echo LT-GATEWAY-DONE")], withCredentials: false });
+    const { sample } = window.close();
+    expect(watch.runtimeSeen && watch.aliveAfter, "precondition not reached: a claude process in a tick snapshot before and after the injected tick (the runtime was alive across it)").toBe(true);
+    expect(watch.fired, "the injected read was made").toBe(true);
+    expect(sample.records.some((record) => record.lastMs > watch.firedAtMs), "the sampler wrote the runtime's record after the injected tick").toBe(true);
+    expect(sample.lostTicks).toBe(1);
+    expect(sample.lostTicksInjected).toBe(1);
+    expect(sample.firstLost).toBe("tree:task:EMFILE");
+    expect(sample.unsandboxedRuntimes, "flagged=0: a lost tick changes no verdict").toEqual([]);
+    const lines: string[] = [];
+    const ltRecorder = new MatrixRecorder("security-lost-tick", ["LT-gateway"], (line) => {
+      lines.push(line);
+      emit(line);
+    });
+    const problems = [...turnProblems(turn), ...sampleProblems(sample, rig.markers.values)];
+    expect(problems, "the sampler's own problem text names the row, the count and the read").toEqual([`not assessable: row ${sample.row}, lost ticks 1, first lost read tree:task:EMFILE`]);
+    expect(() =>
+      finishRow(ltRecorder, rig, { id: "LT-gateway", durationMs: Date.now() - started, deadlineMs: TURN_DEADLINE_MS, surfaces: surfacesOf(rig, [turn]), controls: ["runtime_alive_across_the_injected_tick"], problems, floors: { "tool-results": 5 } }),
+    ).toThrow(/security row LT-gateway: not assessable: lost ticks 1, first lost read tree:task:EMFILE/);
+    expect(lines[0]).toContain("id=LT-gateway expected=pass observed=fail result=not-assessable lost_ticks=1");
+    expect(ltRecorder.summary()).toMatchObject({ fail: 1, lostTicks: 1, notAssessable: 1 });
+    acknowledgeLostTicks(sample, 1);
   });
 });
 
