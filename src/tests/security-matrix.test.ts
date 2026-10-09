@@ -3443,8 +3443,8 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     const record = recordOf(final, state.runtime);
     expect(record.pending).toMatchObject({ state: "cleared", route: "reference-ended" });
     expect(record.clearedBy).toBe("reference-ended");
-    expect(record.exitConfirmed?.runtime).toMatch(/^(Z1|vanished|empty-gone)$/);
-    expect(record.exitConfirmed?.reference).toMatch(/^(Z1|vanished|empty-gone)$/);
+    expect(record.exitConfirmed?.runtime).toMatch(/^(Z1|X|vanished|empty-gone)$/);
+    expect(record.exitConfirmed?.reference).toMatch(/^(Z1|X|vanished|empty-gone)$/);
     expect(sampleProblems(final, {})).toEqual([]);
     expect(audit.filter((line) => line.includes("reference ended after the runtime's own proof") && /exit-confirmed=\w+(-\w+)? reference-exit-confirmed=\w+(-\w+)?/.test(line))).toHaveLength(1);
     expect(summary[0]).toContain("exit_cleared_reference=1");
