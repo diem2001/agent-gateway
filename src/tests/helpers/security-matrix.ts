@@ -580,7 +580,24 @@ export interface ProcessRecord {
    * not flagged yet, `waiting` until the runtime's own exit is confirmed (`cleared`) or the bound passes (`expired`, flagged for
    * good). A waiting record counts as flagged in every snapshot.
    */
-  pending?: { state: "waiting" | "cleared" | "expired" | "expired-reference"; sinceMs: number; route: "reference-ended" | "runtime-ending" | "launcher-ended"; reference?: { pid: number; startTicks: string } };
+  pending?: {
+    state: "waiting" | "cleared" | "expired" | "expired-reference";
+    sinceMs: number;
+    route: "reference-ended" | "runtime-ending" | "launcher-ended";
+    reference?: { pid: number; startTicks: string };
+    /**
+     * Any reading of the runtime at the entry or at a settle showed the leader-exit signature (`Zn`, `empty-n`, or `X`/`Z` with a
+     * count other than 1). Once set, a later `alive` reading of the same pid and start time is a revival (a surviving thread
+     * executed a new program); so is a live reading at a settle whose executable differs from the one at the last proven tick.
+     */
+    sawLeaderExit?: boolean;
+    /** The record was expired at once because it was revived: it never clears and never ends a flag. */
+    revived?: boolean;
+  };
+  /** What confirmed the exit when this record was cleared (kinds only): the runtime's, and the reference's on the reference-ended route. */
+  exitConfirmed?: { runtime: ExitKind; reference?: ExitKind };
+  /** Device and inode of the executable at the last proven tick (never printed): a pending record whose live process runs another one was revived. */
+  provenExeId?: string;
   /**
    * The runtime's direct parent as of its last proven tick (MVP-8125): its pid and start time when that parent's executable is the
    * real bwrap (the inner bwrap that is pid 1 of the sandbox), else `none`. Overwritten on every proven tick, so a record never
@@ -609,6 +626,11 @@ export interface ProofFailure {
   /** How the reference looked on that re-read (`Zn` is a zombie leader whose threads still show). */
   referenceExit: ExitKind;
   runtimeExit: ExitKind;
+  /** `<file>:<errno>` of the failed read behind an `unknown` runtime or reference exit read on the first failing tick (names and codes only). */
+  exitRead?: string;
+  referenceExitRead?: string;
+  /** The exit read seam changed a read on the first failing tick. */
+  exitReadInjected?: boolean;
   pending: "none" | "waiting" | "cleared" | "expired" | "expired-reference";
   /** MVP-8125, set on the first failing tick: whether the runtime's direct parent is the one recorded at a proven tick (`changed`: same pid, other start time). */
   launcherIdentity?: "verified" | "changed" | "none";
@@ -986,61 +1008,296 @@ function sandboxProof(
   };
 }
 
-/** What one re-read of a process whose proof just failed showed (see `exitConfirmed`). */
+/** The files of one exit reading whose failure is named in a diagnostic (`stat` also covers a stat text that cannot be parsed). */
+export type ExitFile = "stat" | "cmdline" | "exe" | "thread-field" | "start-field";
+
+/** What one full re-read of a process whose proof just failed showed (see `exitConfirmed`). */
 export interface ExitReading {
-  /** `/proc/<pid>` could not be read any more. */
+  /** `/proc/<pid>/stat` could not be read any more (ENOENT or ESRCH). */
   vanished: boolean;
   /** The pid now belongs to a process with another start time. */
   startChanged: boolean;
   /** Field 3 of `/proc/<pid>/stat`. */
   state: string;
-  /** `Threads:` of `/proc/<pid>/status`. */
+  /** Field 20 (`num_threads`) of the same `/proc/<pid>/stat` read that gave the state and the start time. */
   threads: number;
   cmdline: string;
-  /** `/proc/<pid>/exe`: gone (ENOENT), unreadable while alive (EACCES) or readable. */
+  /** `/proc/<pid>/exe`: gone (ENOENT or ESRCH), unreadable while alive (EACCES) or readable. */
   exe: "gone" | "denied" | "readable";
+  /** A read failed with any other error, or a field was missing or not numeric: nothing is proven (kind `unknown`). */
+  unknown?: { file: ExitFile; errno: string };
+}
+
+/** How a process looked on one re-read, as an enum for the diagnostics (`Zn` and `empty-n` are a leader that finished while other threads run). */
+export type ExitKind = "vanished" | "start-changed" | "X" | "Z1" | "Zn" | "empty-gone" | "empty-n" | "alive" | "unknown";
+
+/**
+ * Each confirmed kind rests on a kernel fact that all threads are gone: `vanished` (the stat read fails with ENOENT or ESRCH: the
+ * pid is released only after its thread group is empty, and an exec swaps the thread id in one step), `start-changed` (the pid was
+ * freed and reused; an exec keeps the start time), and `X`, `Z1`, `empty-gone` with a thread count of exactly 1 read from the same
+ * stat text as the state (a leader that is dead or a zombie while other threads run shows 2 or more, a task already released 0).
+ */
+const CONFIRMED_EXIT_KINDS: ReadonlySet<ExitKind> = new Set<ExitKind>(["vanished", "start-changed", "X", "Z1", "empty-gone"]);
+
+export function isConfirmedExit(kind: ExitKind): boolean {
+  return CONFIRMED_EXIT_KINDS.has(kind);
+}
+
+/** Whether the reference's state opens a pending record: anything but a live process or a reading that proves nothing. */
+export function isReferenceEnding(kind: ExitKind): boolean {
+  return kind !== "alive" && kind !== "unknown";
 }
 
 /**
- * Whether a process is confirmed to be ending: vanished, a new start time, state `X`, state `Z` with at most one thread
- * (a thread-group leader that exited while other threads run is not ending), or an empty command line and a missing
- * executable together. A live process that blanks its own command line is not ending. Stricter than `exiting`, which
+ * Whether a process is confirmed to be ending: vanished, a new start time, state `X`, state `Z`, or an empty command line with
+ * a missing executable, the last three only with a thread count of exactly one (a thread-group leader that exited while other
+ * threads run is not ending). A live process that blanks its own command line is not ending. Stricter than `exiting`, which
  * only decides whether a reading is usable.
  */
 export function exitConfirmed(reading: ExitReading): boolean {
-  const kind = exitKind(reading);
-  return kind !== "alive" && kind !== "Zn";
+  return isConfirmedExit(exitKind(reading));
 }
-
-/** How a process looked on one re-read, as an enum for the diagnostics (`Zn` is a zombie leader whose threads still run). */
-export type ExitKind = "vanished" | "start-changed" | "X" | "Z1" | "Zn" | "empty-gone" | "alive";
 
 export function exitKind(reading: ExitReading): ExitKind {
   if (reading.vanished) return "vanished";
   if (reading.startChanged) return "start-changed";
-  if (reading.state === "X") return "X";
-  if (reading.state === "Z") return reading.threads <= 1 ? "Z1" : "Zn";
-  return reading.cmdline === "" && reading.exe === "gone" ? "empty-gone" : "alive";
-}
-
-/** Whether the process with this pid and start time is confirmed to be ending (used for the reference and for a pending runtime). */
-export function endedNow(pid: number, startTicks: string): { ended: boolean; kind: ExitKind; zombieLeader: boolean } {
-  const reading = readExitReading(pid, startTicks);
-  const kind = exitKind(reading);
-  return { ended: kind !== "alive" && kind !== "Zn", kind, zombieLeader: runtimeLeaderExited(reading) };
+  if (reading.unknown !== undefined) return "unknown";
+  if (reading.state === "X") return reading.threads === 1 ? "X" : "unknown";
+  if (reading.state === "Z") return reading.threads === 1 ? "Z1" : reading.threads > 1 ? "Zn" : "unknown";
+  if (reading.cmdline === "" && reading.exe === "gone") return reading.threads === 1 ? "empty-gone" : reading.threads > 1 ? "empty-n" : "unknown";
+  return "alive";
 }
 
 /**
- * Condition 2 of the runtime-side route: the process is a zombie thread-group leader whose other threads still show (`Z` with more
- * than one thread). A live process (running or sleeping, with its command line) is never that; a confirmed exit (`Z` with one
- * thread, vanished, `X`) is not that either and is cleared by the own-proof route at once.
+ * What a failed read of one file means. `stat`: ENOENT and ESRCH are `vanished`, any other error `unknown`. `cmdline`: always
+ * `unknown` (a failed command line read next to a readable stat is a race that the stat of the next reading decides; it is never
+ * `vanished` by itself). `exe`: ENOENT and ESRCH are `gone` (the memory is released), EACCES is `denied` (alive, unchanged), any
+ * other error `unknown`.
  */
-export function runtimeLeaderExited(reading: ExitReading): boolean {
-  return exitKind(reading) === "Zn";
+export function exitReadOutcome(file: "stat" | "cmdline" | "exe", errno: string): "vanished" | "gone" | "denied" | "unknown" {
+  const gone = errno === "ENOENT" || errno === "ESRCH";
+  if (file === "stat") return gone ? "vanished" : "unknown";
+  if (file === "cmdline") return "unknown";
+  if (gone) return "gone";
+  return errno === "EACCES" ? "denied" : "unknown";
 }
 
+/** The reads of one exit reading. `status` is never read by the reader (the thread count comes from the stat text); it exists so a row's double can prove that. */
+export interface ExitSource {
+  stat(pid: number): string;
+  cmdline(pid: number): string;
+  status(pid: number): string;
+  /** `denied` for EACCES, `gone` for ENOENT/ESRCH (also from the identity of the executable); any other error is thrown. */
+  exe(pid: number): "readable" | "denied" | "gone";
+}
+
+const errnoOf = (error: unknown): string => {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && /^[A-Z][A-Z0-9-]{1,23}$/.test(code) ? code : "OTHER";
+};
+
+/** The executable read of an exit reading over two file calls (the link, then its identity); a row passes doubles for both. */
+export function exeReaderOver(io: { readlink: (file: string) => string; stat: (file: string) => unknown }): ExitSource["exe"] {
+  return (pid) => {
+    try {
+      io.readlink(`/proc/${pid}/exe`);
+    } catch (error) {
+      const outcome = exitReadOutcome("exe", errnoOf(error));
+      if (outcome === "gone" || outcome === "denied") return outcome;
+      throw error;
+    }
+    try {
+      io.stat(`/proc/${pid}/exe`);
+    } catch (error) {
+      const code = errnoOf(error);
+      if (code === "ENOENT" || code === "ESRCH") return "gone";
+      // A failed identity read after a readable link is no proof of anything, EACCES included.
+      throw Object.assign(new Error("exe identity"), { code: code === "EACCES" ? "EACCES-ID" : code });
+    }
+    return "readable";
+  };
+}
+
+export const realExitSource: ExitSource = {
+  stat: (pid) => fs.readFileSync(`/proc/${pid}/stat`, "utf8"),
+  cmdline: (pid) => fs.readFileSync(`/proc/${pid}/cmdline`).toString("latin1"),
+  status: (pid) => fs.readFileSync(`/proc/${pid}/status`, "utf8"),
+  exe: exeReaderOver({ readlink: (file) => fs.readlinkSync(file), stat: (file) => fs.statSync(file) }),
+};
+
+/**
+ * Test seam of the sampler's exit reads (default none): called before each read of `stat`, `cmdline` or `exe` of an exit reading
+ * and returns an errno code to fail that read with, or undefined. It can only push a reading toward `unknown`: only EIO, EMFILE,
+ * ENFILE, ENOMEM, EPERM and (on stat and cmdline) EACCES are accepted; ENOENT, ESRCH and anything else is a test error and reads
+ * as `unknown` (`SEAM-INVALID`), and so does a seam that throws (`SEAM-THREW`), never as "no fault". It never injects content.
+ */
+export type ExitReadFault = (pid: number, file: "stat" | "cmdline" | "exe") => string | undefined;
+
+const SEAM_ERRNOS: ReadonlySet<string> = new Set(["EIO", "EMFILE", "ENFILE", "ENOMEM", "EPERM", "EACCES"]);
+
+export function exitFaultAllowed(file: "stat" | "cmdline" | "exe", errno: string): boolean {
+  return SEAM_ERRNOS.has(errno) && !(file === "exe" && errno === "EACCES");
+}
+
+function faultedSource(source: ExitSource, fault: ExitReadFault | undefined, note: { injected: boolean }): ExitSource {
+  if (fault === undefined) return source;
+  const check = (pid: number, file: "stat" | "cmdline" | "exe"): void => {
+    let code: string | undefined;
+    try {
+      code = fault(pid, file);
+    } catch {
+      note.injected = true;
+      throw Object.assign(new Error("exit read fault seam threw"), { code: "SEAM-THREW" });
+    }
+    if (code === undefined) return;
+    note.injected = true;
+    throw Object.assign(new Error("injected exit read fault"), { code: exitFaultAllowed(file, code) ? code : "SEAM-INVALID" });
+  };
+  return {
+    stat: (pid) => (check(pid, "stat"), source.stat(pid)),
+    cmdline: (pid) => (check(pid, "cmdline"), source.cmdline(pid)),
+    status: (pid) => source.status(pid),
+    exe: (pid) => (check(pid, "exe"), source.exe(pid)),
+  };
+}
+
+const unknownReading = (file: ExitFile, errno: string, partial: Partial<ExitReading> = {}): ExitReading => ({ vanished: false, startChanged: false, state: "", threads: 0, cmdline: "", exe: "readable", unknown: { file, errno }, ...partial });
+
+/**
+ * One full reading: `/proc/<pid>/stat` first (state, thread count and start time all come from that one text), then the command
+ * line, then the executable. Errors are mapped by `exitReadOutcome`; a missing or non-numeric thread or start field is `unknown`.
+ */
+export function readExitReadingFrom(source: ExitSource, pid: number, startTicks: string): ExitReading {
+  let text: string;
+  try {
+    text = source.stat(pid);
+  } catch (error) {
+    const errno = errnoOf(error);
+    return exitReadOutcome("stat", errno) === "vanished" ? { vanished: true, startChanged: false, state: "", threads: 0, cmdline: "", exe: "gone" } : unknownReading("stat", errno);
+  }
+  const close = text.lastIndexOf(")");
+  const fields = close < 0 ? [] : text.slice(close + 2).split(" ");
+  const [state, count, start] = [fields[0], fields[17], fields[19]];
+  if (state === undefined || !/^[A-Za-z]$/.test(state)) return unknownReading("stat", "PARSE");
+  if (start === undefined || !/^\d+$/.test(start)) return unknownReading("start-field", "PARSE", { state });
+  if (count === undefined || !/^\d+$/.test(count)) return unknownReading("thread-field", "PARSE", { state });
+  const threads = Number(count);
+  if (start !== startTicks) return { vanished: false, startChanged: true, state, threads, cmdline: "", exe: "gone" };
+  let cmdline: string;
+  try {
+    cmdline = source.cmdline(pid).replace(/\0/g, " ");
+  } catch (error) {
+    const code = errnoOf(error);
+    return exitReadOutcome("cmdline", code) === "vanished" ? { vanished: true, startChanged: false, state: "", threads: 0, cmdline: "", exe: "gone" } : unknownReading("cmdline", code, { state, threads });
+  }
+  try {
+    return { vanished: false, startChanged: false, state, threads, cmdline, exe: source.exe(pid) };
+  } catch (error) {
+    const code = errnoOf(error);
+    const outcome = exitReadOutcome("exe", code);
+    return outcome === "gone" || outcome === "denied" ? { vanished: false, startChanged: false, state, threads, cmdline, exe: outcome } : unknownReading("exe", code, { state, threads, cmdline });
+  }
+}
+
+/** Pairs of full readings the bracket may take before it must decide. */
+export const EXIT_PAIRS = 3;
+
+const zeroCount = (reading: ExitReading): boolean => !reading.vanished && !reading.startChanged && reading.unknown === undefined && reading.threads === 0;
+
+/** A command line read that failed with ENOENT or ESRCH next to a readable stat: the process was released between the two reads, so the next stat decides. */
+const raceSignature = (reading: ExitReading): boolean => reading.unknown !== undefined && reading.unknown.file === "cmdline" && (reading.unknown.errno === "ENOENT" || reading.unknown.errno === "ESRCH");
+
+const settledAlone = (reading: ExitReading): ExitKind | null => (reading.vanished ? "vanished" : reading.startChanged ? "start-changed" : null);
+
+function decidePair(a: ExitReading, b: ExitReading, last: boolean): ExitKind | null {
+  // A count of 0 (a task already released) and a released-between-reads error are re-read first: the next stat normally fails with ENOENT.
+  if (zeroCount(a) || zeroCount(b) || raceSignature(a) || raceSignature(b)) return last ? "unknown" : null;
+  const [first, second] = [exitKind(a), exitKind(b)];
+  if (first === "unknown" || second === "unknown") return "unknown";
+  if (first === second) return first;
+  if (!last) return null;
+  // A disagreement never yields a confirmed exit unless both readings were confirmed (then the later one).
+  if (isConfirmedExit(first) && isConfirmedExit(second)) return second;
+  return isConfirmedExit(first) ? second : isConfirmedExit(second) ? first : second;
+}
+
+/**
+ * The exit decision from up to three pairs of full readings. A `vanished` or `start-changed` reading decides at once (both facts
+ * are monotone). Otherwise a pair decides when neither reading has a count of 0 or a released-between-reads error, no reading is
+ * `unknown`, and both agree; a pair that disagrees or holds such a reading is read again. After the third pair a count of 0 or a
+ * race is `unknown`, and a disagreement never yields a confirmed exit unless both kinds were confirmed.
+ */
+export function exitBracket(read: () => ExitReading): { kind: ExitKind; readings: ExitReading[] } {
+  const readings: ExitReading[] = [];
+  const next = (): ExitReading => {
+    const reading = read();
+    readings.push(reading);
+    return reading;
+  };
+  for (let pair = 1; ; pair++) {
+    const a = next();
+    const alone = settledAlone(a);
+    if (alone !== null) return { kind: alone, readings };
+    const b = next();
+    const aloneB = settledAlone(b);
+    if (aloneB !== null) return { kind: aloneB, readings };
+    const decided = decidePair(a, b, pair >= EXIT_PAIRS);
+    if (decided !== null) return { kind: decided, readings };
+  }
+}
+
+/**
+ * Whether one reading shows that a thread-group leader finished while other threads run: `Zn`, `empty-n`, or `X` or `Z` with a count
+ * other than 1 (the old leader of an exec: the exec'ing thread takes over the pid while the old leader is dead).
+ */
+export function leaderExitSign(reading: ExitReading): boolean {
+  const kind = exitKind(reading);
+  return kind === "Zn" || kind === "empty-n" || (!reading.vanished && !reading.startChanged && reading.unknown === undefined && (reading.state === "X" || reading.state === "Z") && reading.threads !== 1);
+}
+
+/** What `endedNow` read: the bracket's decision and what the sampler prints or records about it. */
+export interface ExitNow {
+  ended: boolean;
+  kind: ExitKind;
+  /** A thread-group leader that finished while other threads run (`Zn` or `empty-n`). */
+  zombieLeader: boolean;
+  /** Any reading of the bracket showed the leader-exit signature: `Zn`, `empty-n`, or `X`/`Z` with a count other than 1 (the old leader of an exec). */
+  leaderExitSeen: boolean;
+  /** `<file>:<errno>` of the failed read behind an `unknown` decision. */
+  unknownRead?: string;
+  /** The exit read seam changed at least one read. */
+  injected: boolean;
+}
+
+/** Whether the process with this pid and start time is confirmed to be ending (used for the reference and for a pending runtime). */
+export function endedNow(pid: number, startTicks: string, fault?: ExitReadFault): ExitNow {
+  const note = { injected: false };
+  const source = faultedSource(realExitSource, fault, note);
+  const { kind, readings } = exitBracket(() => readExitReadingFrom(source, pid, startTicks));
+  const failed = [...readings].reverse().find((reading) => reading.unknown !== undefined)?.unknown;
+  return {
+    ended: isConfirmedExit(kind),
+    kind,
+    zombieLeader: kind === "Zn" || kind === "empty-n",
+    leaderExitSeen: readings.some(leaderExitSign),
+    unknownRead: kind === "unknown" && failed !== undefined ? `${failed.file}:${failed.errno}` : undefined,
+    injected: note.injected,
+  };
+}
+
+/**
+ * Condition 2 of the runtime-side route: the process is a thread-group leader that finished while other threads run (`Z` with
+ * more than one thread, or an empty command line and a missing executable with more than one thread). A live process (running
+ * or sleeping, with its command line) is never that; a confirmed exit is not that either and is cleared by the own-proof route.
+ */
+export function runtimeLeaderExited(reading: ExitReading): boolean {
+  const kind = exitKind(reading);
+  return kind === "Zn" || kind === "empty-n";
+}
+
+/** One full reading of the real process (the sampler decides on a bracket of these, see `endedNow`). */
 export function readExitReadingOf(pid: number, startTicks: string): ExitReading {
-  return readExitReading(pid, startTicks);
+  return readExitReadingFrom(realExitSource, pid, startTicks);
 }
 
 /**
@@ -1065,6 +1322,15 @@ export function flagAfterProofFailure(prior: boolean, clearedBy: "own" | "launch
 
 /** Longest a record may wait for its runtime's exit to be confirmed after the reference ended. */
 export const PENDING_BOUND_MS = 2000;
+
+/**
+ * Where the pending bound starts: the start of the tick, always, unless a test seam returned in that tick (a seam holds the tick for
+ * seconds in the held-exit rows, and the record could not have been pending before it returned). No seam is set in a real run, so
+ * the origin is the tick's start there.
+ */
+export function pendingBoundOrigin(tickStart: number, seamReturnedAt: number | null): number {
+  return seamReturnedAt ?? tickStart;
+}
 
 /**
  * Whether the reference ending makes a failed proof pending (not flagged yet): the runtime had its own full proof at an earlier
@@ -1138,9 +1404,9 @@ export interface LauncherEvidence {
  * at a proven tick (the real bwrap, pid and start time) and reads as the real bwrap or as that bwrap in its own exit; that parent
  * is in the tick's snapshot and has left the gateway's tree; the gateway is alive and has a cache; all three of the runtime's own
  * namespace links read at the proof and nothing it reads equals the gateway's; and the exit read that follows the proof found
- * it alive or a zombie leader whose threads still run (`Zn`: a multi-threaded runtime whose leader finished between the two
- * reads; rev 2). Nothing here confirms an exit: a pending record is only cleared by `resolvePending`, and `Zn` is not a
- * confirmed exit, so it waits like a live runtime does and expires flagged.
+ * it alive or a leader that finished while other threads run (`Zn`, `empty-n`: a multi-threaded runtime whose leader finished
+ * between the two reads; rev 2, MVP-8130). Nothing here confirms an exit: a pending record is only cleared by `resolvePending`,
+ * and neither kind is a confirmed exit, so it waits like a live runtime does and expires flagged. `unknown` is no entry.
  */
 export function launcherEndedPending(evidence: LauncherEvidence): boolean {
   return (
@@ -1150,7 +1416,7 @@ export function launcherEndedPending(evidence: LauncherEvidence): boolean {
     evidence.reparented &&
     evidence.referenceExit === "alive" &&
     evidence.cacheExists &&
-    (evidence.runtimeExit === "alive" || evidence.runtimeExit === "Zn") &&
+    (evidence.runtimeExit === "alive" || evidence.runtimeExit === "Zn" || evidence.runtimeExit === "empty-n") &&
     !evidence.ownUnreadable &&
     !evidence.escapeEvidence
   );
@@ -1226,19 +1492,6 @@ export function currentRowId(): string {
   }
 }
 
-function readExitReading(pid: number, startTicks: string): ExitReading {
-  const info = readProc(pid);
-  if (info === null) return { vanished: true, startChanged: false, state: "", threads: 0, cmdline: "", exe: "gone" };
-  let threads = 1;
-  try {
-    threads = Number(/^Threads:\s*(\d+)/m.exec(fs.readFileSync(`/proc/${pid}/status`, "utf8"))?.[1] ?? 1);
-  } catch {
-    // Gone between the reads: the next field read decides.
-  }
-  const exe = readExe(pid);
-  return { vanished: false, startChanged: info.startTicks !== startTicks, state: info.state, threads, cmdline: info.cmdline, exe: "id" in exe ? "readable" : "denied" in exe ? "denied" : "gone" };
-}
-
 /**
  * Whether an ancestor from the tick's snapshot is the real bwrap (by executable) and has the full sandbox proof itself:
  * its own namespaces differ from the gateway's and a real bwrap sits above it. The real bwrap by executable alone is no
@@ -1257,13 +1510,16 @@ function liveLauncherProof(ancestorPids: number[], infos: Map<number, ProcInfo>,
   return false;
 }
 
+/** `<file>:<errno>` of a failed exit read: the file names and the error codes are fixed words, anything else is printed as `other`. */
+const safeExitRead = (value: string): string => (/^(stat|cmdline|exe|thread-field|start-field):[A-Z][A-Z0-9-]{1,23}$/.test(value) ? value : "other");
+
 /** The text a problem line appends for the records, one entry per process. `redactArgv` and the name allowlist already keep
  * every value out; the marker detector is a second check, and a hit withholds the text instead of printing it. */
 export function describeRecords(records: ProcessRecord[], markers: Record<string, string> = {}): string {
   const text = records
     .map((record) => {
       const ns = record.sameNamespaces;
-      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence} own-unreadable=${record.proofFailure.ownUnreadable} reference=${record.proofFailure.reference} chain=${record.proofFailure.chain} reference-ended=${record.proofFailure.referenceEnded} reference-exit=${record.proofFailure.referenceExit} runtime-exit=${record.proofFailure.runtimeExit} pending=${record.proofFailure.pending}${record.proofFailure.launcherIdentity !== undefined ? ` launcher-identity=${record.proofFailure.launcherIdentity} launcher-exe=${record.proofFailure.launcherExe} reparented=${record.proofFailure.reparented}` : ""}]` : ""}${record.pending ? ` pending-route=${record.pending.route}` : ""}${record.clearedBy ? ` cleared-by=${record.clearedBy}` : ""}${record.provedReferenceCached ? ` proved-reference-cached=${record.provedReferenceCached}` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
+      return `pid ${record.pid} comm ${record.comms.map(printableName).join(">")} exe ${record.exe} argv [${record.argvShape}] ancestors [${record.ancestors.map(printableName).join(",")}] same-ns pid=${ns.pid} user=${ns.user} mnt=${ns.mnt} seen ${record.lastMs - record.firstMs} ms ${record.fate} verdict=${record.verdict} unsandboxed=${record.unsandboxed} inconsistent-reads=${record.inconsistentReads}${record.firstMissingProof ? ` first-missing-proof [${record.firstMissingProof}]` : ""}${record.proofFailure ? ` proof-failure [failed-while=${record.proofFailure.failedWhile} own-proof=${record.proofFailure.ownProof} launcher-proof=${record.proofFailure.launcherProof} escape-evidence=${record.proofFailure.escapeEvidence} own-unreadable=${record.proofFailure.ownUnreadable} reference=${record.proofFailure.reference} chain=${record.proofFailure.chain} reference-ended=${record.proofFailure.referenceEnded} reference-exit=${record.proofFailure.referenceExit} runtime-exit=${record.proofFailure.runtimeExit}${record.proofFailure.exitRead ? ` exit-read=${safeExitRead(record.proofFailure.exitRead)}` : ""}${record.proofFailure.referenceExitRead ? ` reference-exit-read=${safeExitRead(record.proofFailure.referenceExitRead)}` : ""}${record.proofFailure.exitReadInjected ? " exit-read-injected=true" : ""} pending=${record.proofFailure.pending}${record.proofFailure.launcherIdentity !== undefined ? ` launcher-identity=${record.proofFailure.launcherIdentity} launcher-exe=${record.proofFailure.launcherExe} reparented=${record.proofFailure.reparented}` : ""}]` : ""}${record.pending ? ` pending-route=${record.pending.route}` : ""}${record.pending?.revived ? " revived=true" : ""}${record.clearedBy ? ` cleared-by=${record.clearedBy}` : ""}${record.exitConfirmed ? ` exit-confirmed=${record.exitConfirmed.runtime}${record.exitConfirmed.reference ? ` reference-exit-confirmed=${record.exitConfirmed.reference}` : ""}` : ""}${record.provedReferenceCached ? ` proved-reference-cached=${record.provedReferenceCached}` : ""} old-counted=${record.oldCounted} old-unsandboxed=${record.oldUnsandboxed}`;
     })
     .join("; ");
   return detect([{ name: "process-records", text }], markers).length > 0 ? "[process records withheld: a marker was detected]" : text;
@@ -1332,6 +1588,30 @@ export function taggedProcessProof(gatewayPid: number, tag: string, tracker: Ret
   return result;
 }
 
+/** Whether the `/proc` mount hides other users' processes (`hidepid` 1, 2 or 4): a live process could then read as ENOENT. */
+export function procMountHidesProcesses(mountinfo: string): boolean {
+  for (const line of mountinfo.split("\n")) {
+    const parts = line.split(" - ");
+    if (parts.length < 2) continue;
+    const fields = parts[0].split(" ");
+    if (fields[4] !== "/proc") continue;
+    const options = `${fields[5] ?? ""},${parts[1].split(" ").slice(2).join(" ")}`;
+    if (/(^|,)hidepid=(1|2|4|noaccess|invisible|ptraceable)(,|$)/.test(options)) return true;
+  }
+  return false;
+}
+
+/** A sampler window needs a `/proc` where a live process never reads as missing: the exit rule treats ENOENT on stat as proof that the process is gone. */
+function assertProcVisible(): void {
+  let mountinfo: string;
+  try {
+    mountinfo = fs.readFileSync("/proc/self/mountinfo", "utf8");
+  } catch {
+    throw new Error("host prerequisite missing: /proc mount options readable");
+  }
+  if (procMountHidesProcesses(mountinfo)) throw new Error("host prerequisite missing: /proc mounted without hidepid");
+}
+
 /**
  * Samples the processes below the gateway every `intervalMs` (20 ms by default). A runtime candidate is any process whose
  * command line names `cli.js` or whose process title is `claude`. Each tick reads a candidate (see `readTick`) and
@@ -1360,8 +1640,9 @@ export function startProcessSampler(
   gatewayPid: () => number,
   tags: string[] = [],
   intervalMs = 20,
-  seam: { afterStableReading?: (pid: number) => void; afterFailedProof?: (pid: number) => void; afterTick?: (processes: readonly TickProcess[]) => void } = {},
+  seam: { afterStableReading?: (pid: number) => void; afterFailedProof?: (pid: number) => void; afterTick?: (processes: readonly TickProcess[]) => void; exitReadFault?: ExitReadFault } = {},
 ): { stop: (markers: Record<string, string>) => ProcessSample; peek: () => ProcessSample } {
+  assertProcVisible();
   const known = knownExecutables();
   const windows: ProcessSample["windows"] = {};
   const records = new Map<string, ProcessRecord>();
@@ -1374,19 +1655,30 @@ export function startProcessSampler(
     const at = Date.now();
     for (const [key, record] of records) {
       if (record.pending?.state !== "waiting") continue;
-      const outcome = resolvePending({
-        elapsedMs: at - record.pending.sinceMs,
-        exitConfirmed: endedNow(record.pid, record.startTicks).ended,
-        // The runtime-side and launcher-ended routes have no reference condition; the reference-ended route also needs the reference confirmed ended.
-        referenceEnded: record.pending.route === "runtime-ending" || record.pending.route === "launcher-ended" || endedNow(record.pending.reference!.pid, record.pending.reference!.startTicks).ended,
-        final,
-      });
-      if (outcome === "waiting") continue;
+      const runtime = endedNow(record.pid, record.startTicks, seam.exitReadFault);
+      // The runtime-side and launcher-ended routes have no reference condition; the reference-ended route also needs the reference confirmed ended.
+      const reference = record.pending.route === "reference-ended" ? endedNow(record.pending.reference!.pid, record.pending.reference!.startTicks, seam.exitReadFault) : null;
+      // After a leader exit, a reading of the same pid and start time that is alive again means a surviving thread executed a new program: it was never ended.
+      const revivedByLeader = record.pending.sawLeaderExit === true && runtime.kind === "alive";
+      // So does a live process that runs another executable than at its last proven tick. The settle reads it by pid, because a runtime that
+      // left the gateway's tree (the launcher-ended route) is read by no tick any more.
+      const exeNow = runtime.kind === "alive" && record.provenExeId !== undefined ? readExe(record.pid) : null;
+      const revivedByExe = exeNow !== null && "id" in exeNow && exeNow.id !== record.provenExeId;
+      const revived = revivedByLeader || revivedByExe;
+      const outcome = revived
+        ? ("expired" as const)
+        : resolvePending({ elapsedMs: at - record.pending.sinceMs, exitConfirmed: runtime.ended, referenceEnded: reference === null || reference.ended, final });
+      const sawLeaderExit = record.pending.sawLeaderExit === true || runtime.leaderExitSeen;
+      if (outcome === "waiting") {
+        if (sawLeaderExit !== (record.pending.sawLeaderExit === true)) records.set(key, { ...record, pending: { ...record.pending, sawLeaderExit } });
+        continue;
+      }
       records.set(key, {
         ...record,
         unsandboxed: record.unsandboxed || outcome === "expired" || outcome === "expired-reference",
         clearedBy: outcome === "cleared" ? record.pending.route : record.clearedBy,
-        pending: { ...record.pending, state: outcome },
+        exitConfirmed: outcome === "cleared" ? { runtime: runtime.kind, reference: reference?.kind } : record.exitConfirmed,
+        pending: { ...record.pending, state: outcome, sawLeaderExit, ...(revived ? { revived: true } : {}) },
         proofFailure: record.proofFailure ? { ...record.proofFailure, pending: outcome } : record.proofFailure,
       });
     }
@@ -1404,6 +1696,8 @@ export function startProcessSampler(
       if (namesRuntime(info)) firstExes.set(pid, readExe(pid));
     }
     const now = Date.now();
+    /** When a test seam last returned in this tick (null: no seam ran, which is every real run). */
+    let seamReturnedAt: number | null = null;
     for (const info of infos.values()) {
       const oldCandidate = /(^|[ /])cli\.js( |$)/.test(info.cmdline);
       if (namesRuntime(info)) {
@@ -1430,6 +1724,8 @@ export function startProcessSampler(
         let clearedBy = prior?.clearedBy;
         let pending = prior?.pending;
         let launcherIdentity = prior?.launcherIdentity;
+        let confirmedBy = prior?.exitConfirmed;
+        let provenExeId = prior?.provenExeId;
         let provedReferenceCached = prior?.provedReferenceCached ?? 0;
         const comms = prior?.comms ?? [];
         let seen = info;
@@ -1446,6 +1742,7 @@ export function startProcessSampler(
             // Test seam (default none): lets a control force the exit between the stable reading and the proof.
             try {
               seam.afterStableReading?.(info.pid);
+              if (seam.afterStableReading) seamReturnedAt = Date.now();
             } catch {
               // A failing control must not end the sampler; its own assertions report the precondition.
             }
@@ -1453,8 +1750,10 @@ export function startProcessSampler(
             ancestors = proof.chain.length > 0 ? proof.chain : ancestors;
             let cleared: "own" | "launcher" | null = null;
             let pendingNow = false;
+            let runtimeKind: ExitKind | undefined;
             if (proof.proven) {
               proven.add(key);
+              provenExeId = read.reading.exeId;
               if (proof.reference !== "live") provedReferenceCached += 1;
               // Overwritten on every proven tick, so an identity never outlives the own proof it was taken with.
               launcherIdentity = proof.parent !== null && launcherExeOf(proof.parent.exe) === "real-bwrap" ? { pid: proof.parent.pid, startTicks: proof.parent.startTicks } : "none";
@@ -1463,11 +1762,13 @@ export function startProcessSampler(
               // Test seam (default none): lets a control place the runtime's exit between the proof and the exit read that follows it.
               try {
                 seam.afterFailedProof?.(info.pid);
+                if (seam.afterFailedProof) seamReturnedAt = Date.now();
               } catch {
                 // A failing control must not end the sampler; its own assertions report the precondition.
               }
               // Was this failure read while the process was alive or ending, and which proof routes exist?
-              const runtimeExit = endedNow(info.pid, info.startTicks);
+              const runtimeExit = endedNow(info.pid, info.startTicks, seam.exitReadFault);
+              runtimeKind = runtimeExit.kind;
               const failure = {
                 failedWhile: runtimeExit.ended ? ("exiting" as const) : ("alive" as const),
                 ownProof: ownProofHeld(proven, info.pid, info.startTicks),
@@ -1476,9 +1777,9 @@ export function startProcessSampler(
               };
               cleared = exitProofClears({ exitConfirmed: failure.failedWhile === "exiting", ...failure });
               // The reference is read after the proof: if it ended, the failure may only say so (pending, never a clear by itself).
-              const referenceNow = reference.startTicks === null ? null : endedNow(root, reference.startTicks);
+              const referenceNow = reference.startTicks === null ? null : endedNow(root, reference.startTicks, seam.exitReadFault);
               const referenceEnded = referenceNow?.ended === true;
-              const referenceEnding = referenceNow !== null && referenceNow.kind !== "alive";
+              const referenceEnding = referenceNow !== null && isReferenceEnding(referenceNow.kind);
               const chainState = proof.brokenChain ? ("broken" as const) : ("complete" as const);
               const pendingPossible = cleared === null && !unsandboxed && (prior?.pending === undefined || prior.pending.state === "waiting");
               // The reference-ended route takes precedence when both apply: it needs more confirmations.
@@ -1511,7 +1812,11 @@ export function startProcessSampler(
               });
               const launcherPending = pendingPossible && !referencePending && !runtimePending && launcherEndedPending(launcher);
               pendingNow = referencePending || runtimePending || launcherPending;
-              if (pendingNow) pending = prior?.pending ?? { state: "waiting", sinceMs: now, route: referencePending ? "reference-ended" : runtimePending ? "runtime-ending" : "launcher-ended", reference: referencePending ? { pid: root, startTicks: reference.startTicks! } : undefined };
+              if (pendingNow) {
+                pending = prior?.pending
+                  ? { ...prior.pending, sawLeaderExit: prior.pending.sawLeaderExit === true || runtimeExit.leaderExitSeen }
+                  : { state: "waiting", sinceMs: pendingBoundOrigin(now, seamReturnedAt), route: referencePending ? "reference-ended" : runtimePending ? "runtime-ending" : "launcher-ended", reference: referencePending ? { pid: root, startTicks: reference.startTicks! } : undefined, sawLeaderExit: runtimeExit.leaderExitSeen };
+              }
               proofFailure = proofFailure
                 ? {
                     ...proofFailure,
@@ -1529,6 +1834,9 @@ export function startProcessSampler(
                     referenceEnded,
                     referenceExit: referenceNow?.kind ?? "vanished",
                     runtimeExit: runtimeExit.kind,
+                    exitRead: runtimeExit.unknownRead,
+                    referenceExitRead: referenceNow?.unknownRead,
+                    exitReadInjected: runtimeExit.injected || referenceNow?.injected === true ? true : undefined,
                     pending: pending ? pending.state : "none",
                     launcherIdentity: launcher.identity,
                     launcherExe: launcher.exe,
@@ -1538,7 +1846,10 @@ export function startProcessSampler(
             // A flag stays: one tick without proof is a run outside the sandbox, whatever the next tick shows.
             const flaggedBefore = unsandboxed;
             if (!proof.proven && !belowProven) unsandboxed = flagAfterProofFailure(unsandboxed, cleared, pendingNow);
-            if (cleared && !flaggedBefore && !unsandboxed) clearedBy = cleared;
+            if (cleared && !flaggedBefore && !unsandboxed) {
+              clearedBy = cleared;
+              confirmedBy = { runtime: runtimeKind! };
+            }
           }
         } else {
           if (read.kind === "alive") {
@@ -1580,6 +1891,8 @@ export function startProcessSampler(
           firstMissingProof,
           proofFailure,
           clearedBy,
+          exitConfirmed: confirmedBy,
+          provenExeId,
           pending,
           launcherIdentity,
           provedReferenceCached: provedReferenceCached > 0 ? provedReferenceCached : undefined,
