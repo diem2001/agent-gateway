@@ -18,8 +18,9 @@ import {
   erasurePendingCount,
   getSessionCount,
   getSettings,
-  updateSettings,
-  type SessionSettings,
+  IdleTimeoutConfigError,
+  checkIdleTimeoutConfig,
+  logId,
 } from "./sessions.js";
 import { queryRouter } from "./query.js";
 import { ErasureConfigError, deleteSessionRoute, loadErasureRetryMs, startErasureSweeper } from "./session-erasure.js";
@@ -101,8 +102,10 @@ try {
   mcpToolTimeoutMs();
   // MVP-7402: the interval of the sweep that finishes pending erasures.
   erasureRetryMs = loadErasureRetryMs();
+  // MVP-7402: the idle timeout comes from the environment only and is parsed strictly; one line reports the effective value.
+  checkIdleTimeoutConfig();
 } catch (e) {
-  if (e instanceof IsolationConfigError || e instanceof ToolPolicyConfigError || e instanceof McpToolTimeoutConfigError || e instanceof ErasureConfigError) logAlways("server", e.logLine);
+  if (e instanceof IsolationConfigError || e instanceof ToolPolicyConfigError || e instanceof McpToolTimeoutConfigError || e instanceof ErasureConfigError || e instanceof IdleTimeoutConfigError) logAlways("server", e.logLine);
   else if (e instanceof ModelProxyConfigError) logAlways("server", `FATAL config key=${e.key} reason=must be a positive whole number of milliseconds`);
   else throw e;
   process.exit(1);
@@ -219,22 +222,18 @@ app.get("/v1/settings", (_req, res) => {
   res.json(getSettings());
 });
 
+// The idle timeout erases conversations irreversibly, so no API key can change it (MVP-7402): the operator sets
+// SESSION_IDLE_TIMEOUT_MS. A body that names it is refused whatever its value; every other body is a read-back.
 app.put("/v1/settings", (req, res) => {
-  const body = req.body as Partial<SessionSettings>;
-
-  if (
-    body.sessionIdleTimeoutMs !== undefined &&
-    (typeof body.sessionIdleTimeoutMs !== "number" ||
-      body.sessionIdleTimeoutMs < 0)
-  ) {
-    res
-      .status(400)
-      .json({ error: "sessionIdleTimeoutMs must be a non-negative number" });
+  const body: unknown = req.body;
+  if (typeof body === "object" && body !== null && !Array.isArray(body) && Object.hasOwn(body, "sessionIdleTimeoutMs")) {
+    // Always logged (also with logging off), without the value; the label is escaped and bounded like a conversation id.
+    const caller = req.clientLabel === undefined ? "-" : logId(req.clientLabel).slice(1, -1);
+    logAlways("audit", `settings.refused key=sessionIdleTimeoutMs label=${caller}`);
+    res.status(400).json({ error: "setting_read_only" });
     return;
   }
-
-  const settings = updateSettings(body);
-  res.json(settings);
+  res.json(getSettings());
 });
 
 /* ------------------------------------------------------------------ */

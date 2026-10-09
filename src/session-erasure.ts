@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { Request, Response } from "express";
-import { log } from "./logging.js";
+import { log, logAlways } from "./logging.js";
 import { loadIsolationConfig, onConversationRunReleased, tryLockConversation } from "./sandbox.js";
 import {
   SANDBOX_DIR_ID,
@@ -17,7 +17,9 @@ import {
   persistTombstonesNow,
   pendingConversationForDir,
   pendingConversations,
-  reflushPending,
+  saveTombstones,
+  sessionSavesSuppressed,
+  tombstonesAreUnsaved,
 } from "./sessions.js";
 
 /**
@@ -47,7 +49,8 @@ export type ErasureFailureCode =
   | "tool_missing"
   | "rm_failed"
   | "incomplete"
-  | "dir_shared";
+  | "dir_shared"
+  | "tombstone_unsaved";
 
 export type ErasureResult = { ok: true } | { ok: false; code: ErasureFailureCode };
 
@@ -166,12 +169,37 @@ function failed(clientId: string, code: ErasureFailureCode): void {
   log("sessions", `sessions.erasure.failed id=${logId(clientId)} code=${code}`);
 }
 
-async function runAttempt(label: string, clientId: string, dirId: string): Promise<boolean> {
+/** What the attempts of one sweep share: after one failed save the others of that sweep do not try again. */
+interface SweepRun {
+  saveFailed: boolean;
+}
+
+/**
+ * The tombstone is on disk before any removal starts (MVP-7402). Returns false when the attempt must not remove
+ * anything: the save failed (the entry stays pending, DELETE answers 503, the next sweep tries again). When saves are
+ * suppressed for this process no entry can ever reach the disk; the removal goes ahead, because blocking it would
+ * orphan the folder at the next restart.
+ */
+function tombstoneSavedOrUnsavable(clientId: string, sweep: SweepRun | undefined): boolean {
+  if (!tombstonesAreUnsaved()) return true;
+  if (sessionSavesSuppressed()) {
+    log("sessions", `sessions.erasure.unsaved_tombstone id=${logId(clientId)}`);
+    return true;
+  }
+  if (sweep?.saveFailed) return false;
+  if (saveTombstones()) return true;
+  if (sweep) sweep.saveFailed = true;
+  logAlways("sessions", `sessions.erasure.failed id=${logId(clientId)} code=tombstone_unsaved`);
+  return false;
+}
+
+async function runAttempt(label: string, clientId: string, dirId: string, sweep?: SweepRun): Promise<boolean> {
   // A folder name referenced by two entries (a tampered or buggy file) would let one erase take the other's data.
   if (folderSharedWithOther(label, clientId, dirId)) {
     failed(clientId, "dir_shared");
     return false;
   }
+  if (!tombstoneSavedOrUnsavable(clientId, sweep)) return false;
   // The same lock a run holds: a held lock is not a failure, the erasure waits for the run's release.
   const lock = tryLockConversation(dirId, "eraser");
   if (!lock) return false;
@@ -198,12 +226,12 @@ async function runAttempt(label: string, clientId: string, dirId: string): Promi
  * Tries to finish the erasure of the label's conversation: true when its folder is gone (entry removed, marker
  * written), false when it stays pending (a run holds it, a file system error, a shared folder name).
  */
-export function eraseOwnedConversation(label: string, clientId: string): Promise<boolean> {
+export function eraseOwnedConversation(label: string, clientId: string, sweep?: SweepRun): Promise<boolean> {
   const own = ownedConversation(label, clientId);
   if (!own) return Promise.resolve(false);
   const running = inFlight.get(own.sandboxDirId);
   if (running) return running;
-  const attempt = runAttempt(label, clientId, own.sandboxDirId).finally(() => inFlight.delete(own.sandboxDirId));
+  const attempt = runAttempt(label, clientId, own.sandboxDirId, sweep).finally(() => inFlight.delete(own.sandboxDirId));
   inFlight.set(own.sandboxDirId, attempt);
   return attempt;
 }
@@ -241,7 +269,8 @@ export async function deleteConversation(clientId: string, label: string | undef
     if (ownedConversation(label, clientId)) {
       markErasePending(label, clientId);
       if (await withinBound(eraseOwnedConversation(label, clientId))) return "deleted";
-      // The caller is told "pending": the tombstone is on disk before the answer, so a restart still blocks the conversation.
+      // The attempt saved the tombstone before it removed anything; this repeats a save that failed, so a tombstone the
+      // caller is told about is on disk when the answer leaves.
       persistTombstonesNow();
       return "pending";
     }
@@ -299,18 +328,18 @@ export function loadErasureRetryMs(env: NodeJS.ProcessEnv = process.env): number
 let sweeping: Promise<void> | null = null;
 
 /**
- * One sweep: save a tombstone whose first save failed, take the idle conversations (when an idle timeout is set),
- * then try every tombstone once, one after the other. A sweep that finds the previous one still running does
+ * One sweep: take the idle conversations (when an idle timeout is set), then try every tombstone once, one after the
+ * other; an attempt saves an unsaved tombstone first, and after one failed save the rest of the sweep skips its attempts. A sweep that finds the previous one still running does
  * nothing, so sweeps never overlap and a slow removal never queues work up.
  */
 export function runErasureSweep(): Promise<void> {
   if (sweeping) return Promise.resolve();
   const sweep = (async (): Promise<void> => {
-    reflushPending();
+    const run: SweepRun = { saveFailed: false };
     expireIdleSessions();
     for (const { label, clientId } of pendingConversations()) {
       try {
-        await eraseOwnedConversation(label, clientId);
+        await eraseOwnedConversation(label, clientId, run);
       } catch {
         // An attempt reports its own failures; the next sweep tries again.
       }

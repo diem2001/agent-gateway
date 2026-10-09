@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { log } from "./logging.js";
+import { log, logAlways } from "./logging.js";
 import { createPersistentStore } from "./persistence.js";
 
 /* ------------------------------------------------------------------ */
@@ -59,7 +59,8 @@ interface PersistedData {
   sessionsByLabel?: Record<string, Record<string, Session>>;
   /** Erased conversations per label and client id (MVP-7402): answers the owning label's late DELETE with 200. */
   erasedByLabel?: Record<string, Record<string, ErasedMarker>>;
-  settings: SessionSettings;
+  /** Written by versions before MVP-7402 R1 only: ignored at load (the idle timeout comes from the environment) and never written. */
+  settings?: unknown;
 }
 
 /* ------------------------------------------------------------------ */
@@ -107,8 +108,48 @@ function allSessions(): Session[] {
 /** An entry that is not an erasure-pending tombstone. */
 const live = (session: Session): boolean => session.erasePendingSince === undefined;
 
-let sessionIdleTimeoutMs =
-  parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || "0", 10) || 0;
+/** An invalid `SESSION_IDLE_TIMEOUT_MS`: startup stops with one fixed line, like the other configuration keys. */
+export class IdleTimeoutConfigError extends Error {
+  readonly key = "SESSION_IDLE_TIMEOUT_MS";
+
+  constructor() {
+    super("invalid value for SESSION_IDLE_TIMEOUT_MS");
+  }
+
+  get logLine(): string {
+    return `FATAL config key=${this.key} reason=must be a whole number of milliseconds (0 = disabled)`;
+  }
+}
+
+/** The idle timeout: unset or empty = 0 (disabled); anything but a whole number of milliseconds is an error (MVP-7402). */
+export function loadIdleTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.SESSION_IDLE_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return 0;
+  if (!/^[0-9]+$/.test(raw.trim())) throw new IdleTimeoutConfigError();
+  const value = Number(raw.trim());
+  if (!Number.isSafeInteger(value)) throw new IdleTimeoutConfigError();
+  return value;
+}
+
+/**
+ * Read once, at start, from the environment only: no route, persisted value or seam changes it afterwards. An invalid
+ * value leaves 0 here and is raised by `checkIdleTimeoutConfig`, which the server calls in its configuration block.
+ */
+let sessionIdleTimeoutMs = 0;
+let idleTimeoutConfigError: IdleTimeoutConfigError | undefined;
+try {
+  sessionIdleTimeoutMs = loadIdleTimeoutMs();
+} catch (e) {
+  if (!(e instanceof IdleTimeoutConfigError)) throw e;
+  idleTimeoutConfigError = e;
+}
+
+/** Throws the error of an invalid `SESSION_IDLE_TIMEOUT_MS`; otherwise logs and returns the effective value. */
+export function checkIdleTimeoutConfig(): number {
+  if (idleTimeoutConfigError) throw idleTimeoutConfigError;
+  logAlways("sessions", `sessions.idle_timeout ms=${sessionIdleTimeoutMs}`);
+  return sessionIdleTimeoutMs;
+}
 
 const PERSIST_PATH =
   process.env.SESSION_PERSIST_PATH || "./data/sessions.json";
@@ -191,7 +232,6 @@ const store = createPersistentStore({
     sessionsByLabel: Object.fromEntries([...sessionsByLabel].map(([label, map]) => [label, Object.fromEntries(map)])),
     // Additive: absent until the first erasure, so a file that never saw one is written back unchanged.
     ...(erasedByLabel.size > 0 ? { erasedByLabel: Object.fromEntries([...erasedByLabel].map(([label, map]) => [label, Object.fromEntries(map)])) } : {}),
-    settings: { sessionIdleTimeoutMs },
   }),
   isValid: isPersistedData,
 });
@@ -205,19 +245,19 @@ export function loadSessions(): void {
   if (!data) return;
   const now = Date.now();
 
-  // Restore settings
-  if (
-    data.settings &&
-    typeof data.settings.sessionIdleTimeoutMs === "number"
-  ) {
-    sessionIdleTimeoutMs = data.settings.sessionIdleTimeoutMs;
+  // A timeout saved by an earlier version is ignored: only the environment sets it. The next save drops the key.
+  if (isObject(data.settings) && Object.hasOwn(data.settings, "sessionIdleTimeoutMs")) {
+    log("sessions", "sessions.settings.ignored key=sessionIdleTimeoutMs");
   }
 
   const expired = (session: Session): boolean => sessionIdleTimeoutMs > 0 && now - session.lastUsed >= sessionIdleTimeoutMs;
   // An expired conversation with a folder is not dropped (MVP-7402): it becomes a tombstone that the startup sweep
   // erases. An expired legacy entry is dropped as before; no file is touched.
   const restoreOwned = (label: string, id: string, session: Session): void => {
-    if (live(session) && expired(session)) session.erasePendingSince = now;
+    if (live(session) && expired(session)) {
+      session.erasePendingSince = now;
+      tombstonesUnsaved = true;
+    }
     labelMap(label, true)!.set(id, session);
   };
 
@@ -247,7 +287,7 @@ export function persistSessions(): void {
   store.schedule();
 }
 
-/** Save sessions and settings now; false when the save failed or is suppressed. */
+/** Save sessions now; false when the save failed or is suppressed. */
 export function flushSessions(): boolean {
   return store.flush();
 }
@@ -409,29 +449,49 @@ export function hasLegacyEntry(clientId: string): boolean {
   return sessions.has(clientId);
 }
 
-/** Set when the last flush of a new tombstone failed: the sweep saves again (it stays pending in memory meanwhile). */
-let pendingFlushFailed = false;
+/**
+ * True while a tombstone exists in memory that no successful save has covered yet. Set wherever a tombstone is set
+ * (a delete, idle expiry, load-time expiry); cleared only by the result of the synchronous `store.flush()` of
+ * `saveTombstones`. The erase path removes nothing while it is set (MVP-7402): the tombstone is on disk before any
+ * removal starts, so a hard kill during the removal is finished by the startup sweep. The sweep's re-save and this
+ * guard are the same flag, so they cannot drift apart.
+ */
+let tombstonesUnsaved = false;
+
+export function tombstonesAreUnsaved(): boolean {
+  return tombstonesUnsaved;
+}
+
+/** True when saves of the sessions area are suppressed for this process (unreadable file that could not be moved aside). */
+export function sessionSavesSuppressed(): boolean {
+  return store.isSuppressed();
+}
+
+/** Saves now; the flag follows the result of this one synchronous flush. */
+export function saveTombstones(): boolean {
+  const saved = flushSessions();
+  tombstonesUnsaved = !saved;
+  return saved;
+}
 
 /**
- * Marks the caller's conversation erasure-pending (idempotent), in memory: the caller of the erase path saves it
- * (`persistTombstonesNow`) before it answers 503, so every tombstone a caller was told about survives a restart. A
- * delete that completes at once never needs the tombstone on disk. False when there is no such conversation.
+ * Marks the caller's conversation erasure-pending (idempotent), in memory. The erase path saves it before it starts
+ * any removal (`tombstonesAreUnsaved` / `saveTombstones`), so a tombstone is on disk before the first byte is removed.
+ * False when there is no such conversation.
  */
 export function markErasePending(label: string, clientId: string): boolean {
   const entry = labelEntry(label, clientId);
   if (!entry?.sandboxDirId) return false;
-  if (live(entry)) entry.erasePendingSince = Date.now();
+  if (live(entry)) {
+    entry.erasePendingSince = Date.now();
+    tombstonesUnsaved = true;
+  }
   return true;
 }
 
-/** Saves now, because a caller was told "pending". A failed save is repeated by every sweep until it succeeds. */
+/** Saves now, because a caller was told "pending" (a no-op once the tombstone is on disk). */
 export function persistTombstonesNow(): void {
-  pendingFlushFailed = !flushSessions();
-}
-
-/** Saves again after a failed save of a tombstone; a no-op otherwise. */
-export function reflushPending(): void {
-  if (pendingFlushFailed) pendingFlushFailed = !flushSessions();
+  if (tombstonesUnsaved) saveTombstones();
 }
 
 /** True when any other entry (of any label, legacy included) references the same folder name. */
@@ -499,8 +559,9 @@ export function expireIdleSessions(now: number = Date.now()): { marked: number; 
   }
   if (marked + dropped > 0) {
     log("sessions", `Expired ${marked + dropped} idle session(s). Active: ${getSessionCount()}`);
-    if (marked > 0) pendingFlushFailed = !flushSessions();
-    else persistSessions();
+    // The new tombstones are saved by the erase path before it removes anything.
+    if (marked > 0) tombstonesUnsaved = true;
+    persistSessions();
   }
   return { marked, dropped };
 }
@@ -510,19 +571,5 @@ export function expireIdleSessions(now: number = Date.now()): { marked: number; 
 /* ------------------------------------------------------------------ */
 
 export function getSettings(): SessionSettings {
-  return { sessionIdleTimeoutMs };
-}
-
-export function updateSettings(
-  updates: Partial<SessionSettings>,
-): SessionSettings {
-  if (typeof updates.sessionIdleTimeoutMs === "number") {
-    sessionIdleTimeoutMs = updates.sessionIdleTimeoutMs;
-    log(
-      "sessions",
-      `Idle timeout updated to ${sessionIdleTimeoutMs}ms`,
-    );
-  }
-  persistSessions();
   return { sessionIdleTimeoutMs };
 }

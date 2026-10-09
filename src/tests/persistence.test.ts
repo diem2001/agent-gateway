@@ -606,6 +606,8 @@ describe("sessions.json with and without the creator's user id (MVP-8044)", () =
     expect(m.admitSession("old", { label: "reqlift", userId: "user-a" })).toEqual({ kind: "refused", reason: "legacy" });
     expect(m.admitSession("c1", { label: "reqlift", userId: "user-a" })).toEqual({ kind: "new" });
     expect(m.flushSessions()).toBe(true);
-    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(content);
+    // Every entry comes back unchanged; the saved `settings` of the earlier version is the one thing dropped (MVP-7402).
+    const { settings: _dropped, ...expected } = content;
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expected);
   });
 });

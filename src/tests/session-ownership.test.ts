@@ -230,9 +230,11 @@ describe("legacy conversations (created before the update)", () => {
     vi.resetModules();
     fs.writeFileSync(
       process.env.SESSION_PERSIST_PATH!,
-      JSON.stringify({ sessions: { legacyConfirmed: { sessionId: "gw-1", sdkSessionId: "sdk-old", systemPrompt: "", model: "m", lastUsed: 1_700_000_000_000 } }, settings: { sessionIdleTimeoutMs: 1000 } }),
+      JSON.stringify({ sessions: { legacyConfirmed: { sessionId: "gw-1", sdkSessionId: "sdk-old", systemPrompt: "", model: "m", lastUsed: 1_700_000_000_000 } } }),
     );
+    process.env.SESSION_IDLE_TIMEOUT_MS = "1000";
     const later = await sessionsModule();
+    delete process.env.SESSION_IDLE_TIMEOUT_MS;
     later.loadSessions();
     expect(later.admitSession("legacyConfirmed", A)).toEqual({ kind: "new" });
     const fresh = later.getSession("legacyConfirmed", "", "m", true, A);
