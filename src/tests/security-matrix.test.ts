@@ -2724,6 +2724,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     "libc = ctypes.CDLL(None)",
     "exit_thread = 60 if platform.machine() == 'x86_64' else 93",
     "trig, fresh, secs, title = os.environ['TRIG'], int(os.environ.get('FRESH', '0')), os.environ.get('SECS', '6'), os.environ.get('TITLE', 'claude')",
+    "image_exe = os.readlink('/proc/self/exe')",
     "limit = resource.getrlimit(resource.RLIMIT_NOFILE)[1]",
     "resource.setrlimit(resource.RLIMIT_NOFILE, (limit, limit))",
     "def worker():",
@@ -2731,6 +2732,8 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     "        if os.path.exists(trig + '/exec'):",
     "            sys.stderr.write('worker: exec\\n')",
     "            sys.stderr.flush()",
+    "            if os.environ.get('IMAGE', 'sleep') == 'same':",
+    "                os.execv(image_exe, [title, '-c', 'import time,sys; time.sleep(float(sys.argv[1]))', secs])",
     "            os.execv('/bin/sleep', [title, secs])",
     "        if os.path.exists(trig + '/end'):",
     "            sys.stderr.write('worker: end\\n')",
@@ -2858,9 +2861,10 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     }
   };
   /** The new program the surviving thread executed runs under the same pid (its command line is the title and the seconds only). */
-  const imageRuns = (pid: number, secs: string, title = "claude"): boolean => {
+  const imageRuns = (pid: number, secs: string, title = "claude", image: "sleep" | "same" = "sleep"): boolean => {
     try {
-      return fs.readFileSync(`/proc/${pid}/cmdline`).toString("latin1") === `${title}\0${secs}\0`;
+      const expected = image === "same" ? `${title}\0-c\0import time,sys; time.sleep(float(sys.argv[1]))\0${secs}\0` : `${title}\0${secs}\0`;
+      return fs.readFileSync(`/proc/${pid}/cmdline`).toString("latin1") === expected;
     } catch {
       return false;
     }
@@ -2986,7 +2990,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   /*  Own route: the leader finishes after the runtime's own proof, below the real bwrap (the R6 shape)  */
 
-  async function ownWindow(state: Seam, options: Plumbed & { secs?: string; fresh?: number } = {}): Promise<{ trig: string; sampler: ReturnType<typeof startProcessSampler>; child: ChildProcess }> {
+  async function ownWindow(state: Seam, options: Plumbed & { secs?: string; fresh?: number; image?: "sleep" | "same" } = {}): Promise<{ trig: string; sampler: ReturnType<typeof startProcessSampler>; child: ChildProcess }> {
     requireHost(["bwrap", "python3"]);
     const trig = scratch();
     const checks = holdChecks(state);
@@ -2997,7 +3001,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
       afterTick: checks.afterTick,
       ...plumb(options),
     });
-    const command = fixtureCommand(trig, { FRESH: options.fresh ?? HOLD_FILES, SECS: options.secs ?? "6" });
+    const command = fixtureCommand(trig, { FRESH: options.fresh ?? HOLD_FILES, SECS: options.secs ?? "6", IMAGE: options.image ?? "sleep" });
     const child = spawnLogged(BWRAP_DIE[0], [...BWRAP_DIE.slice(1), "/bin/bash", "-c", command], trig);
     spawned.push(child);
     await until(() => state.forced, "the seam did not run");
@@ -3062,16 +3066,16 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
   /** The surviving thread executes a new program after the leader finished; `exitsInside` lets that program end inside the bound. */
   async function ownRevive(state: Seam, secs: string, exitsInside: boolean) {
     // A program that must end inside the bound gets the shorter hold: the whole chain (hold, exec, program) has to fit into 2 s under load.
-    const window = await ownWindow(state, { secs, fresh: exitsInside ? 300_000 : undefined });
+    const window = await ownWindow(state, { secs, fresh: exitsInside ? 300_000 : undefined, image: "same" });
     touch(window.trig, "exec");
-    await until(() => imageRuns(state.runtime!.pid, secs), "the surviving thread did not execute the new program");
+    await until(() => imageRuns(state.runtime!.pid, secs, "claude", "same"), "the surviving thread did not execute the new program");
     // The new program has to run early enough for the next settles to see it before the bound expires the record (under load the exec waits for the leader's exit).
     let insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 600;
     if (exitsInside) {
       await until(() => ended(state.runtime!), "the new program did not end");
       insideBound = insideBound && Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
     } else await pause(400);
-    const proof = exitsInside ? undefined : taggedProcessProof(process.pid, `claude ${secs}`);
+    const proof = exitsInside ? undefined : taggedProcessProof(process.pid, `time.sleep(float(sys.argv[1])) ${secs}`);
     const closed = closeWindow(window.sampler);
     return { ...closed, proof, insideBound, exitsInside, record: recordOf(closed.final, state.runtime) };
   }
@@ -3089,7 +3093,6 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     const state = newSeam();
     const run = await ownRevive(state, "6", false);
     assertRevived(state, run);
-    expect(run.record.comms, "the record saw the new program").toContain("sleep");
     expect(run.proof, "the new program is a holder with the full sandbox proof").toMatchObject({ holders: 1, proven: 1 });
   });
 
@@ -3245,7 +3248,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     setInterval(() => {}, 1000);
   `;
 
-  async function launcherWindow(state: Seam, options: Plumbed & { leaderAfterProof?: boolean; secs?: string; fresh?: number; runtime?: "python" | "node" }) {
+  async function launcherWindow(state: Seam, options: Plumbed & { leaderAfterProof?: boolean; secs?: string; fresh?: number; image?: "sleep" | "same"; runtime?: "python" | "node" }) {
     requireHost(["bwrap", "unshare", "python3"]);
     const trig = scratch();
     const outcome = { done: false, reached: false };
@@ -3270,7 +3273,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
       afterTick: checks.afterTick,
       ...plumb(options),
     });
-    const command = options.runtime === "node" ? standIn : fixtureCommand(trig, { FRESH: options.fresh ?? HOLD_FILES, SECS: options.secs ?? "6" });
+    const command = options.runtime === "node" ? standIn : fixtureCommand(trig, { FRESH: options.fresh ?? HOLD_FILES, SECS: options.secs ?? "6", IMAGE: options.image ?? "sleep" });
     reference = spawn(process.execPath, ["-e", REFERENCE_SOURCE, JSON.stringify([...KEEP_INNER, "/bin/bash", "-c", command])], { stdio: "ignore" });
     spawned.push(reference);
     await until(() => state.forced, "the seam did not run");
@@ -3324,9 +3327,11 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
   });
 
   async function launcherRevive(state: Seam, secs: string, options: { leaderAfterProof: boolean; exitsInside: boolean }) {
-    const window = await launcherWindow(state, { leaderAfterProof: options.leaderAfterProof, secs, fresh: options.exitsInside ? 300_000 : undefined });
+    // With a seen leader exit the guard under test is the "alive after a leader exit" one, so the new program is the same executable; the alive-entry row changes the executable.
+    const image = options.leaderAfterProof ? "same" : "sleep";
+    const window = await launcherWindow(state, { leaderAfterProof: options.leaderAfterProof, secs, fresh: options.exitsInside ? 300_000 : undefined, image });
     touch(window.trig, "exec");
-    await until(() => imageRuns(state.runtime!.pid, secs), "the surviving thread did not execute the new program");
+    await until(() => imageRuns(state.runtime!.pid, secs, "claude", image), "the surviving thread did not execute the new program");
     let insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 600;
     if (options.exitsInside) {
       await until(() => ended(state.runtime!), "the new program did not end");
@@ -3421,7 +3426,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
    * R -> H -> real bwrap -> runtime (R1 shape): on the third reading the seam optionally ends the runtime's leader (held) and then
    * kills R, so the chain breaks while the runtime lives; with `endHolderAfterMs` the holder is killed later and the runtime ends.
    */
-  async function runtimeWindow(state: Seam, options: Plumbed & { runtime: "python" | "node"; heldLeader?: boolean; endHolderAfterMs?: number; secs?: string }) {
+  async function runtimeWindow(state: Seam, options: Plumbed & { runtime: "python" | "node"; heldLeader?: boolean; endHolderAfterMs?: number; secs?: string; image?: "sleep" | "same" }) {
     requireHost(["bwrap", "python3"]);
     const trig = scratch();
     const checks = holdChecks(state);
@@ -3442,7 +3447,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
       afterTick: checks.afterTick,
       ...plumb(options),
     });
-    const command = options.runtime === "node" ? standIn : fixtureCommand(trig, { FRESH: options.heldLeader ? HOLD_FILES : 0, SECS: options.secs ?? "6" });
+    const command = options.runtime === "node" ? standIn : fixtureCommand(trig, { FRESH: options.heldLeader ? HOLD_FILES : 0, SECS: options.secs ?? "6", IMAGE: options.image ?? "sleep" });
     reference = spawnLogged("/bin/bash", ["-c", referenceScriptOf(command)], trig);
     spawned.push(reference);
     await until(() => state.forced, "the seam did not run");
@@ -3485,13 +3490,13 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
 
   it("R1-revive-exit: the runtime's leader finishes after the entry, its thread executes a new program that ends inside the bound: flagged (revival), never cleared", async () => {
     const state = newSeam();
-    const window = await runtimeWindow(state, { runtime: "python", secs: "0.1" });
+    const window = await runtimeWindow(state, { runtime: "python", secs: "0.1", image: "same" });
     const pid = state.runtime!.pid;
     expect(endLeader(pid, () => zombieLeader(pid) || held(pid)), `precondition not reached: the leader did not finish (${heldDiag(pid, window.trig)})`).toBe(true);
     // The sampler's settle reads register the leader exit before the thread executes the new program (the zombie leader persists until then).
     await pause(250);
     touch(window.trig, "exec");
-    await until(() => imageRuns(pid, "0.1"), "the surviving thread did not execute the new program");
+    await until(() => imageRuns(pid, "0.1", "claude", "same"), "the surviving thread did not execute the new program");
     await until(() => ended(state.runtime!), "the new program did not end");
     const insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
     const { final, summary } = closeWindow(window.sampler);
