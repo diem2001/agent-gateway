@@ -2919,7 +2919,13 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
   const spawnLogged = (file: string, args: string[], trig: string): ChildProcess => {
     const child = spawn(file, args, { stdio: ["ignore", "ignore", fs.openSync(path.join(trig, "stderr"), "w")] });
     // How the fixture tree ended (exit code or signal of its launcher), for \`heldDiag\`: a kill from outside shows as a signal.
-    child.once("exit", (code, signal) => fs.appendFileSync(path.join(trig, "stderr"), `launcher exit: code=${code} signal=${signal}\n`));
+    child.once("exit", (code, signal) => {
+      try {
+        fs.appendFileSync(path.join(trig, "stderr"), `launcher exit: code=${code} signal=${signal}\n`);
+      } catch {
+        // The row is over and its directory is removed.
+      }
+    });
     return child;
   };
   /** The fixture's own reads right before the exit read (the failed proof's seam) and right after the tick that did it. */
