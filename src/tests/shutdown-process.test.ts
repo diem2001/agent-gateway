@@ -298,13 +298,17 @@ function connectRefused(port: number): Promise<boolean> {
   });
 }
 
+function readSessions(fx: Fixture) {
+  return JSON.parse(fs.readFileSync(fx.file("sessions"), "utf8")) as {
+    sessions: Record<string, unknown>;
+    sessionsByLabel?: Record<string, Record<string, unknown>>;
+    erasedByLabel?: Record<string, Record<string, unknown>>;
+  };
+}
+
 function readState(fx: Fixture) {
   return {
-    sessions: JSON.parse(fs.readFileSync(fx.file("sessions"), "utf8")) as {
-      sessions: Record<string, unknown>;
-      sessionsByLabel?: Record<string, Record<string, unknown>>;
-      erasedByLabel?: Record<string, Record<string, unknown>>;
-    },
+    sessions: readSessions(fx),
     tools: (JSON.parse(fs.readFileSync(fx.file("tools"), "utf8")) as { name: string }[]).map((t) => t.name),
     mcpServers: (JSON.parse(fs.readFileSync(fx.file("mcpServers"), "utf8")) as { name: string }[]).map((s) => s.name),
   };
@@ -544,7 +548,6 @@ describe.skipIf(IS_ROOT)(`A stop whose final save fails for one area exits with 
         fs.writeFileSync(fx.file(area), "{ not json at all");
         fs.chmodSync(fx.dirs[area], 0o555);
       }
-      const kept = fs.readFileSync(fx.file(area));
       // The suppressed sessions row has no earlier conversation to delete: its sessions change is a new conversation on a model that never answers.
       const newConversation = area === "sessions" && condition === "suppressed";
       const scripted = newConversation ? await api() : null;
@@ -563,6 +566,8 @@ describe.skipIf(IS_ROOT)(`A stop whose final save fails for one area exits with 
         while (!stream.ended() && Date.now() - left < 5000) await delay(20);
         await delay(300);
       }
+      // What the final save must leave alone is the file as it is when the error starts: a delete saves its tombstone at once (MVP-7402).
+      const kept = fs.readFileSync(fx.file(area));
       if (condition === "injected write error") fs.chmodSync(fx.dirs[area], 0o555);
 
       const signalledAt = Date.now();
@@ -583,7 +588,7 @@ describe.skipIf(IS_ROOT)(`A stop whose final save fails for one area exits with 
       const others = AREAS.filter((a) => a !== area);
       const restarted = await startGateway(fx);
       if (others.includes("sessions")) {
-        expect(Object.keys(readState(fx).sessions.erasedByLabel?.proc ?? {})).toContain("earlier-1");
+        expect(Object.keys(readSessions(fx).erasedByLabel?.proc ?? {})).toContain("earlier-1");
         const sessions = (await request(restarted.port, "GET", "/v1/sessions")).json().sessions.map((s: { id: string }) => s.id);
         expect(sessions).not.toContain("earlier-1");
       }

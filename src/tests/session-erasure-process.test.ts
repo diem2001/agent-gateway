@@ -721,8 +721,6 @@ describe("R1: no API key can change the idle timeout, and the sweep stays live f
     expect(entryOf(g, "alpha", "alpha-chat")?.erasePendingSince).toBeUndefined();
     const settings = await sendAs(g.port, KEY_BETA, "GET", "/v1/settings");
     expect([settings.status, settings.json]).toEqual([200, { sessionIdleTimeoutMs: 0 }]);
-    const stored = readStore(g) as { settings?: { sessionIdleTimeoutMs?: number } };
-    expect(stored.settings?.sessionIdleTimeoutMs).not.toBe(1);
   }
 
   it("R1-T1: label beta sets the timeout to 1 ms with logging off: the PUT answers 400, alpha's folder, entry and canary are unchanged for 6 sweep intervals and after a restart", async () => {
@@ -739,6 +737,7 @@ describe("R1: no API key can change the idle timeout, and the sweep stays live f
     // The refusal is logged although logging is off; the old success line never appears.
     const refused = g.output().split("\n").filter((l) => l.includes("settings.refused"));
     expect(refused).toEqual(["[audit] settings.refused key=sessionIdleTimeoutMs label=beta"]);
+    expect((readStore(g) as { settings?: { sessionIdleTimeoutMs?: number } }).settings?.sessionIdleTimeoutMs).not.toBe(1);
     expect(g.output()).not.toContain("Idle timeout updated");
 
     const again = await restart(g, GATEWAY_ENV(null, { SESSION_ERASURE_RETRY_MS: "500" }));
