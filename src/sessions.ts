@@ -30,6 +30,16 @@ export interface Session {
   owner?: SessionOwner;
   /** Random name of the conversation's sandbox home below the storage root. Entries without one are legacy. */
   sandboxDirId?: string;
+  /**
+   * Set (MVP-7402) when the conversation was deleted or expired but its folder is not confirmed gone yet: the entry
+   * is then a tombstone that keeps the folder reference, blocks every query and is erased by the gateway itself.
+   */
+  erasePendingSince?: number;
+}
+
+/** What stays of an erased conversation: when it happened, nothing else (no folder name, no content). */
+export interface ErasedMarker {
+  erasedAt: number;
 }
 
 /** The shape of a `sandboxDirId`: 12 random bytes in hex. */
@@ -47,6 +57,8 @@ interface PersistedData {
    * a client id can never collide with a legacy raw id, and one label's ids are invisible to another.
    */
   sessionsByLabel?: Record<string, Record<string, Session>>;
+  /** Erased conversations per label and client id (MVP-7402): answers the owning label's late DELETE with 200. */
+  erasedByLabel?: Record<string, Record<string, ErasedMarker>>;
   settings: SessionSettings;
 }
 
@@ -58,12 +70,28 @@ interface PersistedData {
 const sessions = new Map<string, Session>();
 /** Conversations per API-key label. Every entry has an owner and a sandbox home. */
 const sessionsByLabel = new Map<string, Map<string, Session>>();
+/** Erased markers per label (MVP-7402). Maps, never plain objects: a client id is caller-controlled (`__proto__`). */
+const erasedByLabel = new Map<string, Map<string, ErasedMarker>>();
+
+/** A conversation id for a log line: bounded to 128 characters and JSON-escaped, so it can never forge a line (MVP-7402). */
+export function logId(id: string): string {
+  return JSON.stringify(id.slice(0, 128));
+}
 
 function labelMap(label: string, create: boolean): Map<string, Session> | undefined {
   let map = sessionsByLabel.get(label);
   if (!map && create) {
     map = new Map();
     sessionsByLabel.set(label, map);
+  }
+  return map;
+}
+
+function markerMap(label: string, create: boolean): Map<string, ErasedMarker> | undefined {
+  let map = erasedByLabel.get(label);
+  if (!map && create) {
+    map = new Map();
+    erasedByLabel.set(label, map);
   }
   return map;
 }
@@ -76,10 +104,12 @@ function allSessions(): Session[] {
   return [...sessions.values(), ...[...sessionsByLabel.values()].flatMap((map) => [...map.values()])];
 }
 
+/** An entry that is not an erasure-pending tombstone. */
+const live = (session: Session): boolean => session.erasePendingSince === undefined;
+
 let sessionIdleTimeoutMs =
   parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || "0", 10) || 0;
 
-const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const PERSIST_PATH =
   process.env.SESSION_PERSIST_PATH || "./data/sessions.json";
 
@@ -100,6 +130,7 @@ function isPersistedData(data: unknown): boolean {
     (isObject(data.sessions) &&
       Object.values(data.sessions).every((session) => isObject(session) && typeof session.lastUsed === "number" && hasValidIsolationFields(session)));
   if (!sessionsOk) return false;
+  if (!hasValidMarkers(data.erasedByLabel)) return false;
   const byLabel = data.sessionsByLabel;
   if (byLabel === undefined || byLabel === null) return true;
   if (!isObject(byLabel)) return false;
@@ -119,6 +150,18 @@ function isPersistedData(data: unknown): boolean {
   );
 }
 
+/** `erasedByLabel`: absent, or labels (non-empty names) of client ids whose marker holds a finite `erasedAt` and nothing else. */
+function hasValidMarkers(markers: unknown): boolean {
+  if (markers === undefined || markers === null) return true;
+  if (!isObject(markers)) return false;
+  return Object.entries(markers).every(
+    ([label, map]) =>
+      label.length > 0 &&
+      isObject(map) &&
+      Object.values(map).every((marker) => isObject(marker) && Object.keys(marker).length === 1 && typeof marker.erasedAt === "number" && Number.isFinite(marker.erasedAt)),
+  );
+}
+
 /**
  * The fields added by the isolation update are optional (older files load), but a present one must be
  * usable: an owner with a label and, when it carries one, a string or null creator user id (the key may be absent:
@@ -132,6 +175,11 @@ function hasValidIsolationFields(session: Record<string, unknown>): boolean {
     if (owner.userId !== undefined && owner.userId !== null && typeof owner.userId !== "string") return false;
   }
   if (session.sandboxDirId !== undefined && !(typeof session.sandboxDirId === "string" && SANDBOX_DIR_ID.test(session.sandboxDirId))) return false;
+  // A tombstone belongs to a conversation with an owner and a folder; a legacy entry never has one (MVP-7402).
+  if (session.erasePendingSince !== undefined) {
+    if (typeof session.erasePendingSince !== "number" || !Number.isFinite(session.erasePendingSince)) return false;
+    if (session.owner === undefined || session.sandboxDirId === undefined) return false;
+  }
   return true;
 }
 
@@ -141,6 +189,8 @@ const store = createPersistentStore({
   snapshot: (): PersistedData => ({
     sessions: Object.fromEntries(sessions),
     sessionsByLabel: Object.fromEntries([...sessionsByLabel].map(([label, map]) => [label, Object.fromEntries(map)])),
+    // Additive: absent until the first erasure, so a file that never saw one is written back unchanged.
+    ...(erasedByLabel.size > 0 ? { erasedByLabel: Object.fromEntries([...erasedByLabel].map(([label, map]) => [label, Object.fromEntries(map)])) } : {}),
     settings: { sessionIdleTimeoutMs },
   }),
   isValid: isPersistedData,
@@ -164,18 +214,28 @@ export function loadSessions(): void {
   }
 
   const expired = (session: Session): boolean => sessionIdleTimeoutMs > 0 && now - session.lastUsed >= sessionIdleTimeoutMs;
+  // An expired conversation with a folder is not dropped (MVP-7402): it becomes a tombstone that the startup sweep
+  // erases. An expired legacy entry is dropped as before; no file is touched.
+  const restoreOwned = (label: string, id: string, session: Session): void => {
+    if (live(session) && expired(session)) session.erasePendingSince = now;
+    labelMap(label, true)!.set(id, session);
+  };
 
-  // Restore sessions (filter expired ones). An entry with an owner and a home (written by the isolation update)
+  // Restore sessions. An entry with an owner and a home (written by the isolation update)
   // moves into its label's map; an ownerless one stays a legacy entry under its raw id.
   for (const [id, session] of Object.entries(data.sessions || {})) {
-    if (expired(session)) continue;
-    if (session.owner && session.sandboxDirId) labelMap(session.owner.label, true)!.set(id, session);
-    else sessions.set(id, session);
+    if (session.owner && session.sandboxDirId) restoreOwned(session.owner.label, id, session);
+    else if (!expired(session)) sessions.set(id, session);
   }
   // Per-label entries win over a moved entry of the same label and id.
   for (const [label, map] of Object.entries(data.sessionsByLabel || {})) {
-    for (const [id, session] of Object.entries(map)) {
-      if (!expired(session)) labelMap(label, true)!.set(id, session);
+    for (const [id, session] of Object.entries(map)) restoreOwned(label, id, session);
+  }
+  // Markers of conversations that are gone; a restored entry of the same id means the id is in use again.
+  for (const [label, map] of Object.entries(data.erasedByLabel || {})) {
+    for (const [id, marker] of Object.entries(map)) {
+      if (labelEntry(label, id)) continue;
+      markerMap(label, true)!.set(id, { erasedAt: marker.erasedAt });
     }
   }
 
@@ -203,7 +263,7 @@ export interface GetSessionResult {
   sandboxDirId?: string;
 }
 
-export type Admission = { kind: "new" } | { kind: "resume"; sandboxDirId: string } | { kind: "refused"; reason: "legacy" };
+export type Admission = { kind: "new" } | { kind: "resume"; sandboxDirId: string } | { kind: "refused"; reason: "legacy" | "erasing" };
 
 let legacyRefusals = 0;
 
@@ -218,6 +278,8 @@ export function admitSession(clientId: string, caller: SessionOwner): Admission 
   const own = labelEntry(caller.label, clientId);
   if (own) {
     if (!own.owner || !own.sandboxDirId) return { kind: "refused", reason: "legacy" };
+    // A deleted or expired conversation whose folder is not confirmed gone: nothing may resume or extend it (MVP-7402).
+    if (!live(own)) return { kind: "refused", reason: "erasing" };
     return { kind: "resume", sandboxDirId: own.sandboxDirId };
   }
   // Another label's conversation with the same id is invisible here: this caller gets a new conversation of its
@@ -258,7 +320,7 @@ export function getSession(
     // attempt's transcript if the old ID were reused.
     existing.sessionId = randomUUID();
     persistSessions();
-    log("sessions", `Session ${sessionId} has no confirmed SDK session — starting new query`);
+    log("sessions", `Session ${logId(sessionId)} has no confirmed SDK session — starting new query`);
     return { sessionId: existing.sessionId, isNew: true, sandboxDirId: existing.sandboxDirId };
   }
 
@@ -272,11 +334,14 @@ export function getSession(
     lastUsed: Date.now(),
     ...(caller ? { owner: { label: caller.label, userId: caller.userId }, sandboxDirId } : {}),
   };
-  if (caller) labelMap(caller.label, true)!.set(sessionId, entry);
-  else sessions.set(sessionId, entry);
+  if (caller) {
+    labelMap(caller.label, true)!.set(sessionId, entry);
+    // The id is in use again: a later DELETE concerns this new conversation, not the erased one.
+    markerMap(caller.label, false)?.delete(sessionId);
+  } else sessions.set(sessionId, entry);
   persistSessions();
 
-  log("sessions", `Created session ${sessionId}`);
+  log("sessions", `Created session ${logId(sessionId)}`);
   return { sessionId: claudeSessionId, isNew: true, sandboxDirId: caller ? sandboxDirId : undefined };
 }
 
@@ -301,9 +366,9 @@ export function listSessions(callerLabel?: string): Array<{
     result.push({ id, model: session.model, lastUsed: session.lastUsed });
   };
   if (callerLabel === undefined) {
-    for (const map of sessionsByLabel.values()) for (const [id, session] of map) add(id, session);
+    for (const map of sessionsByLabel.values()) for (const [id, session] of map) if (live(session)) add(id, session);
   } else {
-    for (const [id, session] of sessionsByLabel.get(callerLabel) ?? []) add(id, session);
+    for (const [id, session] of sessionsByLabel.get(callerLabel) ?? []) if (live(session)) add(id, session);
   }
   for (const [id, session] of sessions) add(id, session);
   return result;
@@ -314,28 +379,124 @@ export function updateSessionSdkId(clientId: string, sdkSessionId: string, label
   if (existing && existing.sdkSessionId !== sdkSessionId) {
     existing.sdkSessionId = sdkSessionId;
     persistSessions();
-    log("sessions", `Updated SDK sessionId for ${clientId}: ${sdkSessionId}`);
+    log("sessions", `Updated SDK sessionId for ${logId(clientId)}: ${sdkSessionId}`);
   }
+}
+
+/** Conversations that can be used or listed: tombstones (erasure pending) are not counted. */
+export function getSessionCount(): number {
+  return allSessions().filter(live).length;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Erasure state (MVP-7402; the erase path is session-erasure.ts)      */
+/* ------------------------------------------------------------------ */
+
+/** The caller's own conversation of that id, if any: its folder name and whether it is already a tombstone. */
+export function ownedConversation(label: string, clientId: string): { sandboxDirId: string; pending: boolean } | undefined {
+  const entry = labelEntry(label, clientId);
+  if (!entry?.sandboxDirId) return undefined;
+  return { sandboxDirId: entry.sandboxDirId, pending: !live(entry) };
+}
+
+/** True when the label has an erased marker for that id. */
+export function hasErasedMarker(label: string, clientId: string): boolean {
+  return markerMap(label, false)?.has(clientId) ?? false;
+}
+
+/** True when an ownerless legacy entry (from before the isolation update) exists under that raw id. */
+export function hasLegacyEntry(clientId: string): boolean {
+  return sessions.has(clientId);
+}
+
+/** Set when the last flush of a new tombstone failed: the sweep saves again (it stays pending in memory meanwhile). */
+let pendingFlushFailed = false;
+
+/** Marks the caller's conversation erasure-pending (idempotent) and saves now. False when there is no such conversation. */
+export function markErasePending(label: string, clientId: string): boolean {
+  const entry = labelEntry(label, clientId);
+  if (!entry?.sandboxDirId) return false;
+  if (live(entry)) {
+    entry.erasePendingSince = Date.now();
+    pendingFlushFailed = !flushSessions();
+  }
+  return true;
+}
+
+/** Saves again after a failed save of a tombstone; a no-op otherwise. */
+export function reflushPending(): void {
+  if (pendingFlushFailed) pendingFlushFailed = !flushSessions();
+}
+
+/** True when any other entry (of any label, legacy included) references the same folder name. */
+export function folderSharedWithOther(label: string, clientId: string, sandboxDirId: string): boolean {
+  const self = labelEntry(label, clientId);
+  return allSessions().some((entry) => entry !== self && entry.sandboxDirId === sandboxDirId);
 }
 
 /**
- * Deletes the caller's own entry of that id; failing that, an ownerless legacy entry. Another label's
- * conversation is reported as not found (and stays). Without a label (tests) the legacy map is used.
+ * The folder is gone: in one step the entry is removed and the label's marker written, then saved. Returns whether
+ * the save succeeded (the outcome of the erasure itself does not depend on it). Nothing happens when the entry is gone
+ * or no longer names that folder.
  */
-export function deleteSession(sessionId: string, callerLabel?: string): boolean {
-  let deleted = false;
-  const own = callerLabel !== undefined ? labelMap(callerLabel, false) : undefined;
-  if (own?.delete(sessionId)) deleted = true;
-  else if (sessions.delete(sessionId)) deleted = true;
-  if (deleted) {
-    persistSessions();
-    log("sessions", `Deleted session ${sessionId}`);
-  }
-  return deleted;
+export function completeErasure(label: string, clientId: string, sandboxDirId: string): { completed: boolean; saved: boolean } {
+  const map = labelMap(label, false);
+  const entry = map?.get(clientId);
+  if (!map || !entry || entry.sandboxDirId !== sandboxDirId) return { completed: false, saved: true };
+  map.delete(clientId);
+  markerMap(label, true)!.set(clientId, { erasedAt: Date.now() });
+  const saved = flushSessions();
+  pendingFlushFailed = pendingFlushFailed && !saved;
+  return { completed: true, saved };
 }
 
-export function getSessionCount(): number {
-  return allSessions().length;
+/** Every tombstone, for the sweep. */
+export function pendingConversations(): Array<{ label: string; clientId: string; sandboxDirId: string }> {
+  const out: Array<{ label: string; clientId: string; sandboxDirId: string }> = [];
+  for (const [label, map] of sessionsByLabel) {
+    for (const [clientId, entry] of map) if (!live(entry) && entry.sandboxDirId) out.push({ label, clientId, sandboxDirId: entry.sandboxDirId });
+  }
+  return out;
+}
+
+/** The tombstone that names that folder, for the release of its conversation lock. */
+export function pendingConversationForDir(sandboxDirId: string): { label: string; clientId: string } | undefined {
+  return pendingConversations().find((p) => p.sandboxDirId === sandboxDirId);
+}
+
+/** The number of tombstones: the aggregate `erasurePending` of /health (no ids, no labels). */
+export function erasurePendingCount(): number {
+  return allSessions().filter((entry) => !live(entry)).length;
+}
+
+/**
+ * Idle expiry: an idle conversation with a folder becomes a tombstone (the caller erases it); an idle legacy entry is
+ * dropped without any file being touched, as before. Returns how many entries each rule took.
+ */
+export function expireIdleSessions(now: number = Date.now()): { marked: number; dropped: number } {
+  if (sessionIdleTimeoutMs <= 0) return { marked: 0, dropped: 0 };
+  let marked = 0;
+  let dropped = 0;
+  for (const [id, session] of sessions) {
+    if (now - session.lastUsed > sessionIdleTimeoutMs) {
+      sessions.delete(id);
+      dropped++;
+    }
+  }
+  for (const map of sessionsByLabel.values()) {
+    for (const session of map.values()) {
+      if (live(session) && now - session.lastUsed > sessionIdleTimeoutMs) {
+        session.erasePendingSince = now;
+        marked++;
+      }
+    }
+  }
+  if (marked + dropped > 0) {
+    log("sessions", `Expired ${marked + dropped} idle session(s). Active: ${getSessionCount()}`);
+    if (marked > 0) pendingFlushFailed = !flushSessions();
+    else persistSessions();
+  }
+  return { marked, dropped };
 }
 
 /* ------------------------------------------------------------------ */
@@ -359,35 +520,3 @@ export function updateSettings(
   persistSessions();
   return { sessionIdleTimeoutMs };
 }
-
-/* ------------------------------------------------------------------ */
-/*  Periodic cleanup                                                    */
-/* ------------------------------------------------------------------ */
-
-setInterval(() => {
-  if (sessionIdleTimeoutMs <= 0) return;
-  const now = Date.now();
-  let cleaned = 0;
-  for (const [id, session] of sessions) {
-    if (now - session.lastUsed > sessionIdleTimeoutMs) {
-      sessions.delete(id);
-      cleaned++;
-    }
-  }
-  for (const [label, map] of sessionsByLabel) {
-    for (const [id, session] of map) {
-      if (now - session.lastUsed > sessionIdleTimeoutMs) {
-        map.delete(id);
-        cleaned++;
-      }
-    }
-    if (map.size === 0) sessionsByLabel.delete(label);
-  }
-  if (cleaned > 0) {
-    log(
-      "sessions",
-      `Cleaned ${cleaned} idle session(s). Active: ${getSessionCount()}`,
-    );
-    persistSessions();
-  }
-}, CLEANUP_INTERVAL_MS);

@@ -107,7 +107,7 @@ function makeFolder(dirId: string): void {
 
 function conversation(sessions: SessionsModule, caller: { label: string; userId: string | null }, id: string): string {
   const created = sessions.getSession(id, "sys", "model", true, caller);
-  sessions.updateSessionSdkId(id, `sdk-${id}`, caller.label);
+  sessions.updateSessionSdkId(id, `sdk-${randomBytes(4).toString("hex")}`, caller.label);
   makeFolder(created.sandboxDirId!);
   return created.sandboxDirId!;
 }
@@ -300,6 +300,28 @@ describe("the erase helper (eraseConversationDir)", () => {
     expect(gone(folder(dirId))).toBe(true);
   });
 
+  it("S4: a mount below the folder is never crossed: the removal refuses before any tool runs, and the mounted directory keeps content and mode", async () => {
+    const dirId = "0123456789abcdef01234567";
+    makeFolder(dirId);
+    const outside = path.join(tmp, "mounted-outside");
+    fs.mkdirSync(outside, { mode: 0o700 });
+    fs.writeFileSync(path.join(outside, "canary.txt"), "canary");
+    fs.chmodSync(path.join(outside, "canary.txt"), 0o400);
+    fs.mkdirSync(path.join(folder(dirId), "work", "m"));
+    const before = snapshot(outside);
+    // A user and mount namespace of its own: the bind mount exists only inside it (no privilege needed).
+    const script = `mount --bind "$1" "$2" && exec "$3" --eval 'import("${path.resolve("src/session-erasure.ts")}").then(async (m) => { console.log(JSON.stringify(await m.eraseConversationDir(process.argv[1], process.argv[2]))); })' "$4" "$5"`;
+    let out: string;
+    try {
+      out = execFileSync("/usr/bin/unshare", ["-Urm", "/bin/sh", "-c", script, "sh", outside, path.join(folder(dirId), "work", "m"), path.resolve("node_modules/.bin/tsx"), root, dirId], { encoding: "utf8", env: { ...process.env, AGENT_SANDBOX_ROOT: root } });
+    } catch (e) {
+      throw new Error(`host prerequisite missing: user and mount namespaces for the mount row (${(e as Error).message.split("\n")[0]})`);
+    }
+    expect(JSON.parse(out.trim().split("\n").at(-1)!)).toEqual({ ok: false, code: "mount_boundary" });
+    expect(snapshot(outside)).toEqual(before);
+    expect(fs.existsSync(folder(dirId))).toBe(true);
+  });
+
   it("a failing removal reports a fixed code, never a path or a message", async () => {
     const { erasure } = await load();
     const dirId = "0123456789abcdef01234567";
@@ -383,8 +405,12 @@ describe("DELETE /v1/sessions/:id (the contract table)", () => {
     const entryBefore = readStore().sessionsByLabel.reqlift.c1;
     const folderBefore = snapshot(folder(dirId));
     const orphanBefore = snapshot(folder(orphan));
-    const res = await del(app, id, label);
-    expect([res.status, res.body]).toEqual([404, { error: "Session not found" }]);
+    // An HTTP client normalizes `..` away before it is sent, so that id goes straight to the route's decision.
+    if (id === "..") expect(await (await import("../session-erasure.js")).deleteConversation(id, label)).toBe("not_found");
+    else {
+      const res = await del(app, id, label);
+      expect([res.status, res.body]).toEqual([404, { error: "Session not found" }]);
+    }
     sessions.flushSessions();
     expect(readStore().sessionsByLabel.reqlift.c1).toEqual(entryBefore);
     expect(snapshot(folder(dirId))).toEqual(folderBefore);
@@ -498,7 +524,7 @@ describe("log lines carry the conversation id escaped and bounded (S6)", () => {
     for (const id of hostile) expect((await del(app, id)).status).toBe(200);
     // No log message of this run contains a line break followed by a forged prefix, and none is longer than a bounded line.
     const lines = logs.join("\n").split("\n");
-    expect(lines.some((l) => l.startsWith("[audit] x"))).toBe(false);
+    expect(lines.filter((l) => l.startsWith("[audit] x"))).toEqual([]);
     expect(logs.filter((l) => l.includes("[audit] x")).every((l) => !l.includes("\n"))).toBe(true);
     const failed = logs.filter((l) => l.includes("sessions.erasure.failed"));
     expect(failed).toHaveLength(2);

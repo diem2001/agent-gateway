@@ -15,13 +15,13 @@ import {
 import {
   loadSessions,
   listSessions,
-  deleteSession,
   getSessionCount,
   getSettings,
   updateSettings,
   type SessionSettings,
 } from "./sessions.js";
 import { queryRouter } from "./query.js";
+import { deleteSessionRoute } from "./session-erasure.js";
 import sshRoutes from "./routes/ssh.js";
 import authRoutes from "./routes/auth.js";
 import workspaceRoutes from "./routes/workspace.js";
@@ -198,14 +198,9 @@ app.get("/v1/sessions", (req, res) => {
   res.json({ sessions: visible, count: visible.length });
 });
 
-app.delete("/v1/sessions/:id", (req, res) => {
-  const deleted = deleteSession(req.params.id, req.clientLabel);
-  if (!deleted) {
-    res.status(404).json({ error: "Session not found" });
-    return;
-  }
-  res.json({ deleted: true });
-});
+// 200 only when the conversation's folder is gone; 503 `erasure_pending` while the gateway still has to finish it;
+// 409 `legacy_not_erased` for a conversation from before the isolation update (MVP-7402, session-erasure.ts).
+app.delete("/v1/sessions/:id", deleteSessionRoute);
 
 /* ------------------------------------------------------------------ */
 /*  Routes: Settings (authenticated)                                    */
