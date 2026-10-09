@@ -2729,8 +2729,12 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     "def worker():",
     "    while True:",
     "        if os.path.exists(trig + '/exec'):",
+    "            sys.stderr.write('worker: exec\\n')",
+    "            sys.stderr.flush()",
     "            os.execv('/bin/sleep', [title, secs])",
     "        if os.path.exists(trig + '/end'):",
+    "            sys.stderr.write('worker: end\\n')",
+    "            sys.stderr.flush()",
     "            return",
     "        time.sleep(0.001)",
     "def leave(*_):",
@@ -2912,7 +2916,12 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     return `process ${stat === null ? "gone" : `state=${stat.state} threads=${stat.threads} cmdline-empty=${cmdlineEmpty(pid!)} exe-gone=${linkGone(pid!, "exe")} mnt-gone=${linkGone(pid!, "ns/mnt")} handler=${handlerInstalled(pid!)}`}; fixture stderr: ${stderr}`;
   };
   /** Spawns a fixture tree with its stderr in the trigger directory, for \`heldDiag\`. */
-  const spawnLogged = (file: string, args: string[], trig: string): ChildProcess => spawn(file, args, { stdio: ["ignore", "ignore", fs.openSync(path.join(trig, "stderr"), "w")] });
+  const spawnLogged = (file: string, args: string[], trig: string): ChildProcess => {
+    const child = spawn(file, args, { stdio: ["ignore", "ignore", fs.openSync(path.join(trig, "stderr"), "w")] });
+    // How the fixture tree ended (exit code or signal of its launcher), for \`heldDiag\`: a kill from outside shows as a signal.
+    child.once("exit", (code, signal) => fs.appendFileSync(path.join(trig, "stderr"), `launcher exit: code=${code} signal=${signal}\n`));
+    return child;
+  };
   /** The fixture's own reads right before the exit read (the failed proof's seam) and right after the tick that did it. */
   const holdChecks = (state: Seam) => ({
     before: (): void => {
