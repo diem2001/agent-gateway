@@ -4845,7 +4845,7 @@ describe("process sampler lost ticks (MVP-8139)", () => {
 
   /*  The hook path: the global afterEach and afterAll of the setup file, run by a child vitest on fixtures that only ever exist under /tmp  */
 
-  it("LT-hook: the setup file fails a test whose window lost a tick (stopped, left running, refused seam value), a window started outside a test, and passes a clean one and an exactly acknowledged one", async () => {
+  it("LT-hook: the setup file fails a test whose window lost a tick (stopped, left running, refused seam value, a coded exception out of a tick), a window started outside a test, and passes a clean one and an exactly acknowledged one", async () => {
     const dir = fs.mkdtempSync("/tmp/mvp8139-lt-hook-");
     dirs.push(dir);
     const here = path.dirname(fileURLToPath(import.meta.url));
@@ -4853,7 +4853,10 @@ describe("process sampler lost ticks (MVP-8139)", () => {
     const setup = path.join(here, "setup", "sampler-verdict.ts");
     const head = `import { startProcessSampler, acknowledgeLostTicks } from ${JSON.stringify(helper)};\n`;
     const fault = (value: string): string => `{ tickReadFault: (kind, pid, file) => { if (fired || kind !== "tree" || file !== "task" || pid !== process.pid) return undefined; fired = true; return ${JSON.stringify(value)}; } }`;
-    const start = (value: string): string => `let fired = false;\nconst start = () => startProcessSampler(() => process.pid, [], 20, ${fault(value)});\nconst lost = async (sampler) => { for (const end = Date.now() + 10000; sampler.peek().lostTicks < 1 && Date.now() < end; ) await new Promise((resolve) => setTimeout(resolve, 20)); };\n`;
+    const waitLost = "const lost = async (sampler) => { for (const end = Date.now() + 10000; sampler.peek().lostTicks < 1 && Date.now() < end; ) await new Promise((resolve) => setTimeout(resolve, 20)); };\n";
+    const start = (value: string): string => `let fired = false;\nconst start = () => startProcessSampler(() => process.pid, [], 20, ${fault(value)});\n${waitLost}`;
+    /** A real tick whose own gateway-pid callback throws an exception with a code: the sampler must count it as a lost tick whatever the code says. */
+    const coded = (code: string): string => `let calls = 0;\nconst start = () => startProcessSampler(() => {\n  if (++calls === 3) throw Object.assign(new Error("gone"), { code: ${JSON.stringify(code)} });\n  return process.pid;\n}, [], 20);\n${waitLost}`;
     const files: Record<string, string> = {
       "a.test.ts": `${head}${start("EMFILE")}it("LT-hook-a: an injected lost tick that nobody acknowledged", async () => {\n  const sampler = start();\n  await lost(sampler);\n  sampler.stop({});\n});\n`,
       "b.test.ts": `${head}${start("EMFILE")}it("LT-hook-b: the same, with the window left running at the end of the test", async () => {\n  const sampler = start();\n  await lost(sampler);\n});\n`,
@@ -4861,6 +4864,8 @@ describe("process sampler lost ticks (MVP-8139)", () => {
       "d.test.ts": `${head}${start("EMFILE")}let sampler;\nbeforeAll(async () => {\n  sampler = start();\n  await lost(sampler);\n});\nit("LT-hook-d: a test beside a window started in beforeAll", () => {});\nafterAll(() => {\n  sampler.stop({});\n});\n`,
       "e.test.ts": `${head}${start("ENOENT")}it("LT-hook-e: a refused seam value, acknowledged with zero", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, sample.lostTicksInjected);\n});\n`,
       "f.test.ts": `${head}${start("EMFILE")}it("LT-hook-f: an injected lost tick acknowledged exactly", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, 1);\n});\n`,
+      "g.test.ts": `${head}${coded("ENOENT")}it("LT-hook-g: an ENOENT out of a tick, acknowledged with the injected count", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, sample.lostTicksInjected);\n});\n`,
+      "h.test.ts": `${head}${coded("ESRCH")}it("LT-hook-h: an ESRCH out of a tick, acknowledged with the injected count", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, sample.lostTicksInjected);\n});\n`,
     };
     for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
     fs.writeFileSync(path.join(dir, "vitest.config.mjs"), `export default { test: { globals: true, environment: "node", root: ${JSON.stringify(dir)}, include: ["*.test.ts"], setupFiles: [${JSON.stringify(setup)}] } };\n`);
@@ -4894,6 +4899,11 @@ describe("process sampler lost ticks (MVP-8139)", () => {
     expect(file("e.test.ts").assertionResults.map((assertion) => assertion.status), "a refused seam value is natural: acknowledging zero changes nothing").toEqual(["failed"]);
     expect(failures("e.test.ts")).toMatch(/not assessable: row LT-hook-e-[0-9a-f]{10}, lost ticks 1, first lost read tree:task:SEAM-INVALID/);
     expect(file("f.test.ts").assertionResults.map((assertion) => assertion.status), "an exact acknowledgement passes").toEqual(["passed"]);
+    // A coded exception out of a real tick is a natural lost tick whatever its code says (ENOENT and ESRCH included), so the injected count cannot acknowledge it.
+    for (const [name, code] of [["g", "ENOENT"], ["h", "ESRCH"]] as const) {
+      expect(file(`${name}.test.ts`).assertionResults.map((assertion) => assertion.status), `${name}: the test fails in the hook`).toEqual(["failed"]);
+      expect(failures(`${name}.test.ts`), name).toMatch(new RegExp(`not assessable: row LT-hook-${name}-[0-9a-f]{10}, lost ticks 1, first lost read abort:${code}`));
+    }
   });
 
   /*  Static rows: where the seam and the acknowledgement may be used, and that the verdict is wired in  */
@@ -4905,20 +4915,21 @@ describe("process sampler lost ticks (MVP-8139)", () => {
     ts.forEachChild(node, (child) => walk(child, visit));
   };
 
-  it("LT-static: only the declared LT rows pass the tick read seam or acknowledge lost ticks (every use belongs to the brace-matched body of one row)", () => {
+  it("LT-static: only the declared LT rows pass the tick read seam or acknowledge lost ticks (every identifier or whole string literal of those names in a TypeScript file under src belongs to the brace-matched body of one row)", () => {
     const ALLOWED = ["LT-tree", "LT-snapshot", "LT-first-exe", "LT-reread", "LT-abort", "LT-two-reads", "LT-two-ticks", "LT-records0", "LT-neg", "LT-gateway", "LT-ack", "sandboxedWindow", "assertLostWindow"];
     const names = ["tickRead" + "Fault", "acknowledge" + "LostTicks"];
-    const files = [
-      ...fs.readdirSync(testsDir).filter((name) => name.endsWith(".ts")).map((name) => path.join(testsDir, name)),
-      ...fs.readdirSync(path.join(testsDir, "helpers")).filter((name) => name.endsWith(".ts") && name !== "security-matrix.ts").map((name) => path.join(testsDir, "helpers", name)),
-      ...fs.readdirSync(path.join(testsDir, "setup")).filter((name) => name.endsWith(".ts")).map((name) => path.join(testsDir, "setup", name)),
-    ];
+    const srcDir = path.resolve(testsDir, "..");
+    const definition = path.join(testsDir, "helpers", "security-matrix.ts");
+    const files = (fs.readdirSync(srcDir, { recursive: true }) as string[])
+      .filter((name) => name.endsWith(".ts") && !name.split(path.sep).includes("node_modules"))
+      .map((name) => path.join(srcDir, name))
+      .filter((file) => file !== definition);
     const offenders: string[] = [];
     let uses = 0;
     for (const file of files) {
       const source = sourceOf(file);
       walk(source, (node) => {
-        if (!ts.isIdentifier(node) || !names.includes(node.text)) return;
+        if (!(ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) || !names.includes(node.text)) return;
         for (let up: ts.Node | undefined = node; up; up = up.parent) if (ts.isImportDeclaration(up)) return;
         uses += 1;
         let owner = "outside a row";
@@ -4933,14 +4944,14 @@ describe("process sampler lost ticks (MVP-8139)", () => {
             break;
           }
         }
-        if (!ALLOWED.includes(owner)) offenders.push(`${path.basename(file)}: ${owner}`);
+        if (!ALLOWED.includes(owner)) offenders.push(`${path.relative(srcDir, file)}: ${owner}`);
       });
     }
     expect(uses, "the rows that use the seam were found").toBeGreaterThanOrEqual(10);
     expect(offenders).toEqual([]);
   });
 
-  it("LT-wiring: the setup file is registered, its afterEach asks lostTickVerdict, and the INVALID skip asks invalidSkipDecision with the lost ticks of the test", () => {
+  it("LT-wiring: the setup file is registered, its afterEach asks lostTickVerdict, and the INVALID skip asks invalidSkipDecision with the lost ticks of the test (the call site is pinned exactly)", () => {
     const root = path.resolve(testsDir, "..", "..");
     const config = fs.readFileSync(path.join(root, "vitest.config.ts"), "utf8");
     expect(config).toMatch(/setupFiles:\s*\["src\/tests\/setup\/sampler-verdict\.ts"\]/);
@@ -4961,5 +4972,122 @@ describe("process sampler lost ticks (MVP-8139)", () => {
     expect(wrapper, "the INVALID skip wrapper was found").toContain("baseIt(");
     expect(wrapper).toContain("currentTestLostTicks({ stopRunning: true })");
     expect(wrapper).toMatch(/invalidSkipDecision\(\{[^}]*lostTicks/);
+
+    // The call site itself, exactly: a regex over the text accepts `lostTicks: 0`, a shadowing binding, a second wrapper or a skip that returns.
+    // The expected texts are assembled from parts, so that no line of this row is the verbatim text a falsification patch replaces.
+    const self = sourceOf(fileURLToPath(import.meta.url));
+    const norm = (text: string): string => text.replace(/\s+/g, " ").trim();
+    const wrappers: ts.VariableDeclaration[] = [];
+    const decisionCalls: ts.CallExpression[] = [];
+    walk(self, (node) => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "it" && node.initializer && node.initializer.getText().includes("baseIt(")) wrappers.push(node);
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "invalidSkipDecision") decisionCalls.push(node);
+    });
+    expect(wrappers.length, "wiring: exactly one INVALID skip wrapper declaration in the file").toBe(1);
+    const wrapperNode = wrappers[0];
+    const inside = (node: ts.Node, outer: ts.Node): boolean => node.pos >= outer.pos && node.end <= outer.end;
+    const rowTitle = (node: ts.Node): string => {
+      for (let up: ts.Node | undefined = node.parent; up; up = up.parent) {
+        if (ts.isCallExpression(up) && ts.isIdentifier(up.expression) && up.expression.text === "it" && up.arguments[0] && ts.isStringLiteral(up.arguments[0])) return up.arguments[0].text;
+      }
+      return "";
+    };
+    expect(
+      decisionCalls.every((call) => inside(call, wrapperNode) || rowTitle(call).startsWith("L1:")),
+      "wiring: invalidSkipDecision is called only by the INVALID skip wrapper and by the decision table row",
+    ).toBe(true);
+    const wrapperCalls = decisionCalls.filter((call) => inside(call, wrapperNode));
+    expect(wrapperCalls.length, "wiring: the INVALID skip wrapper makes exactly one decision call").toBe(1);
+    const decisionArgs = wrapperCalls[0].arguments;
+    expect(decisionArgs.length === 1 && ts.isObjectLiteralExpression(decisionArgs[0]), "wiring: the decision call takes one object literal").toBe(true);
+    const properties = (decisionArgs[0] as ts.ObjectLiteralExpression).properties.map((property) => {
+      if (ts.isShorthandPropertyAssignment(property)) return `${property.name.text}:shorthand`;
+      if (ts.isPropertyAssignment(property) && ts.isIdentifier(property.name)) return `${property.name.text}:${norm(property.initializer.getText())}`;
+      return "other";
+    });
+    const suiteFlag = ["process.env.FULL_SUITE_REASON", "!==", "undefined"].join(" ");
+    expect([...properties].sort(), "wiring: the decision arguments are exactly fullSuite, message, skippedSoFar and lostTicks (no spread, no literal)").toEqual(
+      [`fullSuite:${suiteFlag}`, "message:shorthand", "skippedSoFar:shorthand", "lostTicks:shorthand"].sort(),
+    );
+
+    const bound = new Map<string, number>();
+    const decides: ts.VariableDeclaration[] = [];
+    const lostDeclarations: ts.VariableDeclaration[] = [];
+    const skipBranches: ts.IfStatement[] = [];
+    let lostIdentifiers = 0;
+    let lostReassigned = false;
+    walk(wrapperNode.initializer!, (node) => {
+      if (ts.isIdentifier(node) && node.text === "lostTicks") lostIdentifiers += 1;
+      if ((ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node)) && ts.isIdentifier(node.name)) bound.set(node.name.text, (bound.get(node.name.text) ?? 0) + 1);
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "decide") decides.push(node);
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "lostTicks") lostDeclarations.push(node);
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment && ts.isIdentifier(node.left) && node.left.text === "lostTicks") lostReassigned = true;
+      if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(node.operator) && ts.isIdentifier(node.operand) && node.operand.text === "lostTicks") lostReassigned = true;
+      if (ts.isIfStatement(node) && norm(node.expression.getText()) === 'decide(skipped) === "skip"') skipBranches.push(node);
+    });
+    expect(lostDeclarations.length === 1 && bound.get("lostTicks") === 1 && bound.get("message") === 1, "wiring: the wrapper binds lostTicks and message exactly once (no parameter, default or destructuring shadows them)").toBe(true);
+    expect(lostIdentifiers, "wiring: the identifier lostTicks occurs exactly three times in the wrapper (declaration, property read, decision argument)").toBe(3);
+    expect(lostReassigned, "wiring: lostTicks is never assigned after its declaration").toBe(false);
+    const lostSource = ["currentTestLostTicks({ stopRunning: true })", "lostTicks"].join(".");
+    expect(
+      lostDeclarations[0].initializer !== undefined && norm(lostDeclarations[0].initializer.getText()) === lostSource && (lostDeclarations[0].parent.flags & ts.NodeFlags.Const) !== 0,
+      "wiring: lostTicks is a const read from the test's own lost ticks with the running windows stopped",
+    ).toBe(true);
+    const decideFn = decides.length === 1 ? decides[0].initializer : undefined;
+    expect(
+      decideFn !== undefined && ts.isArrowFunction(decideFn) && decideFn.parameters.length === 1 && ts.isIdentifier(decideFn.parameters[0].name) && decideFn.parameters[0].name.text === "skippedSoFar" && decideFn.parameters[0].initializer === undefined && decideFn.parameters[0].dotDotDotToken === undefined,
+      "wiring: the decide function takes exactly one plain parameter, skippedSoFar (decide parameters)",
+    ).toBe(true);
+    expect(skipBranches.length, "wiring: exactly one skip branch asks decide with the count of INVALID rows skipped so far").toBe(1);
+    const branch = skipBranches[0].thenStatement;
+    const statements = ts.isBlock(branch) ? [...branch.statements] : [];
+    let leaves = false;
+    walk(branch, (node) => {
+      if (ts.isReturnStatement(node) || ts.isThrowStatement(node)) leaves = true;
+    });
+    expect(
+      statements.length === 3 && norm(statements[0].getText()) === "skipped += 1;" && statements[1].getText().startsWith("process.stderr.write(") && statements[1].getText().includes("INVALID-SKIP ") && statements[2].getText().startsWith("context.skip("),
+      "wiring: the skip branch counts the skip, writes the INVALID-SKIP line and skips the test, in that order",
+    ).toBe(true);
+    expect(leaves, "wiring: the skip branch neither returns nor throws").toBe(false);
+  });
+
+  it("N1-wiring: the settle of a pending record reads the executable with the errno-aware reader on the real io and hands that reading to the revival rule unchanged (the call site; the reader has its own rows)", () => {
+    const sampler: ts.FunctionDeclaration[] = [];
+    walk(sourceOf(path.join(testsDir, "helpers", "security-matrix.ts")), (node) => {
+      if (ts.isFunctionDeclaration(node) && node.name?.text === "startProcessSampler") sampler.push(node);
+    });
+    expect(sampler.length, "wiring: startProcessSampler is declared once in the helper").toBe(1);
+    const settles: ts.Node[] = [];
+    walk(sampler[0], (node) => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "settlePending" && node.initializer) settles.push(node.initializer);
+    });
+    expect(settles.length, "wiring: settlePending is declared once in startProcessSampler").toBe(1);
+    const norm = (text: string): string => text.replace(/\s+/g, " ").trim();
+    let blindReads = 0;
+    const readCalls: ts.CallExpression[] = [];
+    const revivalCalls: ts.CallExpression[] = [];
+    const exeDeclarations: ts.VariableDeclaration[] = [];
+    walk(settles[0], (node) => {
+      if (ts.isIdentifier(node) && node.text === "readExe") blindReads += 1;
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "settleExeRead") readCalls.push(node);
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "settleRevival") revivalCalls.push(node);
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "exeNow") exeDeclarations.push(node);
+    });
+    expect(blindReads, "wiring: settlePending does not use the error-blind executable reader").toBe(0);
+    expect(readCalls.length, "wiring: settlePending reads the executable with settleExeRead exactly once").toBe(1);
+    expect(readCalls[0].arguments.map((argument) => argument.getText()), "wiring: settleExeRead reads the real io and the pid of the record (read arguments)").toEqual(["realTickIo", "record.pid"]);
+    const reading = ["runtime.kind === \"alive\" && record.provenExeId !== undefined", "settleExeRead(realTickIo, " + "record.pid)", "null"];
+    expect(
+      exeDeclarations.length === 1 && (exeDeclarations[0].parent.flags & ts.NodeFlags.Const) !== 0 && exeDeclarations[0].initializer !== undefined && norm(exeDeclarations[0].initializer.getText()) === `${reading[0]} ? ${reading[1]} : ${reading[2]}`,
+      "wiring: exeNow is a const read only for a live record that has a proven executable (exeNow initializer)",
+    ).toBe(true);
+    expect(revivalCalls.length, "wiring: settlePending asks settleRevival exactly once").toBe(1);
+    const revivalArgs = revivalCalls[0].arguments;
+    const exeRead = revivalArgs.length === 1 && ts.isObjectLiteralExpression(revivalArgs[0]) ? revivalArgs[0].properties.find((property) => ts.isPropertyAssignment(property) && ts.isIdentifier(property.name) && property.name.text === "exeRead") : undefined;
+    expect(
+      exeRead !== undefined && ts.isPropertyAssignment(exeRead) && ts.isIdentifier(exeRead.initializer) && exeRead.initializer.text === "exeNow",
+      "wiring: the revival rule gets the reading exactly as read (exeRead argument)",
+    ).toBe(true);
   });
 });
