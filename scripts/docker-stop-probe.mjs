@@ -232,11 +232,15 @@ function seedHome(home) {
   fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify({ permissions: { allow: [] } }, null, 2));
   const now = Date.now();
+  // Conversations of the key's label `probe` with a folder name, and the trusted storage root with its sessions
+  // directory (MVP-7402): a delete erases the folder; a pre-update entry would answer 409 and stay.
+  const owned = (id, dirId) => ({ sessionId: `sdk-${id}`, systemPrompt: "", model: "m", lastUsed: now, owner: { label: "probe", userId: null }, sandboxDirId: dirId });
+  fs.mkdirSync(path.join(home, ".agent-sandbox", "sessions"), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.join(home, ".agent-sandbox"), 0o700);
+  fs.chmodSync(path.join(home, ".agent-sandbox", "sessions"), 0o700);
   const sessions = {
-    sessions: {
-      "probe-idle": { sessionId: "sdk-probe-idle", systemPrompt: "", model: "m", lastUsed: now },
-      "probe-keep": { sessionId: "sdk-probe-keep", systemPrompt: "", model: "m", lastUsed: now },
-    },
+    sessions: {},
+    sessionsByLabel: { probe: { "probe-idle": owned("probe-idle", "a1a1a1a1a1a1a1a1a1a1a1a1"), "probe-keep": owned("probe-keep", "b2b2b2b2b2b2b2b2b2b2b2b2") } },
     settings: { sessionIdleTimeoutMs: 0 },
   };
   fs.writeFileSync(path.join(home, ".claude", "sessions.json"), JSON.stringify(sessions, null, 2));

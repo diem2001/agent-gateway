@@ -44,10 +44,15 @@ function earlierState(area: Area): unknown {
   const now = Date.now();
   switch (area) {
     case "sessions":
+      // Conversations of the key's label `proc` with a folder name (MVP-7402: a delete erases the folder; a pre-update
+      // entry answers 409 and stays, so it could not stand for "a session deleted just before the stop").
       return {
-        sessions: {
-          "earlier-1": { sessionId: "sdk-1", systemPrompt: "", model: "m", lastUsed: now },
-          "earlier-2": { sessionId: "sdk-2", systemPrompt: "", model: "m", lastUsed: now },
+        sessions: {},
+        sessionsByLabel: {
+          proc: {
+            "earlier-1": { sessionId: "sdk-1", systemPrompt: "", model: "m", lastUsed: now, owner: { label: "proc", userId: null }, sandboxDirId: "1a1a1a1a1a1a1a1a1a1a1a1a" },
+            "earlier-2": { sessionId: "sdk-2", systemPrompt: "", model: "m", lastUsed: now, owner: { label: "proc", userId: null }, sandboxDirId: "2b2b2b2b2b2b2b2b2b2b2b2b" },
+          },
         },
         settings: { sessionIdleTimeoutMs: 0 },
       };
@@ -100,6 +105,10 @@ function fixture(): Fixture {
   const home = path.join(root, "home");
   fs.mkdirSync(home);
   fs.mkdirSync(path.join(root, "tmp"));
+  // The trusted storage root with its sessions directory: the delete of a conversation checks it (MVP-7402).
+  fs.mkdirSync(path.join(home, ".agent-sandbox", "sessions"), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.join(home, ".agent-sandbox"), 0o700);
+  fs.chmodSync(path.join(home, ".agent-sandbox", "sessions"), 0o700);
   const dirs = {} as Record<Area, string>;
   for (const area of AREAS) {
     dirs[area] = path.join(root, `persist-${area}`);
@@ -293,6 +302,7 @@ function readState(fx: Fixture) {
   return {
     sessions: JSON.parse(fs.readFileSync(fx.file("sessions"), "utf8")) as {
       sessions: Record<string, unknown>;
+      sessionsByLabel?: Record<string, Record<string, unknown>>;
       settings: { sessionIdleTimeoutMs: number };
     },
     tools: (JSON.parse(fs.readFileSync(fx.file("tools"), "utf8")) as { name: string }[]).map((t) => t.name),
@@ -615,7 +625,7 @@ describe("A stop during a slow git operation never damages saved state", () => {
 
       const after = readState(fx);
       expect(after.sessions.settings.sessionIdleTimeoutMs).toBe(111_000);
-      expect(Object.keys(after.sessions.sessions)).not.toContain("earlier-1");
+      expect(Object.keys(after.sessions.sessionsByLabel?.proc ?? {})).not.toContain("earlier-1");
       expect(after.tools).toContain("tool-completed");
       expect(after.mcpServers).toContain("mcp-completed");
 
