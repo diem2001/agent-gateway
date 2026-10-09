@@ -62,7 +62,7 @@ beforeEach(() => {
 afterEach(() => {
   for (const m of started.splice(0)) m.stopErasureSweeper();
   vi.restoreAllMocks();
-  for (const key of ["AGENT_SANDBOX_ROOT", "SESSION_PERSIST_PATH", "TOOLS_PERSIST_PATH", "MCP_SERVERS_PERSIST_PATH", "LOG_LEVEL"]) delete process.env[key];
+  for (const key of ["AGENT_SANDBOX_ROOT", "SESSION_PERSIST_PATH", "TOOLS_PERSIST_PATH", "MCP_SERVERS_PERSIST_PATH", "LOG_LEVEL", "SESSION_IDLE_TIMEOUT_MS"]) delete process.env[key];
   // Whatever a failed assertion left unreadable is made readable first, then the fixture root goes (literal /tmp/mvp7402-* roots only).
   for (const dir of roots.splice(0)) {
     try {
@@ -791,8 +791,8 @@ describe("expiry goes through the erase path", () => {
   const owned = (dirId: string, extra: Record<string, unknown> = {}) => ({ sessionId: "gw", sdkSessionId: "sdk", systemPrompt: "", model: "m", lastUsed: old, owner: { label: "reqlift", userId: null }, sandboxDirId: dirId, ...extra });
 
   it("idle expiry erases the folder and leaves a marker: the owner's late delete answers 200, label B 404", async () => {
+    process.env.SESSION_IDLE_TIMEOUT_MS = "100";
     const { app, sessions, erasure } = await rig();
-    sessions.updateSettings({ sessionIdleTimeoutMs: 100 });
     const dirId = conversation(sessions, A, "c1");
     await sleep(150);
     const legacy = { sessionId: "gw", systemPrompt: "", model: "m", lastUsed: Date.now() - 10_000 };
@@ -805,7 +805,8 @@ describe("expiry goes through the erase path", () => {
   });
 
   it("idle expiry takes an idle legacy entry the old way: dropped, no file touched", async () => {
-    fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, JSON.stringify({ sessions: { old: { sessionId: "gw", systemPrompt: "", model: "m", lastUsed: Date.now() } }, settings: { sessionIdleTimeoutMs: 100 } }));
+    fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, JSON.stringify({ sessions: { old: { sessionId: "gw", systemPrompt: "", model: "m", lastUsed: Date.now() } } }));
+    process.env.SESSION_IDLE_TIMEOUT_MS = "100";
     const { sessions, erasure } = await rig();
     sessions.loadSessions();
     const store = path.join(tmp, "legacy-store");
@@ -821,7 +822,8 @@ describe("expiry goes through the erase path", () => {
 
   it("load-time expiry keeps the conversation as a tombstone and the startup sweep erases its folder", async () => {
     const dirId = "0123456789abcdef01234567";
-    fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, JSON.stringify({ sessions: {}, sessionsByLabel: { reqlift: { c1: owned(dirId) } }, settings: { sessionIdleTimeoutMs: 1000 } }));
+    fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, JSON.stringify({ sessions: {}, sessionsByLabel: { reqlift: { c1: owned(dirId) } } }));
+    process.env.SESSION_IDLE_TIMEOUT_MS = "1000";
     const { app, sessions, erasure } = await rig();
     makeFolder(dirId);
     sessions.loadSessions();
@@ -930,6 +932,370 @@ describe("SESSION_ERASURE_RETRY_MS", () => {
     } catch (e) {
       expect(e).toBeInstanceOf(erasure.ErasureConfigError);
       expect((e as InstanceType<typeof erasure.ErasureConfigError>).logLine).toBe("FATAL config key=SESSION_ERASURE_RETRY_MS reason=must be a positive whole number of milliseconds");
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Rework R1 (MVP-7402): the idle timeout is operator configuration,    */
+/*  and the tombstone is on disk before any removal starts               */
+/* ------------------------------------------------------------------ */
+
+describe("R1-T3: PUT /v1/settings refuses the idle timeout", () => {
+  const API_KEY = "r1-secret";
+  let gatewayServer: import("node:http").Server | undefined;
+
+  async function gateway(): Promise<{ app: express.Express; sessions: SessionsModule }> {
+    process.env.PORT = "0";
+    process.env.HOST = "127.0.0.1";
+    process.env.API_KEYS = `alpha:${API_KEY},beta:r1-other`;
+    vi.doMock("@anthropic-ai/claude-agent-sdk", () => ({
+      createSdkMcpServer: vi.fn((options: { name: string }) => ({ type: "sdk", name: options.name })),
+      query: vi.fn(() => {
+        throw new Error("the settings route must not start an agent query");
+      }),
+    }));
+    const mod = (await import("../server.js")) as { default: express.Express; server: import("node:http").Server };
+    gatewayServer = mod.server;
+    const sessions = await import("../sessions.js");
+    started.push(await import("../session-erasure.js"));
+    return { app: mod.default, sessions };
+  }
+
+  afterEach(async () => {
+    if (gatewayServer?.listening) await new Promise<void>((resolve) => gatewayServer!.close(() => resolve()));
+    gatewayServer = undefined;
+    for (const key of ["PORT", "HOST", "API_KEYS"]) delete process.env[key];
+    vi.doUnmock("@anthropic-ai/claude-agent-sdk");
+  });
+
+  const put = (app: express.Express) => request(app).put("/v1/settings").set("Authorization", `Bearer ${API_KEY}`);
+  const afterDebounce = () => sleep(300);
+
+  it.each([[1], [0], [null], [-1], ["5"], [1e12]])("sessionIdleTimeoutMs %j answers 400 setting_read_only, changes nothing and saves nothing", async (value) => {
+    const { app, sessions } = await gateway();
+    const res = await put(app).send({ sessionIdleTimeoutMs: value });
+    expect([res.status, res.body]).toEqual([400, { error: "setting_read_only" }]);
+    expect(sessions.getSettings()).toEqual({ sessionIdleTimeoutMs: 0 });
+    await afterDebounce();
+    expect(fs.existsSync(process.env.SESSION_PERSIST_PATH!)).toBe(false);
+  });
+
+  it("the current value is refused as well, and so is a body with other keys next to it", async () => {
+    process.env.SESSION_IDLE_TIMEOUT_MS = "86400000";
+    const { app, sessions } = await gateway();
+    for (const body of [{ sessionIdleTimeoutMs: 86400000 }, { other: 1, sessionIdleTimeoutMs: 5 }]) {
+      const res = await put(app).send(body);
+      expect([res.status, res.body]).toEqual([400, { error: "setting_read_only" }]);
+    }
+    expect(sessions.getSettings()).toEqual({ sessionIdleTimeoutMs: 86400000 });
+    await afterDebounce();
+    expect(fs.existsSync(process.env.SESSION_PERSIST_PATH!)).toBe(false);
+  });
+
+  it("every other body answers 200 with the read-back, calls nothing and saves nothing", async () => {
+    const { app } = await gateway();
+    const sends: Array<[string, (r: ReturnType<typeof put>) => Promise<{ status: number; body: unknown }>]> = [
+      ["{}", (r) => r.send({})],
+      ["an unknown key", (r) => r.send({ other: 1 })],
+      ["an array", (r) => r.send([{ sessionIdleTimeoutMs: 1 }])],
+      ["no body", (r) => r],
+      ["a text/plain body", (r) => r.set("Content-Type", "text/plain").send('{"sessionIdleTimeoutMs":1}')],
+    ];
+    for (const [name, send] of sends) {
+      const res = await send(put(app));
+      expect([name, res.status, res.body]).toEqual([name, 200, { sessionIdleTimeoutMs: 0 }]);
+    }
+    const read = await request(app).get("/v1/settings").set("Authorization", "Bearer r1-other");
+    expect([read.status, read.body]).toEqual([200, { sessionIdleTimeoutMs: 0 }]);
+    await afterDebounce();
+    expect(fs.existsSync(process.env.SESSION_PERSIST_PATH!)).toBe(false);
+  });
+
+  it("a JSON primitive keeps the body parser's answer (strict mode: 400)", async () => {
+    const { app } = await gateway();
+    const res = await put(app).set("Content-Type", "application/json").send("1");
+    expect(res.status).toBe(400);
+    expect(res.body).not.toEqual({ sessionIdleTimeoutMs: 0 });
+  });
+
+  it("the refusal is logged even with logging off: key and caller label, never the value", async () => {
+    const { app } = await gateway();
+    const logging = await import("../logging.js");
+    logging.setLogLevel("off");
+    try {
+      await request(app).put("/v1/settings").set("Authorization", "Bearer r1-other").send({ sessionIdleTimeoutMs: 987654321 });
+    } finally {
+      logging.setLogLevel("info");
+    }
+    const lines = errors.filter((l) => l.includes("settings.refused"));
+    expect(lines).toEqual(["[audit] settings.refused key=sessionIdleTimeoutMs label=beta"]);
+    expect([...logs, ...errors].some((l) => l.includes("987654321") || l.includes("Idle timeout updated"))).toBe(false);
+  });
+});
+
+describe("R1-T4: a timeout saved by an earlier version is ignored", () => {
+  const dirId = "0123456789abcdef01234567";
+  const entry = (extra: Record<string, unknown> = {}) => ({ sessionId: "gw", sdkSessionId: "sdk", systemPrompt: "", model: "m", lastUsed: Date.now() - 3_600_000, owner: { label: "reqlift", userId: null }, sandboxDirId: dirId, ...extra });
+  const seed = (settings: unknown) => fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, JSON.stringify({ sessions: {}, sessionsByLabel: { reqlift: { c1: entry() } }, settings }));
+
+  it("the saved value 1 does not expire a conversation idle for an hour; one log line names the key only; the next save drops it", async () => {
+    seed({ sessionIdleTimeoutMs: 1 });
+    const { sessions, erasure } = await rig();
+    makeFolder(dirId);
+    sessions.loadSessions();
+    await erasure.runErasureSweep();
+    expect(fs.existsSync(folder(dirId))).toBe(true);
+    expect(sessions.admitSession("c1", A).kind).toBe("resume");
+    expect(sessions.getSettings()).toEqual({ sessionIdleTimeoutMs: 0 });
+    expect(logs.filter((l) => l.includes("sessions.settings.ignored"))).toEqual(["[sessions] sessions.settings.ignored key=sessionIdleTimeoutMs"]);
+    expect(sessions.flushSessions()).toBe(true);
+    const text = fs.readFileSync(process.env.SESSION_PERSIST_PATH!, "utf8");
+    expect(JSON.parse(text).settings).toBeUndefined();
+    expect(text).not.toContain("sessionIdleTimeoutMs");
+  });
+
+  it("mirror: the environment value 1000 applies although the file holds 0", async () => {
+    seed({ sessionIdleTimeoutMs: 0 });
+    process.env.SESSION_IDLE_TIMEOUT_MS = "1000";
+    const { sessions, erasure } = await rig();
+    makeFolder(dirId);
+    sessions.loadSessions();
+    expect(sessions.getSettings()).toEqual({ sessionIdleTimeoutMs: 1000 });
+    expect(sessions.erasurePendingCount()).toBe(1);
+    await erasure.runErasureSweep();
+    expect(gone(folder(dirId))).toBe(true);
+  });
+
+  it("a settings key of any shape loads: the file is never set aside", async () => {
+    for (const settings of ["x", 5, [1], { other: 1 }, null]) {
+      vi.resetModules();
+      seed(settings);
+      const { sessions } = await rig();
+      sessions.loadSessions();
+      expect(fs.readdirSync(tmp).some((f) => f.startsWith("sessions.json.corrupt")), JSON.stringify(settings)).toBe(false);
+      expect(sessions.getSessionCount()).toBe(1);
+    }
+  });
+});
+
+describe("R1-T9: SESSION_IDLE_TIMEOUT_MS is parsed strictly", () => {
+  it.each([
+    [undefined, 0],
+    ["", 0],
+    ["  ", 0],
+    ["0", 0],
+    ["86400000", 86_400_000],
+    [" 1500 ", 1500],
+  ])("%j is accepted as %i ms", async (raw, expected) => {
+    const { sessions } = await load();
+    expect(sessions.loadIdleTimeoutMs(raw === undefined ? {} : { SESSION_IDLE_TIMEOUT_MS: raw })).toBe(expected);
+  });
+
+  it.each(["30m", "1h", "1e6", "-5", "0x10", "1.5", "abc", "9007199254740993", "10 000"])("%j stops startup with the fixed line", async (raw) => {
+    const { sessions } = await load();
+    try {
+      sessions.loadIdleTimeoutMs({ SESSION_IDLE_TIMEOUT_MS: raw });
+      throw new Error("accepted");
+    } catch (e) {
+      expect(e).toBeInstanceOf(sessions.IdleTimeoutConfigError);
+      expect((e as InstanceType<typeof sessions.IdleTimeoutConfigError>).logLine).toBe("FATAL config key=SESSION_IDLE_TIMEOUT_MS reason=must be a whole number of milliseconds (0 = disabled)");
+    }
+  });
+
+  it("the module raises an invalid environment value in the configuration check, and reports a valid one once", async () => {
+    process.env.SESSION_IDLE_TIMEOUT_MS = "30m";
+    const bad = await load();
+    expect(bad.sessions.getSettings()).toEqual({ sessionIdleTimeoutMs: 0 });
+    expect(() => bad.sessions.checkIdleTimeoutConfig()).toThrow(bad.sessions.IdleTimeoutConfigError);
+    vi.resetModules();
+    process.env.SESSION_IDLE_TIMEOUT_MS = "86400000";
+    const good = await load();
+    expect(good.sessions.checkIdleTimeoutConfig()).toBe(86_400_000);
+    expect(errors.filter((l) => l.includes("sessions.idle_timeout"))).toEqual(["[sessions] sessions.idle_timeout ms=86400000"]);
+  });
+});
+
+describe("R1-T5: the tombstone is on disk when the removal starts, on every path", () => {
+  const onDisk = (label: string, id: string): boolean => {
+    try {
+      return typeof readStore().sessionsByLabel[label]?.[id]?.erasePendingSince === "number";
+    } catch {
+      return false;
+    }
+  };
+
+  function watch(erasure: ErasureModule, label: string, id: string): boolean[] {
+    const seen: boolean[] = [];
+    erasure.erasureSeams.remove = async (r, d) => {
+      seen.push(onDisk(label, id));
+      return erasure.eraseConversationDir(r, d);
+    };
+    return seen;
+  }
+
+  it("DELETE", async () => {
+    const { app, sessions, erasure } = await rig();
+    const dirId = conversation(sessions, A, "c1");
+    const seen = watch(erasure, "reqlift", "c1");
+    expect((await del(app, "c1")).status).toBe(200);
+    expect(seen).toEqual([true]);
+    expect(gone(folder(dirId))).toBe(true);
+  });
+
+  it("the lock release of a run that held the conversation", async () => {
+    const { app, sessions, erasure, sandbox } = await rig();
+    const dirId = conversation(sessions, A, "c1");
+    await erasure.startErasureSweeper({ retryMs: 60_000 });
+    const lock = sandbox.tryLockConversation(dirId)!;
+    const seen = watch(erasure, "reqlift", "c1");
+    expect((await del(app, "c1")).status).toBe(503);
+    expect(seen).toEqual([]);
+    lock.release();
+    await vi.waitFor(() => expect(gone(folder(dirId))).toBe(true));
+    expect(seen).toEqual([true]);
+  });
+
+  it("the sweep", async () => {
+    const { sessions, erasure } = await rig();
+    const dirId = conversation(sessions, A, "c1");
+    expect(sessions.markErasePending("reqlift", "c1")).toBe(true);
+    expect(onDisk("reqlift", "c1")).toBe(false);
+    const seen = watch(erasure, "reqlift", "c1");
+    await erasure.runErasureSweep();
+    expect(seen).toEqual([true]);
+    expect(gone(folder(dirId))).toBe(true);
+  });
+
+  it("the startup sweep after load-time expiry", async () => {
+    const dirId = "0123456789abcdef01234567";
+    const old = { sessionId: "gw", sdkSessionId: "sdk", systemPrompt: "", model: "m", lastUsed: Date.now() - 60_000, owner: { label: "reqlift", userId: null }, sandboxDirId: dirId };
+    fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, JSON.stringify({ sessions: {}, sessionsByLabel: { reqlift: { c1: old } } }));
+    process.env.SESSION_IDLE_TIMEOUT_MS = "1000";
+    const { sessions, erasure } = await rig();
+    makeFolder(dirId);
+    sessions.loadSessions();
+    expect(onDisk("reqlift", "c1")).toBe(false);
+    const seen = watch(erasure, "reqlift", "c1");
+    await erasure.startErasureSweeper({ retryMs: 60_000 });
+    expect(seen).toEqual([true]);
+    expect(gone(folder(dirId))).toBe(true);
+  });
+
+  it("idle expiry", async () => {
+    process.env.SESSION_IDLE_TIMEOUT_MS = "100";
+    const { sessions, erasure } = await rig();
+    const dirId = conversation(sessions, A, "c1");
+    expect(sessions.flushSessions()).toBe(true);
+    const seen = watch(erasure, "reqlift", "c1");
+    await sleep(150);
+    await erasure.runErasureSweep();
+    expect(seen).toEqual([true]);
+    expect(gone(folder(dirId))).toBe(true);
+  });
+});
+
+describe("R1-T6: a failed save blocks the removal; suppressed saves do not", () => {
+  /** The save of the sessions file fails (the rename of the temp file), the way a full or read-only disk fails it. */
+  function failSaves(): { attempts: () => number; restore: () => void } {
+    const real = fs.renameSync;
+    let count = 0;
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === process.env.SESSION_PERSIST_PATH) {
+        count++;
+        throw Object.assign(new Error("EROFS: read-only file system"), { code: "EROFS" });
+      }
+      return real(from, to);
+    });
+    return { attempts: () => count, restore: () => spy.mockRestore() };
+  }
+
+  it("R1-T6a: DELETE answers 503, the remover is not called, and one tombstone_unsaved line appears with logging off", async () => {
+    const { app, sessions, erasure } = await rig();
+    const dirId = conversation(sessions, A, "c1");
+    const remover = vi.fn(erasure.eraseConversationDir);
+    erasure.erasureSeams.remove = remover;
+    const logging = await import("../logging.js");
+    logging.setLogLevel("off");
+    const fail = failSaves();
+    let res;
+    try {
+      res = await del(app, "c1");
+    } finally {
+      fail.restore();
+      logging.setLogLevel("info");
+    }
+    expect([res.status, res.body]).toEqual([503, { error: "erasure_pending" }]);
+    expect(remover).not.toHaveBeenCalled();
+    expect(fs.existsSync(folder(dirId))).toBe(true);
+    expect(errors.filter((l) => l.includes("code=tombstone_unsaved"))).toEqual(['[sessions] sessions.erasure.failed id="c1" code=tombstone_unsaved']);
+    // The entry stays pending: nothing may use it, and the next sweep with a working disk saves and erases it.
+    expect(sessions.admitSession("c1", A)).toEqual({ kind: "refused", reason: "erasing" });
+    await erasure.runErasureSweep();
+    expect(remover).toHaveBeenCalledTimes(1);
+    expect(gone(folder(dirId))).toBe(true);
+    expect(sessions.flushSessions()).toBe(true);
+    expect(readStore().erasedByLabel?.reqlift?.c1).toBeDefined();
+  });
+
+  it("R1-T6a: a sweep over three tombstones saves at most once and removes nothing while the save fails", async () => {
+    const { sessions, erasure } = await rig();
+    const dirs = ["c1", "c2", "c3"].map((id) => conversation(sessions, A, id));
+    for (const id of ["c1", "c2", "c3"]) sessions.markErasePending("reqlift", id);
+    const remover = vi.fn(erasure.eraseConversationDir);
+    erasure.erasureSeams.remove = remover;
+    const fail = failSaves();
+    try {
+      await erasure.runErasureSweep();
+      expect(fail.attempts()).toBe(1);
+      expect(remover).not.toHaveBeenCalled();
+    } finally {
+      fail.restore();
+    }
+    dirs.forEach((d) => expect(fs.existsSync(folder(d))).toBe(true));
+    await erasure.runErasureSweep();
+    expect(remover).toHaveBeenCalledTimes(3);
+    dirs.forEach((d) => expect(gone(folder(d))).toBe(true));
+    expect(sessions.flushSessions()).toBe(true);
+    expect(Object.keys(readStore().erasedByLabel?.reqlift ?? {}).sort()).toEqual(["c1", "c2", "c3"]);
+  });
+
+  it.skipIf(process.getuid?.() === 0)("R1-T6a: an unwritable directory fails the save the same way", async () => {
+    const persistDir = path.join(tmp, "persist");
+    fs.mkdirSync(persistDir, { mode: 0o700 });
+    process.env.SESSION_PERSIST_PATH = path.join(persistDir, "sessions.json");
+    const { app, sessions, erasure } = await rig();
+    const dirId = conversation(sessions, A, "c1");
+    expect(sessions.flushSessions()).toBe(true);
+    const remover = vi.fn(erasure.eraseConversationDir);
+    erasure.erasureSeams.remove = remover;
+    fs.chmodSync(persistDir, 0o500);
+    const res = await del(app, "c1");
+    fs.chmodSync(persistDir, 0o700);
+    expect(res.status).toBe(503);
+    expect(remover).not.toHaveBeenCalled();
+    expect(fs.existsSync(folder(dirId))).toBe(true);
+  });
+
+  it("R1-T6b: suppressed saves cannot hold a tombstone back: the removal goes ahead with one unsaved_tombstone line", async () => {
+    fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, "{not json");
+    const realRename = fs.renameSync;
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to).includes(".corrupt-")) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      return realRename(from, to);
+    });
+    try {
+      const { app, sessions } = await rig();
+      sessions.loadSessions();
+      expect(errors.some((l) => l.includes("problem=unreadable-not-preserved"))).toBe(true);
+      const dirId = conversation(sessions, A, "c1");
+      const res = await del(app, "c1");
+      expect([res.status, res.body]).toEqual([200, { deleted: true }]);
+      expect(gone(folder(dirId))).toBe(true);
+      expect(logs.filter((l) => l.includes("sessions.erasure.unsaved_tombstone"))).toEqual(['[sessions] sessions.erasure.unsaved_tombstone id="c1"']);
+      expect([...logs, ...errors].some((l) => l.includes("tombstone_unsaved"))).toBe(false);
+    } finally {
+      spy.mockRestore();
     }
   });
 });

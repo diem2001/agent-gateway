@@ -325,7 +325,8 @@ interface StoreCase {
   /** Valid JSON with at least one entry the store cannot restore; each is set aside like invalid JSON. */
   unrestorable: [label: string, content: unknown][];
   /** Files the pre-MVP-7616 load accepted; they still load, with the listed names. */
-  tolerated: [label: string, content: unknown, names: string[]][];
+  /** The optional fourth element is the environment the row runs with (the idle timeout is read from the environment only). */
+  tolerated: [label: string, content: unknown, names: string[], env?: Record<string, string>][];
   /** Load, change one entry, flush; returns the flush result. */
   loadAndChange: (dirOfFile: string) => Promise<{ loadedNames: string[]; flushed: boolean }>;
 }
@@ -383,15 +384,21 @@ const CASES: StoreCase[] = [
       ["session without sdkSessionId and with an extra field", { sessions: { s1: withoutKey(session({ extra: 1 }), "sdkSessionId") } }, ["s1"]],
       [
         "an expired session is dropped as before",
-        { sessions: { s1: session(), old: session({ lastUsed: 1 }) }, settings: { sessionIdleTimeoutMs: 60_000 } },
+        { sessions: { s1: session(), old: session({ lastUsed: 1 }) } },
         ["s1"],
+        { SESSION_IDLE_TIMEOUT_MS: "60000" },
+      ],
+      [
+        "a timeout saved by an earlier version is ignored: the old entry stays",
+        { sessions: { s1: session(), old: session({ lastUsed: 1 }) }, settings: { sessionIdleTimeoutMs: 60_000 } },
+        ["old", "s1"],
       ],
     ],
     loadAndChange: async () => {
       const m = await freshImport<typeof import("../sessions.js")>("../sessions.js");
       m.loadSessions();
       const loadedNames = m.listSessions().map((s) => s.id);
-      m.updateSettings({ sessionIdleTimeoutMs: 4321 });
+      m.getSession("never-saved", "", "m", true, { label: "persistence-unit", userId: null });
       return { loadedNames, flushed: m.flushSessions() };
     },
   },
@@ -507,9 +514,16 @@ describe.each(CASES)("$area store", (c) => {
     ]);
   });
 
-  it.each(c.tolerated)("existing file loads as before (%s)", async (_label, content, names) => {
+  it.each(c.tolerated)("existing file loads as before (%s)", async (_label, content, names, env) => {
     fs.writeFileSync(file, JSON.stringify(content, null, 2));
-    const { loadedNames, flushed } = await c.loadAndChange(dir);
+    Object.assign(process.env, env);
+    let loaded: { loadedNames: string[]; flushed: boolean };
+    try {
+      loaded = await c.loadAndChange(dir);
+    } finally {
+      for (const key of Object.keys(env ?? {})) delete process.env[key];
+    }
+    const { loadedNames, flushed } = loaded;
     expect(loadedNames.sort()).toEqual(names);
     expect(flushed).toBe(true);
     expect(corruptCopies(file)).toEqual([]);
