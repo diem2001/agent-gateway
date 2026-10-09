@@ -20,6 +20,7 @@ type ErasureModule = typeof import("../session-erasure.js");
 
 const runQuery = vi.fn();
 const roots: string[] = [];
+const started: ErasureModule[] = [];
 let tmp: string;
 let root: string;
 let logs: string[];
@@ -59,6 +60,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const m of started.splice(0)) (m as Partial<ErasureModule>).stopErasureSweeper?.();
   vi.restoreAllMocks();
   for (const key of ["AGENT_SANDBOX_ROOT", "SESSION_PERSIST_PATH", "TOOLS_PERSIST_PATH", "MCP_SERVERS_PERSIST_PATH", "LOG_LEVEL"]) delete process.env[key];
   // Whatever a failed assertion left unreadable is made readable first, then the fixture root goes (literal /tmp/mvp7402-* roots only).
@@ -76,6 +78,7 @@ async function load(): Promise<{ sessions: SessionsModule; erasure: ErasureModul
   const sessions = await import("../sessions.js");
   const erasure = await import("../session-erasure.js");
   const sandbox = await import("../sandbox.js");
+  started.push(erasure);
   return { sessions, erasure, sandbox };
 }
 
@@ -595,5 +598,337 @@ describe("the query route refuses a pending conversation before any run", () => 
     expect(failure.SESSION_ERASING_MESSAGE).toBe("This conversation is being deleted. Its content is erased as soon as the gateway can finish, so it cannot be used any more. Please start a new conversation.");
     expect(failure.SESSION_ERASING_MESSAGE).not.toBe(failure.SESSION_LEGACY_MESSAGE);
     expect(failure.SESSION_ERASING_MESSAGE).not.toBe(failure.SESSION_BUSY_MESSAGE);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Gate B: gateway-driven completion                                   */
+/* ------------------------------------------------------------------ */
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const failedLines = (): string[] => logs.filter((l) => l.includes("sessions.erasure.failed"));
+
+describe("the gateway finishes a pending erasure itself", () => {
+  it("S1: the run's release triggers the erasure; the eraser's own release does not: a persistent error gives one attempt, not a loop", async () => {
+    const { app, sessions, erasure, sandbox } = await rig();
+    await erasure.startErasureSweeper({ retryMs: 60_000 });
+    const dirId = conversation(sessions, A, "c1");
+    // A run holds the conversation: 503, no attempt and no warning while it runs.
+    const lock = sandbox.tryLockConversation(dirId)!;
+    expect((await del(app, "c1")).status).toBe(503);
+    expect(failedLines()).toEqual([]);
+    // The file system is in error when the run releases: exactly one attempt follows, from the run's release.
+    fs.chmodSync(path.join(root, "sessions"), 0o500);
+    lock.release();
+    await vi.waitFor(() => expect(failedLines()).toHaveLength(1));
+    // The eraser took and released the same lock on the way: nothing re-triggers it, whatever the time.
+    await sleep(1500);
+    expect(failedLines()).toHaveLength(1);
+    fs.chmodSync(path.join(root, "sessions"), 0o700);
+    expect(sessions.erasurePendingCount()).toBe(1);
+    expect(fs.existsSync(folder(dirId))).toBe(true);
+  });
+
+  it("a run's release finishes a pending erasure with no further request and far inside the sweep interval", async () => {
+    const { app, sessions, erasure, sandbox } = await rig();
+    await erasure.startErasureSweeper({ retryMs: 60_000 });
+    const dirId = conversation(sessions, A, "c1");
+    const orphan = "eeeeeeeeeeeeeeeeeeeeeeee";
+    makeFolder(orphan);
+    const other = conversation(sessions, B, "c1");
+    const orphanBefore = snapshot(folder(orphan));
+    const otherBefore = snapshot(folder(other));
+    const lock = sandbox.tryLockConversation(dirId)!;
+    expect((await del(app, "c1")).status).toBe(503);
+    expect(fs.existsSync(folder(dirId))).toBe(true);
+    lock.release();
+    await vi.waitFor(() => expect(sessions.erasurePendingCount()).toBe(0));
+    expect(gone(folder(dirId))).toBe(true);
+    // The late retry answers: A 200 (twice), B 404 for the id it never used, a never-used id 404.
+    for (let n = 0; n < 2; n++) expect((await del(app, "c1")).body).toEqual({ deleted: true });
+    expect(sessions.admitSession("c1", B).kind).toBe("resume");
+    expect(snapshot(folder(orphan))).toEqual(orphanBefore);
+    expect(snapshot(folder(other))).toEqual(otherBefore);
+    expect((await del(app, "never-used")).status).toBe(404);
+  });
+
+  it("the sweep finishes a pending erasure after a file system error is gone, without any request and with the idle timeout 0", async () => {
+    const { app, sessions, erasure } = await rig();
+    const dirId = conversation(sessions, A, "c1");
+    fs.chmodSync(path.join(root, "sessions"), 0o500);
+    expect((await del(app, "c1")).status).toBe(503);
+    expect(sessions.getSettings().sessionIdleTimeoutMs).toBe(0);
+    await erasure.startErasureSweeper({ retryMs: 100 });
+    await sleep(350);
+    expect(sessions.erasurePendingCount()).toBe(1);
+    fs.chmodSync(path.join(root, "sessions"), 0o700);
+    await vi.waitFor(() => expect(sessions.erasurePendingCount()).toBe(0), { timeout: 3000 });
+    expect(gone(folder(dirId))).toBe(true);
+    expect(sessions.admitSession("c1", A)).toEqual({ kind: "new" });
+    expect((await del(app, "c1")).status).toBe(200);
+  });
+
+  it("a restart while pending: the tombstone survives, blocks the conversation, and the startup sweep erases it", async () => {
+    const first = await rig();
+    const dirId = conversation(first.sessions, A, "c1");
+    const lock = first.sandbox.tryLockConversation(dirId)!;
+    expect((await del(first.app, "c1")).status).toBe(503);
+    expect(first.sessions.flushSessions()).toBe(true);
+    lock.release();
+    vi.resetModules();
+    const second = await rig();
+    second.sessions.loadSessions();
+    expect(second.sessions.admitSession("c1", A)).toEqual({ kind: "refused", reason: "erasing" });
+    expect(second.sessions.erasurePendingCount()).toBe(1);
+    await second.erasure.startErasureSweeper({ retryMs: 60_000 });
+    expect(second.sessions.erasurePendingCount()).toBe(0);
+    expect(gone(folder(dirId))).toBe(true);
+    const again = await del(second.app, "c1");
+    expect([again.status, again.body]).toEqual([200, { deleted: true }]);
+    // And after one more restart the marker still answers.
+    expect(second.sessions.flushSessions()).toBe(true);
+    vi.resetModules();
+    const third = await rig();
+    third.sessions.loadSessions();
+    expect((await del(third.app, "c1")).status).toBe(200);
+    expect((await del(third.app, "c1", "diemai")).status).toBe(404);
+  });
+
+  it("an error plus a restart: the startup sweep retries and the entry stays pending while the error lasts", async () => {
+    const first = await rig();
+    const dirId = conversation(first.sessions, A, "c1");
+    fs.chmodSync(path.join(root, "sessions"), 0o500);
+    expect((await del(first.app, "c1")).status).toBe(503);
+    expect(first.sessions.flushSessions()).toBe(true);
+    vi.resetModules();
+    const second = await rig();
+    second.sessions.loadSessions();
+    await second.erasure.startErasureSweeper({ retryMs: 60_000 });
+    expect(second.sessions.erasurePendingCount()).toBe(1);
+    expect(failedLines().length).toBeGreaterThanOrEqual(2);
+    fs.chmodSync(path.join(root, "sessions"), 0o700);
+    await second.erasure.runErasureSweep();
+    expect(second.sessions.erasurePendingCount()).toBe(0);
+    expect(gone(folder(dirId))).toBe(true);
+  });
+
+  it("S4: a lock held until a deadline stop's exit is observed: DELETE answers 503 and makes no attempt until the hold resolves, then the folder is gone", async () => {
+    vi.doMock("../agent.js", () => ({ runQuery: (...args: unknown[]) => runQuery(...args), DEFAULT_TOOLS: [] }));
+    const { sessions, erasure } = await load();
+    await erasure.startErasureSweeper({ retryMs: 60_000 });
+    const { queryRouter } = await import("../query.js");
+    const server = express();
+    server.use(express.json());
+    server.use((req, _res, next) => {
+      req.clientLabel = "reqlift";
+      next();
+    });
+    server.use(queryRouter);
+    server.delete("/v1/sessions/:id", erasure.deleteSessionRoute);
+    let releaseHold: () => void = () => undefined;
+    const hold = new Promise<void>((resolve) => (releaseHold = resolve));
+    let dirId = "";
+    runQuery.mockImplementationOnce(async (options: { sandboxDirId?: string; holdConversation?: (until: Promise<unknown>) => void }) => {
+      dirId = options.sandboxDirId!;
+      makeFolder(dirId);
+      options.holdConversation?.(hold);
+      return { response: "answer", resultData: { session_id: "sdk-1", usage: {}, modelUsage: {} } };
+    });
+    const attempts = vi.fn();
+    erasure.erasureSeams.remove = async (r, d) => {
+      attempts();
+      return erasure.eraseConversationDir(r, d);
+    };
+    const res = await request(server).post("/v1/query").send({ model: "m", prompt: "hi", queryId: "q1", sessionId: "c1" });
+    expect(res.text).toContain('"type":"done"');
+    // The request is over, but the sandbox exit was not observed: the conversation stays locked.
+    const first = await request(server).delete("/v1/sessions/c1");
+    expect([first.status, first.body]).toEqual([503, { error: "erasure_pending" }]);
+    await sleep(200);
+    expect(attempts).not.toHaveBeenCalled();
+    expect(fs.existsSync(folder(dirId))).toBe(true);
+    releaseHold();
+    await vi.waitFor(() => expect(gone(folder(dirId))).toBe(true));
+    expect(attempts).toHaveBeenCalledTimes(1);
+    expect(sessions.erasurePendingCount()).toBe(0);
+  });
+
+  it("a delete during a running request: 503, the run is unaffected, and the folder is gone right after the request ends", async () => {
+    vi.doMock("../agent.js", () => ({ runQuery: (...args: unknown[]) => runQuery(...args), DEFAULT_TOOLS: [] }));
+    const { sessions, erasure } = await load();
+    await erasure.startErasureSweeper({ retryMs: 60_000 });
+    const { queryRouter } = await import("../query.js");
+    const server = express();
+    server.use(express.json());
+    server.use((req, _res, next) => {
+      req.clientLabel = "reqlift";
+      next();
+    });
+    server.use(queryRouter);
+    server.delete("/v1/sessions/:id", erasure.deleteSessionRoute);
+    let finish: (v: unknown) => void = () => undefined;
+    let dirId = "";
+    runQuery.mockImplementationOnce((options: { sandboxDirId?: string }) => {
+      dirId = options.sandboxDirId!;
+      makeFolder(dirId);
+      return new Promise((resolve) => (finish = resolve));
+    });
+    const running = request(server).post("/v1/query").send({ model: "m", prompt: "hi", queryId: "q1", sessionId: "c1" }).then((r) => r);
+    await vi.waitFor(() => expect(dirId).not.toBe(""));
+    expect((await request(server).delete("/v1/sessions/c1")).status).toBe(503);
+    finish({ response: "answer", resultData: { session_id: "sdk-1", usage: {}, modelUsage: {} } });
+    const result = await running;
+    expect(result.text).toContain('"type":"done"');
+    await vi.waitFor(() => expect(gone(folder(dirId))).toBe(true));
+    expect(sessions.erasurePendingCount()).toBe(0);
+    expect((await request(server).delete("/v1/sessions/c1")).status).toBe(200);
+  });
+});
+
+describe("expiry goes through the erase path", () => {
+  const old = Date.now() - 60_000;
+  const owned = (dirId: string, extra: Record<string, unknown> = {}) => ({ sessionId: "gw", sdkSessionId: "sdk", systemPrompt: "", model: "m", lastUsed: old, owner: { label: "reqlift", userId: null }, sandboxDirId: dirId, ...extra });
+
+  it("idle expiry erases the folder and leaves a marker: the owner's late delete answers 200, label B 404", async () => {
+    const { app, sessions, erasure } = await rig();
+    sessions.updateSettings({ sessionIdleTimeoutMs: 100 });
+    const dirId = conversation(sessions, A, "c1");
+    await sleep(150);
+    const legacy = { sessionId: "gw", systemPrompt: "", model: "m", lastUsed: Date.now() - 10_000 };
+    await erasure.startErasureSweeper({ retryMs: 100 });
+    await vi.waitFor(() => expect(gone(folder(dirId))).toBe(true), { timeout: 3000 });
+    expect(sessions.getSessionCount()).toBe(0);
+    for (let n = 0; n < 2; n++) expect((await del(app, "c1")).body).toEqual({ deleted: true });
+    expect((await del(app, "c1", "diemai")).status).toBe(404);
+    expect(legacy.lastUsed).toBeLessThan(Date.now());
+  });
+
+  it("idle expiry takes an idle legacy entry the old way: dropped, no file touched", async () => {
+    fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, JSON.stringify({ sessions: { old: { sessionId: "gw", systemPrompt: "", model: "m", lastUsed: Date.now() } }, settings: { sessionIdleTimeoutMs: 100 } }));
+    const { sessions, erasure } = await rig();
+    sessions.loadSessions();
+    const store = path.join(tmp, "legacy-store");
+    fs.mkdirSync(store, { mode: 0o700 });
+    fs.writeFileSync(path.join(store, "T.jsonl"), "legacy transcript");
+    const before = snapshot(store);
+    await sleep(150);
+    await erasure.runErasureSweep();
+    expect(sessions.admitSession("old", A)).toEqual({ kind: "new" });
+    expect(snapshot(store)).toEqual(before);
+    expect(sessions.erasurePendingCount()).toBe(0);
+  });
+
+  it("load-time expiry keeps the conversation as a tombstone and the startup sweep erases its folder", async () => {
+    const dirId = "0123456789abcdef01234567";
+    fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, JSON.stringify({ sessions: {}, sessionsByLabel: { reqlift: { c1: owned(dirId) } }, settings: { sessionIdleTimeoutMs: 1000 } }));
+    const { app, sessions, erasure } = await rig();
+    makeFolder(dirId);
+    sessions.loadSessions();
+    expect(sessions.getSessionCount()).toBe(0);
+    expect(sessions.erasurePendingCount()).toBe(1);
+    expect(sessions.admitSession("c1", A)).toEqual({ kind: "refused", reason: "erasing" });
+    await erasure.startErasureSweeper({ retryMs: 60_000 });
+    expect(gone(folder(dirId))).toBe(true);
+    expect((await del(app, "c1")).status).toBe(200);
+  });
+
+  it("with the idle timeout 0 nothing expires, however old the entry", async () => {
+    const dirId = "0123456789abcdef01234567";
+    fs.writeFileSync(process.env.SESSION_PERSIST_PATH!, JSON.stringify({ sessions: {}, sessionsByLabel: { reqlift: { c1: owned(dirId, { lastUsed: 1 }) } }, settings: { sessionIdleTimeoutMs: 0 } }));
+    const { sessions, erasure } = await rig();
+    makeFolder(dirId);
+    sessions.loadSessions();
+    await erasure.startErasureSweeper({ retryMs: 50 });
+    await sleep(300);
+    expect(sessions.getSessionCount()).toBe(1);
+    expect(fs.existsSync(folder(dirId))).toBe(true);
+  });
+});
+
+describe("bounds and persistence of the erase path", () => {
+  it("S9: a slow removal makes the DELETE answer 503 within its bound while the removal continues; a later DELETE answers 200", async () => {
+    const { app, sessions, erasure } = await rig();
+    const dirId = conversation(sessions, A, "c1");
+    erasure.erasureSeams.deleteWaitMs = 100;
+    erasure.erasureSeams.remove = async (r, d) => {
+      await sleep(600);
+      return erasure.eraseConversationDir(r, d);
+    };
+    const started = Date.now();
+    const slow = await del(app, "c1");
+    expect([slow.status, slow.body]).toEqual([503, { error: "erasure_pending" }]);
+    expect(Date.now() - started).toBeLessThan(450);
+    expect(fs.existsSync(folder(dirId))).toBe(true);
+    await vi.waitFor(() => expect(sessions.erasurePendingCount()).toBe(0), { timeout: 3000 });
+    expect(gone(folder(dirId))).toBe(true);
+    expect((await del(app, "c1")).status).toBe(200);
+  });
+
+  it("S9: with three pending entries the sweeps never overlap and no two removals run at once", async () => {
+    const { sessions, erasure, sandbox } = await rig();
+    const dirs = ["c1", "c2", "c3"].map((id) => conversation(sessions, A, id));
+    const locks = dirs.map((d) => sandbox.tryLockConversation(d)!);
+    for (const id of ["c1", "c2", "c3"]) sessions.markErasePending("reqlift", id);
+    locks.forEach((l) => l.release());
+    let active = 0;
+    let peak = 0;
+    let calls = 0;
+    erasure.erasureSeams.remove = async (r, d) => {
+      calls++;
+      active++;
+      peak = Math.max(peak, active);
+      await sleep(80);
+      const result = await erasure.eraseConversationDir(r, d);
+      active--;
+      return result;
+    };
+    const first = erasure.runErasureSweep();
+    const overlapping = erasure.runErasureSweep();
+    await Promise.all([first, overlapping]);
+    expect(peak).toBe(1);
+    expect(calls).toBe(3);
+    expect(sessions.erasurePendingCount()).toBe(0);
+    dirs.forEach((d) => expect(gone(folder(d))).toBe(true));
+  });
+
+  it("S5: a failed save of a new tombstone keeps it pending in memory and the next sweep saves it", async () => {
+    const persistDir = path.join(tmp, "persist");
+    fs.mkdirSync(persistDir, { mode: 0o700 });
+    process.env.SESSION_PERSIST_PATH = path.join(persistDir, "sessions.json");
+    const { app, sessions, erasure, sandbox } = await rig();
+    const dirId = conversation(sessions, A, "c1");
+    expect(sessions.flushSessions()).toBe(true);
+    const lock = sandbox.tryLockConversation(dirId)!;
+    fs.chmodSync(persistDir, 0o500);
+    expect((await del(app, "c1")).status).toBe(503);
+    fs.chmodSync(persistDir, 0o700);
+    expect(readStore().sessionsByLabel.reqlift.c1.erasePendingSince).toBeUndefined();
+    expect(sessions.erasurePendingCount()).toBe(1);
+    await erasure.runErasureSweep();
+    expect(typeof readStore().sessionsByLabel.reqlift.c1.erasePendingSince).toBe("number");
+    lock.release();
+  });
+});
+
+describe("SESSION_ERASURE_RETRY_MS", () => {
+  it.each([
+    [undefined, 60_000],
+    ["", 60_000],
+    ["250", 250],
+    [" 1500 ", 1500],
+  ])("%j is accepted as %i ms", async (raw, expected) => {
+    const { erasure } = await load();
+    expect(erasure.loadErasureRetryMs(raw === undefined ? {} : { SESSION_ERASURE_RETRY_MS: raw })).toBe(expected);
+  });
+
+  it.each(["0", "-5", "1.5", "abc", "1e3", "9007199254740993", "10 000"])("%j stops startup with the fixed line", async (raw) => {
+    const { erasure } = await load();
+    try {
+      erasure.loadErasureRetryMs({ SESSION_ERASURE_RETRY_MS: raw });
+      throw new Error("accepted");
+    } catch (e) {
+      expect(e).toBeInstanceOf(erasure.ErasureConfigError);
+      expect((e as InstanceType<typeof erasure.ErasureConfigError>).logLine).toBe("FATAL config key=SESSION_ERASURE_RETRY_MS reason=must be a positive whole number of milliseconds");
+    }
   });
 });
