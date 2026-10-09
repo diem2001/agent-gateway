@@ -4864,8 +4864,8 @@ describe("process sampler lost ticks (MVP-8139)", () => {
       "d.test.ts": `${head}${start("EMFILE")}let sampler;\nbeforeAll(async () => {\n  sampler = start();\n  await lost(sampler);\n});\nit("LT-hook-d: a test beside a window started in beforeAll", () => {});\nafterAll(() => {\n  sampler.stop({});\n});\n`,
       "e.test.ts": `${head}${start("ENOENT")}it("LT-hook-e: a refused seam value, acknowledged with zero", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, sample.lostTicksInjected);\n});\n`,
       "f.test.ts": `${head}${start("EMFILE")}it("LT-hook-f: an injected lost tick acknowledged exactly", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, 1);\n});\n`,
-      "g.test.ts": `${head}${coded("ENOENT")}it("LT-hook-g: an ENOENT out of a tick, acknowledged with the injected count", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, sample.lostTicksInjected);\n});\n`,
-      "h.test.ts": `${head}${coded("ESRCH")}it("LT-hook-h: an ESRCH out of a tick, acknowledged with the injected count", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, sample.lostTicksInjected);\n});\n`,
+      "g.test.ts": `${head}${coded("ENOENT")}it("LT-hook-g: an ENOENT out of a tick, acknowledged with the injected count", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, sample.lostTicksInjected);\n}, 20000);\n`,
+      "h.test.ts": `${head}${coded("ESRCH")}it("LT-hook-h: an ESRCH out of a tick, acknowledged with the injected count", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, sample.lostTicksInjected);\n}, 20000);\n`,
     };
     for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
     fs.writeFileSync(path.join(dir, "vitest.config.mjs"), `export default { test: { globals: true, environment: "node", root: ${JSON.stringify(dir)}, include: ["*.test.ts"], setupFiles: [${JSON.stringify(setup)}] } };\n`);
@@ -4900,6 +4900,7 @@ describe("process sampler lost ticks (MVP-8139)", () => {
     expect(failures("e.test.ts")).toMatch(/not assessable: row LT-hook-e-[0-9a-f]{10}, lost ticks 1, first lost read tree:task:SEAM-INVALID/);
     expect(file("f.test.ts").assertionResults.map((assertion) => assertion.status), "an exact acknowledgement passes").toEqual(["passed"]);
     // A coded exception out of a real tick is a natural lost tick whatever its code says (ENOENT and ESRCH included), so the injected count cannot acknowledge it.
+    // Their test timeout (20 s) exceeds the wait for the lost tick (10 s), so a tick that is not counted shows as a passed test, never as a timeout.
     for (const [name, code] of [["g", "ENOENT"], ["h", "ESRCH"]] as const) {
       expect(file(`${name}.test.ts`).assertionResults.map((assertion) => assertion.status), `${name}: the test fails in the hook`).toEqual(["failed"]);
       expect(failures(`${name}.test.ts`), name).toMatch(new RegExp(`not assessable: row LT-hook-${name}-[0-9a-f]{10}, lost ticks 1, first lost read abort:${code}`));
