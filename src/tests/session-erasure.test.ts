@@ -60,7 +60,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  for (const m of started.splice(0)) (m as Partial<ErasureModule>).stopErasureSweeper?.();
+  for (const m of started.splice(0)) m.stopErasureSweeper();
   vi.restoreAllMocks();
   for (const key of ["AGENT_SANDBOX_ROOT", "SESSION_PERSIST_PATH", "TOOLS_PERSIST_PATH", "MCP_SERVERS_PERSIST_PATH", "LOG_LEVEL"]) delete process.env[key];
   // Whatever a failed assertion left unreadable is made readable first, then the fixture root goes (literal /tmp/mvp7402-* roots only).

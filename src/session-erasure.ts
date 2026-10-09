@@ -3,16 +3,20 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Request, Response } from "express";
 import { log } from "./logging.js";
-import { loadIsolationConfig, tryLockConversation } from "./sandbox.js";
+import { loadIsolationConfig, onConversationRunReleased, tryLockConversation } from "./sandbox.js";
 import {
   SANDBOX_DIR_ID,
   completeErasure,
+  expireIdleSessions,
   folderSharedWithOther,
   hasErasedMarker,
   hasLegacyEntry,
   logId,
   markErasePending,
   ownedConversation,
+  pendingConversationForDir,
+  pendingConversations,
+  reflushPending,
 } from "./sessions.js";
 
 /**
@@ -257,4 +261,86 @@ export async function deleteSessionRoute(req: Request, res: Response): Promise<v
     default:
       res.status(404).json({ error: "Session not found" });
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Gateway-driven completion                                           */
+/* ------------------------------------------------------------------ */
+
+export const DEFAULT_SESSION_ERASURE_RETRY_MS = 60_000;
+
+/** An invalid `SESSION_ERASURE_RETRY_MS`: startup stops with one fixed line, like the other configuration keys. */
+export class ErasureConfigError extends Error {
+  readonly key = "SESSION_ERASURE_RETRY_MS";
+
+  constructor() {
+    super("invalid value for SESSION_ERASURE_RETRY_MS");
+  }
+
+  get logLine(): string {
+    return `FATAL config key=${this.key} reason=must be a positive whole number of milliseconds`;
+  }
+}
+
+/** The sweep interval: unset or empty = 60 s; anything but a positive whole number of milliseconds is an error. */
+export function loadErasureRetryMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.SESSION_ERASURE_RETRY_MS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_SESSION_ERASURE_RETRY_MS;
+  if (!/^[0-9]+$/.test(raw.trim())) throw new ErasureConfigError();
+  const value = Number(raw.trim());
+  if (!Number.isSafeInteger(value) || value <= 0) throw new ErasureConfigError();
+  return value;
+}
+
+let sweeping: Promise<void> | null = null;
+
+/**
+ * One sweep: save a tombstone whose first save failed, take the idle conversations (when an idle timeout is set),
+ * then try every tombstone once, one after the other. A sweep that finds the previous one still running does
+ * nothing, so sweeps never overlap and a slow removal never queues work up.
+ */
+export function runErasureSweep(): Promise<void> {
+  if (sweeping) return Promise.resolve();
+  const sweep = (async (): Promise<void> => {
+    reflushPending();
+    expireIdleSessions();
+    for (const { label, clientId } of pendingConversations()) {
+      try {
+        await eraseOwnedConversation(label, clientId);
+      } catch {
+        // An attempt reports its own failures; the next sweep tries again.
+      }
+    }
+  })().finally(() => {
+    sweeping = null;
+  });
+  sweeping = sweep;
+  return sweep;
+}
+
+let sweepTimer: ReturnType<typeof setInterval> | null = null;
+let stopReleaseListener: (() => void) | null = null;
+
+/**
+ * Starts the gateway-driven completion: a tombstone is retried when the run that held its conversation releases it,
+ * on every sweep tick (also with the idle timeout 0), and once now (after a restart). Returns the startup sweep, which
+ * the caller does not wait for. Calling it again restarts the timer.
+ */
+export function startErasureSweeper(options: { retryMs?: number } = {}): Promise<void> {
+  stopErasureSweeper();
+  // A run's release only schedules the attempt (never inside `release`); the eraser's own release is not announced.
+  stopReleaseListener = onConversationRunReleased((dirId) => {
+    const pending = pendingConversationForDir(dirId);
+    if (pending) setImmediate(() => void eraseOwnedConversation(pending.label, pending.clientId).catch(() => undefined));
+  });
+  sweepTimer = setInterval(() => void runErasureSweep(), options.retryMs ?? loadErasureRetryMs());
+  sweepTimer.unref();
+  return runErasureSweep();
+}
+
+export function stopErasureSweeper(): void {
+  if (sweepTimer) clearInterval(sweepTimer);
+  sweepTimer = null;
+  stopReleaseListener?.();
+  stopReleaseListener = null;
 }

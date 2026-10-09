@@ -15,13 +15,14 @@ import {
 import {
   loadSessions,
   listSessions,
+  erasurePendingCount,
   getSessionCount,
   getSettings,
   updateSettings,
   type SessionSettings,
 } from "./sessions.js";
 import { queryRouter } from "./query.js";
-import { deleteSessionRoute } from "./session-erasure.js";
+import { ErasureConfigError, deleteSessionRoute, loadErasureRetryMs, startErasureSweeper } from "./session-erasure.js";
 import sshRoutes from "./routes/ssh.js";
 import authRoutes from "./routes/auth.js";
 import workspaceRoutes from "./routes/workspace.js";
@@ -91,14 +92,17 @@ credentialRelay.start().catch((e: unknown) => {
 
 // Isolation (MVP-7678): every new configuration key is validated now; an invalid value stops
 // startup with one fixed line, nothing falls back silently.
+let erasureRetryMs = 0;
 try {
   loadIsolationConfig();
   void gatewayModelProxy();
   // MVP-7679: the trusted tool policy and the deadline of mediated MCP calls, validated like the keys above.
   loadToolPolicy(process.env, getApiKeyLabels());
   mcpToolTimeoutMs();
+  // MVP-7402: the interval of the sweep that finishes pending erasures.
+  erasureRetryMs = loadErasureRetryMs();
 } catch (e) {
-  if (e instanceof IsolationConfigError || e instanceof ToolPolicyConfigError || e instanceof McpToolTimeoutConfigError) logAlways("server", e.logLine);
+  if (e instanceof IsolationConfigError || e instanceof ToolPolicyConfigError || e instanceof McpToolTimeoutConfigError || e instanceof ErasureConfigError) logAlways("server", e.logLine);
   else if (e instanceof ModelProxyConfigError) logAlways("server", `FATAL config key=${e.key} reason=must be a positive whole number of milliseconds`);
   else throw e;
   process.exit(1);
@@ -109,6 +113,8 @@ try {
 } catch {
   // A missing or unusable storage root is reported by the self-check below.
 }
+// Pending erasures (MVP-7402): finished when their run ends, on every sweep tick and once now, without blocking the listen.
+void startErasureSweeper({ retryMs: erasureRetryMs });
 // The trusted model proxy is the only holder of the provider credential; then a real sandbox
 // start sets /health `isolation`.
 gatewayModelProxy()
@@ -155,6 +161,9 @@ app.get("/health", (_req, res) => {
     version: VERSION,
     uptime: Math.round(process.uptime()),
     sessions: getSessionCount(),
+    // Additive (MVP-7402): conversations deleted or expired whose folder the gateway has not yet confirmed gone.
+    // A count only: no ids, no labels. A value that stays above 0 needs an operator (see docs/architecture.md).
+    erasurePending: erasurePendingCount(),
     // Additive (MVP-7678): "ok" once a sandbox has started and passed its check, "unavailable" after a
     // permanent start problem until a later start succeeds, "starting" until the boot self-check is done.
     isolation: isolationStatus(),
