@@ -12,6 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { afterEach, describe, expect, it, it as baseIt, vi } from "vitest";
 import {
   AC_ROWS,
@@ -78,9 +79,36 @@ import {
   type TickProcess,
   type MatrixRow,
   type Surface,
+  INVALID_SKIP_CAP,
+  abortRead,
+  abortSeam,
+  acknowledgeLostTicks,
+  currentTestLostTicks,
+  finishRow,
+  invalidSkipDecision,
+  lostTickVerdict,
+  newTickLoss,
+  notAssessableText,
+  readExeErrno,
+  readProcOver,
+  realTickIo,
+  samplerLedger,
+  settleExeRead,
+  settleRevival,
+  tickFaultAllowed,
+  tickReadOutcome,
+  walkDescendants,
+  type SamplerLedgerEntry,
+  type SecurityRig,
+  type TickFile,
+  type TickIo,
+  type TickReadFault,
+  type TickReadKind,
+  type TickReads,
+  type VerdictEntry,
 } from "./helpers/security-matrix.js";
 import { launcherEndedPending, launcherEvidenceOf, launcherExeOf, launcherIdentityOf, launcherLeftTree, ownProofHeld, type LauncherEvidence, type LauncherExeRead } from "./helpers/security-matrix.js";
-import { descendants } from "./helpers/git-process-gateway.js";
+import { REPO_ROOT, descendants } from "./helpers/git-process-gateway.js";
 import { ROUTE_IDS, credentialSteps, entrypointRowIds, failureRowIds, registryRowIds, regressionRowIds, parseReport, routeSource, routeSteps, verifyRoute, type RouteContext, type RouteReport } from "./helpers/security-routes.js";
 
 vi.setConfig({ testTimeout: 60_000 });
@@ -92,6 +120,11 @@ const context: RouteContext = {
   gatewayPort: 4321,
   canary: "SYNTH-CANARY-t1fixed",
 };
+
+/** A sample of a window that saw nothing and lost no tick; a row overrides the fields it is about. */
+function cleanSample(row = "t1-row"): ProcessSample {
+  return { referenceChanged: 0, unsandboxedRuntimes: [], runtimesSeen: 0, windows: {}, records: [], clears: [], row, windowId: 0, lostTicks: 0, lostTicksInjected: 0, firstLost: "none", vanishedReads: 0 };
+}
 
 /** Surfaces long enough to clear every byte floor. */
 function clean(): Surface[] {
@@ -205,7 +238,7 @@ describe("evidence lines", () => {
     const recorder = new MatrixRecorder("t1", ["A", "B", "C"], () => undefined);
     recorder.record(row({ id: "A" }));
     recorder.record(row({ id: "B", observed: "fail" }));
-    expect(recorder.summary()).toEqual({ expected: 3, observed: 2, pass: 1, fail: 1, hits: 0, missing: ["C"] });
+    expect(recorder.summary()).toEqual({ expected: 3, observed: 2, pass: 1, fail: 1, hits: 0, missing: ["C"], lostTicks: 0, notAssessable: 0 });
   });
 
   it("every row id a suite requires has an AC description (the map is the single list of stable ids), and no id is listed twice", () => {
@@ -844,7 +877,7 @@ describe("process sampler launcher exemption", () => {
       for (const line of audit) expect(line.includes(marker), "an audit line carried the synthetic name").toBe(false);
       expect(audit.some((line) => line.includes("comm sh exe") && line.includes("verdict=launcher")), "the allowlisted process lost its detail").toBe(true);
       expect(summary, "one summary line of counts per window").toHaveLength(1);
-      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+ failed_exiting=\d+ failed_alive=\d+ failed_own_proof=\d+ failed_launcher_proof=\d+ failed_escape_evidence=\d+ exit_cleared_own=\d+ exit_cleared_launcher=\d+ exit_cleared_reference=\d+ exit_cleared_runtime_ending=\d+ exit_cleared_launcher_ended=\d+ failed_launcher_reparented=\d+ pending_expired=\d+ proved_reference_cached=\d+ failed_reference_cached=\d+ failed_reference_missing=\d+ failed_own_unreadable=\d+ failed_chain_broken=\d+ reference_changed=\d+ row=(none|withheld|[A-Za-z0-9().,_-]+-[0-9a-f]{10}) flagged=\d+$/);
+      expect(summary[0]).toMatch(/^SECURITY-PROCESS-SUMMARY records=\d+ runtime=\d+ launcher=\d+ other=\d+ descendant=\d+ unresolved=\d+ unresolved_unreadable=\d+ unresolved_torn=\d+ unresolved_unread=\d+ flagged_unreadable=\d+ failed_exiting=\d+ failed_alive=\d+ failed_own_proof=\d+ failed_launcher_proof=\d+ failed_escape_evidence=\d+ exit_cleared_own=\d+ exit_cleared_launcher=\d+ exit_cleared_reference=\d+ exit_cleared_runtime_ending=\d+ exit_cleared_launcher_ended=\d+ failed_launcher_reparented=\d+ pending_expired=\d+ proved_reference_cached=\d+ failed_reference_cached=\d+ failed_reference_missing=\d+ failed_own_unreadable=\d+ failed_chain_broken=\d+ reference_changed=\d+ lost_ticks=\d+ lost_ticks_injected=\d+ first_lost=(none|\S+) revival_unchecked=\d+ row=(none|withheld|[A-Za-z0-9().,_-]+-[0-9a-f]{10}) flagged=\d+$/);
     }
   });
 
@@ -2614,7 +2647,7 @@ describe("process sampler thread-safe exit: decision table (MVP-8130)", () => {
   });
 
   it("TH-seam: static: only the declared RE-rows, TH-bracket and this row pass the exit read seam", () => {
-    const ALLOWED = ["RE-own", "RE-exe", "RE-rt", "RE-ref", "RE-le", "RE-launcher", "R1-RE", "TH-bracket", "TH-seam"];
+    const ALLOWED = ["RE-own", "RE-exe", "RE-rt", "RE-ref", "RE-le", "RE-launcher", "R1-RE", "TH-bracket", "TH-seam", "RV-unknown", "LT-exit-unknown"];
     const dir = path.dirname(fileURLToPath(import.meta.url));
     const files = fs.readdirSync(dir, { recursive: true, encoding: "utf8" }).filter((name) => name.endsWith(".ts") && !name.startsWith("helpers"));
     // The plumbing that forwards the seam into the sampler windows sits between two markers; every other use belongs to a row.
@@ -2705,21 +2738,28 @@ describe("process sampler thread-safe exit: decision table (MVP-8130)", () => {
  */
 describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
   /**
-   * A row whose fixture precondition was not met ("precondition not reached") is "not observed this run". In a full suite
-   * (FULL_SUITE_REASON is set by the runner script) it is skipped with its reason and counted by the line `INVALID-SKIP <row>`; its
-   * coverage is proven by the flake-rate step of the gate, where an INVALID row is a failure with the same message and counts
-   * against the row. Any other failure, and every failure outside a full suite, stays a failure.
+   * A row whose fixture precondition was not met ("precondition not reached") is "not observed this run". In a full suite it is skipped with its
+   * reason and counted by the line `INVALID-SKIP <row>`; its coverage is proven by the flake-rate step of the gate, which runs without
+   * `FULL_SUITE_REASON`, where an INVALID row is a failure with the same message and counts against the row. The workflow's test-budget hook
+   * asks for that variable on commands it recognises as a full suite; a script-wrapped or human run may lack it, and then an INVALID fails.
+   * Any other failure, every failure outside a full suite, any test that lost a sampler tick (its windows are stopped first, so that no tick can
+   * be lost between this decision and the afterEach, which cannot undo a skip) and every INVALID past the third stay failures.
    */
+  let skipped = 0;
   const it = (name: string, body: () => Promise<void> | void): void =>
     baseIt(name, async (context) => {
       try {
         await body();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (process.env.FULL_SUITE_REASON !== undefined && message.includes("precondition not reached")) {
+        const lostTicks = currentTestLostTicks({ stopRunning: true }).lostTicks;
+        const decide = (skippedSoFar: number) => invalidSkipDecision({ fullSuite: process.env.FULL_SUITE_REASON !== undefined, message, skippedSoFar, lostTicks });
+        if (decide(skipped) === "skip") {
+          skipped += 1;
           process.stderr.write(`INVALID-SKIP ${name.split(":")[0]}\n`);
           context.skip(`INVALID: ${message.slice(0, 160)}`);
         }
+        if (decide(0) === "skip") throw new Error(`INVALID cap exceeded (${INVALID_SKIP_CAP}): ${message}`);
         throw error;
       }
     });
@@ -3383,12 +3423,14 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
   it("LE8-revive-alive-entry: a record that entered alive and whose thread executes a different executable that then ends inside the bound is flagged (executable identity), never cleared", async () => {
     const state = newSeam();
     const run = await launcherRevive(state, "0.1", { leaderAfterProof: false, exitsInside: true });
+    // The security assertions come first, so that a regression that clears is always a failure and never an INVALID row.
+    flagged(run.final, run.record);
+    noClears(run.summary);
+    expect(run.record.pending?.state).toBe("expired");
     expect(run.insideBound, "precondition not reached: the new program did not run, or did not end, inside the bound").toBe(true);
     expect(run.record.pending?.sawLeaderExit, "precondition not reached: a leader exit was seen, so the executable-identity check is not what revived the record").not.toBe(true);
     expect(run.record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, runtimeExit: "alive" });
     expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
-    flagged(run.final, run.record);
-    noClears(run.summary);
   });
 
   it("RE-le: an injected error on the runtime's exit read reads unknown: no launcher-ended entry and flagged at the failing tick; on the settle reads the pending record expires flagged", async () => {
@@ -3399,25 +3441,26 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     await until(() => ended(first.runtime!), "the runtime did not end");
     const entered = closeWindow(entry.sampler);
     const record = recordOf(entered.final, first.runtime);
-    expect(record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, runtimeExit: "unknown", exitRead: "stat:EIO", exitReadInjected: true, launcherIdentity: "verified", pending: "none" });
-    expect(record.pending, "never pending").toBeUndefined();
     flagged(entered.final, record);
     noClears(entered.summary);
+    expect(record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, runtimeExit: "unknown", exitRead: "stat:EIO", exitReadInjected: true, launcherIdentity: "verified", pending: "none" });
+    expect(record.pending, "never pending").toBeUndefined();
 
-    // Settle: a normal entry, then the fault.
+    // Settle: a normal entry, then the fault. The state seen in the middle of the run is captured and asserted after the security assertions.
     const second = newSeam();
     const flags = { on: false };
     const settle = await launcherWindow(second, { runtime: "node", exitReadFault: (pid, file) => (flags.on && pid === second.pid && file === "stat" ? "EIO" : undefined) });
-    expect(settle.sampler.peek().records[0].pending, "precondition not reached: a normal entry is pending").toMatchObject({ state: "waiting", route: "launcher-ended" });
+    const midRun = settle.sampler.peek().records[0]?.pending;
     flags.on = true;
     signal(second.runtime!.pid, "SIGKILL");
     await until(() => ended(second.runtime!), "the runtime did not end");
     await pastBound();
     const settled = closeWindow(settle.sampler);
     const waited = recordOf(settled.final, second.runtime);
-    expect(waited.pending?.state).toBe("expired");
     flagged(settled.final, waited);
     noClears(settled.summary);
+    expect(midRun, "precondition not reached: a normal entry is pending").toMatchObject({ state: "waiting", route: "launcher-ended" });
+    expect(waited.pending?.state).toBe("expired");
   });
 
   it("RE-rt: injected errors on every settle read of a pending runtime-ending record: it never clears and is flagged at the bound although the runtime fully ended", async () => {
@@ -3434,6 +3477,67 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     flagged(final, record);
     noClears(summary);
     expect(summary[0]).toContain("pending_expired=1");
+  });
+
+  it("LT-exit-unknown: an unknown exit reading is the exit reading of MVP-8130, not a lost tick of the sampler: flagged at the failing tick, expired flagged at the settle, and the window loses no tick", async () => {
+    // Entry: every exit read of the runtime fails from the moment the seam places the leader exit.
+    const first = newSeam();
+    const entry = await ownWindow(first, { exitReadFault: (pid, file) => (pid === first.pid && first.forced && file === "stat" ? "EMFILE" : undefined) });
+    touch(entry.trig, "end");
+    await until(() => ended(first.runtime!), "the runtime did not fully end after its last thread");
+    const entered = closeWindow(entry.sampler);
+    const record = recordOf(entered.final, first.runtime);
+    flagged(entered.final, record);
+    noClears(entered.summary);
+    expect(record.proofFailure).toMatchObject({ failedWhile: "alive", runtimeExit: "unknown", exitRead: "stat:EMFILE", exitReadInjected: true, pending: "none" });
+    expect(entered.final.lostTicks).toBe(0);
+    expect(entered.final.firstLost).toBe("none");
+    expect(entered.summary[0]).toContain("lost_ticks=0 lost_ticks_injected=0 first_lost=none");
+
+    // Settle: a normal entry (pending), then every settle read fails: expired flagged, the same.
+    const second = newSeam();
+    const flags = { on: false };
+    const window = await ownWindow(second, { exitReadFault: (pid) => (flags.on && pid === second.pid ? "EMFILE" : undefined) });
+    flags.on = true;
+    touch(window.trig, "end");
+    await until(() => ended(second.runtime!), "the runtime did not fully end after its last thread");
+    await pastBound();
+    const settled = closeWindow(window.sampler);
+    const waited = recordOf(settled.final, second.runtime);
+    flagged(settled.final, waited);
+    noClears(settled.summary);
+    expect(waited.pending).toMatchObject({ state: "expired", route: "runtime-ending", revivalUnchecked: true });
+    expect(settled.final.lostTicks).toBe(0);
+    expect(settled.final.firstLost).toBe("none");
+    expect(settled.summary[0]).toContain("lost_ticks=0 lost_ticks_injected=0 first_lost=none revival_unchecked=1");
+  });
+
+  it("RV-unknown: a revived image whose settle reads all fail until it has ended is never cleared: the unknown reading cannot be checked for a revival, the record expires flagged at once", async () => {
+    const state = newSeam();
+    const flags = { on: false };
+    const window = await ownWindow(state, { secs: "0.1", fresh: 300_000, image: "same", exitReadFault: (pid, file) => (flags.on && pid === state.pid && file === "stat" ? "EIO" : undefined) });
+    const entered = recordOf(window.sampler.peek(), state.runtime).pending;
+    // The fault is armed only now: the entry showed the leader exit and the record waits.
+    flags.on = true;
+    touch(window.trig, "exec");
+    await until(() => imageRuns(state.runtime!.pid, "0.1", "claude", "same"), "the surviving thread did not execute the new program");
+    await until(() => ended(state.runtime!), "the new program did not end");
+    // The whole chain (hold, exec, program) has to fit into the bound, or the row would not show the hole it closes.
+    const insideBound = entered !== undefined && Date.now() - entered.sinceMs < PENDING_BOUND_MS - 300;
+    flags.on = false;
+    await pause(300);
+    const closed = closeWindow(window.sampler);
+    const record = recordOf(closed.final, state.runtime);
+    // The security assertions first: a record whose revived image ended is flagged, never cleared.
+    flagged(closed.final, record);
+    noClears(closed.summary);
+    expect(record.pending?.state).toBe("expired");
+    expect(record.pending?.revivalUnchecked, "the unknown settle reading was not checked for a revival").toBe(true);
+    expect(describeRecords([record])).toContain("revival-unchecked=true");
+    expect(closed.summary[0]).toContain("revival_unchecked=1");
+    expect(closed.summary[0]).toContain("pending_expired=1");
+    expect(entered, "precondition not reached: the entry did not show the waiting record with the leader exit").toMatchObject({ state: "waiting", route: "runtime-ending", sawLeaderExit: true });
+    expect(insideBound, "precondition not reached: the revived image did not end inside the bound").toBe(true);
   });
 
   /*  Reference-ended route: the gateway ends after the runtime's own proof (R1 and R5 shapes)  */
@@ -4087,9 +4191,775 @@ describe("tagged role processes and the sampler observer", () => {
 
   it("Q8: a sample whose reference changed reports it, with the number of reads, and a sample without a change does not", () => {
     requireHost(["bwrap"]);
-    const sample = (referenceChanged: number): ProcessSample => ({ referenceChanged, unsandboxedRuntimes: [], runtimesSeen: 0, windows: {}, records: [], clears: [] });
+    const sample = (referenceChanged: number): ProcessSample => ({ ...cleanSample(), referenceChanged });
     expect(sampleProblems(sample(1), {})).toEqual(["the reference process's namespaces changed during the window (1 read(s) differed from the cache)"]);
     expect(sampleProblems(sample(3), {})).toEqual(["the reference process's namespaces changed during the window (3 read(s) differed from the cache)"]);
     expect(sampleProblems(sample(0), {})).toEqual([]);
+  });
+});
+
+/**
+ * The lost-tick verdict of the process sampler (MVP-8139), decision tables. A tick whose counted `/proc` read failed with an error that does not say
+ * "the process is gone" is a lost tick, and a window with a lost tick is not assessable. Every row here runs the functions the sampler itself calls,
+ * over doubles for the file calls (no process is started), and its expectations are spelled out in the row, not read from the production table.
+ */
+describe("process sampler lost ticks: decision tables (MVP-8139)", () => {
+  const fail = (code: string): Error => Object.assign(new Error(code), { code });
+  type Entry = string | string[] | Error;
+  /** Files, directory listings, links (`link:`) and identity stats (`id:`) of a double /proc; an Error entry is thrown, a missing one is ENOENT. */
+  const ioOf = (files: Record<string, Entry>): TickIo => {
+    const get = (key: string): Entry => {
+      if (!(key in files)) throw fail("ENOENT");
+      const entry = files[key];
+      if (entry instanceof Error) throw entry;
+      return entry;
+    };
+    return {
+      readdir: (dir) => get(dir) as string[],
+      readText: (file) => get(file) as string,
+      readlink: (file) => get(`link:${file}`) as string,
+      statId: (file) => get(`id:${file}`) as string,
+    };
+  };
+  const readsOf = (files: Record<string, Entry>, fault?: TickReadFault): TickReads => ({ io: ioOf(files), fault, loss: newTickLoss() });
+  /** A stat line: the state, the parent and the start time sit where the kernel puts them (fields 3, 4 and 22). */
+  const statLine = (pid: number, comm: string, ppid: number, start: number, state = "S"): string => `${pid} (${comm}) ${state} ${ppid} ${"0 ".repeat(13)}20 0 1 0 ${start} 0 0`;
+  const procFiles = (pid: number, comm = "claude", ppid = 1, start = 5000): Record<string, Entry> => ({
+    [`/proc/${pid}/stat`]: statLine(pid, comm, ppid, start),
+    [`/proc/${pid}/comm`]: `${comm}\n`,
+    [`/proc/${pid}/cmdline`]: `${comm}\0--print\0`,
+  });
+
+  it("T-lt1: a failed read is vanished for ENOENT and ESRCH on every file, denied only for EACCES on the executable link of a live reading, lost for everything else", () => {
+    const kinds: TickReadKind[] = ["tree", "snapshot", "first-exe", "reread"];
+    const files: TickFile[] = ["task", "children", "stat", "comm", "cmdline", "exe", "exe-id"];
+    const lostCodes = ["EACCES", "EIO", "EMFILE", "ENFILE", "ENOMEM", "EPERM", "EINVAL", "FORMAT", "OTHER", "SEAM-INVALID", "SEAM-THREW"];
+    let denied = 0;
+    for (const kind of kinds) {
+      for (const file of files) {
+        for (const code of ["ENOENT", "ESRCH"]) expect(tickReadOutcome(kind, file, code), `${kind}:${file}:${code}`).toBe("vanished");
+        for (const code of lostCodes) {
+          const outcome = tickReadOutcome(kind, file, code);
+          if (code === "EACCES" && file === "exe" && (kind === "first-exe" || kind === "reread")) {
+            expect(outcome, `${kind}:${file}:${code}`).toBe("denied");
+            denied += 1;
+          } else expect(outcome, `${kind}:${file}:${code}`).toBe("lost");
+        }
+      }
+    }
+    expect(denied, "exactly the two executable reads of a live reading").toBe(2);
+    // The one place where the tick mapping and the exit mapping differ: a command line that vanished is a process that left between two reads.
+    expect(tickReadOutcome("reread", "cmdline", "ENOENT")).toBe("vanished");
+    expect(exitReadOutcome("cmdline", "ENOENT")).toBe("unknown");
+    // Everything else agrees with the exit mapping of MVP-8130.
+    expect(tickReadOutcome("snapshot", "stat", "EIO")).toBe("lost");
+    expect(exitReadOutcome("stat", "EIO")).toBe("unknown");
+    expect(tickReadOutcome("reread", "exe", "EACCES")).toBe("denied");
+    expect(exitReadOutcome("exe", "EACCES")).toBe("denied");
+  });
+
+  it("T-lt2: the walk: a task or children read that fails with ENOENT or ESRCH is the process or thread being gone (not lost), any other error is a lost tick and its subtree is not walked", () => {
+    const tree: Record<string, Entry> = {
+      "/proc/10/task": ["10", "11"],
+      "/proc/10/task/10/children": "20 21 ",
+      "/proc/10/task/11/children": "",
+      "/proc/20/task": fail("ENOENT"),
+      "/proc/21/task": ["21"],
+      "/proc/21/task/21/children": "30",
+      "/proc/30/task": ["30"],
+      "/proc/30/task/30/children": "",
+    };
+    const clean = readsOf(tree);
+    expect(walkDescendants(10, clean), "breadth first, a vanished child task listing ends only that branch").toEqual([20, 21, 30]);
+    expect(clean.loss).toMatchObject({ natural: false, injected: false, vanished: 1 });
+    const children = readsOf({ ...tree, "/proc/10/task/11/children": fail("ESRCH"), "/proc/21/task/21/children": fail("ENOENT") });
+    expect(walkDescendants(10, children)).toEqual([20, 21]);
+    expect(children.loss).toMatchObject({ natural: false, vanished: 3 });
+    const root = readsOf({ ...tree, "/proc/10/task": fail("EMFILE") });
+    expect(walkDescendants(10, root), "the root listing failed: nothing below it is known").toEqual([]);
+    expect(root.loss).toMatchObject({ natural: true, injected: false, first: "tree:task:EMFILE", vanished: 0 });
+    const read = readsOf({ ...tree, "/proc/10/task/11/children": fail("EIO") });
+    expect(walkDescendants(10, read), "a failed children read loses the tick, the other threads are still read").toEqual([20, 21, 30]);
+    expect(read.loss).toMatchObject({ natural: true, first: "tree:children:EIO" });
+    const deep = readsOf({ ...tree, "/proc/21/task": fail("EMFILE") });
+    expect(walkDescendants(10, deep), "the subtree below a lost listing is not walked").toEqual([20, 21]);
+    expect(deep.loss.first).toBe("tree:task:EMFILE");
+  });
+
+  it("T-lt2: the tick read seam reaches the walk: an accepted code is an injected loss at that read, never a natural one", () => {
+    const tree: Record<string, Entry> = { "/proc/10/task": ["10"], "/proc/10/task/10/children": "21", "/proc/21/task": ["21"], "/proc/21/task/21/children": "30", "/proc/30/task": ["30"], "/proc/30/task/30/children": "" };
+    const reads = readsOf(tree, (kind, pid, file) => (kind === "tree" && pid === 21 && file === "task" ? "EMFILE" : undefined));
+    expect(walkDescendants(10, reads)).toEqual([21]);
+    expect(reads.loss).toMatchObject({ natural: false, injected: true, first: "tree:task:EMFILE" });
+  });
+
+  it("T-lt3: the process read: ENOENT and ESRCH on stat, comm or command line drop the process without a lost tick; any other error drops it and loses the tick; a stat that does not parse is stat:FORMAT", () => {
+    const good = procFiles(40);
+    const ok = readsOf(good);
+    expect(readProcOver(ok, "snapshot", 40)).toEqual({ pid: 40, ppid: 1, comm: "claude", cmdline: "claude --print ", argv: ["claude", "--print"], startTicks: "5000", state: "S" });
+    expect(ok.loss).toMatchObject({ natural: false, injected: false, vanished: 0 });
+    for (const file of ["stat", "comm", "cmdline"] as const) {
+      for (const code of ["ENOENT", "ESRCH"]) {
+        const reads = readsOf({ ...good, [`/proc/40/${file}`]: fail(code) });
+        expect(readProcOver(reads, "reread", 40), `${file}:${code}`).toBeNull();
+        expect(reads.loss, `${file}:${code}`).toMatchObject({ natural: false, injected: false, vanished: 1 });
+      }
+      for (const [kind, code] of [["snapshot", "EIO"], ["reread", "EMFILE"], ["snapshot", "EACCES"]] as const) {
+        const reads = readsOf({ ...good, [`/proc/40/${file}`]: fail(code) });
+        expect(readProcOver(reads, kind, 40), `${file}:${code}`).toBeNull();
+        expect(reads.loss, `${file}:${code}`).toMatchObject({ natural: true, first: `${kind}:${file}:${code}`, vanished: 0 });
+      }
+    }
+    // The kernel's own stat text of a process whose name holds a closing parenthesis keeps its fields.
+    const odd = readsOf({ ...good, "/proc/40/stat": statLine(40, "a) S 9 b", 7, 777) });
+    expect(readProcOver(odd, "snapshot", 40)).toMatchObject({ ppid: 7, startTicks: "777", state: "S" });
+    for (const [label, text] of [
+      ["no closing parenthesis", "garbage"],
+      ["a parent that is not a number", `40 (x) S abc ${"0 ".repeat(13)}20 0 1 0 5000 0 0`],
+      ["a start time that is not a number", `40 (x) S 1 ${"0 ".repeat(13)}20 0 1 0 soon 0 0`],
+      ["a stat that ends before the start time", "40 (x) S 1 0 0"],
+      ["a state that is not a letter", `40 (x) 7 1 ${"0 ".repeat(13)}20 0 1 0 5000 0 0`],
+    ] as const) {
+      const reads = readsOf({ ...good, "/proc/40/stat": text });
+      expect(readProcOver(reads, "snapshot", 40), label).toBeNull();
+      expect(reads.loss, label).toMatchObject({ natural: true, first: "snapshot:stat:FORMAT" });
+    }
+  });
+
+  it("T-lt4: the executable read: ENOENT and ESRCH are gone, EACCES on the link is denied, any other error on the link or on the identity stat is an error that loses the tick", () => {
+    const base: Record<string, Entry> = { "link:/proc/50/exe": "/usr/bin/node", "id:/proc/50/exe": "64768:1234" };
+    const read = (files: Record<string, Entry>, kind: "first-exe" | "reread" = "first-exe", fault?: TickReadFault) => {
+      const reads = readsOf(files, fault);
+      return { result: readExeErrno(reads, kind, 50), loss: reads.loss };
+    };
+    expect(read(base)).toMatchObject({ result: { id: "64768:1234" }, loss: { natural: false, vanished: 0 } });
+    for (const code of ["ENOENT", "ESRCH"]) {
+      expect(read({ ...base, "link:/proc/50/exe": fail(code) })).toMatchObject({ result: { gone: true }, loss: { natural: false, vanished: 1 } });
+      expect(read({ ...base, "id:/proc/50/exe": fail(code) }), "the identity of a link that was readable").toMatchObject({ result: { gone: true }, loss: { natural: false, vanished: 1 } });
+    }
+    expect(read({ ...base, "link:/proc/50/exe": fail("EACCES") })).toMatchObject({ result: { denied: true }, loss: { natural: false, vanished: 0 } });
+    for (const kind of ["first-exe", "reread"] as const) {
+      expect(read({ ...base, "link:/proc/50/exe": fail("EMFILE") }, kind)).toMatchObject({ result: { error: "EMFILE", file: "exe" }, loss: { natural: true, first: `${kind}:exe:EMFILE` } });
+      expect(read({ ...base, "id:/proc/50/exe": fail("EMFILE") }, kind)).toMatchObject({ result: { error: "EMFILE", file: "exe-id" }, loss: { natural: true, first: `${kind}:exe-id:EMFILE` } });
+      expect(read({ ...base, "id:/proc/50/exe": fail("EACCES") }, kind), "an identity stat refused after a readable link says nothing about the process").toMatchObject({ result: { error: "EACCES", file: "exe-id" }, loss: { natural: true, first: `${kind}:exe-id:EACCES` } });
+    }
+    expect(read(base, "first-exe", (kind, pid, file) => (kind === "first-exe" && pid === 50 && file === "exe" ? "EMFILE" : undefined))).toMatchObject({ result: { error: "EMFILE" }, loss: { natural: false, injected: true, first: "first-exe:exe:EMFILE" } });
+  });
+
+  it("N1-reader: the settle reads the executable with its errno: the settle's reader keeps EMFILE as an error (the revival check cannot run) and keeps ENOENT, ESRCH and EACCES as before", () => {
+    const base: Record<string, Entry> = { "link:/proc/60/exe": "/usr/bin/node", "id:/proc/60/exe": "64768:99" };
+    expect(settleExeRead(ioOf(base), 60)).toEqual({ id: "64768:99" });
+    expect(settleExeRead(ioOf({ ...base, "link:/proc/60/exe": fail("EMFILE") }), 60)).toEqual({ error: "EMFILE", file: "exe" });
+    expect(settleExeRead(ioOf({ ...base, "id:/proc/60/exe": fail("EMFILE") }), 60)).toEqual({ error: "EMFILE", file: "exe-id" });
+    expect(settleExeRead(ioOf({ ...base, "id:/proc/60/exe": fail("EACCES") }), 60)).toEqual({ error: "EACCES", file: "exe-id" });
+    expect(settleExeRead(ioOf({ ...base, "link:/proc/60/exe": fail("EACCES") }), 60)).toEqual({ denied: true });
+    expect(settleExeRead(ioOf({ ...base, "link:/proc/60/exe": fail("ENOENT") }), 60)).toEqual({ gone: true });
+    expect(settleExeRead(ioOf({ ...base, "id:/proc/60/exe": fail("ESRCH") }), 60)).toEqual({ gone: true });
+    expect(settleExeRead(realTickIo, process.pid), "this very process: a readable link and identity").toHaveProperty("id");
+  });
+
+  it("N1-revival: an unknown settle reading and an unreadable executable identity of a live reading cannot be checked for a revival (unchecked); the other cases keep the handling of MVP-8130", () => {
+    const own = "64768:1";
+    const other = "64768:2";
+    const decide = (kind: ExitKind, exeRead: Parameters<typeof settleRevival>[0]["exeRead"], sawLeaderExit = false, provenExeId: string | undefined = own) => settleRevival({ kind, exeRead, provenExeId, sawLeaderExit });
+    expect(decide("unknown", null)).toBe("unchecked");
+    expect(decide("unknown", null, true), "a leader exit seen earlier does not make an unknown reading checkable").toBe("unchecked");
+    expect(decide("alive", { error: "EMFILE", file: "exe-id" })).toBe("unchecked");
+    expect(decide("alive", { error: "EMFILE", file: "exe" })).toBe("unchecked");
+    expect(decide("alive", { error: "EACCES", file: "exe-id" })).toBe("unchecked");
+    expect(decide("alive", { denied: true }), "EACCES on the link keeps the handling of 40481").toBe("none");
+    expect(decide("alive", { gone: true })).toBe("none");
+    expect(decide("alive", { id: own })).toBe("none");
+    expect(decide("alive", { id: other }), "another executable than at the last proven tick").toBe("revived");
+    expect(decide("alive", null, true), "alive again after a leader exit").toBe("revived");
+    expect(decide("alive", { id: own }, true)).toBe("revived");
+    expect(settleRevival({ kind: "alive", exeRead: { id: other }, provenExeId: undefined, sawLeaderExit: false }), "no proven executable to compare with").toBe("none");
+    for (const kind of ["vanished", "start-changed", "X", "Z1", "Zn", "empty-gone", "empty-n"] as const) expect(decide(kind, null, true), kind).toBe("none");
+  });
+
+  it("LT-seam: the tick read seam accepts only errors that cannot hide a process; a refused value and a throwing seam are natural lost ticks (SEAM-INVALID, SEAM-THREW), never no fault", () => {
+    const accepted = ["EIO", "EMFILE", "ENFILE", "ENOMEM", "EPERM", "EACCES"];
+    const refused = ["ENOENT", "ESRCH", "EBADF", "EINVAL", "throw", "", "eio"];
+    const files: TickFile[] = ["task", "children", "stat", "comm", "cmdline", "exe", "exe-id"];
+    for (const file of files) {
+      for (const code of accepted) expect(tickFaultAllowed("snapshot", file, code), `${file}:${code}`).toBe(!(file === "exe" && code === "EACCES"));
+      for (const code of refused) expect(tickFaultAllowed("reread", file, code), `${file}:${code}`).toBe(false);
+    }
+    expect(tickFaultAllowed("abort", "tick", "throw")).toBe(true);
+    for (const code of [...accepted, ...refused.filter((code) => code !== "throw")]) expect(tickFaultAllowed("abort", "tick", code), `abort:${code}`).toBe(false);
+    // Through the reader the sampler itself uses.
+    const files40 = procFiles(40);
+    for (const code of ["ENOENT", "ESRCH", "EBADF"]) {
+      const reads = readsOf(files40, (kind, pid, file) => (kind === "snapshot" && pid === 40 && file === "stat" ? code : undefined));
+      expect(readProcOver(reads, "snapshot", 40), `refused ${code}`).toBeNull();
+      expect(reads.loss, `refused ${code}`).toMatchObject({ natural: true, injected: false, first: "snapshot:stat:SEAM-INVALID", vanished: 0 });
+    }
+    const exe = readsOf({ "link:/proc/50/exe": "/x", "id:/proc/50/exe": "1:1" }, (kind, _pid, file) => (kind === "first-exe" && file === "exe" ? "EACCES" : undefined));
+    expect(readExeErrno(exe, "first-exe", 50), "EACCES on exe would read as denied: refused").toEqual({ error: "SEAM-INVALID", file: "exe" });
+    expect(exe.loss).toMatchObject({ natural: true, injected: false, first: "first-exe:exe:SEAM-INVALID" });
+    const threw = readsOf(files40, () => {
+      throw new Error("a seam that throws");
+    });
+    expect(readProcOver(threw, "reread", 40)).toBeNull();
+    expect(threw.loss).toMatchObject({ natural: true, injected: false, first: "reread:stat:SEAM-THREW" });
+    const accepting = readsOf(files40, (kind, pid, file) => (kind === "snapshot" && pid === 40 && file === "comm" ? "EPERM" : undefined));
+    expect(readProcOver(accepting, "snapshot", 40)).toBeNull();
+    expect(accepting.loss).toMatchObject({ natural: false, injected: true, first: "snapshot:comm:EPERM" });
+    // The abort seam: only "throw" raises the injected abort, anything else raises a natural one with its own code.
+    const abort = (value: string | (() => never) | undefined): { error: unknown; loss: ReturnType<typeof newTickLoss> } => {
+      const reads = readsOf({}, () => (typeof value === "function" ? value() : value));
+      try {
+        abortSeam(reads, 10);
+        return { error: undefined, loss: reads.loss };
+      } catch (error) {
+        return { error, loss: reads.loss };
+      }
+    };
+    expect(abort(undefined).error).toBeUndefined();
+    const thrown = abort("throw");
+    expect(abortRead(thrown.error)).toBe("abort:throw");
+    expect(thrown.loss.abortInjected).toBe(true);
+    for (const value of ["EIO", "ENOENT"]) {
+      const refusedAbort = abort(value);
+      expect(abortRead(refusedAbort.error), value).toBe("abort:SEAM-INVALID");
+      expect(refusedAbort.loss.abortInjected, value).toBe(false);
+    }
+    const seamThrew = abort(() => {
+      throw new Error("a seam that throws");
+    });
+    expect(abortRead(seamThrew.error)).toBe("abort:SEAM-THREW");
+    expect(seamThrew.loss.abortInjected).toBe(false);
+    expect(abortRead(new Error("plain")), "an exception without a code word").toBe("abort:throw");
+    expect(abortRead(fail("EMFILE"))).toBe("abort:EMFILE");
+  });
+
+  it("LT-verdict: the not-assessable text names the row, the number of lost ticks and the first lost read, and never the word the INVALID skip looks for", () => {
+    const text = notAssessableText("RT-1", 2, "tree:task:EMFILE");
+    expect(text).toBe("not assessable: row RT-1, lost ticks 2, first lost read tree:task:EMFILE");
+    expect(text).not.toContain("precondition not reached");
+    expect(sampleProblems(cleanSample(), {})).toEqual([]);
+    expect(sampleProblems({ ...cleanSample("RT-9"), lostTicks: 3, lostTicksInjected: 1, firstLost: "snapshot:stat:EIO" }, {})).toEqual(["not assessable: row RT-9, lost ticks 3, first lost read snapshot:stat:EIO"]);
+    expect(sampleProblems({ ...cleanSample("RT-9"), lostTicks: 1, firstLost: "abort:throw" }, { synthetic: "RT-9" }), "a row id that matches a marker is withheld").toEqual(["not assessable: row withheld, lost ticks 1, first lost read abort:throw"]);
+  });
+
+  it("LT-recorder: a row with a lost tick is not assessable for any expectation: its line says so, it counts as a fail, and the summary counts the rows and the lost ticks", () => {
+    const row = (overrides: Partial<MatrixRow>): MatrixRow => ({ id: "X", expected: "pass", observed: "pass", hits: 0, durationMs: 1, deadlineMs: 2, surfaces: [], ...overrides });
+    expect(matrixLine(row({ lostTicks: 0 }))).toContain("result=pass");
+    expect(matrixLine(row({ lostTicks: 0 }))).not.toContain("lost_ticks");
+    for (const [expected, observed] of [["pass", "pass"], ["fail", "fail"], ["pass", "fail"], ["fail", "pass"]] as const) {
+      const line = matrixLine(row({ expected, observed, lostTicks: 2 }));
+      expect(line, `${expected}/${observed}`).toContain("result=not-assessable lost_ticks=2");
+      expect(line, `${expected}/${observed}`).not.toMatch(/result=(pass|fail)/);
+    }
+    const lines: string[] = [];
+    const recorder = new MatrixRecorder("t1-lost", ["A", "B", "C"], (line) => lines.push(line));
+    expect(recorder.record(row({ id: "A", lostTicks: 0 }))).toBe("pass");
+    expect(recorder.record(row({ id: "B", expected: "fail", observed: "fail", lostTicks: 1 })), "a negative control that matched its expectation but lost a tick").toBe("fail");
+    expect(recorder.record(row({ id: "C", observed: "fail", lostTicks: 0 }))).toBe("fail");
+    expect(recorder.summary()).toEqual({ expected: 3, observed: 3, pass: 1, fail: 2, hits: 0, missing: [], lostTicks: 1, notAssessable: 1 });
+    recorder.finish();
+    expect(lines.at(-1)).toBe("SECURITY-SUMMARY suite=t1-lost expected=3 observed=3 pass=1 fail=2 hits=0 missing=none lost_ticks=1 not_assessable=1");
+  });
+
+  it("LT-recorder: a row recorded without a count takes the lost ticks of the windows the running test started", () => {
+    const ledger = samplerLedger();
+    const entry: SamplerLedgerEntry = { id: 9001, row: "t1", test: ledger.current, running: false, natural: 0, injected: 2, acknowledged: 0, first: "tree:task:EIO", drained: true, stop: () => undefined };
+    ledger.entries.push(entry);
+    try {
+      const lines: string[] = [];
+      const recorder = new MatrixRecorder("t1-fill", ["A"], (line) => lines.push(line));
+      expect(recorder.record({ id: "A", expected: "pass", observed: "pass", hits: 0, durationMs: 1, deadlineMs: 2, surfaces: [] })).toBe("fail");
+      expect(lines[0]).toContain("result=not-assessable lost_ticks=2");
+      expect(currentTestLostTicks()).toEqual({ lostTicks: 2, first: "tree:task:EIO" });
+    } finally {
+      ledger.entries.splice(ledger.entries.indexOf(entry), 1);
+    }
+    expect(currentTestLostTicks()).toEqual({ lostTicks: 0, first: "none" });
+  });
+
+  it("LT-hook-fn: the verdict of the global afterEach: a natural lost tick, an injected one that was not acknowledged exactly, and a running window with a lost tick are not assessable", () => {
+    const entry = (overrides: Partial<VerdictEntry> = {}): VerdictEntry => ({ row: "R", running: false, natural: 0, injected: 0, acknowledged: 0, first: undefined, ...overrides });
+    expect(lostTickVerdict([]).problems).toEqual([]);
+    expect(lostTickVerdict([entry()]).problems, "a clean window").toEqual([]);
+    expect(lostTickVerdict([entry({ running: true })]).problems, "running without a lost tick: the hook stops it and the next decision sees its count").toEqual([]);
+    expect(lostTickVerdict([entry({ natural: 1, first: "tree:task:EMFILE" })]).problems).toEqual(["not assessable: row R, lost ticks 1, first lost read tree:task:EMFILE"]);
+    expect(lostTickVerdict([entry({ injected: 1, first: "snapshot:stat:EIO" })]).problems, "injected and not acknowledged").toEqual(["not assessable: row R, lost ticks 1, first lost read snapshot:stat:EIO"]);
+    expect(lostTickVerdict([entry({ injected: 1, acknowledged: 1, first: "snapshot:stat:EIO" })]).problems, "injected and acknowledged exactly").toEqual([]);
+    expect(lostTickVerdict([entry({ injected: 2, acknowledged: 1, first: "snapshot:stat:EIO" })]).problems, "a smaller acknowledgement").toEqual(["not assessable: row R, lost ticks 2, first lost read snapshot:stat:EIO"]);
+    expect(lostTickVerdict([entry({ natural: 1, injected: 1, acknowledged: 1, first: "tree:task:EIO" })]).problems, "a natural tick in an acknowledged window").toEqual(["not assessable: row R, lost ticks 2, first lost read tree:task:EIO"]);
+    expect(lostTickVerdict([entry({ running: true, injected: 1, acknowledged: 1, first: "abort:throw" })]).problems, "a window still running with a lost tick").toHaveLength(1);
+    expect(lostTickVerdict([entry({ row: "A", natural: 1, first: "abort:throw" }), entry({ row: "B" }), entry({ row: "C", injected: 1, first: "reread:stat:EIO" })]).problems).toHaveLength(2);
+  });
+
+  it("LT-ack: an acknowledgement needs a stopped window and the exact number of injected lost ticks, and never clears a natural one", () => {
+    const ledger = samplerLedger();
+    const make = (id: number, overrides: Partial<SamplerLedgerEntry>): SamplerLedgerEntry => ({ id, row: "ack", test: undefined, running: false, natural: 0, injected: 0, acknowledged: 0, first: undefined, drained: true, stop: () => undefined, ...overrides });
+    const entries = [make(9101, { injected: 2, first: "tree:task:EIO" }), make(9102, { injected: 1, natural: 1, first: "tree:task:EIO" }), make(9103, { injected: 1, running: true, first: "tree:task:EIO" }), make(9104, {})];
+    ledger.entries.push(...entries);
+    try {
+      expect(() => acknowledgeLostTicks({ windowId: 9101 }, 1), "fewer than injected").toThrow(/acknowledged 1 lost tick\(s\) but 2 were injected/);
+      expect(() => acknowledgeLostTicks({ windowId: 9101 }, 3), "more than injected").toThrow(/but 2 were injected/);
+      expect(entries[0].acknowledged).toBe(0);
+      acknowledgeLostTicks({ windowId: 9101 }, 2);
+      expect(lostTickVerdict([entries[0]]).problems).toEqual([]);
+      acknowledgeLostTicks({ windowId: 9102 }, 1);
+      expect(lostTickVerdict([entries[1]]).problems, "the natural tick of the same window is still not assessable").toHaveLength(1);
+      expect(() => acknowledgeLostTicks({ windowId: 9103 }, 1), "the count of a running window is not final").toThrow(/still running/);
+      expect(() => acknowledgeLostTicks({ windowId: 9104 }, 1), "a window without an injected tick").toThrow(/but 0 were injected/);
+      acknowledgeLostTicks({ windowId: 9104 }, 0);
+      expect(() => acknowledgeLostTicks({ windowId: 424242 }, 1)).toThrow(/no sampler window/);
+    } finally {
+      for (const entry of entries) ledger.entries.splice(ledger.entries.indexOf(entry), 1);
+    }
+  });
+
+  it("L1: a row whose fixture precondition was not reached is skipped only in a full suite, only for that message, never with a lost tick, and at most three times per run of the file", () => {
+    const base = { fullSuite: true, message: "precondition not reached: the runtime was not recorded", skippedSoFar: 0, lostTicks: 0 };
+    expect(invalidSkipDecision(base)).toBe("skip");
+    expect(invalidSkipDecision({ ...base, fullSuite: false }), "outside a full suite an INVALID row is a failure").toBe("fail");
+    expect(invalidSkipDecision({ ...base, message: "expected 1 to be 2" }), "any other failure").toBe("fail");
+    expect(invalidSkipDecision({ ...base, message: "" })).toBe("fail");
+    expect(invalidSkipDecision({ ...base, message: "not assessable: row R, lost ticks 1, first lost read tree:task:EMFILE" }), "not assessable never skips").toBe("fail");
+    expect(invalidSkipDecision({ ...base, message: "precondition not reached: x (not assessable: row R, lost ticks 1, first lost read tree:task:EMFILE)" }), "even inside a precondition message").toBe("fail");
+    expect(invalidSkipDecision({ ...base, lostTicks: 1 }), "a lost tick in the test never skips").toBe("fail");
+    for (const skipped of [0, 1, 2]) expect(invalidSkipDecision({ ...base, skippedSoFar: skipped }), `${skipped} skipped so far`).toBe("skip");
+    expect(INVALID_SKIP_CAP).toBe(3);
+    expect(invalidSkipDecision({ ...base, skippedSoFar: 3 }), "the fourth INVALID fails").toBe("fail");
+    expect(invalidSkipDecision({ ...base, skippedSoFar: 10 })).toBe("fail");
+  });
+
+  it("T-lt5: the record shape prints the unchecked revival and the injected tick as booleans only", () => {
+    const record: ProcessRecord = {
+      pid: 4343,
+      startTicks: "99",
+      comms: ["claude"],
+      argvShape: "claude",
+      exe: "node",
+      ancestors: ["bwrap", "gateway"],
+      sameNamespaces: { pid: false, user: false, mnt: false },
+      firstMs: 1,
+      lastMs: 2,
+      oldCounted: false,
+      oldUnsandboxed: false,
+      verdict: "runtime",
+      unsandboxed: true,
+      inconsistentReads: 0,
+      pending: { state: "expired", sinceMs: 1, route: "runtime-ending", revivalUnchecked: true },
+      tickReadInjected: true,
+      fate: "exited",
+    };
+    const text = describeRecords([record]);
+    expect(text).toContain("pending-route=runtime-ending revival-unchecked=true tick-read-injected=true");
+    expect(describeRecords([{ ...record, pending: { ...record.pending!, revivalUnchecked: undefined }, tickReadInjected: undefined }])).not.toMatch(/revival-unchecked|tick-read-injected/);
+  });
+});
+
+/**
+ * The lost-tick verdict on real processes (MVP-8139). Every row starts a window beside a real process tree below this test worker (the
+ * reference), first waits until the sampler recorded the candidate in the state under test (a fixture that was not reached is INVALID, with
+ * the message "precondition not reached", and never a pass), then injects exactly one failed read with the `tickReadFault` seam, asserts the
+ * exact window result and count, and only then acknowledges the injected tick. The rows record into their own recorder (suite
+ * `security-lost-tick`), so the `fail=0` assertions of the other suites keep their meaning. They sit outside the INVALID skip: a lost tick is
+ * never skipped.
+ */
+describe("process sampler lost ticks (MVP-8139)", () => {
+  const IDLE = "setInterval(() => {}, 1000)";
+  const BWRAP_DIE = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--unshare-user", "--unshare-pid", "--dev", "/dev", "--proc", "/proc"];
+  const quote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+  const standIn = `exec -a claude ${quote(process.execPath)} -e ${quote(IDLE)}`;
+  const rig = { markers } as unknown as SecurityRig;
+  const children: ChildProcess[] = [];
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const child of children.splice(0)) {
+      for (const pid of [...descendants(child.pid!), child.pid!]) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    }
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  /** A fixture precondition: when it is not reached within its bound the row is INVALID (never a pass). */
+  const until = async (condition: () => boolean, what: string, boundMs = 30_000): Promise<void> => {
+    for (const end = Date.now() + boundMs; !condition() && Date.now() < end; ) await pause(25);
+    expect(condition(), `precondition not reached: ${what}`).toBe(true);
+  };
+  /** An outcome the sampler itself must produce within its bound: a miss is a failure of the row, not an INVALID. */
+  const within = async (condition: () => boolean, what: string, boundMs = 15_000): Promise<void> => {
+    for (const end = Date.now() + boundMs; !condition() && Date.now() < end; ) await pause(25);
+    expect(condition(), what).toBe(true);
+  };
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  function stopCapturing(sampler: { stop: (markers: Record<string, string>) => ProcessSample }): { sample: ProcessSample; summary: string[] } {
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    let sample: ProcessSample;
+    try {
+      sample = sampler.stop({});
+    } finally {
+      spy.mockRestore();
+    }
+    return { sample, summary: lines.join("").split("\n").filter((line) => line.startsWith("SECURITY-PROCESS-SUMMARY")) };
+  }
+
+  /** What the seams of one row did: which read to fail, how often it fired, and the sampler's ticks (the `abort` seam is called once per tick). */
+  interface Armed {
+    pid: number;
+    armed: boolean;
+    /** How many reads the seam fails at most (each fails the read `match` names, on whichever tick it comes). */
+    max: number;
+    fired: number;
+    ticks: number;
+    firedAtTick: number;
+    firedAtMs: number;
+  }
+  type Match = (state: Armed, kind: TickReadKind | "abort", pid: number, file: TickFile | "tick") => string | undefined;
+  /** The seam that fails the reads `match` names, once armed, until `max` reads failed. */
+  const faultOf =
+    (state: Armed, match: Match): TickReadFault =>
+    (kind, pid, file) => {
+      if (kind === "abort") state.ticks += 1;
+      if (!state.armed || state.fired >= state.max) return undefined;
+      const errno = match(state, kind, pid, file);
+      if (errno === undefined) return undefined;
+      state.fired += 1;
+      if (state.fired === 1) {
+        state.firedAtTick = state.ticks;
+        state.firedAtMs = Date.now();
+      }
+      return errno;
+    };
+  const newArmed = (max = 1): Armed => ({ pid: 0, armed: false, max, fired: 0, ticks: 0, firedAtTick: -1, firedAtMs: 0 });
+
+  const provenRuntime = (sample: ProcessSample): ProcessRecord | undefined => sample.records.find((record) => record.argvShape.startsWith("claude ") && record.verdict === "runtime" && !record.unsandboxed);
+
+  /** A sandboxed stand-in (a `claude`-titled Node below a real bwrap, in namespaces of its own) that the sampler has read with the full proof. */
+  async function sandboxedWindow(state: Armed, match: Match) {
+    requireHost(["bwrap"]);
+    const sampler = startProcessSampler(() => process.pid, [], 20, { tickReadFault: faultOf(state, match) });
+    const child = spawn(BWRAP_DIE[0], [...BWRAP_DIE.slice(1), "/bin/bash", "-c", standIn], { stdio: "ignore" });
+    children.push(child);
+    await until(() => {
+      const record = provenRuntime(sampler.peek());
+      if (record) state.pid = record.pid;
+      return record !== undefined;
+    }, "the sandboxed stand-in was not recorded before the fault");
+    return { sampler, child };
+  }
+  const lastMsOf = (sampler: { peek: () => ProcessSample }, pid: number): number => sampler.peek().records.find((record) => record.pid === pid)?.lastMs ?? 0;
+
+  /** The recorder line and the suite summary a row with `lostTicks` produces, through the ledger fill-in (the row passes no count). */
+  function recordInSuite(id: string): string[] {
+    const lines: string[] = [];
+    const recorder = new MatrixRecorder("security-lost-tick", [id], (line) => lines.push(line));
+    recorder.record({ id, expected: "pass", observed: "pass", hits: 0, durationMs: 1, deadlineMs: 2, surfaces: [] });
+    recorder.finish();
+    return lines;
+  }
+
+  /** The exact result of a window with `count` lost ticks, all injected, the first of them `first`; verdicts of the records are unchanged. */
+  function assertLostWindow(sample: ProcessSample, summary: string[], id: string, count: number, first: string): void {
+    expect(sample.lostTicks, "lost ticks").toBe(count);
+    expect(sample.lostTicksInjected, "injected lost ticks").toBe(count);
+    expect(sample.firstLost).toBe(first);
+    expect(sampleProblems(sample, {})).toContain(`not assessable: row ${sample.row}, lost ticks ${count}, first lost read ${first}`);
+    expect(summary, "one summary line for the window").toHaveLength(1);
+    expect(summary[0]).toContain(`lost_ticks=${count} lost_ticks_injected=${count} first_lost=${first}`);
+    expect(sample.unsandboxedRuntimes, "a lost tick changes no record verdict").toEqual([]);
+    const lines = recordInSuite(id);
+    expect(lines[0]).toContain(`id=${id} expected=pass observed=pass result=not-assessable lost_ticks=${count}`);
+    expect(lines[0]).not.toContain("result=pass");
+    expect(lines[1]).toBe(`SECURITY-SUMMARY suite=security-lost-tick expected=1 observed=1 pass=0 fail=1 hits=0 missing=none lost_ticks=${count} not_assessable=1`);
+    acknowledgeLostTicks(sample, count);
+  }
+
+  /** One injected read on a sandboxed stand-in: the sampler goes on (the stand-in's record is refreshed after the lost tick) and the window ends not assessable. */
+  async function injectOnce(id: string, match: Match, first: string) {
+    const state = newArmed();
+    const window = await sandboxedWindow(state, match);
+    state.armed = true;
+    await within(() => state.fired === 1, "the injected read was never made");
+    await within(() => lastMsOf(window.sampler, state.pid) > state.firedAtMs, "the sampler did not write the stand-in's record after the lost tick");
+    const { sample, summary } = stopCapturing(window.sampler);
+    expect(state.fired, "the seam fired exactly once").toBe(1);
+    expect(provenRuntime(sample), "the stand-in kept its verdict and its proof").toBeDefined();
+    assertLostWindow(sample, summary, id, 1, first);
+  }
+
+  it("LT-tree: a tree walk that fails with EMFILE on the gateway's task listing loses the tick: the window is not assessable with its row id, one lost tick and the read", async () => {
+    await injectOnce("LT-tree", (_state, kind, pid, file) => (kind === "tree" && file === "task" && pid === process.pid ? "EMFILE" : undefined), "tree:task:EMFILE");
+  });
+
+  it("LT-snapshot: a discovery snapshot whose stat read of the stand-in fails with EIO loses the tick", async () => {
+    await injectOnce("LT-snapshot", (state, kind, pid, file) => (kind === "snapshot" && file === "stat" && pid === state.pid ? "EIO" : undefined), "snapshot:stat:EIO");
+  });
+
+  it("LT-first-exe: a link read of the stand-in's executable that fails with EMFILE right after the discovery loses the tick", async () => {
+    await injectOnce("LT-first-exe", (state, kind, pid, file) => (kind === "first-exe" && file === "exe" && pid === state.pid ? "EMFILE" : undefined), "first-exe:exe:EMFILE");
+  });
+
+  it("LT-reread: the candidate re-read of the stand-in that fails with EIO on its stat loses the tick", async () => {
+    await injectOnce("LT-reread", (state, kind, pid, file) => (kind === "reread" && file === "stat" && pid === state.pid ? "EIO" : undefined), "reread:stat:EIO");
+  });
+
+  it("LT-abort: an exception that leaves the tick callback loses the tick, the sampler goes on and the next tick writes its records", async () => {
+    await injectOnce("LT-abort", (_state, kind) => (kind === "abort" ? "throw" : undefined), "abort:throw");
+  });
+
+  it("LT-two-reads: two failed reads on the same tick are one lost tick, and the first lost read is the earlier one", async () => {
+    const state = newArmed(2);
+    // The walk reads the stand-in's own task listing before the snapshot reads the stand-in's stat, on the same tick.
+    const window = await sandboxedWindow(state, (seen, kind, pid, file) => {
+      if (kind === "tree" && file === "task" && pid === seen.pid && seen.fired === 0) return "EMFILE";
+      if (kind === "snapshot" && file === "stat" && pid === seen.pid && seen.fired === 1 && seen.ticks === seen.firedAtTick) return "EIO";
+      return undefined;
+    });
+    state.armed = true;
+    await within(() => state.fired === 2, "the two injected reads were never made");
+    await within(() => lastMsOf(window.sampler, state.pid) > state.firedAtMs, "the sampler did not write the stand-in's record after the lost tick");
+    const { sample, summary } = stopCapturing(window.sampler);
+    expect(state.fired).toBe(2);
+    assertLostWindow(sample, summary, "LT-two-reads", 1, "tree:task:EMFILE");
+  });
+
+  it("LT-two-ticks: a failed read on each of two ticks is two lost ticks, and the first lost read stays the first", async () => {
+    const state = newArmed(2);
+    const window = await sandboxedWindow(state, (seen, kind, pid, file) => {
+      if (kind === "tree" && file === "task" && pid === process.pid && seen.fired === 0) return "EMFILE";
+      if (kind === "snapshot" && file === "stat" && pid === seen.pid && seen.fired === 1 && seen.ticks > seen.firedAtTick) return "EIO";
+      return undefined;
+    });
+    state.armed = true;
+    await within(() => state.fired === 2, "the two injected reads were never made");
+    await within(() => lastMsOf(window.sampler, state.pid) > state.firedAtMs, "the sampler did not write the stand-in's record after the lost ticks");
+    const { sample, summary } = stopCapturing(window.sampler);
+    expect(state.fired).toBe(2);
+    assertLostWindow(sample, summary, "LT-two-ticks", 2, "tree:task:EMFILE");
+  });
+
+  it("LT-records0: a tree walk lost before the first discovery leaves no record and still prints its window line with the lost tick", async () => {
+    const state = newArmed();
+    const sampler = startProcessSampler(() => process.pid, [], 20, { tickReadFault: faultOf(state, (_seen, kind, pid, file) => (kind === "tree" && file === "task" && pid === process.pid ? "EMFILE" : undefined)) });
+    state.armed = true;
+    await within(() => state.fired === 1, "the injected read was never made");
+    await pause(100);
+    const { sample, summary } = stopCapturing(sampler);
+    expect(sample.records, "no candidate was ever discovered").toEqual([]);
+    expect(summary, "the line is printed without a record").toHaveLength(1);
+    expect(summary[0]).toContain("records=0 ");
+    assertLostWindow(sample, summary, "LT-records0", 1, "tree:task:EMFILE");
+  });
+
+  it("LT-neg: a negative control with a lost tick is not assessable: its line says so, never result=pass, and finishRow throws", async () => {
+    const state = newArmed();
+    const window = await sandboxedWindow(state, (_seen, kind, pid, file) => (kind === "tree" && file === "task" && pid === process.pid ? "EMFILE" : undefined));
+    state.armed = true;
+    await within(() => state.fired === 1, "the injected read was never made");
+    const { sample } = stopCapturing(window.sampler);
+    const lines: string[] = [];
+    const recorder = new MatrixRecorder("security-lost-tick", ["LT-neg"], (line) => lines.push(line));
+    // The control observed what it expects (a hit): without the lost tick this reads expected=fail observed=fail result=pass.
+    expect(() => finishRow(recorder, rig, { id: "LT-neg", expected: "fail", durationMs: 1, deadlineMs: 2, surfaces: Object.entries(SURFACE_FLOORS).map(([name, floor]) => ({ name, text: "x".repeat(floor + 10) })), problems: ["the negative control hit"] })).toThrow(
+      /security row LT-neg: not assessable: lost ticks 1, first lost read tree:task:EMFILE/,
+    );
+    expect(lines[0]).toContain("expected=fail observed=fail result=not-assessable lost_ticks=1");
+    expect(lines[0]).not.toContain("result=pass");
+    expect(recorder.summary()).toMatchObject({ pass: 0, fail: 1, lostTicks: 1, notAssessable: 1 });
+    expect(sample.lostTicks).toBe(1);
+    acknowledgeLostTicks(sample, sample.lostTicksInjected);
+  });
+
+  it("LT-churn: short-lived claude-titled children that appear and vanish between two reads are not lost ticks (ENOENT and ESRCH are the process being gone)", async () => {
+    let ticks = 0;
+    const sampler = startProcessSampler(() => process.pid, [], 20, { afterTick: () => void (ticks += 1) });
+    const child = spawn("bash", ["-c", 'end=$((SECONDS + 4)); while [ $SECONDS -lt $end ]; do ( exec -a claude sleep 0.005 ); done'], { stdio: "ignore" });
+    children.push(child);
+    await until(() => ticks >= 60 && sampler.peek().vanishedReads >= 1, "the churn produced no read that failed with ENOENT or ESRCH within its bound", 20_000);
+    const { sample, summary } = stopCapturing(sampler);
+    expect(sample.vanishedReads, "reads that found the process gone").toBeGreaterThanOrEqual(1);
+    expect(sample.lostTicks).toBe(0);
+    expect(sample.firstLost).toBe("none");
+    if (summary.length > 0) expect(summary[0]).toContain("lost_ticks=0 lost_ticks_injected=0 first_lost=none");
+  });
+
+  it("LT-denied: a live non-dumpable claude-titled process whose executable cannot be read is flagged as before (unreadable while alive), and the refused link is no lost tick", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mvp8139-denied-"));
+    dirs.push(dir);
+    const copy = path.join(dir, "execute-only");
+    fs.copyFileSync(fs.realpathSync("/bin/sh"), copy);
+    fs.chmodSync(copy, 0o111);
+    const sampler = startProcessSampler(() => process.pid, []);
+    const child = spawn(copy, ["-c", "sleep 4; :", "sh", "cli.js"], { stdio: "ignore" });
+    children.push(child);
+    const refused = (): boolean => {
+      try {
+        fs.readlinkSync(`/proc/${child.pid}/exe`);
+        return false;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "EACCES";
+      }
+    };
+    await until(refused, `the test's own readlink of the executable was not refused with EACCES (needs a non-root user and fs.suid_dumpable 0 or 2; euid ${process.geteuid?.()}, suid_dumpable ${fs.readFileSync("/proc/sys/fs/suid_dumpable", "utf8").trim()})`);
+    await until(() => sampler.peek().records.some((record) => record.pid === child.pid), "the sampler did not record the execute-only process");
+    await pause(150);
+    const { sample, summary } = stopCapturing(sampler);
+    const record = sample.records.find((candidate) => candidate.pid === child.pid)!;
+    expect(record.exe).toBe("unreadable");
+    expect(record.firstMissingProof).toBe("executable unreadable while the process was alive");
+    expect(sample.unsandboxedRuntimes).toContain(child.pid);
+    expect(sample.lostTicks).toBe(0);
+    expect(summary[0]).toContain("lost_ticks=0 lost_ticks_injected=0 first_lost=none");
+  });
+
+  it("LT-clean: a window without a fault loses no tick and keeps its verdicts: the stand-in killed while proven is cleared by its own proof, flagged=0, and the line reads lost_ticks=0 first_lost=none", async () => {
+    const state = newArmed();
+    const window = await sandboxedWindow(state, () => undefined);
+    process.kill(state.pid, "SIGKILL");
+    await until(() => !alive(state.pid), "the stand-in did not end");
+    await pause(300);
+    const { sample, summary } = stopCapturing(window.sampler);
+    expect(sample.records.some((record) => record.pid === state.pid)).toBe(true);
+    expect(sample.unsandboxedRuntimes).toEqual([]);
+    expect(sample.lostTicks).toBe(0);
+    expect(sample.firstLost).toBe("none");
+    expect(sampleProblems(sample, {})).toEqual([]);
+    expect(summary[0]).toContain("lost_ticks=0 lost_ticks_injected=0 first_lost=none");
+    expect(summary[0]).toMatch(/ flagged=0$/);
+  });
+
+  /*  The hook path: the global afterEach and afterAll of the setup file, run by a child vitest on fixtures that only ever exist under /tmp  */
+
+  it("LT-hook: the setup file fails a test whose window lost a tick (stopped, left running, refused seam value), a window started outside a test, and passes a clean one and an exactly acknowledged one", async () => {
+    const dir = fs.mkdtempSync("/tmp/mvp8139-lt-hook-");
+    dirs.push(dir);
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const helper = path.join(here, "helpers", "security-matrix.ts");
+    const setup = path.join(here, "setup", "sampler-verdict.ts");
+    const head = `import { startProcessSampler, acknowledgeLostTicks } from ${JSON.stringify(helper)};\n`;
+    const fault = (value: string): string => `{ tickReadFault: (kind, pid, file) => { if (fired || kind !== "tree" || file !== "task" || pid !== process.pid) return undefined; fired = true; return ${JSON.stringify(value)}; } }`;
+    const start = (value: string): string => `let fired = false;\nconst start = () => startProcessSampler(() => process.pid, [], 20, ${fault(value)});\nconst lost = async (sampler) => { for (const end = Date.now() + 10000; sampler.peek().lostTicks < 1 && Date.now() < end; ) await new Promise((resolve) => setTimeout(resolve, 20)); };\n`;
+    const files: Record<string, string> = {
+      "a.test.ts": `${head}${start("EMFILE")}it("LT-hook-a: an injected lost tick that nobody acknowledged", async () => {\n  const sampler = start();\n  await lost(sampler);\n  sampler.stop({});\n});\n`,
+      "b.test.ts": `${head}${start("EMFILE")}it("LT-hook-b: the same, with the window left running at the end of the test", async () => {\n  const sampler = start();\n  await lost(sampler);\n});\n`,
+      "c.test.ts": `${head}it("LT-hook-c: a clean window", async () => {\n  const sampler = startProcessSampler(() => process.pid, [], 20);\n  await new Promise((resolve) => setTimeout(resolve, 100));\n  sampler.stop({});\n});\n`,
+      "d.test.ts": `${head}${start("EMFILE")}let sampler;\nbeforeAll(async () => {\n  sampler = start();\n  await lost(sampler);\n});\nit("LT-hook-d: a test beside a window started in beforeAll", () => {});\nafterAll(() => {\n  sampler.stop({});\n});\n`,
+      "e.test.ts": `${head}${start("ENOENT")}it("LT-hook-e: a refused seam value, acknowledged with zero", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, sample.lostTicksInjected);\n});\n`,
+      "f.test.ts": `${head}${start("EMFILE")}it("LT-hook-f: an injected lost tick acknowledged exactly", async () => {\n  const sampler = start();\n  await lost(sampler);\n  const sample = sampler.stop({});\n  acknowledgeLostTicks(sample, 1);\n});\n`,
+    };
+    for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
+    fs.writeFileSync(path.join(dir, "vitest.config.mjs"), `export default { test: { globals: true, environment: "node", root: ${JSON.stringify(dir)}, include: ["*.test.ts"], setupFiles: [${JSON.stringify(setup)}] } };\n`);
+    const out = path.join(dir, "result.json");
+    const run = await runChild(
+      [process.execPath, path.join(REPO_ROOT, "node_modules", "vitest", "vitest.mjs"), "run", "--config", path.join(dir, "vitest.config.mjs"), "--reporter=json", `--outputFile=${out}`],
+      { PATH: process.env.PATH, HOME: process.env.HOME },
+      dir,
+      180_000,
+    );
+    expect(run.timedOut, "precondition not reached: the child vitest did not finish within its bound").toBe(false);
+    expect(fs.existsSync(out), `precondition not reached: the child vitest wrote no result (exit ${run.code})`).toBe(true);
+    const report = JSON.parse(fs.readFileSync(out, "utf8")) as { testResults: { name: string; status: string; message: string; assertionResults: { title: string; status: string; failureMessages: string[] }[] }[] };
+    const file = (name: string) => {
+      const result = report.testResults.find((candidate) => candidate.name.endsWith(`/${name}`));
+      expect(result, `precondition not reached: the child vitest ran ${name}`).toBeDefined();
+      return result!;
+    };
+    const failures = (name: string): string => {
+      const result = file(name);
+      return [result.message, ...result.assertionResults.flatMap((assertion) => assertion.failureMessages)].join("\n");
+    };
+    for (const name of ["a", "b"]) {
+      const result = file(`${name}.test.ts`);
+      expect(result.assertionResults.map((assertion) => assertion.status), `${name}: the test fails in the hook`).toEqual(["failed"]);
+      expect(failures(`${name}.test.ts`), name).toMatch(new RegExp(`not assessable: row LT-hook-${name}-[0-9a-f]{10}, lost ticks 1, first lost read tree:task:EMFILE`));
+    }
+    expect(file("c.test.ts").assertionResults.map((assertion) => assertion.status), "a clean window passes").toEqual(["passed"]);
+    expect(file("d.test.ts").status, "a window started in beforeAll fails the file").toBe("failed");
+    expect(failures("d.test.ts")).toContain("not assessable");
+    expect(file("e.test.ts").assertionResults.map((assertion) => assertion.status), "a refused seam value is natural: acknowledging zero changes nothing").toEqual(["failed"]);
+    expect(failures("e.test.ts")).toMatch(/not assessable: row LT-hook-e-[0-9a-f]{10}, lost ticks 1, first lost read tree:task:SEAM-INVALID/);
+    expect(file("f.test.ts").assertionResults.map((assertion) => assertion.status), "an exact acknowledgement passes").toEqual(["passed"]);
+  });
+
+  /*  Static rows: where the seam and the acknowledgement may be used, and that the verdict is wired in  */
+
+  const testsDir = path.dirname(fileURLToPath(import.meta.url));
+  const sourceOf = (file: string): ts.SourceFile => ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.ES2022, true);
+  const walk = (node: ts.Node, visit: (node: ts.Node) => void): void => {
+    visit(node);
+    ts.forEachChild(node, (child) => walk(child, visit));
+  };
+
+  it("LT-static: only the declared LT rows pass the tick read seam or acknowledge lost ticks (every use belongs to the brace-matched body of one row)", () => {
+    const ALLOWED = ["LT-tree", "LT-snapshot", "LT-first-exe", "LT-reread", "LT-abort", "LT-two-reads", "LT-two-ticks", "LT-records0", "LT-neg", "LT-gateway", "LT-ack", "sandboxedWindow", "assertLostWindow"];
+    const names = ["tickRead" + "Fault", "acknowledge" + "LostTicks"];
+    const files = [
+      ...fs.readdirSync(testsDir).filter((name) => name.endsWith(".ts")).map((name) => path.join(testsDir, name)),
+      ...fs.readdirSync(path.join(testsDir, "helpers")).filter((name) => name.endsWith(".ts") && name !== "security-matrix.ts").map((name) => path.join(testsDir, "helpers", name)),
+      ...fs.readdirSync(path.join(testsDir, "setup")).filter((name) => name.endsWith(".ts")).map((name) => path.join(testsDir, "setup", name)),
+    ];
+    const offenders: string[] = [];
+    let uses = 0;
+    for (const file of files) {
+      const source = sourceOf(file);
+      walk(source, (node) => {
+        if (!ts.isIdentifier(node) || !names.includes(node.text)) return;
+        for (let up: ts.Node | undefined = node; up; up = up.parent) if (ts.isImportDeclaration(up)) return;
+        uses += 1;
+        let owner = "outside a row";
+        for (let up: ts.Node | undefined = node.parent; up; up = up.parent) {
+          if (ts.isFunctionDeclaration(up) && up.name && ALLOWED.includes(up.name.text)) {
+            owner = up.name.text;
+            break;
+          }
+          if (ts.isCallExpression(up) && ts.isIdentifier(up.expression) && up.expression.text === "it") {
+            const title = up.arguments[0];
+            owner = title && (ts.isStringLiteral(title) || ts.isNoSubstitutionTemplateLiteral(title) || ts.isTemplateExpression(title)) ? title.getText().slice(1).split(":")[0].trim() : "an unnamed row";
+            break;
+          }
+        }
+        if (!ALLOWED.includes(owner)) offenders.push(`${path.basename(file)}: ${owner}`);
+      });
+    }
+    expect(uses, "the rows that use the seam were found").toBeGreaterThanOrEqual(10);
+    expect(offenders).toEqual([]);
+  });
+
+  it("LT-wiring: the setup file is registered, its afterEach asks lostTickVerdict, and the INVALID skip asks invalidSkipDecision with the lost ticks of the test", () => {
+    const root = path.resolve(testsDir, "..", "..");
+    const config = fs.readFileSync(path.join(root, "vitest.config.ts"), "utf8");
+    expect(config).toMatch(/setupFiles:\s*\["src\/tests\/setup\/sampler-verdict\.ts"\]/);
+    expect(config, "the hook order is the default (stack): the setup file's afterEach runs last").not.toMatch(/hooks\s*:/);
+    const setup = sourceOf(path.join(testsDir, "setup", "sampler-verdict.ts"));
+    const calls = new Map<string, string>();
+    walk(setup, (node) => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && ["beforeEach", "afterEach", "afterAll"].includes(node.expression.text)) calls.set(node.expression.text, node.getText());
+    });
+    expect([...calls.keys()].sort()).toEqual(["afterAll", "afterEach", "beforeEach"]);
+    expect(calls.get("afterEach")).toContain("lostTickVerdict(");
+    expect(calls.get("afterEach")).toContain("entry.stop()");
+    expect(calls.get("afterAll")).toContain("lostTickVerdict(");
+    let wrapper = "";
+    walk(sourceOf(fileURLToPath(import.meta.url)), (node) => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "it" && node.initializer && node.initializer.getText().includes("baseIt(")) wrapper = node.initializer.getText();
+    });
+    expect(wrapper, "the INVALID skip wrapper was found").toContain("baseIt(");
+    expect(wrapper).toContain("currentTestLostTicks({ stopRunning: true })");
+    expect(wrapper).toMatch(/invalidSkipDecision\(\{[^}]*lostTicks/);
   });
 });
