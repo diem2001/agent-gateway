@@ -1389,8 +1389,9 @@ describe("lost-tick verdict (MVP-8139)", () => {
     });
     const turn = await chatTurn(rig, { prompt: "LT-GATEWAY", sessionId: "conv-lt-gateway", steps: [bashStep("sleep 3; echo LT-GATEWAY-DONE")], withCredentials: false });
     const { sample } = window.close();
-    expect(watch.runtimeSeen && watch.aliveAfter, "precondition not reached: a claude process in a tick snapshot before and after the injected tick (the runtime was alive across it)").toBe(true);
+    expect(watch.runtimeSeen, "precondition not reached: no claude process was in any tick snapshot").toBe(true);
     expect(watch.fired, "the injected read was made").toBe(true);
+    expect(watch.aliveAfter, "precondition not reached: the runtime was not alive in a tick after the injected one").toBe(true);
     expect(sample.records.some((record) => record.lastMs > watch.firedAtMs), "the sampler wrote the runtime's record after the injected tick").toBe(true);
     expect(sample.lostTicks).toBe(1);
     expect(sample.lostTicksInjected).toBe(1);
