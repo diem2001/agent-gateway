@@ -3050,17 +3050,18 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     const window = await ownWindow(state, { secs, fresh: exitsInside ? 300_000 : undefined });
     touch(window.trig, "exec");
     await until(() => imageRuns(state.runtime!.pid, secs), "the surviving thread did not execute the new program");
-    let insideBound = true;
+    // The new program has to run early enough for the next settles to see it before the bound expires the record (under load the exec waits for the leader's exit).
+    let insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 600;
     if (exitsInside) {
       await until(() => ended(state.runtime!), "the new program did not end");
-      insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
+      insideBound = insideBound && Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
     } else await pause(400);
     const proof = exitsInside ? undefined : taggedProcessProof(process.pid, `claude ${secs}`);
     const closed = closeWindow(window.sampler);
     return { ...closed, proof, insideBound, exitsInside, record: recordOf(closed.final, state.runtime) };
   }
   const assertRevived = (state: Seam, run: Awaited<ReturnType<typeof ownRevive>>): void => {
-    expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
+    expect(run.insideBound, "precondition not reached: the new program did not run, or did not end, inside the bound").toBe(true);
     // The rows that must fit the whole chain into the bound use the shorter hold: a leader that is already a zombie leader at the exit read is as good for them.
     expectHeldKind(state, run.record.proofFailure?.runtimeExit, run.exitsInside && run.record.proofFailure?.runtimeExit === "Zn" ? "Zn" : "empty-n");
     expect(run.record.pending).toMatchObject({ state: "expired", route: "runtime-ending", revived: true });
@@ -3311,10 +3312,10 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     const window = await launcherWindow(state, { leaderAfterProof: options.leaderAfterProof, secs, fresh: options.exitsInside ? 300_000 : undefined });
     touch(window.trig, "exec");
     await until(() => imageRuns(state.runtime!.pid, secs), "the surviving thread did not execute the new program");
-    let insideBound = true;
+    let insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 600;
     if (options.exitsInside) {
       await until(() => ended(state.runtime!), "the new program did not end");
-      insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
+      insideBound = insideBound && Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
     } else await pause(400);
     const closed = closeWindow(window.sampler);
     return { ...closed, insideBound, record: recordOf(closed.final, state.runtime) };
@@ -3323,6 +3324,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
   it("LE8-revive: the surviving thread executes a new program after the leader finished: the pending record is expired at once (revived) and flagged", async () => {
     const state = newSeam();
     const run = await launcherRevive(state, "6", { leaderAfterProof: true, exitsInside: false });
+    expect(run.insideBound, "precondition not reached: the new program did not run, or did not end, inside the bound").toBe(true);
     expectHeldKind(state, run.record.proofFailure?.runtimeExit, "empty-n");
     expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
     flagged(run.final, run.record);
@@ -3332,7 +3334,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
   it("LE8-revive-exit: the new program ends inside the bound: the record is still flagged, never cleared", async () => {
     const state = newSeam();
     const run = await launcherRevive(state, "0.1", { leaderAfterProof: true, exitsInside: true });
-    expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
+    expect(run.insideBound, "precondition not reached: the new program did not run, or did not end, inside the bound").toBe(true);
     expectHeldKind(state, run.record.proofFailure?.runtimeExit, run.record.proofFailure?.runtimeExit === "Zn" ? "Zn" : "empty-n");
     expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
     flagged(run.final, run.record);
@@ -3342,7 +3344,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
   it("LE8-revive-alive-entry: a record that entered alive and whose thread executes a different executable that then ends inside the bound is flagged (executable identity), never cleared", async () => {
     const state = newSeam();
     const run = await launcherRevive(state, "0.1", { leaderAfterProof: false, exitsInside: true });
-    expect(run.insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
+    expect(run.insideBound, "precondition not reached: the new program did not run, or did not end, inside the bound").toBe(true);
     expect(run.record.pending?.sawLeaderExit, "precondition not reached: a leader exit was seen, so the executable-identity check is not what revived the record").not.toBe(true);
     expect(run.record.proofFailure).toMatchObject({ failedWhile: "alive", ownProof: true, runtimeExit: "alive" });
     expect(run.record.pending).toMatchObject({ state: "expired", route: "launcher-ended", revived: true });
@@ -3478,7 +3480,7 @@ describe("process sampler thread-safe exit: real processes (MVP-8130)", () => {
     await until(() => ended(state.runtime!), "the new program did not end");
     const insideBound = Date.now() - recordOf(window.sampler.peek(), state.runtime).pending!.sinceMs < PENDING_BOUND_MS - 300;
     const { final, summary } = closeWindow(window.sampler);
-    expect(insideBound, "precondition not reached: the new program ended after the bound").toBe(true);
+    expect(insideBound, "precondition not reached: the new program did not run, or did not end, inside the bound").toBe(true);
     const record = recordOf(final, state.runtime);
     expect(record.pending).toMatchObject({ state: "expired", route: "reference-ended", revived: true });
     flagged(final, record);
