@@ -4948,7 +4948,7 @@ describe("process sampler lost ticks (MVP-8139)", () => {
       });
     }
     expect(uses, "the rows that use the seam were found").toBeGreaterThanOrEqual(10);
-    expect(offenders).toEqual([]);
+    expect(offenders, `offenders: ${offenders.join(" | ")}`).toEqual([]);
   });
 
   it("LT-wiring: the setup file is registered, its afterEach asks lostTickVerdict, and the INVALID skip asks invalidSkipDecision with the lost ticks of the test (the call site is pinned exactly)", () => {
