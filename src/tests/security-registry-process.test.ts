@@ -34,10 +34,11 @@ import { createHash, randomBytes } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Cleanup } from "./helpers/git-process-gateway.js";
-import { gatewayRequest } from "./helpers/git-process-gateway.js";
+import { REPO_ROOT, gatewayRequest } from "./helpers/git-process-gateway.js";
 import { startOAuthMcpStub, type OAuthMcpStub } from "./helpers/oauth-mcp-stub.js";
 import {
   MatrixRecorder,
@@ -52,6 +53,7 @@ import {
   registerStandardServers,
   queryAs,
   requireHost,
+  runChild,
   surfacesOf,
   turnProblems,
   type SecurityMarkers,
@@ -66,11 +68,25 @@ const markers: SecurityMarkers = createMarkers();
 const recorder = new MatrixRecorder("security-registry-process", registryRowIds());
 
 const cleanups: Cleanup[] = [];
+
+/**
+ * The gateway build the negative controls of the reserved-name rows start instead of `dist/server.js`. It is honored only
+ * in a child run (`REGISTRY_RESERVED_CHILD=1`); anywhere else a set variable throws, so a leaked variable can never make an
+ * ordinary run green against another build.
+ */
+function negativeControlServer(): string | undefined {
+  const dist = process.env.REGISTRY_RESERVED_DIST;
+  if (dist === undefined || dist === "") return undefined;
+  if (process.env.REGISTRY_RESERVED_CHILD !== "1") throw new Error("REGISTRY_RESERVED_DIST is set outside a negative-control child run");
+  return dist;
+}
+
 afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()!();
 });
 
 beforeAll(() => {
+  negativeControlServer();
   requireHost(["bwrap", "userns", "git", "python3", "build"]);
   emit(
     evidenceLine({
@@ -427,7 +443,9 @@ const RESERVED = "agent-gateway-tools";
 const AUDIT_LINE = `[audit] mcp.registry.reserved_name_excluded serverName=${RESERVED}`;
 const RESERVED_BODY = { error: { code: "MCP_SERVER_NAME_RESERVED", message: `"${RESERVED}" is reserved for the gateway's webhook tools` } };
 const OWNER_DENIAL = { error: { code: "MCP_SERVER_OWNER_MISMATCH", message: `MCP server "${RESERVED}" is registered by another application` } };
-const LABEL_KEYS = { alpha: `sk-gw-alpha-${randomBytes(6).toString("hex")}`, beta: `sk-gw-beta-${randomBytes(6).toString("hex")}` };
+/** The two synthetic labels' keys carry the run's marker seed, so a negative control's parent can scan its child's output for them. */
+const labelKeysFor = (seed: string) => ({ alpha: `sk-gw-alpha-${seed}`, beta: `sk-gw-beta-${seed}` });
+const LABEL_KEYS = labelKeysFor(markers.seed);
 
 /** A recording webhook: path, tool name header and body (the tool input itself) of every call, answered with a fixed output. */
 async function startRecordingHook(): Promise<{ base: string; calls: { path: string; toolName: string; body: Record<string, unknown> }[]; close: () => Promise<void> }> {
@@ -488,6 +506,7 @@ async function newReservedRig(entries: (stubs: { reserved: OAuthMcpStub; control
   cleanups.push(() => hook.close());
   const rig = await createRig(cleanups, {
     markers,
+    distServer: negativeControlServer(),
     env: { API_KEYS: `reqlift:${markers.values.gatewayKeyReqlift},diemcrm:${markers.values.gatewayKeyDiemcrm},alpha:${LABEL_KEYS.alpha},beta:${LABEL_KEYS.beta}` },
     seed: (dirs) => fs.writeFileSync(path.join(dirs.persist, "mcp-servers.json"), JSON.stringify(entries({ reserved, control }), null, 2)),
   });
@@ -672,6 +691,86 @@ describe("reserved server name rows (MVP-8203)", () => {
       floors: { "tool-results": 10 },
       controls: ["alpha_put_of_reserved_name_400", "beta_webhook_received_exactly_one_call_with_the_input", "reserved_stub_received_no_request", "ordinary_registry_server_contacted_in_the_same_run", "stream_shows_tool_use_and_tool_result"],
       problems,
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Negative controls (MVP-8203)                                        */
+/* ------------------------------------------------------------------ */
+
+interface DistPatch {
+  file: string;
+  from: string;
+  to: string;
+}
+
+/** A copy of `dist/` whose files carry the given patches; every patch must match its compiled file exactly once and change it. */
+function patchedDist(patches: DistPatch[]): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mvp8203-vulnerable-"));
+  cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.cpSync(path.join(REPO_ROOT, "dist"), path.join(root, "dist"), { recursive: true, filter: (source) => !source.startsWith(path.join(REPO_ROOT, "dist", "tests")) });
+  fs.copyFileSync(path.join(REPO_ROOT, "package.json"), path.join(root, "package.json"));
+  fs.symlinkSync(path.join(REPO_ROOT, "node_modules"), path.join(root, "node_modules"));
+  for (const { file, from, to } of patches) {
+    const target = path.join(root, "dist", file);
+    const source = fs.readFileSync(target, "utf8");
+    expect(source.split(from).length - 1, `the patch of ${file} must match exactly once`).toBe(1);
+    fs.writeFileSync(target, source.replace(from, () => to));
+    expect(fs.readFileSync(target, "utf8"), `the patch of ${file} must change the compiled file`).not.toBe(source);
+  }
+  return path.join(root, "dist", "server.js");
+}
+
+/**
+ * Runs `-t <row>:` of this file in a child vitest against the patched build and records names and counts only: the child
+ * must exit nonzero, name the row with `observed=fail`, report the row's own failure text, and print no marker value.
+ */
+async function negativeControl(options: { id: string; row: string; patches: DistPatch[]; mustSay: string }): Promise<void> {
+  const dist = patchedDist(options.patches);
+  const seed = randomBytes(4).toString("hex");
+  const childMarkers = createMarkers(seed);
+  const child = await runChild(
+    [process.execPath, path.join(REPO_ROOT, "node_modules", "vitest", "vitest.mjs"), "run", "src/tests/security-registry-process.test.ts", "-t", `${options.row}:`],
+    { PATH: process.env.PATH, HOME: process.env.HOME, LANG: process.env.LANG, TMPDIR: os.tmpdir(), NO_COLOR: "1", REGISTRY_RESERVED_CHILD: "1", REGISTRY_RESERVED_DIST: dist, SECURITY_MARKER_SEED: seed },
+    REPO_ROOT,
+    280_000,
+  );
+  const line = new RegExp(`SECURITY-MATRIX id=${options.row.replace(/\./g, "\\.")}[^\\n]*`).exec(child.output)?.[0] ?? "";
+  const printsAMarkerValue = [...Object.values(childMarkers.values), labelKeysFor(seed).alpha, labelKeysFor(seed).beta].some((value) => child.output.includes(value));
+  emit(`SECURITY-EVIDENCE negative-control id=${options.id} row=${options.row} exit=${child.code} named_row=${/observed=fail/.test(line)} says_expected=${child.output.includes(options.mustSay)} printed_marker=${printsAMarkerValue}`);
+  expect(child.timedOut, "the child run hit its deadline").toBe(false);
+  expect(child.code !== 0 && child.code !== null, "the row must exit nonzero against the vulnerable build").toBe(true);
+  expect(/observed=fail/.test(line), "the child output must name the row with observed=fail").toBe(true);
+  expect(child.output.includes(options.mustSay), "the child must report why the vulnerable build was caught").toBe(true);
+  expect(printsAMarkerValue, "the child output must contain no marker value").toBe(false);
+}
+
+describe("negative controls of the reserved-name rows (child runs against patched copies of dist/)", () => {
+  it("NC1: against a registry route without the reserved-name refusal, RG.reserved-new fails", async () => {
+    await negativeControl({
+      id: "NC1",
+      row: "RG.reserved-new",
+      patches: [{ file: "routes/mcp.js", from: "if (name === WEBHOOK_SERVER_NAME) {", to: "if (false) {" }],
+      mustSay: "the PUT of the reserved name was not the fixed 400",
+    });
+  });
+
+  it("NC2: against the baseline run path (selection without the exclusion, no run-layer filter, no re-assert), RG.reserved-run fails", async () => {
+    await negativeControl({
+      id: "NC2",
+      row: "RG.reserved-run",
+      patches: [
+        { file: "mcp-registry.js", from: "return getEnabledMcpServers().filter((s) => s.name !== WEBHOOK_SERVER_NAME);", to: "return getEnabledMcpServers();" },
+        { file: "agent.js", from: "selection.attached.filter((def) => def.name !== WEBHOOK_SERVER_NAME)", to: "selection.attached" },
+        { file: "agent.js", from: "name !== WEBHOOK_SERVER_NAME && !omittedServers.includes(name)", to: "!omittedServers.includes(name)" },
+        {
+          file: "agent.js",
+          from: "    if (webhookServer !== undefined)\n        mcpServers[WEBHOOK_SERVER_NAME] = webhookServer;\n    else\n        delete mcpServers[WEBHOOK_SERVER_NAME];\n",
+          to: "",
+        },
+      ],
+      mustSay: "reproduced: input reached the other caller's server",
     });
   });
 });
