@@ -429,9 +429,9 @@ const RESERVED_BODY = { error: { code: "MCP_SERVER_NAME_RESERVED", message: `"${
 const OWNER_DENIAL = { error: { code: "MCP_SERVER_OWNER_MISMATCH", message: `MCP server "${RESERVED}" is registered by another application` } };
 const LABEL_KEYS = { alpha: `sk-gw-alpha-${randomBytes(6).toString("hex")}`, beta: `sk-gw-beta-${randomBytes(6).toString("hex")}` };
 
-/** A recording webhook: the body of every call, answered with a fixed output. */
-async function startRecordingHook(): Promise<{ base: string; calls: { path: string; body: Record<string, unknown> }[]; close: () => Promise<void> }> {
-  const calls: { path: string; body: Record<string, unknown> }[] = [];
+/** A recording webhook: path, tool name header and body (the tool input itself) of every call, answered with a fixed output. */
+async function startRecordingHook(): Promise<{ base: string; calls: { path: string; toolName: string; body: Record<string, unknown> }[]; close: () => Promise<void> }> {
+  const calls: { path: string; toolName: string; body: Record<string, unknown> }[] = [];
   const sockets = new Set<import("node:net").Socket>();
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -443,7 +443,7 @@ async function startRecordingHook(): Promise<{ base: string; calls: { path: stri
       } catch {
         // Not JSON: recorded as an empty body.
       }
-      calls.push({ path: req.url ?? "", body });
+      calls.push({ path: req.url ?? "", toolName: String(req.headers["x-webhook-tool-name"] ?? ""), body });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ output: "BETA-WEBHOOK-ANSWER" }));
     });
@@ -652,7 +652,7 @@ describe("reserved server name rows (MVP-8203)", () => {
     problems.push(...turnProblems(turn));
 
     if (hook.calls.length !== 1) problems.push(`beta's webhook received ${hook.calls.length} call(s), expected exactly 1`);
-    else if (hook.calls[0].path !== "/probe_read" || hook.calls[0].body.tool_name !== "probe_read" || JSON.stringify(hook.calls[0].body.input) !== JSON.stringify({ marker })) problems.push("beta's webhook did not receive exactly the scripted input");
+    else if (hook.calls[0].path !== "/probe_read" || hook.calls[0].toolName !== "probe_read" || JSON.stringify(hook.calls[0].body) !== JSON.stringify({ marker })) problems.push("beta's webhook did not receive exactly the scripted input");
     const methods = reserved.requests.flatMap((request) => request.rpcMethods);
     if (reserved.requests.length !== 0) problems.push(`reproduced: input reached the other caller's server (${reserved.requests.length} request(s), ${methods.filter((method) => method === "tools/call").length} tools/call, ${reserved.toolCalls.length} tool call(s) answered)`);
     const controlMethods = control.requests.flatMap((request) => request.rpcMethods);
