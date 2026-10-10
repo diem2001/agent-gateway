@@ -67,7 +67,7 @@ import {
 
 vi.setConfig({ testTimeout: 300_000 });
 
-const ROW_IDS = ["SI.stream-input-secret", "SI.mask-overlap", "SI.mask-scheme", "SI.refusal-mask", "SI.refusal-cost", "SI.credentials-bound"];
+const ROW_IDS = ["SI.stream-input-secret", "SI.mask-overlap", "SI.mask-scheme", "SI.refusal-mask", "SI.refusal-cost", "SI.credentials-bound", "SI.stored-registry-budget", "SI.stored-url-budget", "SI.stored-write-caps"];
 const TOOL = "stream_probe";
 const FULL = `mcp__agent-gateway-tools__${TOOL}`;
 /** The budgets of `SI.refusal-cost`: the turn (measured about 1.5 s) and the longest wait of one `/health` ping (measured about 0.2 s). */
@@ -75,6 +75,9 @@ const REFUSAL_COST_TURN_MS = 10_000;
 const REFUSAL_COST_HEALTH_MS = 1_000;
 /** The budget of one refused 8 MB request of `SI.credentials-bound`: parsing and validating it, measured well under a second. */
 const BOUND_REFUSAL_MS = 3_000;
+/** The fixed text a refusal shows once the run's known values are over the masking budget (no upstream detail). */
+const WITHHELD_REFUSAL = `TOOL_UNAVAILABLE: "refuse_probe" refused the request, and the gateway cannot show its answer safely. Tell your gateway administrator; retrying will not help.`;
+const WITHHELD_INPUT = "[input withheld]";
 const CONTROL_TEXT = "harmless control text without any known value";
 const REFUSE_TOOL = "refuse_probe";
 const REFUSE_FULL = `mcp__agent-gateway-tools__${REFUSE_TOOL}`;
@@ -618,6 +621,148 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
       ],
       floors: { "refusal-bodies": 50, "model-results": 20 },
       controls: ["refusing_tool_registered", "both_oversize_requests_answered_400_with_the_code", "no_value_in_the_refusal_body", "webhook_not_called_by_the_refused_requests", "health_answered_during_the_refusals", "in_limit_request_on_the_same_route_ran"],
+      problems,
+    });
+  });
+
+
+  /**
+   * Hand-written state files model an entry stored before the write caps existed: the gateway must load it, and the masking
+   * budget (not the cap) is what keeps a refusal cheap and closed.
+   */
+  const storedBudgetRow = (id: string, plant: "registry" | "url") => async (): Promise<void> => {
+    const huge = randomBytes(4_000_000).toString("hex");
+    const now = new Date().toISOString();
+    const rig = await createRig(cleanups, {
+      markers,
+      logLevel: "debug",
+      rootPrefix: `mvp8207-${plant}-`,
+      distServer: negativeControlServer(),
+      seed: (dirs) => {
+        if (plant === "registry") {
+          fs.writeFileSync(path.join(dirs.persist, "mcp-servers.json"), JSON.stringify([{ name: "qabig", type: "http", url: "http://127.0.0.1:9/mcp", description: "", enabled: true, headers: { Authorization: `Bearer ${huge}` }, owner: "reqlift", createdAt: now, updatedAt: now }]));
+        } else {
+          fs.writeFileSync(path.join(dirs.persist, "tools.json"), JSON.stringify([{ name: "qabigurl", description: "stored before the cap", input_schema: { type: "object", properties: {} }, webhook_url: `http://127.0.0.1:9/${huge}`, timeout_ms: 1000, owner: "reqlift", stream_input: "summary" }]));
+        }
+      },
+    });
+    expect(pinnedProblems(rig)).toEqual([]);
+    const started = Date.now();
+    const problems: string[] = [];
+
+    const refuser = await startRefusingDouble(["a".repeat(8 * 1024 * 1024 - 64)]);
+    cleanups.push(() => refuser.close());
+    const put = await gatewayRequest(
+      rig.gateway.port,
+      "PUT",
+      `/v1/tools/${REFUSE_TOOL}`,
+      { description: "Probe tool that always refuses.", input_schema: { type: "object", properties: {} }, webhook_url: `${refuser.base}/${REFUSE_TOOL}` },
+      rig.keys.reqlift,
+    );
+    if (put.status !== 201) problems.push("the refusing tool was not registered");
+    problems.push(...(await registerRawProbe(rig)));
+    const listed = await gatewayRequest(rig.gateway.port, "GET", plant === "registry" ? "/v1/mcp-servers/qabig" : "/v1/tools/qabigurl", undefined, rig.keys.reqlift);
+    if (listed.status !== 200) problems.push(`control: the stored oversized entry did not load (GET answered ${listed.status})`);
+
+    let pinging = true;
+    let worstHealthMs = 0;
+    let pings = 0;
+    const pinger = (async () => {
+      while (pinging) {
+        const pingStarted = Date.now();
+        try {
+          await fetch(`http://127.0.0.1:${rig.gateway.port}/health`, { signal: AbortSignal.timeout(60_000) });
+        } catch {
+          worstHealthMs = Number.POSITIVE_INFINITY;
+        }
+        worstHealthMs = Math.max(worstHealthMs, Date.now() - pingStarted);
+        pings++;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    })();
+    const turn = await chatTurn(rig, {
+      prompt: `SI-STORED-${plant.toUpperCase()}`,
+      sessionId: `conv-si-stored-${plant}`,
+      steps: [{ name: FULL, input: { question: "plain question" } }, { name: REFUSE_FULL, input: {} }, { name: REFUSE_FULL, input: {} }],
+      withCredentials: false,
+      body: { allowedTools: [...ROUTE_ALLOWED_TOOLS, FULL, REFUSE_FULL] },
+    });
+    pinging = false;
+    await pinger;
+
+    problems.push(...turnProblems(turn));
+    if (refuser.hits.length !== 2) problems.push(`control: the webhook received ${refuser.hits.length} refusing calls, expected 2`);
+    if (turn.outcome.ms > REFUSAL_COST_TURN_MS) problems.push(`the turn took ${turn.outcome.ms} ms, budget ${REFUSAL_COST_TURN_MS} ms`);
+    if (pings < 3) problems.push(`control: only ${pings} health pings were answered during the turn`);
+    if (worstHealthMs > REFUSAL_COST_HEALTH_MS) problems.push(`/health waited ${worstHealthMs} ms during the turn, budget ${REFUSAL_COST_HEALTH_MS} ms`);
+    const refusals = turn.results.filter((result) => result.text.startsWith("The tool rejected") || result.text.startsWith("TOOL_"));
+    if (refusals.length !== 2) problems.push(`the model received ${refusals.length} refusal results, expected 2`);
+    for (const result of refusals) if (result.text !== WITHHELD_REFUSAL) problems.push("a refusal result is not the fixed withheld text");
+    const streamedRefusals = (turn.outcome.events as StreamEvent[]).filter((event) => event.type === "tool_result" && event.toolName === REFUSE_FULL);
+    for (const event of streamedRefusals) if (event.output !== WITHHELD_REFUSAL) problems.push("a streamed refusal is not the fixed withheld text");
+    const toolUse = (turn.outcome.events as StreamEvent[]).find((event) => event.type === "tool_use" && event.toolName === FULL);
+    if (toolUse?.input !== WITHHELD_INPUT) problems.push("the raw tool's tool_use input is not the fixed placeholder");
+    if (!rig.log().includes("masking.budget_exceeded")) problems.push("the budget log line is missing");
+    if (rig.log().includes(huge.slice(0, 64))) problems.push("the gateway log holds a stored value");
+    emit(`SECURITY-MASK-EVIDENCE ${id} stored_bytes=${huge.length} turn_ms=${turn.outcome.ms} health_pings=${pings} health_max_ms=${worstHealthMs}`);
+    finishRow(recorder, rig, {
+      id,
+      durationMs: Date.now() - started,
+      deadlineMs: TURN_DEADLINE_MS,
+      surfaces: [
+        { name: "model-results", text: turn.results.map((result) => result.text).join("\n") },
+        { name: "stream-events", text: JSON.stringify(turn.outcome.events) },
+      ],
+      floors: { "model-results": 50, "stream-events": 100 },
+      controls: ["refusing_tool_registered", "stored_oversized_entry_loaded", "webhook_received_both_calls", "health_answered_during_the_turn", "both_refusals_are_the_fixed_text", "raw_tool_input_is_the_placeholder", "budget_line_logged"],
+      problems,
+    });
+  };
+
+  it("SI.stored-registry-budget: a stored registry value of 8 MB neither stalls /health nor lets a refusal text through", storedBudgetRow("SI.stored-registry-budget", "registry"));
+  it("SI.stored-url-budget: a stored webhook URL of 8 MB neither stalls /health nor lets a refusal text through", storedBudgetRow("SI.stored-url-budget", "url"));
+
+  it("SI.stored-write-caps: an 8 MB header value or webhook URL is refused at the write route, fast, nothing is stored and /health stays responsive", async () => {
+    const rig = await createRig(cleanups, { markers, logLevel: "debug", rootPrefix: "mvp8207-caps-", distServer: negativeControlServer() });
+    expect(pinnedProblems(rig)).toEqual([]);
+    const started = Date.now();
+    const problems: string[] = [];
+    const huge = randomBytes(4_000_000).toString("hex");
+    const attempts: { name: string; status: number; code?: string; text: string; ms: number }[] = [];
+    const send = async (name: string, route: string, body: Record<string, unknown>): Promise<void> => {
+      const sent = Date.now();
+      const res = await gatewayRequest(rig.gateway.port, "PUT", route, body, rig.keys.reqlift);
+      attempts.push({ name, status: res.status, code: (res.json?.error as { code?: string } | undefined)?.code, text: res.text, ms: Date.now() - sent });
+    };
+    await send("header", "/v1/mcp-servers/qabig", { type: "http", url: rig.jira.url, headers: { Authorization: `Bearer ${huge}` } });
+    await send("env", "/v1/mcp-servers/qabigenv", { type: "stdio", command: "node", env: { TOKEN: huge } });
+    await send("args", "/v1/mcp-servers/qabigargs", { type: "stdio", command: "node", args: [huge] });
+    await send("webhook_url", "/v1/tools/qabigurl", { description: "big", input_schema: { type: "object", properties: {} }, webhook_url: `http://127.0.0.1:9/${huge}` });
+    const expectedCodes: Record<string, string> = { header: "MCP_SERVER_VALUE_TOO_LARGE", env: "MCP_SERVER_VALUE_TOO_LARGE", args: "MCP_SERVER_VALUE_TOO_LARGE", webhook_url: "TOOL_WEBHOOK_URL_TOO_LONG" };
+    for (const attempt of attempts) {
+      if (attempt.status !== 400 || attempt.code !== expectedCodes[attempt.name]) problems.push(`${attempt.name}: answered ${attempt.status} ${attempt.code ?? "no code"}, expected 400 ${expectedCodes[attempt.name]}`);
+      if (attempt.text.length > 400) problems.push(`${attempt.name}: the refusal body is ${attempt.text.length} characters, expected a short fixed text`);
+      if (attempt.text.includes(huge.slice(0, 64))) problems.push(`${attempt.name}: the refusal body holds a submitted value`);
+    }
+    for (const route of ["/v1/mcp-servers/qabig", "/v1/mcp-servers/qabigenv", "/v1/mcp-servers/qabigargs", "/v1/tools/qabigurl"]) {
+      const stored = await gatewayRequest(rig.gateway.port, "GET", route, undefined, rig.keys.reqlift);
+      if (stored.status !== 404) problems.push(`${route}: something was stored (GET answered ${stored.status})`);
+    }
+    const health = Date.now();
+    const ping = await fetch(`http://127.0.0.1:${rig.gateway.port}/health`);
+    const healthMs = Date.now() - health;
+    if (ping.status !== 200 || healthMs > REFUSAL_COST_HEALTH_MS) problems.push(`/health answered ${ping.status} in ${healthMs} ms after the refused writes`);
+    // The permitted control: a value at the cap is accepted.
+    const atCap = await gatewayRequest(rig.gateway.port, "PUT", "/v1/mcp-servers/qaatcap", { type: "http", url: rig.jira.url, headers: { Authorization: `Bearer ${"b".repeat(65_536 - 7)}` } }, rig.keys.reqlift);
+    if (atCap.status !== 201) problems.push(`control: a header value of exactly 65,536 bytes answered ${atCap.status}, expected 201`);
+    emit(`SECURITY-MASK-EVIDENCE stored-write-caps ${attempts.map((a) => `${a.name}_status=${a.status} ${a.name}_ms=${a.ms}`).join(" ")} health_ms=${healthMs}`);
+    finishRow(recorder, rig, {
+      id: "SI.stored-write-caps",
+      durationMs: Date.now() - started,
+      deadlineMs: TURN_DEADLINE_MS,
+      surfaces: [{ name: "refusal-bodies", text: attempts.map((a) => a.text).join("\n") }],
+      floors: { "refusal-bodies": 50 },
+      controls: ["four_oversize_writes_answered_400_with_the_code", "no_value_in_the_refusal_body", "nothing_stored", "health_answered_after_the_writes", "value_at_the_cap_accepted"],
       problems,
     });
   });
