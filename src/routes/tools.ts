@@ -5,6 +5,9 @@ import {
   getAllTools,
   deleteTool,
   isValidJsonSchema,
+  isStreamInput,
+  normalizeStreamInput,
+  STREAM_INPUT_ERROR,
   type ToolDefinition,
 } from "../tools.js";
 
@@ -38,6 +41,12 @@ router.put("/v1/tools/:name", (req: Request, res: Response) => {
     return;
   }
 
+  // Present but not "summary"/"raw" (including null) is refused; an omitted field stores "summary" (full replacement).
+  if (Object.hasOwn(body, "stream_input") && !isStreamInput(body.stream_input)) {
+    res.status(400).json({ error: STREAM_INPUT_ERROR });
+    return;
+  }
+
   // The owner is always the authenticated label; an `owner` in the body is ignored. A legacy entry without an
   // owner is claimed by the first label that registers it again.
   const label = req.clientLabel ?? "";
@@ -54,6 +63,7 @@ router.put("/v1/tools/:name", (req: Request, res: Response) => {
     webhook_url: body.webhook_url,
     timeout_ms: typeof body.timeout_ms === "number" ? body.timeout_ms : DEFAULT_TIMEOUT_MS,
     ...(label ? { owner: label } : {}),
+    stream_input: normalizeStreamInput(body.stream_input),
   };
 
   const isNew = registerTool(def);

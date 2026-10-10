@@ -159,3 +159,64 @@ describe("DELETE /v1/tools/:name", () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe("stream_input (MVP-8096)", () => {
+  const exactError = { error: 'stream_input must be "summary" or "raw"' };
+
+  it.each(["raw", "summary"])("accepts %j: 201 for a new tool, 200 for an update, and GET shows it", async (value) => {
+    const app = createApp();
+    const n = `route-test-si-${value}-${Date.now()}`;
+    const created = await request(app).put(`/v1/tools/${n}`).send({ ...BASE_TOOL, stream_input: value });
+    expect(created.status).toBe(201);
+    expect(created.body.stream_input).toBe(value);
+    const updated = await request(app).put(`/v1/tools/${n}`).send({ ...BASE_TOOL, stream_input: value });
+    expect(updated.status).toBe(200);
+    expect(updated.body.stream_input).toBe(value);
+    expect((await request(app).get(`/v1/tools/${n}`)).body.stream_input).toBe(value);
+    const list = await request(app).get("/v1/tools");
+    expect(list.body.tools.find((t: { name: string }) => t.name === n).stream_input).toBe(value);
+    deleteTool(n);
+  });
+
+  it("an omitted field stores summary, also on an update of a raw tool (full replacement)", async () => {
+    const app = createApp();
+    const n = `route-test-si-omit-${Date.now()}`;
+    const created = await request(app).put(`/v1/tools/${n}`).send(BASE_TOOL);
+    expect(created.status).toBe(201);
+    expect(created.body.stream_input).toBe("summary");
+    await request(app).put(`/v1/tools/${n}`).send({ ...BASE_TOOL, stream_input: "raw" });
+    const replaced = await request(app).put(`/v1/tools/${n}`).send(BASE_TOOL);
+    expect(replaced.status).toBe(200);
+    expect(replaced.body.stream_input).toBe("summary");
+    expect((await request(app).get(`/v1/tools/${n}`)).body.stream_input).toBe("summary");
+    deleteTool(n);
+  });
+
+  it.each([["full"], [5], [null], ["RAW"], [true], [[]]])("rejects %j with 400 and the exact envelope, storing nothing", async (value) => {
+    const app = createApp();
+    const n = `route-test-si-bad-${Date.now()}`;
+    const res = await request(app).put(`/v1/tools/${n}`).send({ ...BASE_TOOL, stream_input: value });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual(exactError);
+    expect((await request(app).get(`/v1/tools/${n}`)).status).toBe(404);
+  });
+
+  it("a rejected update leaves the stored raw tool unchanged", async () => {
+    const app = createApp();
+    const n = `route-test-si-keep-${Date.now()}`;
+    await request(app).put(`/v1/tools/${n}`).send({ ...BASE_TOOL, stream_input: "raw", description: "first" });
+    const res = await request(app).put(`/v1/tools/${n}`).send({ ...BASE_TOOL, stream_input: "full", description: "second" });
+    expect(res.status).toBe(400);
+    const got = await request(app).get(`/v1/tools/${n}`);
+    expect(got.body.stream_input).toBe("raw");
+    expect(got.body.description).toBe("first");
+    deleteTool(n);
+  });
+
+  it("the existing body validations still answer first", async () => {
+    const app = createApp();
+    const res = await request(app).put("/v1/tools/si-order").send({ input_schema: { type: "object" }, webhook_url: "https://example.com/h", stream_input: "full" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/description/);
+  });
+});

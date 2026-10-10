@@ -5,6 +5,11 @@ import { createPersistentStore, hasValidOwners } from "./persistence.js";
 /*  Types                                                               */
 /* ------------------------------------------------------------------ */
 
+/** How a tool's input reaches the `tool_use` stream event: today's text summary, or the structured object (MVP-8096). */
+export type StreamInput = "summary" | "raw";
+
+export const STREAM_INPUT_ERROR = 'stream_input must be "summary" or "raw"';
+
 export interface ToolDefinition {
   name: string;
   description: string;
@@ -17,6 +22,12 @@ export interface ToolDefinition {
    * the update have none ("legacy") until they are registered again.
    */
   owner?: string;
+  /**
+   * `raw` opts the tool in to its structured input on the `tool_use` event (src/tool-use-input.ts); anything else
+   * streams the text summary. Always set once registered or loaded; optional in the type only so hand-built
+   * definitions stay valid.
+   */
+  stream_input?: StreamInput;
 }
 
 /* ------------------------------------------------------------------ */
@@ -47,6 +58,15 @@ export function isValidJsonSchema(schema: unknown): boolean {
   return typeof s["type"] === "string";
 }
 
+export function isStreamInput(value: unknown): value is StreamInput {
+  return value === "summary" || value === "raw";
+}
+
+/** The stored value: anything but a valid one (absent, hand-edited) means the unchanged summary behavior. */
+export function normalizeStreamInput(value: unknown): StreamInput {
+  return value === "raw" ? "raw" : "summary";
+}
+
 /* ------------------------------------------------------------------ */
 /*  Persistence                                                         */
 /* ------------------------------------------------------------------ */
@@ -55,7 +75,11 @@ export function loadTools(): void {
   const data = store.load() as ToolDefinition[] | undefined;
   if (!data) return;
   for (const tool of data) {
-    tools.set(tool.name, tool);
+    const raw = (tool as { stream_input?: unknown }).stream_input;
+    if (raw !== undefined && !isStreamInput(raw)) {
+      log("tools", `tools.stream_input.invalid name=${JSON.stringify(String(tool.name).slice(0, 128))}`);
+    }
+    tools.set(tool.name, { ...tool, stream_input: normalizeStreamInput(raw) });
   }
   log("tools", `Loaded ${tools.size} tool(s) from disk`);
   const ownerless = countOwnerlessTools();
@@ -85,7 +109,7 @@ export function flushTools(): boolean {
 
 export function registerTool(def: ToolDefinition): boolean {
   const isNew = !tools.has(def.name);
-  tools.set(def.name, def);
+  tools.set(def.name, { ...def, stream_input: normalizeStreamInput(def.stream_input) });
   persistTools();
   log("tools", `${isNew ? "Registered" : "Updated"} tool: ${def.name}`);
   return isNew;
