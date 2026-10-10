@@ -149,6 +149,8 @@ function leakProblems(surfaces: Surface[], values: Record<string, string>): stri
   return hits.length > 0 ? [`hits=${hits.length} [${hits.join(", ")}]`] : [];
 }
 
+const ROW_PREFIX = "secrets the gateway holds ";
+
 describe("a raw tool's structured input and the secrets the gateway holds", () => {
   it("every row id has an AC description in the single map", () => {
     expect(ROW_IDS.filter((id) => AC_ROWS[id] === undefined)).toEqual([]);
@@ -469,7 +471,8 @@ async function negativeControl(options: { file: string; anchor: string; patch: (
   expect(child.output.includes(seed), "the child output must hold no marker value").toBe(false);
 }
 
-describe("negative controls (child runs against patched copies of dist/)", () => {
+// A child run never starts a negative control itself: its `-t` filter names rows, and this guard makes a recursion impossible.
+describe.skipIf(process.env.SECURITY_MASK_CHILD === "1")("negative controls (child runs against patched copies of dist/)", () => {
   it("NC1: against a build that masks one value after another in input order, SI.mask-overlap and SI.refusal-mask fail", async () => {
     await negativeControl({
       file: "tool-mediation.js",
@@ -479,7 +482,7 @@ describe("negative controls (child runs against patched copies of dist/)", () =>
           "export function maskSecrets(text, secrets) {",
           () => 'export function maskSecrets(text, secrets) {\n    let out = text;\n    for (const secret of secrets) {\n        if (secret.length >= 8)\n            out = out.split(secret).join("[REDACTED]");\n    }\n    return out;\n}\nfunction maskSecretsByRanges(text, secrets) {',
         ),
-      rows: "SI.mask-overlap|SI.refusal-mask",
+      rows: `${ROW_PREFIX}SI\\.mask-overlap:|${ROW_PREFIX}SI\\.refusal-mask:`,
       mustName: ["SI.mask-overlap", "SI.refusal-mask"],
     });
   }, 300_000);
@@ -489,7 +492,7 @@ describe("negative controls (child runs against patched copies of dist/)", () =>
       file: "tool-mediation.js",
       anchor: "function withSchemeTokens(values) {",
       patch: (source) => source.replace("function withSchemeTokens(values) {", () => "function withSchemeTokens(values) {\n    return [...values];\n}\nfunction withSchemeTokensExpanded(values) {"),
-      rows: "SI.mask-scheme",
+      rows: `${ROW_PREFIX}SI\\.mask-scheme:`,
       mustName: ["SI.mask-scheme"],
     });
   }, 300_000);
@@ -499,7 +502,7 @@ describe("negative controls (child runs against patched copies of dist/)", () =>
       file: "agent.js",
       anchor: "secrets: () => secretValuesForMasking([",
       patch: (source) => source.replace(/secrets: \(\) => secretValuesForMasking\(\[[\s\S]*?\n\s*\]\),/, () => "secrets: () => secretValuesForMasking(clientAuthToken ? [clientAuthToken] : []),"),
-      rows: "SI.refusal-mask",
+      rows: `${ROW_PREFIX}SI\\.refusal-mask:`,
       mustName: ["SI.refusal-mask"],
     });
   }, 300_000);
