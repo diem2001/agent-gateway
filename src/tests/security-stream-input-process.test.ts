@@ -20,6 +20,9 @@
  * - `SI.refusal-mask`: a webhook tool refuses with a message that holds V2, the registry token, a per-request server's
  *   `Basic` token and the per-user override's `Basic` token (one call each): the `tool_result` text in the stream and
  *   the tool result the scripted model received hold none of them and show `[REDACTED]`.
+ * - `SI.refusal-cost`: a caller with about 100 per-user override values whose webhook tool refuses with an 8 MiB body gets
+ *   the refusal within the budget, and `/health` of the same gateway, pinged from this process while the turn runs, never
+ *   waits longer than the health budget.
  *
  * The model's own tool call is the one place a value is expected (it is the scripted input), so this row does not use
  * the model-request or transcript surfaces: they hold what the "model" said, not what the gateway streamed.
@@ -59,9 +62,12 @@ import {
 
 vi.setConfig({ testTimeout: 300_000 });
 
-const ROW_IDS = ["SI.stream-input-secret", "SI.mask-overlap", "SI.mask-scheme", "SI.refusal-mask"];
+const ROW_IDS = ["SI.stream-input-secret", "SI.mask-overlap", "SI.mask-scheme", "SI.refusal-mask", "SI.refusal-cost"];
 const TOOL = "stream_probe";
 const FULL = `mcp__agent-gateway-tools__${TOOL}`;
+/** The budgets of `SI.refusal-cost`: the turn (measured about 1.5 s) and the longest wait of one `/health` ping (measured about 0.2 s). */
+const REFUSAL_COST_TURN_MS = 10_000;
+const REFUSAL_COST_HEALTH_MS = 1_000;
 const CONTROL_TEXT = "harmless control text without any known value";
 const REFUSE_TOOL = "refuse_probe";
 const REFUSE_FULL = `mcp__agent-gateway-tools__${REFUSE_TOOL}`;
@@ -430,6 +436,75 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
       surfaces,
       floors: { "stream-results": 100, "replay-results": 100, "model-results": 100 },
       controls: ["refusing_tool_registered", "four_refusals_each_with_redacted_on_stream_and_model_result", "refusal_without_known_value_unchanged", "webhook_received_every_call"],
+      problems,
+    });
+  });
+
+  it("SI.refusal-cost: about 100 override values and an 8 MiB refusal body neither delay the refusal nor stall /health", async () => {
+    const rig = await createRig(cleanups, { markers, logLevel: "debug", rootPrefix: "mvp8207-cost-", distServer: negativeControlServer() });
+    expect(pinnedProblems(rig)).toEqual([]);
+    await registerStandardServers(rig);
+    const started = Date.now();
+    const problems: string[] = [];
+
+    const body = "a".repeat(8 * 1024 * 1024 - 64);
+    const refuser = await startRefusingDouble([body]);
+    cleanups.push(() => refuser.close());
+    const put = await gatewayRequest(
+      rig.gateway.port,
+      "PUT",
+      `/v1/tools/${REFUSE_TOOL}`,
+      { description: "Probe tool that always refuses.", input_schema: { type: "object", properties: {} }, webhook_url: `${refuser.base}/${REFUSE_TOOL}` },
+      rig.keys.reqlift,
+    );
+    if (put.status !== 201) problems.push("the refusing tool was not registered");
+
+    const headers = Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`x-cost-${i}`, `${"a".repeat(10 + i)}b`]));
+    let pinging = true;
+    let worstHealthMs = 0;
+    let pings = 0;
+    const pinger = (async () => {
+      while (pinging) {
+        const pingStarted = Date.now();
+        try {
+          await fetch(`http://127.0.0.1:${rig.gateway.port}/health`, { signal: AbortSignal.timeout(60_000) });
+        } catch {
+          worstHealthMs = Number.POSITIVE_INFINITY;
+        }
+        worstHealthMs = Math.max(worstHealthMs, Date.now() - pingStarted);
+        pings++;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    })();
+    const turn = await chatTurn(rig, {
+      prompt: "SI-REFUSAL-COST",
+      sessionId: "conv-si-refusal-cost",
+      steps: [{ name: REFUSE_FULL, input: {} }],
+      withCredentials: false,
+      body: {
+        allowedTools: [...ROUTE_ALLOWED_TOOLS, REFUSE_FULL],
+        mcpCredentialOverrides: { jira: { headers } },
+      },
+    });
+    pinging = false;
+    await pinger;
+
+    problems.push(...turnProblems(turn));
+    if (refuser.hits.length !== 1) problems.push(`control: the webhook received ${refuser.hits.length} calls, expected 1`);
+    if (turn.outcome.ms > REFUSAL_COST_TURN_MS) problems.push(`the turn took ${turn.outcome.ms} ms, budget ${REFUSAL_COST_TURN_MS} ms`);
+    if (pings < 3) problems.push(`control: only ${pings} health pings were answered during the turn`);
+    if (worstHealthMs > REFUSAL_COST_HEALTH_MS) problems.push(`/health waited ${worstHealthMs} ms during the turn, budget ${REFUSAL_COST_HEALTH_MS} ms`);
+    // The permitted control: the refusal text is the tool's own message, cut to 500 characters, and nothing in it is masked.
+    const expected = `The tool rejected the request (HTTP 422): ${"a".repeat(500)}`;
+    if (turn.results[0]?.text !== expected) problems.push("control: the model's refusal text was not the unmasked message cut to 500 characters");
+    emit(`SECURITY-MASK-EVIDENCE refusal-cost override_values=100 body_bytes=${body.length + 14} turn_ms=${turn.outcome.ms} health_pings=${pings} health_max_ms=${worstHealthMs}`);
+    finishRow(recorder, rig, {
+      id: "SI.refusal-cost",
+      durationMs: Date.now() - started,
+      deadlineMs: TURN_DEADLINE_MS,
+      surfaces: [{ name: "model-results", text: turn.results.map((result) => result.text).join("\n") }],
+      floors: { "model-results": 100 },
+      controls: ["refusing_tool_registered", "webhook_received_the_call", "health_answered_during_the_turn", "refusal_text_unmasked_and_cut"],
       problems,
     });
   });

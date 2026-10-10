@@ -222,6 +222,23 @@ describe("masking cost and equivalence (MVP-8207 rework)", () => {
     }
   });
 
+  it("gives the reference result on 3000 random inputs with many values", () => {
+    let seed = 20261011;
+    const next = (bound: number): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      return (seed >>> 8) % bound;
+    };
+    const word = (alphabet: string, length: number): string => Array.from({ length }, () => alphabet[next(alphabet.length)]).join("");
+    for (let i = 0; i < 3000; i++) {
+      const alphabet = i % 3 === 0 ? "ab" : i % 3 === 1 ? "abc" : "ab-";
+      const text = word(alphabet, 20 + next(120));
+      const secrets = Array.from({ length: 8 + next(40) }, () => (next(3) === 0 ? text.slice(next(text.length), next(text.length) + 8 + next(6)) : word(alphabet, 6 + next(9))));
+      secrets.push(secrets[0], "", "short");
+      expect(maskSecrets(text, secrets), JSON.stringify({ text, secrets })).toBe(referenceMask(text, secrets));
+      expect(maskSecrets(text, secrets.reverse())).toBe(referenceMask(text, secrets));
+    }
+  });
+
   it("C1 a 1 MiB text and a 20 KiB value that overlap at every position finish within the budget", () => {
     const text = "a".repeat(1024 * 1024);
     const started = performance.now();
@@ -250,6 +267,28 @@ describe("masking cost and equivalence (MVP-8207 rework)", () => {
     const text = webhookRejectionText(400, "text/plain", body, secrets);
     expect(performance.now() - started).toBeLessThan(2500);
     expect(text).toBe("The tool rejected the request (HTTP 400): [REDACTED]");
+  });
+
+  it.each([200, 1000])("C5 %i caller-supplied values over an 8 MiB text finish within the budget whether they match or not", (count) => {
+    const text = "a".repeat(8 * 1024 * 1024);
+    const missing = Array.from({ length: count }, (_, i) => `${"a".repeat(10 + i)}b`);
+    let started = performance.now();
+    expect(maskSecrets(text, missing)).toBe(text);
+    const missingMs = performance.now() - started;
+    const matching = Array.from({ length: count }, (_, i) => "a".repeat(10 + i));
+    started = performance.now();
+    expect(maskSecrets(text, matching)).toBe("[REDACTED]");
+    const matchingMs = performance.now() - started;
+    expect(Math.max(missingMs, matchingMs)).toBeLessThan(4000);
+  });
+
+  it("C6 an 8 MiB refusal body with 200 repetitive caller values stays within the budget", () => {
+    const body = "a".repeat(8 * 1024 * 1024 - 64);
+    const secrets = Array.from({ length: 200 }, (_, i) => `${"a".repeat(10 + i)}b`);
+    const started = performance.now();
+    const text = webhookRejectionText(400, "text/plain", body, secrets);
+    expect(performance.now() - started).toBeLessThan(4000);
+    expect(text).toBe(`The tool rejected the request (HTTP 400): ${"a".repeat(500)}`);
   });
 
   it("C4 a stored header of 'Bearer' and 40,000 spaces then a line break does not stall the known-value list", () => {
