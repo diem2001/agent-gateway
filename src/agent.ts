@@ -10,6 +10,7 @@ import { buildStreamInputTable, streamedToolInput } from "./tool-use-input.js";
 import { buildMcpServersForSdk, getMcpAllowedToolPatterns, getRunMcpServers } from "./mcp-registry.js";
 import {
   applyMcpCredentialOverrides,
+  credentialValues,
   hasUserCredential,
   selectRegistryServersForRun,
   summarizeOverrideKeys,
@@ -178,20 +179,6 @@ function carriesEnv(config: unknown): boolean {
 
 /** The relay binding of a stdio server has no upstream URL: its bridge talks to the tool sandbox. */
 const STDIO_PLACEHOLDER_URL = "stdio://tool-sandbox";
-
-/** The header and env values of server configs or credential overrides: the secrets a tool input must not echo. */
-function credentialValues(configs: readonly unknown[]): string[] {
-  const values: string[] = [];
-  for (const config of configs) {
-    if (typeof config !== "object" || config === null) continue;
-    for (const key of ["headers", "env"] as const) {
-      const map = (config as Record<string, unknown>)[key];
-      if (typeof map !== "object" || map === null) continue;
-      for (const value of Object.values(map)) if (typeof value === "string") values.push(value);
-    }
-  }
-  return values;
-}
 
 /** A tool name as it may appear in an audit line. */
 function loggableName(name: string): string {

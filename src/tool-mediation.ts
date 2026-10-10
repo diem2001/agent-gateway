@@ -271,7 +271,8 @@ class ValueAutomaton {
  * fragment of a value is left behind whatever the order of `secrets` (a value that starts, ends or sits inside a longer
  * one, or two values that overlap partially). One pass over the text through an automaton of all values: the cost is
  * linear in the text length plus the total length of the values (plus the replacements), independent of how many values
- * there are; memory is linear in the same two. The caller of a request bounds the values by the size of that request.
+ * there are; memory is linear in the same two. The values a caller supplies per request are capped at request validation
+ * (`MAX_CREDENTIAL_VALUES` values, `MAX_CREDENTIAL_BYTES` bytes in `mcp-overrides.ts`), which bounds the automaton for them.
  */
 export function maskSecrets(text: string, secrets: readonly string[]): string {
   const values = [...new Set(secrets)].filter((secret) => secret.length >= MIN_MASKED_LENGTH && secret.length <= text.length);

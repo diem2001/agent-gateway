@@ -4,6 +4,7 @@ import {
   applyMcpCredentialOverrides,
   hasUserCredential,
   carriesCredentialValue,
+  credentialMaterialTooLarge,
   selectRegistryServersForRun,
   summarizeOverrideKeys,
 } from "../mcp-overrides.js";
@@ -208,5 +209,36 @@ describe("ownerless servers (MVP-7925)", () => {
     const flagged = { ...ownerless(), requireUserCredentials: true };
     expect(selectRegistryServersForRun([flagged], { aida: { headers: { Authorization: "Bearer USER_X" } } }).omitted).toEqual([{ name: "aida", reason: "ownerless" }]);
     expect(selectRegistryServersForRun([flagged], undefined).omitted).toEqual([{ name: "aida", reason: "missing_user_credential" }]);
+  });
+});
+
+describe("credentialMaterialTooLarge", () => {
+  const headers = (values: string[]) => ({ jira: { headers: Object.fromEntries(values.map((v, i) => [`h${i}`, v])) } });
+  const env = (values: string[]) => ({ srv: { command: "node", env: Object.fromEntries(values.map((v, i) => [`E${i}`, v])) } });
+
+  it("passes exactly 65,536 UTF-8 bytes and refuses one more", () => {
+    expect(credentialMaterialTooLarge(headers(["a".repeat(65_536)]), undefined)).toBe(false);
+    expect(credentialMaterialTooLarge(headers(["a".repeat(65_537)]), undefined)).toBe(true);
+    expect(credentialMaterialTooLarge(undefined, env(["é".repeat(32_768)]))).toBe(false);
+    expect(credentialMaterialTooLarge(undefined, env(["é".repeat(32_768), "a"]))).toBe(true);
+  });
+
+  it("sums the overrides and the request servers", () => {
+    expect(credentialMaterialTooLarge(headers(["a".repeat(32_768)]), env(["b".repeat(32_768)]))).toBe(false);
+    expect(credentialMaterialTooLarge(headers(["a".repeat(32_768)]), env(["b".repeat(32_769)]))).toBe(true);
+  });
+
+  it("passes 256 values and refuses 257, over both sources", () => {
+    const many = (n: number) => Array.from({ length: n }, () => "a");
+    expect(credentialMaterialTooLarge(headers(many(256)), undefined)).toBe(false);
+    expect(credentialMaterialTooLarge(headers(many(257)), undefined)).toBe(true);
+    expect(credentialMaterialTooLarge(headers(many(128)), env(many(128)))).toBe(false);
+    expect(credentialMaterialTooLarge(headers(many(128)), env(many(129)))).toBe(true);
+  });
+
+  it("counts only string header and env values, and tolerates any shape", () => {
+    expect(credentialMaterialTooLarge(undefined, undefined)).toBe(false);
+    expect(credentialMaterialTooLarge("x".repeat(100_000), null)).toBe(false);
+    expect(credentialMaterialTooLarge({ jira: null, other: { headers: "a".repeat(100_000), env: [1, 2] } }, { s: { args: ["a".repeat(100_000)], command: "node" } })).toBe(false);
   });
 });

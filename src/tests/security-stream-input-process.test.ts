@@ -559,10 +559,12 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
     const values = Array.from({ length: 1600 }, (_, i) => `Bearer ${i === 0 ? marker : ""}${"a".repeat(5000)}`);
     const asHeaders = Object.fromEntries(values.map((value, i) => [`x-big-${i}`, value]));
     const attempts: { name: string; status: number; text: string; ms: number }[] = [];
-    for (const [name, extra] of [
+    // Four rounds of both shapes, so the health pings overlap the refusals.
+    const shapes = [
       ["overrides", { mcpCredentialOverrides: { jira: { headers: asHeaders } } }],
       ["request-server", { mcpServers: { bigsrv: { url: "http://127.0.0.1:9/mcp", headers: asHeaders } } }],
-    ] as const) {
+    ] as const;
+    for (const [name, extra] of [0, 1, 2, 3].flatMap(() => shapes)) {
       const sent = Date.now();
       const res = await gatewayRequest(
         rig.gateway.port,
