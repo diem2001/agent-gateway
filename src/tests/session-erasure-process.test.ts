@@ -17,6 +17,7 @@ import http from "node:http";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startFakeAnthropicApi, type ExactToolScript, type FakeAnthropicApi, type FakeApiMode } from "./helpers/fake-anthropic-api.js";
+import { filesWith, listing } from "./helpers/tree-search.js";
 import { descendants, killGatewayGroup, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
 
 vi.setConfig({ testTimeout: 240_000, hookTimeout: 60_000 });
@@ -187,35 +188,6 @@ const gone = (p: string): boolean => {
     return (e as NodeJS.ErrnoException).code === "ENOENT";
   }
 };
-
-/** Regular files below `dir` that contain `needle`; links and special files are not followed or read. */
-function filesWith(dir: string, needle: string): string[] {
-  const hits: string[] = [];
-  if (gone(dir)) return hits;
-  const walk = (d: string): void => {
-    for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
-      const full = path.join(d, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (entry.isFile() && fs.readFileSync(full, "latin1").includes(needle)) hits.push(full);
-    }
-  };
-  walk(dir);
-  return hits;
-}
-
-/** Regular files below `dir` with their sizes, for an assertion message. */
-function listing(dir: string): string {
-  const out: string[] = [];
-  const walk = (d: string): void => {
-    for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
-      const full = path.join(d, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (entry.isFile()) out.push(`${path.relative(dir, full)} ${fs.statSync(full).size}`);
-    }
-  };
-  if (!gone(dir)) walk(dir);
-  return out.join("; ");
-}
 
 /** Every path below `dir` with mode and the SHA-256 of regular files (links are listed, not followed). */
 function snapshot(dir: string): string[] {
