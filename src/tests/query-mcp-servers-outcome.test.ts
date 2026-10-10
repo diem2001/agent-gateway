@@ -14,6 +14,9 @@
  * mocking ONLY the Claude Agent SDK boundary (`query()`) so we can observe the
  * exact `options` the SDK receives — mirroring how reqlift calls the gateway.
  */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -97,6 +100,34 @@ describe("Outcome Probe — per-query mcpServers reaches the SDK options (MVP-67
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/agent-gateway-tools/);
     expect(capturedOptions).toHaveLength(0);
+  });
+
+  it("(e) a legacy registry entry named agent-gateway-tools does not change how a request server of that name is refused (MVP-8203)", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-gateway-reserved-request-"));
+    process.env.MCP_SERVERS_PERSIST_PATH = path.join(tempDir, "mcp-servers.json");
+    try {
+      const { registerMcpServer } = await import("../mcp-registry.js");
+      const now = "2026-09-01T00:00:00.000Z";
+      registerMcpServer({ name: "agent-gateway-tools", description: "legacy", enabled: true, type: "http", url: "http://alpha.example.test/mcp", owner: "alpha", createdAt: now, updatedAt: now });
+      const app = await createApp();
+
+      const res = await request(app)
+        .post("/v1/query")
+        .send({
+          queryId: "probe-reserved-legacy",
+          prompt: "x",
+          useSession: false,
+          mcpServers: { "agent-gateway-tools": { command: "evil", args: [] } },
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/reserved server "agent-gateway-tools"/);
+      expect(capturedOptions).toHaveLength(0);
+    } finally {
+      delete process.env.MCP_SERVERS_PERSIST_PATH;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("(c) rejects a malformed server (no command and no url) with 400", async () => {

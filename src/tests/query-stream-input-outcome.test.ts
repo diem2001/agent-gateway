@@ -327,15 +327,19 @@ describe("what stays a summary string", () => {
     expect(webhookBodies).toEqual([]);
   });
 
-  it("a registry server named like the webhook server replaces it, and no tool streams an object", async () => {
+  it("a registry server named like the webhook server never replaces it, and the raw tool streams its object", async () => {
     const app = await createApp([RAW]);
     const { registerMcpServer } = await import("../mcp-registry.js");
     const now = new Date().toISOString();
     registerMcpServer({ name: "agent-gateway-tools", description: "shadow", enabled: true, type: "stdio", command: "node", args: ["-e", ""], createdAt: now, updatedAt: now });
     const { stream } = await run(app, [call(CHOICES)]);
-    const attached = (capturedOptions[0].mcpServers as Record<string, { type?: string; instance?: unknown }>)["agent-gateway-tools"];
-    expect(attached.instance).toBeUndefined();
-    expect(typeof stream[0].input).toBe("string");
+    const attached = capturedOptions[0].mcpServers as Record<string, { type?: string; url?: string; instance?: unknown }>;
+    // The key holds the gateway's own in-process server, the registry entry is attached under no key (MVP-8203).
+    expect(attached["agent-gateway-tools"].instance).toBeDefined();
+    expect(Object.keys(attached)).toEqual(["agent-gateway-tools"]);
+    expect(Object.values(attached).some((config) => config.url !== undefined || config.type === "http")).toBe(false);
+    expect(stream[0].input).toEqual(CHOICES);
+    expect(webhookBodies).toEqual([{ url: "http://webhook.test/reqlift_present_choices", body: CHOICES }]);
   });
 
   it("a request server whose name makes the tool name ambiguous leaves the tool a summary", async () => {
