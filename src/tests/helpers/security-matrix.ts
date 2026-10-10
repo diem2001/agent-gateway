@@ -365,6 +365,7 @@ export const AC_ROWS: Record<string, string> = {
   "RG.args-url": "Registry args and URL: no client sees stored stdio args; a compliant URL is returned verbatim; a legacy URL with user info, query or fragment is withheld with a migration flag; unsafe URL writes are refused without echo; a toggle keeps the args and the run still receives them",
   "RG.failure-text": "Registry failure text: health, test and call answer a fixed category for an unsendable stored header, an unusable stored address and an unreachable upstream, with no stored value in any response or log line",
   "RT.config.subject": "The config route as the file detector's subject row (child run of the negative control)",
+  "SI.stream-input-secret": "Stream input: a raw webhook tool's streamed input never carries a registry header, user override, request-server header or env value, or the caller's gateway key (stream, replay and debug log), and a call without a known value streams the object",
 };
 
 /* ------------------------------------------------------------------ */
