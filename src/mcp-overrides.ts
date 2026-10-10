@@ -19,6 +19,71 @@ export interface McpOverrideValidationError {
   message: string;
 }
 
+/** The most header and env values one query may carry, over `mcpCredentialOverrides` and the request's `mcpServers` together. */
+export const MAX_CREDENTIAL_VALUES = 256;
+/** The most UTF-8 bytes those values may hold in total. Real credentials are a few hundred bytes; a JWT is a few KB. */
+export const MAX_CREDENTIAL_BYTES = 64 * 1024;
+
+export const CREDENTIALS_TOO_LARGE_CODE = "MCP_CREDENTIALS_TOO_LARGE";
+/** Fixed text: it names the limits and never echoes a value. */
+export const CREDENTIALS_TOO_LARGE_MESSAGE = `mcpCredentialOverrides and mcpServers header and env values together may hold at most ${MAX_CREDENTIAL_VALUES} values and ${MAX_CREDENTIAL_BYTES} bytes`;
+
+/**
+ * Whether the caller-supplied credential material of one query is over the limits (MVP-8207). It is checked before a run
+ * starts, so everything that scales with these values (the matcher that masks them in refusal text and tool input, the
+ * relay bindings) works on at most `MAX_CREDENTIAL_VALUES` values of `MAX_CREDENTIAL_BYTES` bytes. Tolerates any shape:
+ * only string header and env values count.
+ */
+export function credentialMaterialTooLarge(overrides: unknown, requestServers: unknown): boolean {
+  const values = [
+    ...credentialValues(typeof overrides === "object" && overrides !== null ? Object.values(overrides) : []),
+    ...credentialValues(typeof requestServers === "object" && requestServers !== null ? Object.values(requestServers) : []),
+  ];
+  if (values.length > MAX_CREDENTIAL_VALUES) return true;
+  let bytes = 0;
+  for (const value of values) {
+    bytes += Buffer.byteLength(value, "utf8");
+    if (bytes > MAX_CREDENTIAL_BYTES) return true;
+  }
+  return false;
+}
+
+/** The most UTF-8 bytes one stored header, env or args value of a registry entry may hold (`PUT /v1/mcp-servers`). */
+export const MAX_STORED_VALUE_BYTES = 64 * 1024;
+
+export const STORED_VALUE_TOO_LARGE_CODE = "MCP_SERVER_VALUE_TOO_LARGE";
+/** Fixed text: it names the limit and never echoes a value. */
+export const STORED_VALUE_TOO_LARGE_MESSAGE = `A header, env or args value may hold at most ${MAX_STORED_VALUE_BYTES} bytes.`;
+
+/**
+ * Whether a registry entry being written holds a header, env or args value over `MAX_STORED_VALUE_BYTES` (MVP-8207). These
+ * values become known values of every later run; the cap is the write-time half of the bound, `MASKING_BUDGET_BYTES` in
+ * `tool-mediation.ts` is the other half and also covers entries stored before the cap. Tolerates any shape: only string
+ * values count.
+ */
+export function storedValueTooLarge(headers: unknown, env: unknown, args: unknown): boolean {
+  const values: unknown[] = [
+    ...(typeof headers === "object" && headers !== null ? Object.values(headers) : []),
+    ...(typeof env === "object" && env !== null ? Object.values(env) : []),
+    ...(Array.isArray(args) ? args : []),
+  ];
+  return values.some((value) => typeof value === "string" && Buffer.byteLength(value, "utf8") > MAX_STORED_VALUE_BYTES);
+}
+
+/** The header and env values of server configs or credential overrides: the secrets a tool input must not echo. */
+export function credentialValues(configs: readonly unknown[]): string[] {
+  const values: string[] = [];
+  for (const config of configs) {
+    if (typeof config !== "object" || config === null) continue;
+    for (const key of ["headers", "env"] as const) {
+      const map = (config as Record<string, unknown>)[key];
+      if (typeof map !== "object" || map === null) continue;
+      for (const value of Object.values(map)) if (typeof value === "string") values.push(value);
+    }
+  }
+  return values;
+}
+
 export function validateMcpCredentialOverrides(
   overrides: unknown,
 ): { overrides?: McpCredentialOverrides; error?: McpOverrideValidationError } {

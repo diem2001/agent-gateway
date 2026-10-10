@@ -2,6 +2,9 @@
  * The structured `tool_use` input of a `stream_input: "raw"` webhook tool (MVP-8096, src/tool-use-input.ts): the table
  * of eligible tools and the decision per call. Expected values are written out here, not derived from the module.
  */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_INPUT_BYTES, buildStreamInputTable, streamedToolInput, type StreamInputTable } from "../tool-use-input.js";
 import type { ToolDefinition } from "../tools.js";
@@ -315,6 +318,74 @@ describe("known secret values", () => {
     call(t, { question: "a" });
     call(t, { question: "b" });
     expect(secretValues).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("overlapping and prefixed secret values (MVP-8207)", () => {
+  const SHORT = "dbuser01";
+  const LONG = "dbuser01:Pa55w0rdXYZ";
+  let dir: string;
+  const saved = { ...process.env };
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tool-use-input-8207-"));
+    process.env.MCP_SERVERS_PERSIST_PATH = path.join(dir, "mcp-servers.json");
+    process.env.TOOLS_PERSIST_PATH = path.join(dir, "tools.json");
+    vi.resetModules();
+  });
+  afterEach(async () => {
+    process.env = { ...saved };
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** The needles as production builds them: a registry server's header, through the real list. */
+  async function needlesOf(header: string): Promise<string[]> {
+    const { registerMcpServer } = await import("../mcp-registry.js");
+    const now = new Date().toISOString();
+    registerMcpServer({ name: "dbhttp", description: "", enabled: true, type: "http", url: "http://127.0.0.1:9/mcp", headers: { Authorization: header }, createdAt: now, updatedAt: now });
+    const { secretValuesForMasking } = await import("../tool-mediation.js");
+    return secretValuesForMasking();
+  }
+
+  it("U1 a needle that starts a longer needle, shorter first: no fragment of the longer one", () => {
+    const needles = [SHORT, LONG];
+    expect(needles[0] < needles[1] && needles[1].startsWith(needles[0])).toBe(true);
+    const result = call(table([def()], { secrets: needles }), { question: `login ${LONG} now` }) as string;
+    expect(typeof result).toBe("string");
+    expect(result).toContain("login [REDACTED] now");
+    expect(result).not.toContain("Pa55w0rdXYZ");
+  });
+
+  it("U1 the same with needles that need JSON escaping: no fragment of the longer one", () => {
+    const short = 'pa"ss\\word';
+    const long = 'pa"ss\\word-12345';
+    expect(long.startsWith(short)).toBe(true);
+    const result = call(table([def()], { secrets: [short, long] }), { question: `use ${long} now` }) as string;
+    expect(typeof result).toBe("string");
+    expect(result).toContain("use [REDACTED] now");
+    expect(result).not.toContain("12345");
+  });
+
+  it("U2 the bare token of a registry `Bearer <token>` header is withheld with reason=secret and masked", async () => {
+    const token = "tokenU2abcdefgh1";
+    const needles = await needlesOf(`Bearer ${token}`);
+    const result = call(table([def()], { secrets: needles }), { question: token }) as string;
+    expect(typeof result).toBe("string");
+    expect(result).not.toContain(token);
+    expect(result).toContain("[REDACTED]");
+    expect(logs.join("\n")).toContain("reason=secret");
+    expect(logs.join("\n")).not.toContain(token);
+  });
+
+  it("U3 non-secret input stays visible (anti-suppression control)", async () => {
+    const needles = await needlesOf("Bearer tokenU3abcdefgh1");
+    expect(call(table([def()], { secrets: needles }), { question: "list the open tickets for project ALPHA" })).toEqual({ question: "list the open tickets for project ALPHA" });
+  });
+
+  it("U4 a 7-character token is not a known value: the object streams (threshold control)", async () => {
+    const needles = await needlesOf("Bearer abc1234");
+    expect(needles).toContain("Bearer abc1234");
+    expect(call(table([def()], { secrets: needles }), { question: "count abc1234 items" })).toEqual({ question: "count abc1234 items" });
   });
 });
 

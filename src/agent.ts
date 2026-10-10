@@ -10,6 +10,7 @@ import { buildStreamInputTable, streamedToolInput } from "./tool-use-input.js";
 import { buildMcpServersForSdk, getMcpAllowedToolPatterns, getRunMcpServers } from "./mcp-registry.js";
 import {
   applyMcpCredentialOverrides,
+  credentialValues,
   hasUserCredential,
   selectRegistryServersForRun,
   summarizeOverrideKeys,
@@ -26,7 +27,7 @@ import { SANDBOX_WORK } from "./sandbox-content.js";
 import { RunFailure, classifyRunFailure, fixedFailure, isAbortError } from "./run-failure.js";
 import { builtInTools, createToolPolicyHook } from "./tool-policy.js";
 import { WEBHOOK_SERVER_NAME, computeToolGrant, mcpToolName, type ToolGrant } from "./tool-grant.js";
-import { secretValuesForMasking } from "./tool-mediation.js";
+import { runMaskingValues } from "./tool-mediation.js";
 import type { ToolDefinition } from "./tools.js";
 
 export interface QueryParams {
@@ -178,20 +179,6 @@ function carriesEnv(config: unknown): boolean {
 
 /** The relay binding of a stdio server has no upstream URL: its bridge talks to the tool sandbox. */
 const STDIO_PLACEHOLDER_URL = "stdio://tool-sandbox";
-
-/** The header and env values of server configs or credential overrides: the secrets a tool input must not echo. */
-function credentialValues(configs: readonly unknown[]): string[] {
-  const values: string[] = [];
-  for (const config of configs) {
-    if (typeof config !== "object" || config === null) continue;
-    for (const key of ["headers", "env"] as const) {
-      const map = (config as Record<string, unknown>)[key];
-      if (typeof map !== "object" || map === null) continue;
-      for (const value of Object.values(map)) if (typeof value === "string") values.push(value);
-    }
-  }
-  return values;
-}
 
 /** A tool name as it may appear in an audit line. */
 function loggableName(name: string): string {
@@ -421,6 +408,14 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // gateway's own webhook tools or a registered server (MVP-6755).
   const mcpServers: Record<string, unknown> = { ...(runRequestMcpServers ?? {}) };
 
+  // The known values both the webhook refusals and the raw tool_use summaries are masked with: built on first use, once per
+  // run, and over the masking budget (see runMaskingValues) both fail closed.
+  const maskingValues = runMaskingValues(() => [
+    ...(clientAuthToken ? [clientAuthToken] : []),
+    ...credentialValues(Object.values(mcpCredentialOverrides ?? {})),
+    ...credentialValues(Object.values(runRequestMcpServers ?? {})),
+  ]);
+
   let webhookServer: unknown;
   if (registeredTools.length > 0 && webhookContext) {
     const hosted = new Set(registeredToolNames);
@@ -430,7 +425,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
       (tool) => webhookBearer(tool, callerLabel, clientAuthToken),
       {
         isGranted: (name) => hosted.has(name) && grant.allows(mcpToolName(WEBHOOK_SERVER_NAME, name)),
-        secrets: () => secretValuesForMasking(clientAuthToken ? [clientAuthToken] : []),
+        secrets: maskingValues,
       },
     );
   }
@@ -556,11 +551,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     callerLabel,
     mcpServers,
     webhookServer,
-    secretValues: () => secretValuesForMasking([
-      ...(clientAuthToken ? [clientAuthToken] : []),
-      ...credentialValues(Object.values(mcpCredentialOverrides ?? {})),
-      ...credentialValues(Object.values(runRequestMcpServers ?? {})),
-    ]),
+    secretValues: maskingValues,
   });
 
   if (mcpCredentialOverrides) {

@@ -1,5 +1,5 @@
 import type { ToolDefinition } from "./tools.js";
-import { describeFailure, webhookRejectionText, type ToolErrorCode } from "./tool-mediation.js";
+import { describeFailure, isMaskingOverBudget, webhookRejectionText, type MaskingValues, type ToolErrorCode } from "./tool-mediation.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */
@@ -66,7 +66,7 @@ async function readCapped(response: Response): Promise<string | null> {
  * Calls a registered webhook tool. Never follows a redirect (the credential must not leave the registered
  * origin), never echoes an upstream body except the bounded, masked message of the tool's own 4xx refusal, and
  * maps every other failure to one of the fixed texts of tool-mediation.ts. `secrets` are the known secret values
- * masked out of a refusal message.
+ * masked out of a refusal message; over the masking budget (`MASKING_OVER_BUDGET`) the refusal is replaced by a fixed text.
  */
 export async function executeWebhook(
   toolDef: ToolDefinition,
@@ -75,7 +75,7 @@ export async function executeWebhook(
   input: Record<string, unknown>,
   context: WebhookContext,
   authToken?: string,
-  secrets: readonly string[] = [],
+  secrets: MaskingValues = [],
 ): Promise<WebhookResponse | WebhookError> {
   const timeoutMs = toolDef.timeout_ms ?? 30000;
 
@@ -127,6 +127,11 @@ export async function executeWebhook(
     return failure({ kind: "unreachable", name: toolName });
   }
   if (!response.ok) {
+    // The run's known values are over the masking budget: the refusal cannot be masked, so none of it is shown.
+    if (isMaskingOverBudget(secrets)) {
+      await response.body?.cancel().catch(() => undefined);
+      return failure({ kind: "refusal_withheld", name: toolName });
+    }
     // The tool's own refusal (its message is bounded, cleaned and masked).
     let text: string | null = "";
     try {

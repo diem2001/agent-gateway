@@ -15,6 +15,9 @@ import {
   isAbortError,
 } from "./run-failure.js";
 import {
+  CREDENTIALS_TOO_LARGE_CODE,
+  CREDENTIALS_TOO_LARGE_MESSAGE,
+  credentialMaterialTooLarge,
   validateMcpCredentialOverrides,
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
@@ -120,6 +123,11 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   const resolved = resolveContentBlocks(content, prompt);
   if ("error" in resolved) { res.status(400).json({ error: resolved.error }); return; }
   const contentBlocks = resolved.blocks;
+  // The caller's credential values are bounded before anything works on them (MVP-8207): a fixed answer, no value echoed.
+  if (credentialMaterialTooLarge(mcpCredentialOverrides, mcpServers)) {
+    res.status(400).json({ error: { code: CREDENTIALS_TOO_LARGE_CODE, message: CREDENTIALS_TOO_LARGE_MESSAGE } });
+    return;
+  }
   const overrideValidation = validateMcpCredentialOverrides(mcpCredentialOverrides);
   if (overrideValidation.error) {
     res.status(400).json({ error: overrideValidation.error });

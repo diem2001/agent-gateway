@@ -690,6 +690,8 @@ function failureReason(failure: ToolFailure): string {
       return "timeout";
     case "invalid_response":
       return "invalid_response";
+    case "refusal_withheld":
+      return "refusal_withheld";
   }
 }
 
