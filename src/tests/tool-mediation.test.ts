@@ -175,6 +175,13 @@ describe("masking", () => {
     expect(maskSecrets("x SYNTHabcd1234ABCDEFGHIJ y", ["SYNTHabcd1234", "ABCDEFGHIJ"])).toBe("x [REDACTED] y");
   });
 
+  it("M6 a longer value that ends after two separate shorter ones starts before both and replaces them as one range", () => {
+    const text = "12345678--9abcdefg--hijklmno";
+    const secrets = ["12345678", "9abcdefg", "5678--9abcdefg--hijklmno"];
+    expect(maskSecrets(text, secrets)).toBe("[REDACTED]");
+    expect(maskSecrets(text, [...secrets].reverse())).toBe("[REDACTED]");
+  });
+
   it("M4 a value under 8 characters is not masked", () => {
     expect(maskSecrets("a short77 b", ["short77"])).toBe("a short77 b");
     expect(maskSecrets("a short77 b", ["short77", "12345678"])).toBe("a short77 b");

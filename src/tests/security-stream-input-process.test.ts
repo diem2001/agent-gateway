@@ -463,12 +463,14 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
     let pinging = true;
     let worstHealthMs = 0;
     let pings = 0;
+    const healthErrors: string[] = [];
     const pinger = (async () => {
       while (pinging) {
         const pingStarted = Date.now();
         try {
           await fetch(`http://127.0.0.1:${rig.gateway.port}/health`, { signal: AbortSignal.timeout(60_000) });
-        } catch {
+        } catch (error) {
+          healthErrors.push(`${(error as Error).name}:${((error as { cause?: { code?: string } }).cause?.code) ?? "none"}`);
           worstHealthMs = Number.POSITIVE_INFINITY;
         }
         worstHealthMs = Math.max(worstHealthMs, Date.now() - pingStarted);
@@ -497,7 +499,7 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
     // The permitted control: the refusal text is the tool's own message, cut to 500 characters, and nothing in it is masked.
     const expected = `The tool rejected the request (HTTP 422): ${"a".repeat(500)}`;
     if (turn.results[0]?.text !== expected) problems.push("control: the model's refusal text was not the unmasked message cut to 500 characters");
-    emit(`SECURITY-MASK-EVIDENCE refusal-cost override_values=100 body_bytes=${body.length + 14} turn_ms=${turn.outcome.ms} health_pings=${pings} health_max_ms=${worstHealthMs}`);
+    emit(`SECURITY-MASK-EVIDENCE refusal-cost override_values=100 body_bytes=${body.length + 14} turn_ms=${turn.outcome.ms} health_pings=${pings} health_max_ms=${worstHealthMs} health_errors=${healthErrors.join("+") || "none"}`);
     finishRow(recorder, rig, {
       id: "SI.refusal-cost",
       durationMs: Date.now() - started,

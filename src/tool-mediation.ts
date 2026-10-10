@@ -135,7 +135,7 @@ function refusalMaskingForms(secrets: readonly string[]): string[] {
  * The model-facing text of a webhook 4xx answer that is the tool's own refusal (not 401/403/408/429): in this
  * order `error.message`, a string `error`, `message` of a JSON body, else a text/plain body; at most 500
  * characters with control characters removed and every known secret value masked, also a multi-line or JSON-escaped one.
- * Masking covers the whole message in linear time (`maskSecrets`) before the cut to 500 characters: the masked text can
+ * Masking covers the whole message in one pass over all values (`maskSecrets`) before the cut to 500 characters: the masked text can
  * be far shorter than the message, so a cut first could neither be sized safely nor keep the result identical.
  */
 export function webhookRejectionText(status: number, contentType: string | null, body: string, secrets: readonly string[]): string {
@@ -168,46 +168,100 @@ export function webhookRejectionText(status: number, contentType: string | null,
 const MIN_MASKED_LENGTH = 8;
 
 /**
- * Adds to `covered` (a difference array over the text: +1 at a start, -1 at an end) every maximal run of overlapping or
- * touching occurrences of `secret` in `text`. Knuth-Morris-Pratt, so the cost is linear in the text plus the value however
- * repetitive both are; every occurrence is found, also the ones that overlap each other.
+ * An Aho-Corasick automaton over every value to mask, built once per call. A text character costs one hash lookup and an
+ * amortized constant number of failure steps, whatever the number of values, so the masking cost does not depend on
+ * how many values a caller supplies. The trie holds one node per character of the distinct values (the values are
+ * bounded by the request they arrive in); `longest[node]` is the length of the longest value that ends at the node or at
+ * any node on its failure chain, which is the only match that matters for a position: the shorter ones end at the same
+ * position and lie inside it.
  */
-function markOccurrences(text: string, secret: string, covered: Int32Array): void {
-  const m = secret.length;
-  const fail = new Int32Array(m);
-  for (let i = 1, k = 0; i < m; i++) {
-    while (k > 0 && secret.charCodeAt(i) !== secret.charCodeAt(k)) k = fail[k - 1];
-    if (secret.charCodeAt(i) === secret.charCodeAt(k)) k++;
-    fail[i] = k;
-  }
-  const first = secret[0];
-  let runStart = -1;
-  let runEnd = -1;
-  let k = 0;
-  for (let i = 0; i < text.length; i++) {
-    if (k === 0) {
-      i = text.indexOf(first, i);
-      if (i === -1) break;
-    }
-    while (k > 0 && text.charCodeAt(i) !== secret.charCodeAt(k)) k = fail[k - 1];
-    if (text.charCodeAt(i) === secret.charCodeAt(k)) k++;
-    if (k < m) continue;
-    const from = i - m + 1;
-    if (runStart !== -1 && from <= runEnd) {
-      runEnd = i + 1;
-    } else {
-      if (runStart !== -1) {
-        covered[runStart]++;
-        covered[runEnd]--;
+class ValueAutomaton {
+  readonly longest: Int32Array;
+  private readonly fail: Int32Array;
+  private readonly mask: number;
+  private readonly slotNode: Int32Array;
+  private readonly slotCode: Uint16Array;
+  private readonly slotNext: Int32Array;
+
+  constructor(values: readonly string[]) {
+    let nodes = 1;
+    for (const value of values) nodes += value.length;
+    let slots = 16;
+    while (slots < nodes * 2) slots *= 2;
+    this.mask = slots - 1;
+    this.slotNode = new Int32Array(slots).fill(-1);
+    this.slotCode = new Uint16Array(slots);
+    this.slotNext = new Int32Array(slots);
+    this.longest = new Int32Array(nodes);
+    this.fail = new Int32Array(nodes);
+    const parent = new Int32Array(nodes);
+    const code = new Uint16Array(nodes);
+    const depth = new Int32Array(nodes);
+    let count = 1;
+    let deepest = 0;
+    for (const value of values) {
+      let node = 0;
+      for (let i = 0; i < value.length; i++) {
+        const c = value.charCodeAt(i);
+        let next = this.child(node, c);
+        if (next === -1) {
+          next = count++;
+          parent[next] = node;
+          code[next] = c;
+          depth[next] = i + 1;
+          this.put(node, c, next);
+        }
+        node = next;
       }
-      runStart = from;
-      runEnd = i + 1;
+      this.longest[node] = value.length;
+      deepest = Math.max(deepest, value.length);
     }
-    k = fail[m - 1];
+    // Failure links in order of depth (counting sort), so a node's parent chain is complete when the node is reached.
+    const start = new Int32Array(deepest + 2);
+    for (let v = 1; v < count; v++) start[depth[v] + 1]++;
+    for (let d = 1; d < start.length; d++) start[d] += start[d - 1];
+    const order = new Int32Array(count);
+    for (let v = 1; v < count; v++) order[start[depth[v]]++] = v;
+    for (let k = 0; k < count - 1; k++) {
+      const v = order[k];
+      let state = parent[v] === 0 ? 0 : this.fail[parent[v]];
+      if (parent[v] !== 0) {
+        while (state !== 0 && this.child(state, code[v]) === -1) state = this.fail[state];
+        const hit = this.child(state, code[v]);
+        state = hit === -1 ? 0 : hit;
+      }
+      this.fail[v] = state;
+      if (this.longest[state] > this.longest[v]) this.longest[v] = this.longest[state];
+    }
   }
-  if (runStart !== -1) {
-    covered[runStart]++;
-    covered[runEnd]--;
+
+  private slot(node: number, c: number): number {
+    return ((Math.imul(node, 0x9e3779b1) ^ Math.imul(c + 1, 0x85ebca6b)) >>> 0) & this.mask;
+  }
+
+  private child(node: number, c: number): number {
+    for (let at = this.slot(node, c); this.slotNode[at] !== -1; at = (at + 1) & this.mask) {
+      if (this.slotNode[at] === node && this.slotCode[at] === c) return this.slotNext[at];
+    }
+    return -1;
+  }
+
+  private put(node: number, c: number, next: number): void {
+    let at = this.slot(node, c);
+    while (this.slotNode[at] !== -1) at = (at + 1) & this.mask;
+    this.slotNode[at] = node;
+    this.slotCode[at] = c;
+    this.slotNext[at] = next;
+  }
+
+  /** The state after `c` from `state`. */
+  step(state: number, c: number): number {
+    for (;;) {
+      const next = this.child(state, c);
+      if (next !== -1) return next;
+      if (state === 0) return 0;
+      state = this.fail[state];
+    }
   }
 }
 
@@ -215,34 +269,39 @@ function markOccurrences(text: string, secret: string, covered: Int32Array): voi
  * Replaces every known secret value (8 characters or longer) with `[REDACTED]`. Every occurrence of every value is
  * located in the unmodified text, also overlapping ones; ranges that overlap or touch are replaced as one, so no
  * fragment of a value is left behind whatever the order of `secrets` (a value that starts, ends or sits inside a longer
- * one, or two values that overlap partially). Time and memory are linear in the text length plus the total length of
- * the values times the number of values: a caller-supplied value or message cannot make this quadratic.
+ * one, or two values that overlap partially). One pass over the text through an automaton of all values: the cost is
+ * linear in the text length plus the total length of the values (plus the replacements), independent of how many values
+ * there are; memory is linear in the same two. The caller of a request bounds the values by the size of that request.
  */
 export function maskSecrets(text: string, secrets: readonly string[]): string {
-  let covered: Int32Array | undefined;
-  for (const secret of new Set(secrets)) {
-    if (secret.length < MIN_MASKED_LENGTH || secret.length > text.length) continue;
-    covered ??= new Int32Array(text.length + 1);
-    markOccurrences(text, secret, covered);
+  const values = [...new Set(secrets)].filter((secret) => secret.length >= MIN_MASKED_LENGTH && secret.length <= text.length);
+  if (values.length === 0) return text;
+  const automaton = new ValueAutomaton(values);
+  // The merged runs, left to right. A match is found at its end, so a longer value that ends later can start before
+  // earlier runs: those runs are folded into the new one.
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let state = 0;
+  for (let i = 0; i < text.length; i++) {
+    state = automaton.step(state, text.charCodeAt(i));
+    const length = automaton.longest[state];
+    if (length === 0) continue;
+    let from = i + 1 - length;
+    while (ends.length > 0 && ends[ends.length - 1] >= from) {
+      from = Math.min(from, starts.pop()!);
+      ends.pop();
+    }
+    starts.push(from);
+    ends.push(i + 1);
   }
-  if (covered === undefined) return text;
+  if (starts.length === 0) return text;
   let out = "";
   let copied = 0;
-  let start = 0;
-  let depth = 0;
-  for (let i = 0; i <= text.length; i++) {
-    const step = covered[i];
-    if (step === 0) continue;
-    const before = depth;
-    depth += step;
-    if (before === 0) {
-      start = i;
-    } else if (depth === 0) {
-      out += `${text.slice(copied, start)}[REDACTED]`;
-      copied = i;
-    }
+  for (let r = 0; r < starts.length; r++) {
+    out += `${text.slice(copied, starts[r])}[REDACTED]`;
+    copied = ends[r];
   }
-  return copied === 0 && out === "" ? text : `${out}${text.slice(copied)}`;
+  return `${out}${text.slice(copied)}`;
 }
 
 // `\S[^]*` rather than `.+`: after the spaces the token starts at a non-space and runs to the end, so a long run of
