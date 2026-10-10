@@ -7,6 +7,7 @@ import { tryLockConversation, type ConversationLock } from "./sandbox.js";
 import {
   RunFailure,
   SESSION_BUSY_MESSAGE,
+  SESSION_ERASING_MESSAGE,
   SESSION_LEGACY_MESSAGE,
   classifyRunFailure,
   fixedFailure,
@@ -206,7 +207,7 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
 
   // Admission comes before anything else happens for this request: a refused caller gets one fixed
   // `error` event and nothing ran (no runtime, no session change, no acknowledgment).
-  const refuse = (kind: "session_legacy" | "session_busy", message: string): void => {
+  const refuse = (kind: "session_legacy" | "session_busy" | "session_erasing", message: string): void => {
     log("query", `Refused queryId=${queryId} kind=${kind}`);
     emit({ type: "error", content: fixedFailure(kind, message).message });
     markDone(label, queryId);
@@ -227,7 +228,9 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   if (conversationId) {
     const admission = admitSession(conversationId, caller);
     if (admission.kind === "refused") {
-      refuse("session_legacy", SESSION_LEGACY_MESSAGE);
+      // A deleted conversation whose folder is not confirmed gone gets its own fixed text, not the legacy one (MVP-7402).
+      if (admission.reason === "erasing") refuse("session_erasing", SESSION_ERASING_MESSAGE);
+      else refuse("session_legacy", SESSION_LEGACY_MESSAGE);
       return;
     }
     // One active request per conversation: the lock is taken before the conversation entry is touched.

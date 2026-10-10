@@ -449,8 +449,8 @@ function ensureAgentDir(dir: string): void {
  * The persistent directories of a conversation: `<root>/sessions/<name>/home` (rebuilt at every start, only the
  * runtime's data carries over) and `<root>/sessions/<name>/work` (the agent's work area, bound at `/work`), both
  * created on first use. The name is the random id recorded with the conversation; the directories above are
- * private to the gateway, the two below are the agent's. Deleting a conversation leaves both in place: cleanup and
- * retention belong to MVP-7402.
+ * private to the gateway, the two below are the agent's. Deleting the conversation removes the whole folder
+ * (`session-erasure.ts`, MVP-7402).
  */
 function sessionDirs(root: string, dirId: string): { home: string; work: string } {
   if (!/^[0-9a-f]{24}$/.test(dirId)) throw new SandboxPrepError("content_invalid");
@@ -667,14 +667,30 @@ export interface ConversationLock {
   release: () => void;
 }
 
+/** Who holds a conversation lock: a request's run (its release is announced) or the eraser (its release is not, MVP-7402). */
+export type ConversationLockHolder = "run" | "eraser";
+
+const releaseListeners = new Set<(dirId: string) => void>();
+
+/**
+ * Registers a listener that is told which conversation was just released by a RUN. The eraser's own release never
+ * notifies, so a failing erasure cannot re-trigger itself. A listener runs synchronously inside `release` and must
+ * schedule its work instead of doing it there. Returns the function that removes the listener.
+ */
+export function onConversationRunReleased(listener: (dirId: string) => void): () => void {
+  releaseListeners.add(listener);
+  return () => releaseListeners.delete(listener);
+}
+
 /**
  * The trusted-side lock of one conversation home: a second request for a conversation that is still
  * answering gets null (and is refused with 0 runtime starts). Held for the whole request, retries
  * included; `SandboxRun.dispose` has waited for the sandbox process to exit before it is released (after a
  * deadline stop whose exit was not observed in time, query.ts keeps the lock until that exit), so two sandboxes
- * never share one home at the same time.
+ * never share one home at the same time. The erasure of a deleted conversation takes the same lock (holder
+ * "eraser"), so it never removes a home a sandbox still uses.
  */
-export function tryLockConversation(dirId: string): ConversationLock | null {
+export function tryLockConversation(dirId: string, holder: ConversationLockHolder = "run"): ConversationLock | null {
   if (lockedConversations.has(dirId)) return null;
   lockedConversations.add(dirId);
   let released = false;
@@ -683,6 +699,14 @@ export function tryLockConversation(dirId: string): ConversationLock | null {
       if (released) return;
       released = true;
       lockedConversations.delete(dirId);
+      if (holder !== "run") return;
+      for (const listener of releaseListeners) {
+        try {
+          listener(dirId);
+        } catch {
+          // A listener never breaks the release of a conversation.
+        }
+      }
     },
   };
 }

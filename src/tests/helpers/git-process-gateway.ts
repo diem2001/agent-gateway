@@ -48,6 +48,24 @@ export interface SpawnedGateway {
   dirs: { home: string; tmp: string; cwd: string; persist: string; workspace: string; projects: string };
   /** Everything the gateway wrote to stdout and stderr so far. */
   output: () => string;
+  /** True when the gateway was spawned as the leader of its own process group (`detached`), the only case `killGatewayGroup` accepts. */
+  detached: boolean;
+}
+
+/**
+ * SIGKILL for the whole process group of a gateway that was spawned `detached` (a hard stop of the gateway together
+ * with its children, the way a container kill does it). Guarded: it refuses a gateway that is not a group leader by
+ * construction, one that already exited, and one whose process group is not its own pid; it never signals by name or
+ * pattern.
+ */
+export function killGatewayGroup(gateway: Pick<SpawnedGateway, "child" | "detached">): void {
+  const { child } = gateway;
+  if (!gateway.detached) throw new Error("refusing a group kill: this gateway was not spawned detached");
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) throw new Error("refusing a group kill: the gateway process is not running");
+  const stat = fs.readFileSync(`/proc/${child.pid}/stat`, "utf8");
+  const pgrp = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[2]);
+  if (pgrp !== child.pid) throw new Error(`refusing a group kill: process group ${pgrp} is not the gateway pid ${child.pid}`);
+  process.kill(-child.pid, "SIGKILL");
 }
 
 export type Cleanup = () => Promise<void> | void;
@@ -391,6 +409,8 @@ export async function spawnGateway(
     inheritedFds?: number[];
     /** Bound of the readiness wait in ms (default `GATEWAY_READY_TIMEOUT_MS`). */
     readyTimeoutMs?: number;
+    /** Spawn the gateway as the leader of its own process group, so `killGatewayGroup` can stop it with all its children. */
+    detached?: boolean;
   } = {},
 ): Promise<SpawnedGateway> {
   assertFreshBuild();
@@ -426,6 +446,7 @@ export async function spawnGateway(
   const child = spawn(process.execPath, ["--expose-gc", options.distServer ?? DIST_SERVER], {
     cwd: dirs.cwd,
     env: childEnv,
+    detached: options.detached === true,
     stdio: options.inheritedFds ? ["ignore", "pipe", "pipe", ...Array<"ignore">(17).fill("ignore"), ...options.inheritedFds] : ["ignore", "pipe", "pipe"],
   });
   let output = "";
@@ -439,6 +460,14 @@ export async function spawnGateway(
         // Already gone.
       }
     }
+    if (options.detached && child.exitCode === null && child.signalCode === null) {
+      // The guarded group kill: only the recorded group of a gateway that really leads its own group.
+      try {
+        killGatewayGroup({ child, detached: true });
+      } catch {
+        // The per-process kill below still applies.
+      }
+    }
     if (child.exitCode === null && child.signalCode === null) {
       const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
       child.kill("SIGKILL");
@@ -449,7 +478,7 @@ export async function spawnGateway(
   });
 
   await waitForGatewayReady({ child, port, output: () => output, readyTimeoutMs: options.readyTimeoutMs, env: childEnv });
-  return { child, port, root, dirs, output: () => output };
+  return { child, port, root, dirs, output: () => output, detached: options.detached === true };
 }
 
 /** GET /health; status 0 when the connection failed. */
