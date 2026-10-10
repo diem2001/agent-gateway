@@ -181,6 +181,114 @@ describe("masking", () => {
   });
 });
 
+/** The previous implementation (one range per position, quadratic): the reference every input must still match. */
+function referenceMask(text: string, secrets: readonly string[]): string {
+  const ranges: [number, number][] = [];
+  for (const secret of new Set(secrets)) {
+    if (secret.length < 8) continue;
+    for (let at = text.indexOf(secret); at !== -1; at = text.indexOf(secret, at + 1)) ranges.push([at, at + secret.length]);
+  }
+  if (ranges.length === 0) return text;
+  ranges.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  let out = "";
+  let copied = 0;
+  let [start, end] = ranges[0];
+  for (const [from, to] of ranges.slice(1)) {
+    if (from <= end) {
+      end = Math.max(end, to);
+      continue;
+    }
+    out += `${text.slice(copied, start)}[REDACTED]`;
+    copied = end;
+    [start, end] = [from, to];
+  }
+  return `${out}${text.slice(copied, start)}[REDACTED]${text.slice(end)}`;
+}
+
+describe("masking cost and equivalence (MVP-8207 rework)", () => {
+  it("gives the reference result on 6000 random inputs over a tiny alphabet", () => {
+    let seed = 20261010;
+    const next = (bound: number): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      return (seed >>> 8) % bound;
+    };
+    const word = (alphabet: string, length: number): string => Array.from({ length }, () => alphabet[next(alphabet.length)]).join("");
+    for (let i = 0; i < 6000; i++) {
+      const alphabet = i % 3 === 0 ? "ab" : i % 3 === 1 ? "abc" : "ab-";
+      const text = word(alphabet, 10 + next(70));
+      const secrets = Array.from({ length: 1 + next(4) }, () => word(alphabet, 6 + next(9)));
+      expect(maskSecrets(text, secrets), JSON.stringify({ text, secrets })).toBe(referenceMask(text, secrets));
+      expect(maskSecrets(text, secrets.reverse())).toBe(referenceMask(text, secrets));
+    }
+  });
+
+  it("C1 a 1 MiB text and a 20 KiB value that overlap at every position finish within the budget", () => {
+    const text = "a".repeat(1024 * 1024);
+    const started = performance.now();
+    expect(maskSecrets(text, ["a".repeat(20 * 1024)])).toBe("[REDACTED]");
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it("C2 a 2 MiB text of one repeated 8-character value finishes within the budget", () => {
+    const text = "abcdefgh".repeat(256 * 1024);
+    const started = performance.now();
+    expect(maskSecrets(text, ["abcdefgh"])).toBe("[REDACTED]");
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it("C2b a 2 MiB text of one repeated character and an 8-character value of it finishes within the budget", () => {
+    const text = "a".repeat(2 * 1024 * 1024);
+    const started = performance.now();
+    expect(maskSecrets(text, ["a".repeat(8)])).toBe("[REDACTED]");
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it("C3 an 8 MiB refusal body with several long repetitive values stays within the budget", () => {
+    const body = "ab".repeat(4 * 1024 * 1024);
+    const secrets = ["ab".repeat(10 * 1024), "ba".repeat(10 * 1024), "a".repeat(8), "abab".repeat(5000)];
+    const started = performance.now();
+    const text = webhookRejectionText(400, "text/plain", body, secrets);
+    expect(performance.now() - started).toBeLessThan(2500);
+    expect(text).toBe("The tool rejected the request (HTTP 400): [REDACTED]");
+  });
+
+  it("C4 a stored header of 'Bearer' and 40,000 spaces then a line break does not stall the known-value list", () => {
+    const value = `Bearer${" ".repeat(40000)}\nx`;
+    const started = performance.now();
+    const values = secretValuesForMasking([value]);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(values).toContain(value);
+  });
+});
+
+describe("a refusal text is masked before it is cleaned (MVP-8207 rework)", () => {
+  const PEM = "-----BEGIN KEY-----\nSYNTHline1abcdef\nSYNTHline2abcdef\n-----END KEY-----";
+
+  it("R1 a multi-line known value in a JSON body is masked", () => {
+    const body = JSON.stringify({ error: `bad key ${PEM} given` });
+    expect(webhookRejectionText(400, "application/json", body, [PEM])).toBe("The tool rejected the request (HTTP 400): bad key [REDACTED] given");
+  });
+
+  it("R2 a multi-line known value in a text/plain body is masked", () => {
+    expect(webhookRejectionText(400, "text/plain", `bad key ${PEM} given`, [PEM])).toBe("The tool rejected the request (HTTP 400): bad key [REDACTED] given");
+  });
+
+  it("R3 a known value with a quote and a backslash, JSON-escaped in a text/plain body, is masked", () => {
+    const secret = 'pa"ss\\word-SYNTH';
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    expect(webhookRejectionText(400, "text/plain", `got ${escaped} here`, [secret])).toBe("The tool rejected the request (HTTP 400): got [REDACTED] here");
+  });
+
+  it("R4 a multi-line value whose JSON-escaped form appears in a text/plain body is masked", () => {
+    const escaped = JSON.stringify(PEM).slice(1, -1);
+    expect(webhookRejectionText(400, "text/plain", `got ${escaped} here`, [PEM])).toBe("The tool rejected the request (HTTP 400): got [REDACTED] here");
+  });
+
+  it("R5 a message without a known value is unchanged (control)", () => {
+    expect(webhookRejectionText(400, "text/plain", "list the open tickets", [PEM])).toBe("The tool rejected the request (HTTP 400): list the open tickets");
+  });
+});
+
 describe("the values masked in a refusal message", () => {
   let dir: string;
   const saved = { ...process.env };
