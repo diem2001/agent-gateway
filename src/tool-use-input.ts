@@ -156,10 +156,7 @@ function carriesSecret(needles: readonly string[], data: Json, serialized: strin
 function maskedSummary(input: unknown, needles: readonly string[]): string {
   if (input === undefined) return "";
   try {
-    let text = JSON.stringify(input, null, 2) ?? "";
-    for (const needle of needles) {
-      text = maskSecrets(text, [needle, jsonEscaped(needle)]);
-    }
+    const text = maskSecrets(JSON.stringify(input, null, 2) ?? "", needles.flatMap((needle) => [needle, jsonEscaped(needle)]));
     return text.substring(0, SUMMARY_MAX);
   } catch {
     // V8 throws a RangeError on very deep input.

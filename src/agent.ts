@@ -428,7 +428,11 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
       (tool) => webhookBearer(tool, callerLabel, clientAuthToken),
       {
         isGranted: (name) => hosted.has(name) && grant.allows(mcpToolName(WEBHOOK_SERVER_NAME, name)),
-        secrets: () => secretValuesForMasking(clientAuthToken ? [clientAuthToken] : []),
+        secrets: () => secretValuesForMasking([
+          ...(clientAuthToken ? [clientAuthToken] : []),
+          ...credentialValues(Object.values(mcpCredentialOverrides ?? {})),
+          ...credentialValues(Object.values(runRequestMcpServers ?? {})),
+        ]),
       },
     );
   }

@@ -141,11 +141,50 @@ export function webhookRejectionText(status: number, contentType: string | null,
   return message.length > 0 ? `The tool rejected the request (HTTP ${status}): ${message}` : `The tool rejected the request (HTTP ${status}).`;
 }
 
-/** Replaces every known secret value (8 characters or longer) with `[REDACTED]`. */
+/** The shortest value that is masked, and the shortest token derived from an `Authorization` style value. */
+const MIN_MASKED_LENGTH = 8;
+
+/**
+ * Replaces every known secret value (8 characters or longer) with `[REDACTED]`. Every occurrence of every value is
+ * located in the unmodified text, also overlapping ones; ranges that overlap or touch are replaced as one, so no
+ * fragment of a value is left behind whatever the order of `secrets` (a value that starts, ends or sits inside a longer
+ * one, or two values that overlap partially).
+ */
 export function maskSecrets(text: string, secrets: readonly string[]): string {
-  let out = text;
-  for (const secret of secrets) {
-    if (secret.length >= 8) out = out.split(secret).join("[REDACTED]");
+  const ranges: [number, number][] = [];
+  for (const secret of new Set(secrets)) {
+    if (secret.length < MIN_MASKED_LENGTH) continue;
+    for (let at = text.indexOf(secret); at !== -1; at = text.indexOf(secret, at + 1)) ranges.push([at, at + secret.length]);
+  }
+  if (ranges.length === 0) return text;
+  ranges.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  let out = "";
+  let copied = 0;
+  let [start, end] = ranges[0];
+  for (const [from, to] of ranges.slice(1)) {
+    if (from <= end) {
+      end = Math.max(end, to);
+      continue;
+    }
+    out += `${text.slice(copied, start)}[REDACTED]`;
+    copied = end;
+    [start, end] = [from, to];
+  }
+  return `${out}${text.slice(copied, start)}[REDACTED]${text.slice(end)}`;
+}
+
+const AUTH_SCHEME_VALUE = /^(?:bearer|basic) +(.+)$/i;
+
+/**
+ * `values` and, for each one that reads `Bearer <token>` or `Basic <token>` (matched on the trimmed value, scheme in any
+ * case), the token itself when it has 8 or more characters: the model can send the bare token without its scheme. Other
+ * schemes are not recognized and a `Basic` blob is not decoded.
+ */
+function withSchemeTokens(values: readonly string[]): string[] {
+  const out = [...values];
+  for (const value of values) {
+    const token = AUTH_SCHEME_VALUE.exec(value.trim())?.[1].trim();
+    if (token !== undefined && token.length >= MIN_MASKED_LENGTH) out.push(token);
   }
   return out;
 }
@@ -155,7 +194,8 @@ export function maskSecrets(text: string, secrets: readonly string[]): string {
  * refusal texts: secret-looking environment values (API keys, provider credentials), the OAuth tokens of the
  * trusted credentials file, every enabled registry server's header and env values, the private-key lines of
  * `$HOME/.ssh`, the credential parts of every registered webhook URL, and `extra` (for example the bearer
- * forwarded to the webhook).
+ * forwarded to the webhook). A registry or `extra` value that reads `Bearer <token>` or `Basic <token>` also
+ * contributes the token (`withSchemeTokens`).
  */
 export function gatewayKnownValues(workspaceRoot: string, extra: readonly string[] = []): Buffer[] {
   const registry: string[] = [];
@@ -164,10 +204,10 @@ export function gatewayKnownValues(workspaceRoot: string, extra: readonly string
   }
   const sshDir = path.join(process.env.HOME || "/home/node", ".ssh");
   return knownSecretValues(process.env, path.join(workspaceRoot, ".credentials.json"), [
-    ...registry,
+    ...withSchemeTokens(registry),
     ...sshPrivateKeyValues(sshDir),
     ...webhookUrlValues(getAllTools()),
-    ...extra,
+    ...withSchemeTokens(extra),
   ]);
 }
 

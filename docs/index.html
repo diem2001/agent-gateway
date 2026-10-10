@@ -1227,7 +1227,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
     "message": "Invalid input: expected string, received number"
   }
 ]</code></pre>
-    <p>Webhooks keep their own validation; a 4xx answer other than 401/403/408/429 reaches the model as <code>The tool rejected the request (HTTP &lt;status&gt;): &lt;message&gt;</code> (<code>&lt;message&gt;</code> is, in order, <code>error.message</code>, a string <code>error</code>, <code>message</code> of a JSON body, else a text/plain body; at most 500 characters, control characters removed, known secret values masked), and every other failure ends in a fixed <a href="#tool-errors"><code>TOOL_*</code> text</a>. A schema the gateway cannot convert makes that tool alone accept any value for every declared field (logged as <code>tools.schema.untyped_fallback</code>). The field names <code>__proto__</code> and a top-level <code>constructor</code> are never advertised, because they cannot reach the webhook.</p>
+    <p>Webhooks keep their own validation; a 4xx answer other than 401/403/408/429 reaches the model as <code>The tool rejected the request (HTTP &lt;status&gt;): &lt;message&gt;</code> (<code>&lt;message&gt;</code> is, in order, <code>error.message</code>, a string <code>error</code>, <code>message</code> of a JSON body, else a text/plain body; at most 500 characters, control characters removed, known secret values masked, see <em>Streaming the structured input</em> below for what counts as known), and every other failure ends in a fixed <a href="#tool-errors"><code>TOOL_*</code> text</a>. A schema the gateway cannot convert makes that tool alone accept any value for every declared field (logged as <code>tools.schema.untyped_fallback</code>). The field names <code>__proto__</code> and a top-level <code>constructor</code> are never advertised, because they cannot reach the webhook.</p>
 
     <h3>Streaming the structured input (<code>stream_input</code>)</h3>
 
@@ -1237,11 +1237,15 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <li>The tool is registered by the calling API-key label (an ownerless legacy entry stores <code>raw</code> but never streams an object), is offered and granted in this run, and is served by the gateway's own webhook server.</li>
       <li>The call passes the tool's input schema. The object is exactly what the webhook received: undeclared top-level keys are dropped, nested values stay as sent (a nested <code>__proto__</code> key never arrives).</li>
       <li>It nests at most 32 levels, and its compact JSON serialization is at most 16384 UTF-8 bytes (bytes, not characters).</li>
-      <li>No string key or value contains U+0000 or a lone surrogate, and none contains a secret value the gateway knows (for a raw-registered tool the summary then shows <code>[REDACTED]</code> in its place).</li>
+      <li>No string key or value contains U+0000 or a lone surrogate, and none contains a secret value the gateway knows (for a raw-registered tool in the run's table the summary then shows <code>[REDACTED]</code> in its place).</li>
       <li>The tool name matches <code>^[A-Za-z0-9_-]{1,64}$</code>.</li>
     </ul>
 
     <p>The event is sent before the tool runs, so an object also appears for a call that the webhook later refuses or a hook denies; show the result only after a successful <code>tool_result</code> for the same <code>toolUseId</code>. <code>TodoWrite</code>, <code>tool_result</code> and the webhook request are unchanged. A gateway older than this field ignores it and streams the summary string.</p>
+
+    <p><strong>Masking scope.</strong> The known values are the gateway's secret-looking environment values and OAuth tokens, every enabled registry server's header and env values, the credential parts of registered webhook URLs and SSH key lines, the caller's forwarded bearer and, for a run, the header and env values of its per-request MCP servers and per-user credential overrides. A header or env value that reads <code>Bearer &lt;token&gt;</code> or <code>Basic &lt;token&gt;</code> (scheme in any case) also contributes the token when it has 8 or more characters. Values that overlap, or sit inside one another, are masked as a whole. The <code>tool_use</code> summary of a raw tool in the run's table, its replay and the webhook refusal text cover registry, per-request and per-user values alike; the sandbox's hidden-file scan covers registry values and their tokens only (no request or override values).</p>
+
+    <p>Not covered: other schemes (<code>Token</code>, <code>Bot</code>), decoding of a <code>Basic</code> base64 blob, values under 8 characters, a secret split across fields, and a raw-registered tool that is not in the run's raw table (ambiguous name, shadowed server, ownerless entry): its <code>tool_use</code> input is today's summary without masking.</p>
 
     <h3>Response (201 Created / 200 OK)</h3>
 <pre><code>{
