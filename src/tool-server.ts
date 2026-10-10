@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { buildToolInputShape } from "./tool-input-schema.js";
 import type { ToolDefinition } from "./tools.js";
@@ -18,6 +19,31 @@ export interface ToolServerOptions {
 
 /** The bearer a tool's webhook receives: one value for every tool, or a decision per tool (owner-bound forwarding). */
 export type WebhookAuth = string | undefined | ((tool: ToolDefinition) => string | undefined);
+
+/* ------------------------------------------------------------------ */
+/*  Input shape                                                         */
+/* ------------------------------------------------------------------ */
+
+/** One shape per registered definition, shared by the MCP server and the `tool_use` event builder (no drift). */
+const shapes = new WeakMap<ToolDefinition, Record<string, z.ZodType>>();
+
+function inputShape(toolDef: ToolDefinition): Record<string, z.ZodType> {
+  let shape = shapes.get(toolDef);
+  if (!shape) {
+    shape = buildToolInputShape(toolDef.name, toolDef.input_schema);
+    shapes.set(toolDef, shape);
+  }
+  return shape;
+}
+
+/**
+ * The validator the MCP server applies to a call's arguments (the SDK wraps the raw shape in a strip-mode object):
+ * undeclared top-level keys are dropped, nested values stay as sent. The `tool_use` event of a `raw` tool is built
+ * from this parse, so it carries exactly what the webhook receives.
+ */
+export function toolInputValidator(toolDef: ToolDefinition): z.ZodType<Record<string, unknown>> {
+  return z.object(inputShape(toolDef)) as unknown as z.ZodType<Record<string, unknown>>;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Factory                                                             */
@@ -41,7 +67,7 @@ export function createToolMcpServer(
 ): McpSdkServerConfigWithInstance {
   const server = new McpServer({ name: "agent-gateway-tools", version: "1.0.0" });
   for (const toolDef of tools) {
-    const inputSchema = buildToolInputShape(toolDef.name, toolDef.input_schema);
+    const inputSchema = inputShape(toolDef);
     server.registerTool(toolDef.name, {
       description: toolDef.description,
       inputSchema,

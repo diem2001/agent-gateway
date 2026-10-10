@@ -411,9 +411,9 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`.
 | `DELETE` | `/v1/users/{user_id}/skills/*` | Delete a user-namespaced skill file |
 | `GET` | `/v1/knowledge-base` | List knowledge-base files (read-only) |
 | `GET` | `/v1/knowledge-base/*` | Read a knowledge-base file as `text/markdown` (read-only) |
-| `PUT` | `/v1/tools/:name` | Register/update a webhook tool; records the calling label as `owner` (another label's tool: 403 `TOOL_OWNED_BY_OTHER_CLIENT`) |
-| `GET` | `/v1/tools` | List all registered tools (with `owner`) |
-| `GET` | `/v1/tools/:name` | Get a single tool (with `owner`) |
+| `PUT` | `/v1/tools/:name` | Register/update a webhook tool; records the calling label as `owner` (another label's tool: 403 `TOOL_OWNED_BY_OTHER_CLIENT`); optional `stream_input` `"summary"` (default) or `"raw"` (anything else: 400) |
+| `GET` | `/v1/tools` | List all registered tools (with `owner` and `stream_input`) |
+| `GET` | `/v1/tools/:name` | Get a single tool (with `owner` and `stream_input`) |
 | `DELETE` | `/v1/tools/:name` | Delete a tool (another label's tool: 403 `TOOL_OWNED_BY_OTHER_CLIENT`) |
 | `PUT` | `/v1/mcp-servers/:name` | Register/update an external MCP server; records the calling label as owner on creation (another label's or an ownerless entry: 403 `MCP_SERVER_OWNER_MISMATCH`). `headers`, `env` and `args` are write-only: the reply never carries them; omitted keeps the stored value, `{}` / `[]` clears it, a non-empty one replaces it; a transport change between http/sse and stdio that would strand a stored map or args list: 400 `MCP_CREDENTIAL_MAP_INAPPLICABLE`. The `url` is public: a new or changed http/sse `url` with user info, a query string or a fragment: 400 `MCP_SERVER_URL_INVALID`; malformed `args`: 400 `MCP_SERVER_ARGS_INVALID`; a stored legacy URL that breaks the rule is withheld (see below) |
 | `GET` | `/v1/mcp-servers` | List all registered MCP servers (metadata only: no `headers`, no `env`, no `args`, no owner; the full `url`, or `urlMigrationRequired: true` instead of it for a legacy entry that breaks the URL rule) |
@@ -679,21 +679,13 @@ External tools can be registered via the `/v1/tools` endpoints. Each tool define
 
 The tool's `input_schema` is what the model is told about its arguments: field types (`string`, `number`, `integer`, `boolean`, `object`, `array`), `enum` values, nested `properties`/`required`, array `items` and every `description` are passed through. The gateway rejects a call that violates them before the webhook is called; the model gets a tool error naming the field and the expected type, so it can correct itself. Unsupported JSON Schema constructs (`format`, `pattern`, `oneOf`, numeric bounds, ...) make that property alone accept any value, so registration never fails because of them. Values are never converted or defaulted, undeclared top-level arguments are still dropped, and webhooks keep their own validation. Details: [docs/architecture.md](docs/architecture.md#tool-input-schemats----webhook-tool-input-schemas).
 
-When the agent calls a registered tool, the gateway POSTs to the webhook URL with:
+When the agent calls a registered tool, the gateway POSTs the tool's input object as the flat JSON body (for example `{"param": "value"}`; there is no envelope) to the webhook URL, with these headers:
 
-```json
-{
-  "tool_use_id": "tu_abc",
-  "tool_name": "my-tool",
-  "input": { "param": "value" },
-  "context": {
-    "user_id": null,
-    "conversation_id": null,
-    "session_id": "session-1",
-    "api_key_label": "myapp"
-  }
-}
-```
+- `X-Webhook-Tool-Use-Id`: the call's tool use id.
+- `X-Webhook-Tool-Name`: the tool name.
+- `X-Webhook-Context`: JSON `{"user_id", "conversation_id", "session_id", "api_key_label"}`, from the authenticated request only.
+
+**Streaming the structured input (`stream_input`).** `stream_input` (optional, `"summary"` or `"raw"`, default `"summary"`) decides what the `tool_use` stream event carries as `input`. With `"raw"` it is the JSON object the webhook receives (after input-schema filtering: undeclared top-level keys are dropped, nested values stay as sent), when the tool is registered by the calling label, offered and granted in the run, the gateway's own webhook server serves it, the object nests at most 32 levels, serializes (compact JSON) to at most 16384 UTF-8 bytes, holds no U+0000 or lone surrogate and no known gateway secret value, and the tool name matches `^[A-Za-z0-9_-]{1,64}$`. In every other case, and for every `"summary"` tool, `input` stays the text summary (at most 1000 characters; for a raw-registered tool known secret values in it are replaced by `[REDACTED]`). A PUT is a full replacement: an omitted `stream_input` stores `"summary"`; any other value answers 400 `{"error":"stream_input must be \"summary\" or \"raw\""}` and stores nothing. `GET /v1/tools` always returns the field (entries saved before it read `"summary"`). An ownerless (legacy) entry stores `raw` but never streams an object. The event is sent before the tool runs, so an object also appears for a call that the webhook later refuses. `TodoWrite`, `tool_result` and the webhook request are unchanged. Details: [docs/architecture.md](docs/architecture.md#tool-use-inputts----structured-tool_use-input-of-raw-tools).
 
 The calling client's Bearer token is forwarded to webhook calls for authentication, only to tools its own API-key label registered (see [Tool mediation](#tool-mediation)); a webhook call never follows a redirect, and its failures end in the fixed `TOOL_*` texts. Every tool records the registering label as `owner`, and a run is offered only its own label's tools plus legacy ownerless entries. Tools persist to disk at `TOOLS_PERSIST_PATH` and survive server restarts.
 

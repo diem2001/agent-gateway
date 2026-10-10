@@ -6,6 +6,7 @@ import type { StreamEvent } from "./event-cache.js";
 import { getAllTools } from "./tools.js";
 import type { WebhookContext } from "./webhook.js";
 import { createToolMcpServer } from "./tool-server.js";
+import { buildStreamInputTable, streamedToolInput } from "./tool-use-input.js";
 import { buildMcpServersForSdk, getEnabledMcpServers, getMcpAllowedToolPatterns } from "./mcp-registry.js";
 import {
   applyMcpCredentialOverrides,
@@ -177,6 +178,20 @@ function carriesEnv(config: unknown): boolean {
 
 /** The relay binding of a stdio server has no upstream URL: its bridge talks to the tool sandbox. */
 const STDIO_PLACEHOLDER_URL = "stdio://tool-sandbox";
+
+/** The header and env values of server configs or credential overrides: the secrets a tool input must not echo. */
+function credentialValues(configs: readonly unknown[]): string[] {
+  const values: string[] = [];
+  for (const config of configs) {
+    if (typeof config !== "object" || config === null) continue;
+    for (const key of ["headers", "env"] as const) {
+      const map = (config as Record<string, unknown>)[key];
+      if (typeof map !== "object" || map === null) continue;
+      for (const value of Object.values(map)) if (typeof value === "string") values.push(value);
+    }
+  }
+  return values;
+}
 
 /** A tool name as it may appear in an audit line. */
 function loggableName(name: string): string {
@@ -404,9 +419,10 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // gateway's own webhook tools or a registered server (MVP-6755).
   const mcpServers: Record<string, unknown> = { ...(runRequestMcpServers ?? {}) };
 
+  let webhookServer: unknown;
   if (registeredTools.length > 0 && webhookContext) {
     const hosted = new Set(registeredToolNames);
-    mcpServers[WEBHOOK_SERVER_NAME] = createToolMcpServer(
+    webhookServer = mcpServers[WEBHOOK_SERVER_NAME] = createToolMcpServer(
       registeredTools,
       webhookContext,
       (tool) => webhookBearer(tool, callerLabel, clientAuthToken),
@@ -527,6 +543,19 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     throw error;
   }
 
+  // The tools whose `tool_use` event carries the structured input (MVP-8096), from the final server map.
+  const streamInputTable = buildStreamInputTable({
+    registeredTools,
+    callerLabel,
+    mcpServers,
+    webhookServer,
+    secretValues: () => secretValuesForMasking([
+      ...(clientAuthToken ? [clientAuthToken] : []),
+      ...credentialValues(Object.values(mcpCredentialOverrides ?? {})),
+      ...credentialValues(Object.values(runRequestMcpServers ?? {})),
+    ]),
+  });
+
   if (mcpCredentialOverrides) {
     // Only for servers this run actually attached; a server left out received nothing.
     for (const [serverName, override] of Object.entries(mcpCredentialOverrides)) {
@@ -598,7 +627,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
         if (block.type === "tool_use") {
           const pending = pendingTools.get(block.id);
           const toolName: string = pending?.name || block.name;
-          const eventInput = toolUseEventInput(toolName, block.input);
+          const eventInput = streamedToolInput(toolName, block.input, block.id, streamInputTable, toolUseEventInput);
           toolTimings.set(block.id, Date.now());
           // parent_tool_use_id is carried at the SDKAssistantMessage level: null for the
           // main conversation agent, the spawning Task/Agent tool_use id for a sub-agent.

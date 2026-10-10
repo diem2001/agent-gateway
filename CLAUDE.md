@@ -150,7 +150,8 @@ src/
   logging.ts         # Runtime-adjustable log levels
   tools.ts           # Tool registry CRUD + persistence (TOOLS_PERSIST_PATH); owner per tool, legacy ownerless count at startup
   webhook.ts         # Webhook executor (POST to tool webhook_url with context; no redirects, 8 MiB cap, fixed TOOL_* failure texts)
-  tool-server.ts     # MCP server factory (wraps registered tools for Agent SDK)
+  tool-server.ts     # MCP server factory (wraps registered tools for Agent SDK); `toolInputValidator` = the argument parse the server applies, shared with the tool_use event builder
+  tool-use-input.ts  # tool_use `input` of a webhook tool registered `stream_input: "raw"` (MVP-8096): per-run table (owner = label, granted, own webhook server, name rule), decision order schema -> depth 32 -> encoding -> 16384 UTF-8 bytes -> known secret values (masked summary otherwise), one `tool.stream_input.withheld` audit line per withheld call
   tool-grant.ts      # AGENT_TOOL_POLICY parsing (FATAL lines), the runtime inventory + `Task` alias, APPROVED_DEFAULT_SET, effective grant = policy(label) intersected with enforcedTools/allowedTools, the explicit built-in lists of every run, startup audit line per label
   tool-mediation.ts  # Internal ToolRequest/ToolReply contract, the five TOOL_* codes with fixed texts, webhook rejection text, secret masking, AGENT_MCP_TOOL_TIMEOUT_MS
   tool-policy.ts     # enforcedTools: request validation, built-in/server selection, deny-only PreToolUse hook (per-run enforced tool set)
@@ -180,7 +181,9 @@ src/
     mcp.ts           # PUT/GET/DELETE /v1/mcp-servers (stored `headers`/`env`/`args` are write-only: never in a GET or PUT reply, per field omitted = keep, `{}`/`[]` = clear, a transport-family change that strands a stored map or args list = 400 `MCP_CREDENTIAL_MAP_INAPPLICABLE`; `MCP_FIELD_CLASS` in `mcp-registry.ts` classifies every stored field; the `url` is public but a new or changed http/sse URL with user info, query or fragment is refused with 400 `MCP_SERVER_URL_INVALID` (`publicUrlProblem`), and a legacy stored URL that breaks that rule is withheld with `urlMigrationRequired: true`; `/health`, `/test`, `/call` answer fixed failure texts from `mcp-upstream-request.ts`, never a stored value) + /restart + /health + /test + /call (MCP Server Registry; PUT/DELETE of an existing name only for its owner, else 403 MCP_SERVER_OWNER_MISMATCH before any validation, ownerless entries refused for every label and for credential-bearing /call, /test, /uploads/*; PUT refuses a NEW name outside ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ with 400 MCP_SERVER_NAME_INVALID, existing names stay editable/deletable; /call = direct LLM-free tools/call passthrough, gates on enabled unlike /test; /uploads/* = streaming upload relay)
   tests/
     e2e-session.test.ts    # E2E session continuity tests
-    routes.tools.test.ts   # Tool routes unit tests
+    routes.tools.test.ts   # Tool routes unit tests (including the `stream_input` PUT/GET rows)
+    tool-use-input.test.ts # MVP-8096: the raw-tool table and the per-call decision (sizes in UTF-8 bytes, depth, encoding, schema, secrets, ownership, shadowing)
+    query-stream-input-outcome.test.ts # MVP-8096: the stream and replay `tool_use` input through query/agent with the SDK mocked and the REAL MCP server: the event equals the body the webhook received; restart keeps the registration
     tool-server.test.ts    # MCP server factory tests
     tool-input-schema.test.ts # Webhook tool schemas via JSON-RPC tools/list + tools/call (advertised types, rejection, fallback, depth, prototype names)
     webhook-tool-schema-process.test.ts # Real-runtime probe: model-facing webhook tool schemas + pre-dispatch rejection, reqlift/diemcrm fixtures (needs `npm run build`)

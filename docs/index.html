@@ -195,9 +195,9 @@ API_KEYS=myapp:sk-gw-abc123,cicd:sk-gw-def456</code></pre>
       <tr><td><strong>DELETE</strong></td><td><code>/v1/users/{user_id}/skills/*</code></td><td>Yes</td><td>Delete a user-namespaced skill</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/knowledge-base</code></td><td>Yes</td><td>List knowledge-base files (read-only)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/knowledge-base/*</code></td><td>Yes</td><td>Read knowledge-base file as <code>text/markdown</code> (read-only)</td></tr>
-      <tr><td><strong>PUT</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Register/update a webhook tool; records the calling label as <code>owner</code> (another label's tool: 403 <code>TOOL_OWNED_BY_OTHER_CLIENT</code>)</td></tr>
-      <tr><td><strong>GET</strong></td><td><code>/v1/tools</code></td><td>Yes</td><td>List all registered tools (with <code>owner</code>)</td></tr>
-      <tr><td><strong>GET</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Get a single tool (with <code>owner</code>)</td></tr>
+      <tr><td><strong>PUT</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Register/update a webhook tool; records the calling label as <code>owner</code> (another label's tool: 403 <code>TOOL_OWNED_BY_OTHER_CLIENT</code>); optional <code>stream_input</code> <code>"summary"</code> (default) or <code>"raw"</code> (anything else: 400)</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/tools</code></td><td>Yes</td><td>List all registered tools (with <code>owner</code> and <code>stream_input</code>)</td></tr>
+      <tr><td><strong>GET</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Get a single tool (with <code>owner</code> and <code>stream_input</code>)</td></tr>
       <tr><td><strong>DELETE</strong></td><td><code>/v1/tools/:name</code></td><td>Yes</td><td>Delete a tool (another label's tool: 403 <code>TOOL_OWNED_BY_OTHER_CLIENT</code>)</td></tr>
       <tr><td><strong>PUT</strong></td><td><code>/v1/mcp-servers/:name</code></td><td>Yes</td><td>Register/update an MCP server; records the calling label as owner on creation (another label's or an ownerless entry: <code>403 MCP_SERVER_OWNER_MISMATCH</code>)</td></tr>
       <tr><td><strong>GET</strong></td><td><code>/v1/mcp-servers</code></td><td>Yes</td><td>List registered MCP servers</td></tr>
@@ -1194,6 +1194,7 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
         <tr><td><code>webhook_url</code></td><td>string</td><td>Yes</td><td>URL to POST to when the agent invokes this tool</td></tr>
         <tr><td><code>timeout_ms</code></td><td>number</td><td>No</td><td>Webhook timeout in milliseconds (default: <code>30000</code>)</td></tr>
         <tr><td><code>owner</code></td><td>string</td><td>No</td><td>Ignored if sent: the owner is always the authenticated API-key label of the request. Returned by <code>GET /v1/tools</code> and <code>GET /v1/tools/:name</code></td></tr>
+        <tr><td><code>stream_input</code></td><td>string</td><td>No</td><td><code>"summary"</code> (default) or <code>"raw"</code>. With <code>"raw"</code> the <code>tool_use</code> stream event carries the tool's input object instead of a text summary, within the bounds described under <em>Streaming the structured input</em> below. PUT is a full replacement: an omitted field stores <code>"summary"</code>. Any other value (including <code>null</code>) answers 400 <code>{"error": "stream_input must be \"summary\" or \"raw\""}</code> and stores nothing. Always returned by <code>GET /v1/tools</code> and <code>GET /v1/tools/:name</code></td></tr>
       </tbody>
     </table>
 
@@ -1228,6 +1229,20 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 ]</code></pre>
     <p>Webhooks keep their own validation; a 4xx answer other than 401/403/408/429 reaches the model as <code>The tool rejected the request (HTTP &lt;status&gt;): &lt;message&gt;</code> (<code>&lt;message&gt;</code> is, in order, <code>error.message</code>, a string <code>error</code>, <code>message</code> of a JSON body, else a text/plain body; at most 500 characters, control characters removed, known secret values masked), and every other failure ends in a fixed <a href="#tool-errors"><code>TOOL_*</code> text</a>. A schema the gateway cannot convert makes that tool alone accept any value for every declared field (logged as <code>tools.schema.untyped_fallback</code>). The field names <code>__proto__</code> and a top-level <code>constructor</code> are never advertised, because they cannot reach the webhook.</p>
 
+    <h3>Streaming the structured input (<code>stream_input</code>)</h3>
+
+    <p>By default the <code>tool_use</code> event of a webhook tool carries a text summary of the call (at most 1000 characters). A tool registered with <code>"stream_input": "raw"</code> carries the JSON object its webhook receives, so a client can render it, live and from the replay (<code>GET /v1/query/:queryId/events</code> returns the identical event). The object is sent only when all of these hold; otherwise <code>input</code> is the summary string and the client must type-check it:</p>
+
+    <ul>
+      <li>The tool is registered by the calling API-key label (an ownerless legacy entry stores <code>raw</code> but never streams an object), is offered and granted in this run, and is served by the gateway's own webhook server.</li>
+      <li>The call passes the tool's input schema. The object is exactly what the webhook received: undeclared top-level keys are dropped, nested values stay as sent (a nested <code>__proto__</code> key never arrives).</li>
+      <li>It nests at most 32 levels, and its compact JSON serialization is at most 16384 UTF-8 bytes (bytes, not characters).</li>
+      <li>No string key or value contains U+0000 or a lone surrogate, and none contains a secret value the gateway knows (for a raw-registered tool the summary then shows <code>[REDACTED]</code> in its place).</li>
+      <li>The tool name matches <code>^[A-Za-z0-9_-]{1,64}$</code>.</li>
+    </ul>
+
+    <p>The event is sent before the tool runs, so an object also appears for a call that the webhook later refuses or a hook denies; show the result only after a successful <code>tool_result</code> for the same <code>toolUseId</code>. <code>TodoWrite</code>, <code>tool_result</code> and the webhook request are unchanged. A gateway older than this field ignores it and streams the summary string.</p>
+
     <h3>Response (201 Created / 200 OK)</h3>
 <pre><code>{
   "name": "lookup-customer",
@@ -1241,7 +1256,8 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
   },
   "webhook_url": "https://api.example.com/tools/lookup-customer",
   "timeout_ms": 30000,
-  "owner": "myapp"
+  "owner": "myapp",
+  "stream_input": "summary"
 }</code></pre>
 
     <h3>Example</h3>
@@ -1334,18 +1350,13 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
       <div class="vflow-num n-amber">2</div>
       <div class="vflow-body">
         <h4 class="c-amber">Gateway POSTs to webhook</h4>
-        <p>The MCP server handler sends a POST request to the tool's <code>webhook_url</code> with the following body:</p>
-<pre><code>{
-  "tool_use_id": "tu_abc123",
-  "tool_name": "lookup-customer",
-  "input": { "email": "user@example.com" },
-  "context": {
-    "user_id": null,
-    "conversation_id": null,
-    "session_id": "session-1",
-    "api_key_label": "myapp"
-  }
-}</code></pre>
+        <p>The MCP server handler sends a POST request to the tool's <code>webhook_url</code>. The body is the tool's input object itself (flat fields, no envelope), and the call's identity travels in headers:</p>
+<pre><code>POST https://api.example.com/tools/lookup-customer
+X-Webhook-Tool-Use-Id: tu_abc123
+X-Webhook-Tool-Name: lookup-customer
+X-Webhook-Context: {"user_id":null,"conversation_id":null,"session_id":"session-1","api_key_label":"myapp"}
+
+{ "email": "user@example.com" }</code></pre>
         <p>The calling client's Bearer token is forwarded in the <code>Authorization</code> header, only to tools its own label owns (a legacy tool without an owner keeps this until it is registered again, with the audit line <code>tool.webhook.legacy_forward toolName=&lt;name&gt;</code> per call; a tool of another label never gets it). The <code>X-Webhook-Context</code> header comes only from the authenticated request; tool input keys such as <code>context</code> or <code>user_id</code> stay in the body. The webhook call never follows a redirect, and a run is offered only its own label's tools plus legacy ownerless ones.</p>
       </div>
     </div>
@@ -1529,11 +1540,13 @@ curl -X PUT http://localhost:3001/v1/agents/config.json \
 
   <div class="event-card">
     <h4>tool_use</h4>
-    <p>Agent is invoking a tool. <code>input</code> is a human-readable summary (command for Bash, file path for Read/Write/Edit, pattern for Glob/Grep). <code>parentToolUseId</code> attributes the call to its emitting agent: it is the <code>toolUseId</code> of the spawning Task/Agent <code>tool_use</code> for a sub-agent's tool calls, and <code>null</code> for conversation-level (main-agent) tool calls. The field is always present.</p>
+    <p>Agent is invoking a tool. <code>input</code> is a human-readable summary string (command for Bash, file path for Read/Write/Edit, pattern for Glob/Grep, at most 1000 characters), with two exceptions where it is the structured JSON object: <code>TodoWrite</code> (its <code>{todos: [...]}</code> input) and a webhook tool registered with <code>stream_input: "raw"</code>, while its input passes the tool's schema and stays within 32 levels and 16384 UTF-8 bytes (see <em>Streaming the structured input</em> in the Tool Registry section). The same tool can therefore stream a string; type-check <code>input</code>. The event is sent before the tool runs, so an object also appears for a call that is later refused. <code>parentToolUseId</code> attributes the call to its emitting agent: it is the <code>toolUseId</code> of the spawning Task/Agent <code>tool_use</code> for a sub-agent's tool calls, and <code>null</code> for conversation-level (main-agent) tool calls. The field is always present.</p>
 <pre><code>// main-conversation (top-level) tool call
 {"seq": 1, "type": "tool_use", "toolName": "Bash", "toolUseId": "tu_abc123", "input": "df -h /var", "startedAt": 1711461600000, "parentToolUseId": null}
 // sub-agent tool call (spawned via a Task/Agent tool_use whose id is tu_task42)
-{"seq": 5, "type": "tool_use", "toolName": "Grep", "toolUseId": "tu_child9", "input": "TODO in src", "startedAt": 1711461600000, "parentToolUseId": "tu_task42"}</code></pre>
+{"seq": 5, "type": "tool_use", "toolName": "Grep", "toolUseId": "tu_child9", "input": "TODO in src", "startedAt": 1711461600000, "parentToolUseId": "tu_task42"}
+// webhook tool registered with stream_input "raw": the input object
+{"seq": 6, "type": "tool_use", "toolName": "mcp__agent-gateway-tools__reqlift_present_choices", "toolUseId": "tu_raw1", "input": {"question": "Which environment?", "options": [{"label": "Test"}, {"label": "Stage"}]}, "startedAt": 1711461600000, "parentToolUseId": null}</code></pre>
   </div>
 
   <div class="event-card">
