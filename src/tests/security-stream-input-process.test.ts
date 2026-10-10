@@ -374,7 +374,8 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
       sessionId: "conv-si-refusal-mask",
       steps: Array.from({ length: refusals.length + 1 }, () => ({ name: REFUSE_FULL, input: {} })),
       body: {
-        allowedTools: [...ROUTE_ALLOWED_TOOLS, REFUSE_FULL],
+        // A request server with no granted tool is not attached, and its credential never becomes a known value of the run.
+        allowedTools: [...ROUTE_ALLOWED_TOOLS, REFUSE_FULL, "mcp__reqbasic__*"],
         mcpServers: { ...(base.mcpServers as Record<string, unknown>), reqbasic: { type: "http", url: rig.reqHttp.url, headers: { Authorization: `Basic ${values.reqBasicToken}` } } },
         mcpCredentialOverrides: { jira: { headers: { authorization: `Basic ${values.ovrToken}` } } },
       },
