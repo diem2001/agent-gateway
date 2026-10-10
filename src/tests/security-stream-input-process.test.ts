@@ -26,9 +26,12 @@
  * Every secret is a synthetic marker with a random suffix; only names, booleans and counts are printed.
  * Needs `npm run build`, `bwrap`, user namespaces, `git` and `python3`. Linux only.
  */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Cleanup } from "./helpers/git-process-gateway.js";
-import { gatewayRequest } from "./helpers/git-process-gateway.js";
+import { REPO_ROOT, gatewayRequest } from "./helpers/git-process-gateway.js";
 import { startRefusingDouble } from "./helpers/refusing-webhook.js";
 import {
   AC_ROWS,
@@ -47,6 +50,7 @@ import {
   registerStandardServers,
   requestCredentials,
   requireHost,
+  runChild,
   turnProblems,
   type SecurityMarkers,
   type SecurityRig,
@@ -61,6 +65,18 @@ const FULL = `mcp__agent-gateway-tools__${TOOL}`;
 const CONTROL_TEXT = "harmless control text without any known value";
 const REFUSE_TOOL = "refuse_probe";
 const REFUSE_FULL = `mcp__agent-gateway-tools__${REFUSE_TOOL}`;
+
+/**
+ * The gateway build the negative controls start instead of `dist/server.js`. It is honored only in a child run
+ * (`SECURITY_MASK_CHILD=1`); anywhere else a set variable throws, so a leaked variable can never make an ordinary run
+ * green against another build.
+ */
+function negativeControlServer(): string | undefined {
+  const dist = process.env.SECURITY_MASK_DIST;
+  if (dist === undefined || dist === "") return undefined;
+  if (process.env.SECURITY_MASK_CHILD !== "1") throw new Error("SECURITY_MASK_DIST is set outside a negative-control child run");
+  return dist;
+}
 
 const markers: SecurityMarkers = createMarkers();
 const recorder = new MatrixRecorder("security-stream-input-process", ROW_IDS);
@@ -218,7 +234,7 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
   });
 
   it("SI.mask-overlap: a known value that starts a longer one leaves no fragment of the longer one on the stream, the replay or the debug log", async () => {
-    const rig = await createRig(cleanups, { markers, logLevel: "debug", rootPrefix: "mvp8207-ovl-" });
+    const rig = await createRig(cleanups, { markers, logLevel: "debug", rootPrefix: "mvp8207-ovl-", distServer: negativeControlServer() });
     expect(pinnedProblems(rig)).toEqual([]);
     await registerStandardServers(rig);
     const values = maskValues(rig.markers.seed);
@@ -275,7 +291,7 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
   });
 
   it("SI.mask-scheme: the bare token of a Bearer or Basic header is masked whatever its source, and a 7-character token is not", async () => {
-    const rig = await createRig(cleanups, { markers, logLevel: "debug", rootPrefix: "mvp8207-sch-" });
+    const rig = await createRig(cleanups, { markers, logLevel: "debug", rootPrefix: "mvp8207-sch-", distServer: negativeControlServer() });
     expect(pinnedProblems(rig)).toEqual([]);
     await registerStandardServers(rig);
     const values = maskValues(rig.markers.seed);
@@ -342,7 +358,7 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
   });
 
   it("SI.refusal-mask: a webhook refusal text masks an overlapping value and the bare token of a registry, request-server or override header", async () => {
-    const rig = await createRig(cleanups, { markers, logLevel: "debug", rootPrefix: "mvp8207-ref-" });
+    const rig = await createRig(cleanups, { markers, logLevel: "debug", rootPrefix: "mvp8207-ref-", distServer: negativeControlServer() });
     expect(pinnedProblems(rig)).toEqual([]);
     await registerStandardServers(rig);
     const values = maskValues(rig.markers.seed);
@@ -415,6 +431,78 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
       problems,
     });
   });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Negative controls                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A copy of `dist/` with exactly one protection taken out (the patch changes its compiled file once, asserted). The child
+ * run executes this very file against it, for the named rows only, with a known marker seed, and must exit nonzero naming
+ * those rows. It prints names and counts only; the parent checks that no marker value is in its output.
+ */
+async function negativeControl(options: { file: string; anchor: string; patch: (source: string) => string; rows: string; mustName: string[] }): Promise<void> {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mvp8207-vulnerable-"));
+  cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.cpSync(path.join(REPO_ROOT, "dist"), path.join(root, "dist"), { recursive: true, filter: (source) => !source.startsWith(path.join(REPO_ROOT, "dist", "tests")) });
+  fs.copyFileSync(path.join(REPO_ROOT, "package.json"), path.join(root, "package.json"));
+  fs.symlinkSync(path.join(REPO_ROOT, "node_modules"), path.join(root, "node_modules"));
+  const target = path.join(root, "dist", options.file);
+  const source = fs.readFileSync(target, "utf8");
+  expect(source.split(options.anchor).length - 1, "the anchor must occur in the compiled file").toBeGreaterThanOrEqual(1);
+  const patched = options.patch(source);
+  expect(patched, "the patch must change the compiled file").not.toBe(source);
+  fs.writeFileSync(target, patched);
+  const seed = `nc${Date.now().toString(16)}`;
+  const child = await runChild(
+    [process.execPath, path.join(REPO_ROOT, "node_modules", "vitest", "vitest.mjs"), "run", "src/tests/security-stream-input-process.test.ts", "-t", options.rows],
+    { PATH: process.env.PATH, HOME: process.env.HOME, LANG: process.env.LANG, TMPDIR: os.tmpdir(), NO_COLOR: "1", SECURITY_MARKER_SEED: seed, SECURITY_MASK_CHILD: "1", SECURITY_MASK_DIST: path.join(root, "dist", "server.js") },
+    REPO_ROOT,
+    280_000,
+  );
+  expect(child.timedOut, "the child run hit its deadline").toBe(false);
+  expect(child.code !== 0 && child.code !== null, "the rows must exit nonzero against the vulnerable build").toBe(true);
+  const failed = [...child.output.matchAll(/FAIL .*? > (.*)/g)].map((match) => match[1]);
+  process.stderr.write(`SECURITY-MASK-EVIDENCE negative-control file=${options.file} rows=${JSON.stringify(options.rows)} exit=${child.code} failed_rows=${failed.length} marker_in_output=${child.output.includes(seed)}\n`);
+  for (const name of options.mustName) expect(failed.some((title) => title.includes(name)), `the child run must fail ${name}`).toBe(true);
+  expect(child.output.includes(seed), "the child output must hold no marker value").toBe(false);
+}
+
+describe("negative controls (child runs against patched copies of dist/)", () => {
+  it("NC1: against a build that masks one value after another in input order, SI.mask-overlap and SI.refusal-mask fail", async () => {
+    await negativeControl({
+      file: "tool-mediation.js",
+      anchor: "export function maskSecrets(text, secrets) {",
+      patch: (source) =>
+        source.replace(
+          "export function maskSecrets(text, secrets) {",
+          () => 'export function maskSecrets(text, secrets) {\n    let out = text;\n    for (const secret of secrets) {\n        if (secret.length >= 8)\n            out = out.split(secret).join("[REDACTED]");\n    }\n    return out;\n}\nfunction maskSecretsByRanges(text, secrets) {',
+        ),
+      rows: "SI.mask-overlap|SI.refusal-mask",
+      mustName: ["SI.mask-overlap", "SI.refusal-mask"],
+    });
+  }, 300_000);
+
+  it("NC2: against a build without the token after Bearer or Basic, SI.mask-scheme fails", async () => {
+    await negativeControl({
+      file: "tool-mediation.js",
+      anchor: "function withSchemeTokens(values) {",
+      patch: (source) => source.replace("function withSchemeTokens(values) {", () => "function withSchemeTokens(values) {\n    return [...values];\n}\nfunction withSchemeTokensExpanded(values) {"),
+      rows: "SI.mask-scheme",
+      mustName: ["SI.mask-scheme"],
+    });
+  }, 300_000);
+
+  it("NC3: against a build whose refusal text holds no request-server or override value, SI.refusal-mask fails", async () => {
+    await negativeControl({
+      file: "agent.js",
+      anchor: "secrets: () => secretValuesForMasking([",
+      patch: (source) => source.replace(/secrets: \(\) => secretValuesForMasking\(\[[\s\S]*?\n\s*\]\),/, () => "secrets: () => secretValuesForMasking(clientAuthToken ? [clientAuthToken] : []),"),
+      rows: "SI.refusal-mask",
+      mustName: ["SI.refusal-mask"],
+    });
+  }, 300_000);
 });
 
 describe("summary", () => {
