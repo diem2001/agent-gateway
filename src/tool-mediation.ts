@@ -109,10 +109,34 @@ export function mcpFailureResult(failure: ToolFailure): { isError: true; content
 
 const TOOL_MESSAGE_MAX = 500;
 
+/** Control characters replaced by one space and the ends trimmed: the form of a message the model is shown. */
+function cleanedMessage(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+}
+
+/**
+ * The forms of each known value that can appear in a refusal message once it is cleaned: the value itself, its
+ * JSON-escaped form (a text/plain body may echo a value with `\"`, `\\` or `\n` escapes) and both forms with control
+ * characters turned into a space (a multi-line value, such as a private key, reads that way after cleaning). Values under
+ * the masking minimum stay unmasked.
+ */
+function refusalMaskingForms(secrets: readonly string[]): string[] {
+  const forms: string[] = [];
+  for (const secret of secrets) {
+    if (secret.length < MIN_MASKED_LENGTH) continue;
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    forms.push(secret, escaped, cleanedMessage(secret), cleanedMessage(escaped));
+  }
+  return forms;
+}
+
 /**
  * The model-facing text of a webhook 4xx answer that is the tool's own refusal (not 401/403/408/429): in this
  * order `error.message`, a string `error`, `message` of a JSON body, else a text/plain body; at most 500
- * characters with control characters removed and every known secret value masked.
+ * characters with control characters removed and every known secret value masked, also a multi-line or JSON-escaped one.
+ * Masking covers the whole message in linear time (`maskSecrets`) before the cut to 500 characters: the masked text can
+ * be far shorter than the message, so a cut first could neither be sized safely nor keep the result identical.
  */
 export function webhookRejectionText(status: number, contentType: string | null, body: string, secrets: readonly string[]): string {
   let message = "";
@@ -136,8 +160,7 @@ export function webhookRejectionText(status: number, contentType: string | null,
   } else if (contentType !== null && /^text\/plain/i.test(contentType)) {
     message = body;
   }
-  // eslint-disable-next-line no-control-regex
-  message = maskSecrets(message.replace(/[\u0000-\u001f\u007f]+/g, " ").trim(), secrets).slice(0, TOOL_MESSAGE_MAX);
+  message = maskSecrets(cleanedMessage(message), refusalMaskingForms(secrets)).slice(0, TOOL_MESSAGE_MAX);
   return message.length > 0 ? `The tool rejected the request (HTTP ${status}): ${message}` : `The tool rejected the request (HTTP ${status}).`;
 }
 
@@ -145,35 +168,86 @@ export function webhookRejectionText(status: number, contentType: string | null,
 const MIN_MASKED_LENGTH = 8;
 
 /**
+ * Adds to `covered` (a difference array over the text: +1 at a start, -1 at an end) every maximal run of overlapping or
+ * touching occurrences of `secret` in `text`. Knuth-Morris-Pratt, so the cost is linear in the text plus the value however
+ * repetitive both are; every occurrence is found, also the ones that overlap each other.
+ */
+function markOccurrences(text: string, secret: string, covered: Int32Array): void {
+  const m = secret.length;
+  const fail = new Int32Array(m);
+  for (let i = 1, k = 0; i < m; i++) {
+    while (k > 0 && secret.charCodeAt(i) !== secret.charCodeAt(k)) k = fail[k - 1];
+    if (secret.charCodeAt(i) === secret.charCodeAt(k)) k++;
+    fail[i] = k;
+  }
+  const first = secret[0];
+  let runStart = -1;
+  let runEnd = -1;
+  let k = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (k === 0) {
+      i = text.indexOf(first, i);
+      if (i === -1) break;
+    }
+    while (k > 0 && text.charCodeAt(i) !== secret.charCodeAt(k)) k = fail[k - 1];
+    if (text.charCodeAt(i) === secret.charCodeAt(k)) k++;
+    if (k < m) continue;
+    const from = i - m + 1;
+    if (runStart !== -1 && from <= runEnd) {
+      runEnd = i + 1;
+    } else {
+      if (runStart !== -1) {
+        covered[runStart]++;
+        covered[runEnd]--;
+      }
+      runStart = from;
+      runEnd = i + 1;
+    }
+    k = fail[m - 1];
+  }
+  if (runStart !== -1) {
+    covered[runStart]++;
+    covered[runEnd]--;
+  }
+}
+
+/**
  * Replaces every known secret value (8 characters or longer) with `[REDACTED]`. Every occurrence of every value is
  * located in the unmodified text, also overlapping ones; ranges that overlap or touch are replaced as one, so no
  * fragment of a value is left behind whatever the order of `secrets` (a value that starts, ends or sits inside a longer
- * one, or two values that overlap partially).
+ * one, or two values that overlap partially). Time and memory are linear in the text length plus the total length of
+ * the values times the number of values: a caller-supplied value or message cannot make this quadratic.
  */
 export function maskSecrets(text: string, secrets: readonly string[]): string {
-  const ranges: [number, number][] = [];
+  let covered: Int32Array | undefined;
   for (const secret of new Set(secrets)) {
-    if (secret.length < MIN_MASKED_LENGTH) continue;
-    for (let at = text.indexOf(secret); at !== -1; at = text.indexOf(secret, at + 1)) ranges.push([at, at + secret.length]);
+    if (secret.length < MIN_MASKED_LENGTH || secret.length > text.length) continue;
+    covered ??= new Int32Array(text.length + 1);
+    markOccurrences(text, secret, covered);
   }
-  if (ranges.length === 0) return text;
-  ranges.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  if (covered === undefined) return text;
   let out = "";
   let copied = 0;
-  let [start, end] = ranges[0];
-  for (const [from, to] of ranges.slice(1)) {
-    if (from <= end) {
-      end = Math.max(end, to);
-      continue;
+  let start = 0;
+  let depth = 0;
+  for (let i = 0; i <= text.length; i++) {
+    const step = covered[i];
+    if (step === 0) continue;
+    const before = depth;
+    depth += step;
+    if (before === 0) {
+      start = i;
+    } else if (depth === 0) {
+      out += `${text.slice(copied, start)}[REDACTED]`;
+      copied = i;
     }
-    out += `${text.slice(copied, start)}[REDACTED]`;
-    copied = end;
-    [start, end] = [from, to];
   }
-  return `${out}${text.slice(copied, start)}[REDACTED]${text.slice(end)}`;
+  return copied === 0 && out === "" ? text : `${out}${text.slice(copied)}`;
 }
 
-const AUTH_SCHEME_VALUE = /^(?:bearer|basic) +(.+)$/i;
+// `\S[^]*` rather than `.+`: after the spaces the token starts at a non-space and runs to the end, so a long run of
+// spaces followed by a line break cannot make the match backtrack quadratically.
+const AUTH_SCHEME_VALUE = /^(?:bearer|basic) +(\S[^]*)$/i;
 
 /**
  * `values` and, for each one that reads `Bearer <token>` or `Basic <token>` (matched on the trimmed value, scheme in any
