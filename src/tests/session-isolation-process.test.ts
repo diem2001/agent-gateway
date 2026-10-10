@@ -215,10 +215,12 @@ describe("legacy conversations (created before the update)", () => {
     expect(JSON.stringify(r.api.requests.map((q) => [q.userTexts, q.toolResults]))).not.toContain(LEGACY_CONTAMINATED);
     expect(JSON.stringify(r.api.requests.map((q) => [q.userTexts, q.toolResults]))).not.toContain(LEGACY_CLEAN_TEXT);
 
-    // Legacy entries stay listable and deletable (for any label), as before.
+    // Legacy entries stay listable for any label; a delete answers 409 legacy_not_erased and keeps the entry (MVP-7402, comment 40659).
     const list = await getAs(r.gateway.port, KEY_BETA, "GET", "/v1/sessions");
     expect((list.json?.sessions as { id: string }[]).map((s) => s.id).sort()).toEqual(["legacy-clean", "legacy-contaminated"]);
-    expect((await getAs(r.gateway.port, KEY_BETA, "DELETE", "/v1/sessions/legacy-clean")).status).toBe(200);
+    const deleteLegacy = await getAs(r.gateway.port, KEY_BETA, "DELETE", "/v1/sessions/legacy-clean");
+    expect([deleteLegacy.status, deleteLegacy.json]).toEqual([409, { error: "legacy_not_erased" }]);
+    expect(((await getAs(r.gateway.port, KEY_BETA, "GET", "/v1/sessions")).json?.sessions as { id: string }[]).map((s) => s.id).sort()).toEqual(["legacy-clean", "legacy-contaminated"]);
   });
 });
 

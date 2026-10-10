@@ -44,10 +44,15 @@ function earlierState(area: Area): unknown {
   const now = Date.now();
   switch (area) {
     case "sessions":
+      // Conversations of the key's label `proc` with a folder name (MVP-7402: a delete erases the folder; a pre-update
+      // entry answers 409 and stays, so it could not stand for "a session deleted just before the stop").
       return {
-        sessions: {
-          "earlier-1": { sessionId: "sdk-1", systemPrompt: "", model: "m", lastUsed: now },
-          "earlier-2": { sessionId: "sdk-2", systemPrompt: "", model: "m", lastUsed: now },
+        sessions: {},
+        sessionsByLabel: {
+          proc: {
+            "earlier-1": { sessionId: "sdk-1", systemPrompt: "", model: "m", lastUsed: now, owner: { label: "proc", userId: null }, sandboxDirId: "1a1a1a1a1a1a1a1a1a1a1a1a" },
+            "earlier-2": { sessionId: "sdk-2", systemPrompt: "", model: "m", lastUsed: now, owner: { label: "proc", userId: null }, sandboxDirId: "2b2b2b2b2b2b2b2b2b2b2b2b" },
+          },
         },
         settings: { sessionIdleTimeoutMs: 0 },
       };
@@ -100,6 +105,10 @@ function fixture(): Fixture {
   const home = path.join(root, "home");
   fs.mkdirSync(home);
   fs.mkdirSync(path.join(root, "tmp"));
+  // The trusted storage root with its sessions directory: the delete of a conversation checks it (MVP-7402).
+  fs.mkdirSync(path.join(home, ".agent-sandbox", "sessions"), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.join(home, ".agent-sandbox"), 0o700);
+  fs.chmodSync(path.join(home, ".agent-sandbox", "sessions"), 0o700);
   const dirs = {} as Record<Area, string>;
   for (const area of AREAS) {
     dirs[area] = path.join(root, `persist-${area}`);
@@ -289,12 +298,17 @@ function connectRefused(port: number): Promise<boolean> {
   });
 }
 
+function readSessions(fx: Fixture) {
+  return JSON.parse(fs.readFileSync(fx.file("sessions"), "utf8")) as {
+    sessions: Record<string, unknown>;
+    sessionsByLabel?: Record<string, Record<string, unknown>>;
+    erasedByLabel?: Record<string, Record<string, unknown>>;
+  };
+}
+
 function readState(fx: Fixture) {
   return {
-    sessions: JSON.parse(fs.readFileSync(fx.file("sessions"), "utf8")) as {
-      sessions: Record<string, unknown>;
-      settings: { sessionIdleTimeoutMs: number };
-    },
+    sessions: readSessions(fx),
     tools: (JSON.parse(fs.readFileSync(fx.file("tools"), "utf8")) as { name: string }[]).map((t) => t.name),
     mcpServers: (JSON.parse(fs.readFileSync(fx.file("mcpServers"), "utf8")) as { name: string }[]).map((s) => s.name),
   };
@@ -306,11 +320,10 @@ const mcpBody = { type: "http", url: "http://127.0.0.1:9/mcp" };
 /**
  * Pending, not yet saved changes in all three areas (inside the 100 ms
  * debounce). Without earlier sessions (an unreadable sessions file) the
- * sessions change is the idle-timeout setting alone.
+ * sessions change is made by the caller (a new conversation).
  */
 async function pendingChanges(gateway: Gateway, tag: string, withSessionDelete = true): Promise<void> {
   const replies = await Promise.all([
-    request(gateway.port, "PUT", "/v1/settings", { sessionIdleTimeoutMs: 111_000 }),
     ...(withSessionDelete ? [request(gateway.port, "DELETE", "/v1/sessions/earlier-1")] : []),
     request(gateway.port, "PUT", `/v1/tools/tool-${tag}`, toolBody),
     request(gateway.port, "PUT", `/v1/mcp-servers/mcp-${tag}`, mcpBody),
@@ -334,7 +347,8 @@ describe("Every pending change in every area survives a stop signal", () => {
       const gateway = await startGateway(fx);
 
       // Requests received before the signal, whose bodies (and state changes) arrive while draining.
-      const drainSettings = await partialRequest(gateway.port, "PUT", "/v1/settings", { sessionIdleTimeoutMs: 222_000 });
+      // The idle timeout cannot be changed over the API (MVP-7402 R1): a drain-time attempt is refused.
+      const drainSettings = await partialRequest(gateway.port, "PUT", "/v1/settings", { sessionIdleTimeoutMs: 1 });
       const drainSession = await partialRequest(gateway.port, "DELETE", "/v1/sessions/earlier-2", {});
       const drainTool = await partialRequest(gateway.port, "PUT", "/v1/tools/tool-drain", toolBody);
       const drainMcp = await partialRequest(gateway.port, "PUT", "/v1/mcp-servers/mcp-drain", mcpBody);
@@ -352,7 +366,10 @@ describe("Every pending change in every area survives a stop signal", () => {
       expect(await connectRefused(gateway.port)).toBe(true);
       expect(gateway.child.exitCode).toBeNull();
 
-      const replies = await Promise.all([drainSettings.finish(), drainSession.finish(), drainTool.finish(), drainMcp.finish()]);
+      const settingsReply = await drainSettings.finish();
+      expect([settingsReply.status, JSON.parse(settingsReply.text)]).toEqual([400, { error: "setting_read_only" }]);
+      expect(settingsReply.connection).toBe("close");
+      const replies = await Promise.all([drainSession.finish(), drainTool.finish(), drainMcp.finish()]);
       for (const r of replies) expect([200, 201]).toContain(r.status);
       for (const r of replies) expect(r.connection).toBe("close");
 
@@ -365,7 +382,10 @@ describe("Every pending change in every area survives a stop signal", () => {
       const sessions = (await request(restarted.port, "GET", "/v1/sessions")).json().sessions.map((s: { id: string }) => s.id);
       expect(sessions).not.toContain("earlier-1");
       expect(sessions).not.toContain("earlier-2");
-      expect((await request(restarted.port, "GET", "/v1/settings")).json()).toEqual({ sessionIdleTimeoutMs: 222_000 });
+      // Both deletes (the pending one and the drain-time one) saved their markers, and the refused settings change left no key behind.
+      const saved = readState(fx).sessions;
+      expect(Object.keys(saved.erasedByLabel?.proc ?? {}).sort()).toEqual(["earlier-1", "earlier-2"]);
+      expect(saved).not.toHaveProperty("settings");
       const tools = (await request(restarted.port, "GET", "/v1/tools")).json().tools.map((t: { name: string }) => t.name);
       expect(tools).toEqual(expect.arrayContaining(["earlier-tool", "tool-pending", "tool-drain"]));
       const mcp = (await request(restarted.port, "GET", "/v1/mcp-servers")).json().servers.map((s: { name: string }) => s.name);
@@ -411,7 +431,7 @@ async function api(): Promise<FakeAnthropicApi> {
 }
 
 /** Starts a streaming chat answer for a new session and waits until the session exists. */
-async function openStream(gateway: Gateway, sessionId: string): Promise<{ ended: () => boolean }> {
+async function openStream(gateway: Gateway, sessionId: string): Promise<{ ended: () => boolean; abort: () => void }> {
   let ended = false;
   const payload = Buffer.from(JSON.stringify({ queryId: `q-${sessionId}`, prompt: "Say hello.", sessionId, model: "claude-sonnet-4-5" }));
   const req = http.request(
@@ -438,7 +458,7 @@ async function openStream(gateway: Gateway, sessionId: string): Promise<{ ended:
     if (Date.now() - started > 10_000) throw new Error(`stream did not start: ${gateway.output()}`);
     await delay(20);
   }
-  return { ended: () => ended };
+  return { ended: () => ended, abort: () => req.destroy() };
 }
 
 describe("A streaming chat answer during a stop", () => {
@@ -528,13 +548,26 @@ describe.skipIf(IS_ROOT)(`A stop whose final save fails for one area exits with 
         fs.writeFileSync(fx.file(area), "{ not json at all");
         fs.chmodSync(fx.dirs[area], 0o555);
       }
-      const kept = fs.readFileSync(fx.file(area));
-      const gateway = await startGateway(fx);
+      // The suppressed sessions row has no earlier conversation to delete: its sessions change is a new conversation on a model that never answers.
+      const newConversation = area === "sessions" && condition === "suppressed";
+      const scripted = newConversation ? await api() : null;
+      const gateway = await startGateway(fx, scripted ? { ANTHROPIC_BASE_URL: scripted.baseUrl, ANTHROPIC_API_KEY: "sk-ant-fake-7616" } : {});
       if (condition === "suppressed") {
         expect(errorLines(gateway.output())[0]).toContain(`area=${area} problem=unreadable-not-preserved`);
       }
 
-      await pendingChanges(gateway, "pending", !(area === "sessions" && condition === "suppressed"));
+      await pendingChanges(gateway, "pending", !newConversation);
+      if (newConversation) {
+        // The conversation exists and is unsaved; the client leaves again so that the stop has no open stream to wait for.
+        const stream = await openStream(gateway, "pending-conversation");
+        reapLater(descendants(gateway.child.pid!));
+        stream.abort();
+        const left = Date.now();
+        while (!stream.ended() && Date.now() - left < 5000) await delay(20);
+        await delay(300);
+      }
+      // What the final save must leave alone is the file as it is when the error starts: a delete saves its tombstone at once (MVP-7402).
+      const kept = fs.readFileSync(fx.file(area));
       if (condition === "injected write error") fs.chmodSync(fx.dirs[area], 0o555);
 
       const signalledAt = Date.now();
@@ -555,7 +588,7 @@ describe.skipIf(IS_ROOT)(`A stop whose final save fails for one area exits with 
       const others = AREAS.filter((a) => a !== area);
       const restarted = await startGateway(fx);
       if (others.includes("sessions")) {
-        expect((await request(restarted.port, "GET", "/v1/settings")).json()).toEqual({ sessionIdleTimeoutMs: 111_000 });
+        expect(Object.keys(readSessions(fx).erasedByLabel?.proc ?? {})).toContain("earlier-1");
         const sessions = (await request(restarted.port, "GET", "/v1/sessions")).json().sessions.map((s: { id: string }) => s.id);
         expect(sessions).not.toContain("earlier-1");
       }
@@ -614,8 +647,8 @@ describe("A stop during a slow git operation never damages saved state", () => {
       await gitRequest;
 
       const after = readState(fx);
-      expect(after.sessions.settings.sessionIdleTimeoutMs).toBe(111_000);
-      expect(Object.keys(after.sessions.sessions)).not.toContain("earlier-1");
+      expect(Object.keys(after.sessions.erasedByLabel?.proc ?? {})).toContain("earlier-1");
+      expect(Object.keys(after.sessions.sessionsByLabel?.proc ?? {})).not.toContain("earlier-1");
       expect(after.tools).toContain("tool-completed");
       expect(after.mcpServers).toContain("mcp-completed");
 

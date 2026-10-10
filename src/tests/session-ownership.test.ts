@@ -22,6 +22,9 @@ beforeEach(() => {
   process.env.SESSION_PERSIST_PATH = path.join(dir, "sessions.json");
   process.env.TOOLS_PERSIST_PATH = path.join(dir, "tools.json");
   process.env.MCP_SERVERS_PERSIST_PATH = path.join(dir, "mcp-servers.json");
+  // A trusted storage root with its sessions directory: a delete of an owned conversation checks it (MVP-7402).
+  process.env.AGENT_SANDBOX_ROOT = path.join(dir, "store");
+  fs.mkdirSync(path.join(dir, "store", "sessions"), { recursive: true, mode: 0o700 });
   logs = [];
   vi.spyOn(console, "log").mockImplementation((...args) => {
     logs.push(args.map(String).join(" "));
@@ -35,11 +38,17 @@ afterEach(() => {
   delete process.env.SESSION_PERSIST_PATH;
   delete process.env.TOOLS_PERSIST_PATH;
   delete process.env.MCP_SERVERS_PERSIST_PATH;
+  delete process.env.AGENT_SANDBOX_ROOT;
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
 async function sessionsModule(): Promise<typeof import("../sessions.js")> {
   return await import("../sessions.js");
+}
+
+/** The route's decision for a delete of `id` by `label` (MVP-7402): "deleted", "pending", "legacy" or "not_found". */
+async function remove(id: string, label: string): Promise<string> {
+  return (await import("../session-erasure.js")).deleteConversation(id, label);
 }
 
 const A = { label: "reqlift", userId: "user-1" };
@@ -196,7 +205,7 @@ describe("legacy conversations (created before the update)", () => {
     expect(audit.join("\n")).not.toMatch(/legacy[A-Z]|ownerOnly|dirOnly|reqlift|diemai/);
   });
 
-  it("legacy entries stay listable and deletable for every label, as before", async () => {
+  it("legacy entries stay listable for every label; a delete answers legacy_not_erased and changes nothing (MVP-7402)", async () => {
     seed(process.env.SESSION_PERSIST_PATH!);
     const m = await sessionsModule();
     m.loadSessions();
@@ -204,18 +213,31 @@ describe("legacy conversations (created before the update)", () => {
     // visible to every label (MVP-7679: only complete entries move into their label's map).
     expect(m.listSessions("anyone").map((s) => s.id).sort()).toEqual(["dirOnly", "legacyConfirmed", "legacyUnconfirmed", "ownerOnly"]);
     expect(m.listSessions("reqlift").map((s) => s.id).sort()).toEqual(["dirOnly", "legacyConfirmed", "legacyUnconfirmed", "ownerOnly"]);
-    expect(m.deleteSession("legacyConfirmed", "anyone")).toBe(true);
-    expect(m.deleteSession("legacyConfirmed", "anyone")).toBe(false);
+    // Comment 40659 (option B): the old shared store is not erased here, so a delete never reports success for it.
+    expect(await remove("legacyConfirmed", "anyone")).toBe("legacy");
+    expect(await remove("legacyConfirmed", "anyone")).toBe("legacy");
+    expect(m.getSessionCount()).toBe(4);
   });
 
-  it("a new conversation with a legacy id is not possible until the legacy entry is deleted; then it is new", async () => {
+  it("a legacy id stays refused after a delete; only expiry drops it, and then the id is new", async () => {
     seed(process.env.SESSION_PERSIST_PATH!);
     const m = await sessionsModule();
     m.loadSessions();
     expect(m.admitSession("legacyConfirmed", A).kind).toBe("refused");
-    m.deleteSession("legacyConfirmed", A.label);
-    expect(m.admitSession("legacyConfirmed", A)).toEqual({ kind: "new" });
-    const fresh = m.getSession("legacyConfirmed", "", "m", true, A);
+    expect(await remove("legacyConfirmed", A.label)).toBe("legacy");
+    expect(m.admitSession("legacyConfirmed", A).kind).toBe("refused");
+    // Expiry keeps today's behavior for a legacy entry: dropped without any file being touched.
+    vi.resetModules();
+    fs.writeFileSync(
+      process.env.SESSION_PERSIST_PATH!,
+      JSON.stringify({ sessions: { legacyConfirmed: { sessionId: "gw-1", sdkSessionId: "sdk-old", systemPrompt: "", model: "m", lastUsed: 1_700_000_000_000 } } }),
+    );
+    process.env.SESSION_IDLE_TIMEOUT_MS = "1000";
+    const later = await sessionsModule();
+    delete process.env.SESSION_IDLE_TIMEOUT_MS;
+    later.loadSessions();
+    expect(later.admitSession("legacyConfirmed", A)).toEqual({ kind: "new" });
+    const fresh = later.getSession("legacyConfirmed", "", "m", true, A);
     expect(fresh.isNew).toBe(true);
     // A fresh random home: nothing of the old conversation is reused.
     expect(fresh.sandboxDirId).not.toBe("0123456789abcdef01234567");
@@ -231,9 +253,9 @@ describe("list and delete are scoped to the caller's label", () => {
     expect(m.listSessions("reqlift").map((s) => s.id).sort()).toEqual(["mine", "mine-without-user"]);
     expect(m.listSessions("diemai").map((s) => s.id)).toEqual(["theirs"]);
     expect(m.listSessions("nobody")).toEqual([]);
-    expect(m.deleteSession("theirs", "reqlift")).toBe(false);
+    expect(await remove("theirs", "reqlift")).toBe("not_found");
     expect(m.getSessionCount()).toBe(3);
-    expect(m.deleteSession("theirs", "diemai")).toBe(true);
+    expect(await remove("theirs", "diemai")).toBe("deleted");
     expect(m.getSessionCount()).toBe(2);
     // Unscoped (no label) keeps the old behavior for internal callers.
     expect(m.listSessions()).toHaveLength(2);
@@ -439,10 +461,12 @@ describe("conversations per label (MVP-7679)", () => {
     m.getSession("same", "", "m", true, A);
     m.getSession("same", "", "m", true, B);
     expect(m.listSessions("reqlift").map((x) => x.id)).toEqual(["same"]);
-    expect(m.deleteSession("same", "reqlift")).toBe(true);
+    expect(await remove("same", "reqlift")).toBe("deleted");
     expect(m.listSessions("reqlift")).toEqual([]);
     expect(m.listSessions("diemai").map((x) => x.id)).toEqual(["same"]);
-    expect(m.deleteSession("same", "reqlift")).toBe(false);
+    // The owner's repeat is answered from the erased marker, another label's never-used id is not found.
+    expect(await remove("same", "reqlift")).toBe("deleted");
+    expect(await remove("same", "third")).toBe("not_found");
   });
 
   it.each([

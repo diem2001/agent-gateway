@@ -29,7 +29,8 @@ export type RunFailureKind =
   | "isolation_timeout"
   | "run_deadline"
   | "session_legacy"
-  | "session_busy";
+  | "session_busy"
+  | "session_erasing";
 
 /** Everything agent.ts may pass to the classifier for one attempt. */
 export interface RunDiagnostics {
@@ -377,3 +378,5 @@ export function fixedFailure(kind: RunFailureKind, message: string): RunFailure 
 /** Conversation admission refusals (MVP-7678). Both texts are pinned: reqlift matches them byte for byte (MVP-8045). */
 export const SESSION_LEGACY_MESSAGE = "This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help.";
 export const SESSION_BUSY_MESSAGE = "This conversation is still answering an earlier request. Please wait until it has finished, then try again.";
+/** A conversation whose deletion is not finished (MVP-7402): fixed and different from both texts above, so reqlift does not read it as a legacy conversation and rotate. */
+export const SESSION_ERASING_MESSAGE = "This conversation is being deleted. Its content is erased as soon as the gateway can finish, so it cannot be used any more. Please start a new conversation.";

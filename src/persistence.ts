@@ -232,6 +232,11 @@ export class PersistentStore {
     return data;
   }
 
+  /** True when saves of this area are suppressed for this process (read-only accessor; MVP-7402). */
+  isSuppressed(): boolean {
+    return this.suppressed;
+  }
+
   /** Debounced save (100 ms), as before. */
   schedule(): void {
     if (this.timer) return;

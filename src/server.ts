@@ -15,13 +15,15 @@ import {
 import {
   loadSessions,
   listSessions,
-  deleteSession,
+  erasurePendingCount,
   getSessionCount,
   getSettings,
-  updateSettings,
-  type SessionSettings,
+  IdleTimeoutConfigError,
+  checkIdleTimeoutConfig,
+  logId,
 } from "./sessions.js";
 import { queryRouter } from "./query.js";
+import { ErasureConfigError, deleteSessionRoute, loadErasureRetryMs, startErasureSweeper } from "./session-erasure.js";
 import sshRoutes from "./routes/ssh.js";
 import authRoutes from "./routes/auth.js";
 import workspaceRoutes from "./routes/workspace.js";
@@ -91,14 +93,19 @@ credentialRelay.start().catch((e: unknown) => {
 
 // Isolation (MVP-7678): every new configuration key is validated now; an invalid value stops
 // startup with one fixed line, nothing falls back silently.
+let erasureRetryMs = 0;
 try {
   loadIsolationConfig();
   void gatewayModelProxy();
   // MVP-7679: the trusted tool policy and the deadline of mediated MCP calls, validated like the keys above.
   loadToolPolicy(process.env, getApiKeyLabels());
   mcpToolTimeoutMs();
+  // MVP-7402: the interval of the sweep that finishes pending erasures.
+  erasureRetryMs = loadErasureRetryMs();
+  // MVP-7402: the idle timeout comes from the environment only and is parsed strictly; one line reports the effective value.
+  checkIdleTimeoutConfig();
 } catch (e) {
-  if (e instanceof IsolationConfigError || e instanceof ToolPolicyConfigError || e instanceof McpToolTimeoutConfigError) logAlways("server", e.logLine);
+  if (e instanceof IsolationConfigError || e instanceof ToolPolicyConfigError || e instanceof McpToolTimeoutConfigError || e instanceof ErasureConfigError || e instanceof IdleTimeoutConfigError) logAlways("server", e.logLine);
   else if (e instanceof ModelProxyConfigError) logAlways("server", `FATAL config key=${e.key} reason=must be a positive whole number of milliseconds`);
   else throw e;
   process.exit(1);
@@ -109,6 +116,8 @@ try {
 } catch {
   // A missing or unusable storage root is reported by the self-check below.
 }
+// Pending erasures (MVP-7402): finished when their run ends, on every sweep tick and once now, without blocking the listen.
+void startErasureSweeper({ retryMs: erasureRetryMs });
 // The trusted model proxy is the only holder of the provider credential; then a real sandbox
 // start sets /health `isolation`.
 gatewayModelProxy()
@@ -155,6 +164,9 @@ app.get("/health", (_req, res) => {
     version: VERSION,
     uptime: Math.round(process.uptime()),
     sessions: getSessionCount(),
+    // Additive (MVP-7402): conversations deleted or expired whose folder the gateway has not yet confirmed gone.
+    // A count only: no ids, no labels. A value that stays above 0 needs an operator (see docs/architecture.md).
+    erasurePending: erasurePendingCount(),
     // Additive (MVP-7678): "ok" once a sandbox has started and passed its check, "unavailable" after a
     // permanent start problem until a later start succeeds, "starting" until the boot self-check is done.
     isolation: isolationStatus(),
@@ -198,14 +210,9 @@ app.get("/v1/sessions", (req, res) => {
   res.json({ sessions: visible, count: visible.length });
 });
 
-app.delete("/v1/sessions/:id", (req, res) => {
-  const deleted = deleteSession(req.params.id, req.clientLabel);
-  if (!deleted) {
-    res.status(404).json({ error: "Session not found" });
-    return;
-  }
-  res.json({ deleted: true });
-});
+// 200 only when the conversation's folder is gone; 503 `erasure_pending` while the gateway still has to finish it;
+// 409 `legacy_not_erased` for a conversation from before the isolation update (MVP-7402, session-erasure.ts).
+app.delete("/v1/sessions/:id", deleteSessionRoute);
 
 /* ------------------------------------------------------------------ */
 /*  Routes: Settings (authenticated)                                    */
@@ -215,22 +222,18 @@ app.get("/v1/settings", (_req, res) => {
   res.json(getSettings());
 });
 
+// The idle timeout erases conversations irreversibly, so no API key can change it (MVP-7402): the operator sets
+// SESSION_IDLE_TIMEOUT_MS. A body that names it is refused whatever its value; every other body is a read-back.
 app.put("/v1/settings", (req, res) => {
-  const body = req.body as Partial<SessionSettings>;
-
-  if (
-    body.sessionIdleTimeoutMs !== undefined &&
-    (typeof body.sessionIdleTimeoutMs !== "number" ||
-      body.sessionIdleTimeoutMs < 0)
-  ) {
-    res
-      .status(400)
-      .json({ error: "sessionIdleTimeoutMs must be a non-negative number" });
+  const body: unknown = req.body;
+  if (typeof body === "object" && body !== null && !Array.isArray(body) && Object.hasOwn(body, "sessionIdleTimeoutMs")) {
+    // Always logged (also with logging off), without the value; the label is escaped and bounded like a conversation id.
+    const caller = req.clientLabel === undefined ? "-" : logId(req.clientLabel).slice(1, -1);
+    logAlways("audit", `settings.refused key=sessionIdleTimeoutMs label=${caller}`);
+    res.status(400).json({ error: "setting_read_only" });
     return;
   }
-
-  const settings = updateSettings(body);
-  res.json(settings);
+  res.json(getSettings());
 });
 
 /* ------------------------------------------------------------------ */

@@ -501,11 +501,13 @@ async function main() {
     const text = "This conversation was started before a gateway security update and cannot be continued safely. Please start a new conversation. Retrying will not help.";
     if (!(refused.events.length === 1 && refused.events[0].type === "error" && refused.events[0].content === text)) problems.push("the legacy conversation was not refused with its exact text");
     if (model.api.requests.length !== before) problems.push("the legacy resume made a model request");
+    // MVP-7402: a delete of a conversation from before the isolation update answers 409 legacy_not_erased and keeps the
+    // entry, so it is still refused; the caller (reqlift) then rotates to a new conversation id, which runs.
     const deleted = await call("DELETE", "/v1/sessions/legacy-conv", undefined, K.reqlift);
-    if (deleted.status >= 300) problems.push(`delete-and-replay: the delete answered ${deleted.status}`);
-    const replay = await turn({ label: "reqlift", prompt: "LEGACY-REPLAY", session: "legacy-conv", steps: [bash("echo REPLAYED")], body: { user_id: "user-1" } });
-    if (!done(replay) || !(replay.results[0]?.text ?? "").includes("REPLAYED")) problems.push("the replay after the delete did not run");
-    addRow("EI.legacy", { problems, controls: ["legacy_refused_with_exact_text_and_no_model_request", "delete_and_replay_succeeded"], surfaces: [{ name: "events", text: JSON.stringify([refused.events, replay.outcome.events]) }, { name: "gateway-log", text: await sinceMark(mark) }, { name: "caller-body", text: refused.raw }] });
+    if (deleted.status !== 409) problems.push(`the delete of the legacy conversation answered ${deleted.status}, expected 409 legacy_not_erased`);
+    const replay = await turn({ label: "reqlift", prompt: "LEGACY-REPLAY", session: "legacy-conv-rotated", steps: [bash("echo REPLAYED")], body: { user_id: "user-1" } });
+    if (!done(replay) || !(replay.results[0]?.text ?? "").includes("REPLAYED")) problems.push("the replay under a new conversation id did not run");
+    addRow("EI.legacy", { problems, controls: ["legacy_refused_with_exact_text_and_no_model_request", "legacy_delete_answered_409", "rotated_replay_succeeded"], surfaces: [{ name: "events", text: JSON.stringify([refused.events, replay.outcome.events]) }, { name: "gateway-log", text: await sinceMark(mark) }, { name: "caller-body", text: refused.raw }] });
   }
 
   /* docker restart: both callers resume, the routes run again (resumed in their old conversations and in new ones) */
