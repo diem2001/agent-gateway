@@ -5,7 +5,7 @@ import { buildToolInputShape } from "./tool-input-schema.js";
 import type { ToolDefinition } from "./tools.js";
 import type { WebhookContext, WebhookResponse } from "./webhook.js";
 import { executeWebhook } from "./webhook.js";
-import { mcpFailureResult } from "./tool-mediation.js";
+import { mcpFailureResult, type MaskingValues } from "./tool-mediation.js";
 
 export interface ToolServerOptions {
   /**
@@ -14,7 +14,7 @@ export interface ToolServerOptions {
    */
   isGranted?: (toolName: string) => boolean;
   /** Known secret values masked out of a tool's own refusal message. */
-  secrets?: () => readonly string[];
+  secrets?: () => MaskingValues;
 }
 
 /** The bearer a tool's webhook receives: one value for every tool, or a decision per tool (owner-bound forwarding). */

@@ -48,6 +48,28 @@ export function credentialMaterialTooLarge(overrides: unknown, requestServers: u
   return false;
 }
 
+/** The most UTF-8 bytes one stored header, env or args value of a registry entry may hold (`PUT /v1/mcp-servers`). */
+export const MAX_STORED_VALUE_BYTES = 64 * 1024;
+
+export const STORED_VALUE_TOO_LARGE_CODE = "MCP_SERVER_VALUE_TOO_LARGE";
+/** Fixed text: it names the limit and never echoes a value. */
+export const STORED_VALUE_TOO_LARGE_MESSAGE = `A header, env or args value may hold at most ${MAX_STORED_VALUE_BYTES} bytes.`;
+
+/**
+ * Whether a registry entry being written holds a header, env or args value over `MAX_STORED_VALUE_BYTES` (MVP-8207). These
+ * values become known values of every later run; the cap is the write-time half of the bound, `MASKING_BUDGET_BYTES` in
+ * `tool-mediation.ts` is the other half and also covers entries stored before the cap. Tolerates any shape: only string
+ * values count.
+ */
+export function storedValueTooLarge(headers: unknown, env: unknown, args: unknown): boolean {
+  const values: unknown[] = [
+    ...(typeof headers === "object" && headers !== null ? Object.values(headers) : []),
+    ...(typeof env === "object" && env !== null ? Object.values(env) : []),
+    ...(Array.isArray(args) ? args : []),
+  ];
+  return values.some((value) => typeof value === "string" && Buffer.byteLength(value, "utf8") > MAX_STORED_VALUE_BYTES);
+}
+
 /** The header and env values of server configs or credential overrides: the secrets a tool input must not echo. */
 export function credentialValues(configs: readonly unknown[]): string[] {
   const values: string[] = [];

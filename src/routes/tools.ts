@@ -14,6 +14,11 @@ import {
 const router = Router();
 
 const DEFAULT_TIMEOUT_MS = 30000;
+/** The most UTF-8 bytes a webhook address may hold. Its credential parts become known values of every later run (MVP-8207). */
+const MAX_WEBHOOK_URL_BYTES = 8 * 1024;
+const WEBHOOK_URL_TOO_LONG_BODY = {
+  error: { code: "TOOL_WEBHOOK_URL_TOO_LONG", message: `webhook_url may hold at most ${MAX_WEBHOOK_URL_BYTES} bytes.` },
+};
 const OWNED_BY_OTHER_MESSAGE = "This tool was registered by another client and can only be changed or deleted by that client.";
 
 /* ------------------------------------------------------------------ */
@@ -38,6 +43,10 @@ router.put("/v1/tools/:name", (req: Request, res: Response) => {
   }
   if (!body.webhook_url || typeof body.webhook_url !== "string") {
     res.status(400).json({ error: "webhook_url is required and must be a string" });
+    return;
+  }
+  if (Buffer.byteLength(body.webhook_url, "utf8") > MAX_WEBHOOK_URL_BYTES) {
+    res.status(400).json(WEBHOOK_URL_TOO_LONG_BODY);
     return;
   }
 

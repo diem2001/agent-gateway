@@ -1,5 +1,5 @@
 import { log } from "./logging.js";
-import { maskSecrets } from "./tool-mediation.js";
+import { isMaskingOverBudget, maskSecrets, type MaskingValues } from "./tool-mediation.js";
 import { WEBHOOK_SERVER_NAME, mcpToolName } from "./tool-grant.js";
 import { toolInputValidator } from "./tool-server.js";
 import type { ToolDefinition } from "./tools.js";
@@ -22,6 +22,8 @@ export const MAX_INPUT_DEPTH = 32;
 /** The summary length of every tool, as `formatToolInput` cuts it. */
 const SUMMARY_MAX = 1000;
 const UNAVAILABLE = "[input unavailable]";
+/** The summary of an input when the run's known values are over the masking budget and so cannot be masked. */
+const WITHHELD = "[input withheld]";
 const RAW_TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const MIN_NEEDLE = 8;
 /** U+0000, a high surrogate without its low one, or a low surrogate without its high one (code units, no `u` flag). */
@@ -38,8 +40,8 @@ interface RawTool {
 export interface StreamInputTable {
   /** Full MCP tool names (`mcp__agent-gateway-tools__<name>`) of the tools that may stream their object. */
   tools: ReadonlyMap<string, RawTool>;
-  /** The known secret values (computed once, on the first raw-eligible call). */
-  needles: () => readonly string[];
+  /** The known secret values (computed once, on the first raw-eligible call), or `MASKING_OVER_BUDGET`. */
+  needles: () => MaskingValues;
 }
 
 export interface StreamInputTableOptions {
@@ -49,8 +51,8 @@ export interface StreamInputTableOptions {
   /** The final `mcpServers` map of the run, and the webhook server config this run created (undefined = none). */
   mcpServers: Readonly<Record<string, unknown>>;
   webhookServer: unknown;
-  /** Lazy list of known secret values (any length; short ones are ignored). */
-  secretValues: () => readonly string[];
+  /** Lazy list of known secret values (any length; short ones are ignored), or `MASKING_OVER_BUDGET`. */
+  secretValues: () => MaskingValues;
 }
 
 /** How the runtime names a server in a tool name: characters outside `[A-Za-z0-9_-]` become `_`. */
@@ -82,10 +84,15 @@ export function buildStreamInputTable(options: StreamInputTableOptions): StreamI
     tools.set(fullName, { name: def.name, validator: toolInputValidator(def) });
   }
   if (tools.size === 0) return EMPTY_STREAM_INPUT_TABLE;
-  let needles: string[] | undefined;
+  let needles: MaskingValues | undefined;
   return {
     tools,
-    needles: () => (needles ??= secretValues().filter((value) => value.length >= MIN_NEEDLE)),
+    needles: () => {
+      if (needles !== undefined) return needles;
+      const values = secretValues();
+      needles = isMaskingOverBudget(values) ? values : values.filter((value) => value.length >= MIN_NEEDLE);
+      return needles;
+    },
   };
 }
 
@@ -142,7 +149,9 @@ function jsonEscaped(needle: string): string {
   return JSON.stringify(needle).slice(1, -1);
 }
 
-function carriesSecret(needles: readonly string[], data: Json, serialized: string): boolean {
+function carriesSecret(needles: MaskingValues, data: Json, serialized: string): boolean {
+  // Over the masking budget nothing can be checked, so the input counts as carrying a secret.
+  if (isMaskingOverBudget(needles)) return true;
   if (needles.length === 0) return false;
   const escaped = needles.map(jsonEscaped);
   if (needles.some((needle, i) => serialized.includes(needle) || serialized.includes(escaped[i]))) return true;
@@ -153,8 +162,9 @@ function carriesSecret(needles: readonly string[], data: Json, serialized: strin
 }
 
 /** Today's summary of a raw-registered tool's input, with every known secret value masked before the cut. */
-function maskedSummary(input: unknown, needles: readonly string[]): string {
+function maskedSummary(input: unknown, needles: MaskingValues): string {
   if (input === undefined) return "";
+  if (isMaskingOverBudget(needles)) return WITHHELD;
   try {
     const text = maskSecrets(JSON.stringify(input, null, 2) ?? "", needles.flatMap((needle) => [needle, jsonEscaped(needle)]));
     return text.substring(0, SUMMARY_MAX);

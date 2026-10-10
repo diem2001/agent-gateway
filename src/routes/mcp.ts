@@ -17,7 +17,15 @@ import { getCredentialTemplateFieldKeys } from "../credential-composer.js";
 import { WEBHOOK_SERVER_NAME } from "../tool-grant.js";
 import { testMcpServer, McpTestError } from "../mcp-test-client.js";
 import { callMcpTool, McpCallError } from "../mcp-call-client.js";
-import { carriesCredentialValue, credentialMapsError, hasUserCredential, type McpCredentialOverride } from "../mcp-overrides.js";
+import {
+  STORED_VALUE_TOO_LARGE_CODE,
+  STORED_VALUE_TOO_LARGE_MESSAGE,
+  carriesCredentialValue,
+  credentialMapsError,
+  hasUserCredential,
+  storedValueTooLarge,
+  type McpCredentialOverride,
+} from "../mcp-overrides.js";
 import {
   CREDENTIAL_HEADER,
   UPLOAD_MESSAGES,
@@ -91,6 +99,8 @@ const URL_INVALID_BODY = {
 const ARGS_INVALID_BODY = {
   error: { code: "MCP_SERVER_ARGS_INVALID", message: "args must be a list of text values without NUL characters." },
 };
+
+const STORED_VALUE_TOO_LARGE_BODY = { error: { code: STORED_VALUE_TOO_LARGE_CODE, message: STORED_VALUE_TOO_LARGE_MESSAGE } };
 
 const FIELD_TYPES = new Set(["text", "password", "url", "email"]);
 const OUTPUT_TARGETS = new Set(["headers", "env"]);
@@ -258,6 +268,12 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
   const credentialError = credentialMapsError(body.headers, body.env);
   if (credentialError) {
     res.status(400).json({ error: credentialError });
+    return;
+  }
+
+  // Only what this request sends is checked: a stored entry over the cap stays editable (the masking budget covers it).
+  if (storedValueTooLarge(body.headers, body.env, body.args)) {
+    res.status(400).json(STORED_VALUE_TOO_LARGE_BODY);
     return;
   }
 

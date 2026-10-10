@@ -27,7 +27,7 @@ import { SANDBOX_WORK } from "./sandbox-content.js";
 import { RunFailure, classifyRunFailure, fixedFailure, isAbortError } from "./run-failure.js";
 import { builtInTools, createToolPolicyHook } from "./tool-policy.js";
 import { WEBHOOK_SERVER_NAME, computeToolGrant, mcpToolName, type ToolGrant } from "./tool-grant.js";
-import { secretValuesForMasking } from "./tool-mediation.js";
+import { runMaskingValues } from "./tool-mediation.js";
 import type { ToolDefinition } from "./tools.js";
 
 export interface QueryParams {
@@ -408,6 +408,14 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // gateway's own webhook tools or a registered server (MVP-6755).
   const mcpServers: Record<string, unknown> = { ...(runRequestMcpServers ?? {}) };
 
+  // The known values both the webhook refusals and the raw tool_use summaries are masked with: built on first use, once per
+  // run, and over the masking budget (see runMaskingValues) both fail closed.
+  const maskingValues = runMaskingValues(() => [
+    ...(clientAuthToken ? [clientAuthToken] : []),
+    ...credentialValues(Object.values(mcpCredentialOverrides ?? {})),
+    ...credentialValues(Object.values(runRequestMcpServers ?? {})),
+  ]);
+
   let webhookServer: unknown;
   if (registeredTools.length > 0 && webhookContext) {
     const hosted = new Set(registeredToolNames);
@@ -417,11 +425,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
       (tool) => webhookBearer(tool, callerLabel, clientAuthToken),
       {
         isGranted: (name) => hosted.has(name) && grant.allows(mcpToolName(WEBHOOK_SERVER_NAME, name)),
-        secrets: () => secretValuesForMasking([
-          ...(clientAuthToken ? [clientAuthToken] : []),
-          ...credentialValues(Object.values(mcpCredentialOverrides ?? {})),
-          ...credentialValues(Object.values(runRequestMcpServers ?? {})),
-        ]),
+        secrets: maskingValues,
       },
     );
   }
@@ -547,11 +551,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     callerLabel,
     mcpServers,
     webhookServer,
-    secretValues: () => secretValuesForMasking([
-      ...(clientAuthToken ? [clientAuthToken] : []),
-      ...credentialValues(Object.values(mcpCredentialOverrides ?? {})),
-      ...credentialValues(Object.values(runRequestMcpServers ?? {})),
-    ]),
+    secretValues: maskingValues,
   });
 
   if (mcpCredentialOverrides) {

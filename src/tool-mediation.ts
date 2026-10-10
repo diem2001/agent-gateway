@@ -12,6 +12,7 @@
  */
 
 import path from "node:path";
+import { log } from "./logging.js";
 import { getEnabledMcpServers } from "./mcp-registry.js";
 import { knownSecretValues, sshPrivateKeyValues, webhookUrlValues } from "./sandbox-content.js";
 import { getAllTools } from "./tools.js";
@@ -42,7 +43,8 @@ export type ToolFailure =
   | { kind: "unreachable"; name: string }
   | { kind: "redirect"; name: string }
   | { kind: "timeout"; name: string; timeoutMs: number }
-  | { kind: "invalid_response"; name: string };
+  | { kind: "invalid_response"; name: string }
+  | { kind: "refusal_withheld"; name: string };
 
 export function toolFailureReply(callId: string, failure: ToolFailure): ToolReply {
   const { code, message } = describeFailure(failure);
@@ -89,6 +91,11 @@ export function describeFailure(failure: ToolFailure): { code: ToolErrorCode; me
       return {
         code: "TOOL_RESPONSE_INVALID",
         message: `TOOL_RESPONSE_INVALID: "${failure.name}" sent an answer the gateway could not read. If it keeps happening, tell your gateway administrator.`,
+      };
+    case "refusal_withheld":
+      return {
+        code: "TOOL_UNAVAILABLE",
+        message: `TOOL_UNAVAILABLE: "${failure.name}" refused the request, and the gateway cannot show its answer safely. Tell your gateway administrator; retrying will not help.`,
       };
   }
 }
@@ -271,8 +278,9 @@ class ValueAutomaton {
  * fragment of a value is left behind whatever the order of `secrets` (a value that starts, ends or sits inside a longer
  * one, or two values that overlap partially). One pass over the text through an automaton of all values: the cost is
  * linear in the text length plus the total length of the values (plus the replacements), independent of how many values
- * there are; memory is linear in the same two. The values a caller supplies per request are capped at request validation
- * (`MAX_CREDENTIAL_VALUES` values, `MAX_CREDENTIAL_BYTES` bytes in `mcp-overrides.ts`), which bounds the automaton for them.
+ * there are; memory is linear in the same two. The total length of the values is bounded one level up, where the list of a
+ * run is built (`maskingValuesWithinBudget`): a caller never hands this function more than `MASKING_BUDGET_BYTES` of
+ * values, whatever route stored them.
  */
 export function maskSecrets(text: string, secrets: readonly string[]): string {
   const values = [...new Set(secrets)].filter((secret) => secret.length >= MIN_MASKED_LENGTH && secret.length <= text.length);
@@ -348,6 +356,59 @@ export function gatewayKnownValues(workspaceRoot: string, extra: readonly string
 /** The values to mask in a tool's refusal message: the gateway's known values (`gatewayKnownValues`) and `extra`. */
 export function secretValuesForMasking(extra: readonly string[] = []): string[] {
   return gatewayKnownValues(getWorkspaceRoot(), extra).map((value) => value.toString("utf8"));
+}
+
+/**
+ * The most UTF-8 bytes the distinct known values of one run may hold in total for the masking to work on them. A real
+ * deployment holds a few KB (API keys, a provider credential, a registry entry or two, SSH key lines, reqlift's override
+ * wallet of 20 KB or less); this is more than ten times that. Over it, masking is not attempted and the texts that would be
+ * masked fail closed (`MASKING_OVER_BUDGET`): the automaton's time and memory grow with the total length of the values, so
+ * this one limit holds whichever route stored them.
+ */
+export const MASKING_BUDGET_BYTES = 256 * 1024;
+
+/** The marker of a run whose known values are over `MASKING_BUDGET_BYTES`; the holder shows a fixed text instead of masking. */
+export const MASKING_OVER_BUDGET: { readonly overBudget: true } = Object.freeze({ overBudget: true as const });
+
+/** The known values to mask with, or `MASKING_OVER_BUDGET`. */
+export type MaskingValues = readonly string[] | typeof MASKING_OVER_BUDGET;
+
+export function isMaskingOverBudget(values: MaskingValues): values is typeof MASKING_OVER_BUDGET {
+  return values === MASKING_OVER_BUDGET;
+}
+
+/** `values` when the distinct ones of 8 or more characters hold at most `MASKING_BUDGET_BYTES` UTF-8 bytes, else `MASKING_OVER_BUDGET`. */
+export function maskingValuesWithinBudget(values: readonly string[]): MaskingValues {
+  return overMaskingBudget(values) ? MASKING_OVER_BUDGET : values;
+}
+
+function overMaskingBudget(values: readonly string[]): boolean {
+  const seen = new Set<string>();
+  let bytes = 0;
+  for (const value of values) {
+    if (value.length < MIN_MASKED_LENGTH || seen.has(value)) continue;
+    seen.add(value);
+    bytes += Buffer.byteLength(value, "utf8");
+    if (bytes > MASKING_BUDGET_BYTES) return true;
+  }
+  return false;
+}
+
+/**
+ * The known values of one run (`secretValuesForMasking` over `extra()`), built on first use and then kept: the values are
+ * fixed for a run, so a refusal pays for the file reads and the list once, not once per call. An over-budget list logs one
+ * line (event name and a count, never a value).
+ */
+export function runMaskingValues(extra: () => readonly string[]): () => MaskingValues {
+  let built: MaskingValues | undefined;
+  return () => {
+    if (built !== undefined) return built;
+    const values = secretValuesForMasking(extra());
+    const over = overMaskingBudget(values);
+    if (over) log("audit", `masking.budget_exceeded values=${values.length}`);
+    built = over ? MASKING_OVER_BUDGET : values;
+    return built;
+  };
 }
 
 /* ------------------------------------------------------------------ */
