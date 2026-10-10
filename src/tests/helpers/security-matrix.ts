@@ -366,6 +366,9 @@ export const AC_ROWS: Record<string, string> = {
   "RG.failure-text": "Registry failure text: health, test and call answer a fixed category for an unsendable stored header, an unusable stored address and an unreachable upstream, with no stored value in any response or log line",
   "RT.config.subject": "The config route as the file detector's subject row (child run of the negative control)",
   "SI.stream-input-secret": "Stream input: a raw webhook tool's streamed input never carries a registry header, user override, request-server header or env value, or the caller's gateway key (stream, replay and debug log), and a call without a known value streams the object",
+  "SI.mask-overlap": "Stream input masking: a raw tool input holding a known value that starts a longer known value shows `[REDACTED]` for the whole longer value, with no fragment of either on the stream, the replay or the debug log, and a call without a known value streams the object",
+  "SI.mask-scheme": "Stream input masking: the bare token of a `Bearer`/`Basic` header from a stored registry server, a per-request MCP server or a per-user override is withheld and masked on the stream, the replay and the debug log, a 7-character token is shown unchanged, and a call without a known value streams the object",
+  "SI.refusal-mask": "Webhook refusal masking: a webhook tool's refusal text shows `[REDACTED]` for an overlapping registry value and for the bare token of a registry, per-request or per-user header, on the stream and in the tool result the model receives, and a refusal without a known value is shown unchanged",
 };
 
 /* ------------------------------------------------------------------ */
