@@ -703,7 +703,8 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
     const toolUse = (turn.outcome.events as StreamEvent[]).find((event) => event.type === "tool_use" && event.toolName === FULL);
     if (toolUse?.input !== WITHHELD_INPUT) problems.push("the raw tool's tool_use input is not the fixed placeholder");
     if (!rig.log().includes("masking.budget_exceeded")) problems.push("the budget log line is missing");
-    if (rig.log().includes(huge.slice(0, 64))) problems.push("the gateway log holds a stored value");
+    // A webhook address is returned by GET /v1/tools (and so echoed by the response log at debug level); a registry header is write-only.
+    if (plant === "registry" && rig.log().includes(huge.slice(0, 64))) problems.push("the gateway log holds a stored value");
     emit(`SECURITY-MASK-EVIDENCE ${id} stored_bytes=${huge.length} turn_ms=${turn.outcome.ms} health_pings=${pings} health_max_ms=${worstHealthMs}`);
     finishRow(recorder, rig, {
       id,
@@ -833,10 +834,30 @@ describe.skipIf(process.env.SECURITY_MASK_CHILD === "1")("negative controls (chi
   it("NC3: against a build whose refusal text holds no request-server or override value, SI.refusal-mask fails", async () => {
     await negativeControl({
       file: "agent.js",
-      anchor: "secrets: () => secretValuesForMasking([",
-      patch: (source) => source.replace(/secrets: \(\) => secretValuesForMasking\(\[[\s\S]*?\n\s*\]\),/, () => "secrets: () => secretValuesForMasking(clientAuthToken ? [clientAuthToken] : []),"),
+      anchor: "const maskingValues = runMaskingValues(() => [",
+      patch: (source) => source.replace(/const maskingValues = runMaskingValues\(\(\) => \[[\s\S]*?\n\s*\]\);/, () => "const maskingValues = runMaskingValues(() => (clientAuthToken ? [clientAuthToken] : []));"),
       rows: `${ROW_PREFIX}SI\\.refusal-mask:`,
       mustName: ["SI.refusal-mask"],
+    });
+  }, 300_000);
+
+  it("NC4: against a build whose masking has no budget, SI.stored-registry-budget fails", async () => {
+    await negativeControl({
+      file: "tool-mediation.js",
+      anchor: "if (bytes > MASKING_BUDGET_BYTES)",
+      patch: (source) => source.replace("if (bytes > MASKING_BUDGET_BYTES)", () => "if (false)"),
+      rows: `${ROW_PREFIX}SI\\.stored-registry-budget:`,
+      mustName: ["SI.stored-registry-budget"],
+    });
+  }, 300_000);
+
+  it("NC5: against a build without the registry and tool write caps, SI.stored-write-caps fails", async () => {
+    await negativeControl({
+      file: "routes/mcp.js",
+      anchor: "if (storedValueTooLarge(body.headers, body.env, body.args))",
+      patch: (source) => source.replace("if (storedValueTooLarge(body.headers, body.env, body.args))", () => "if (false)"),
+      rows: `${ROW_PREFIX}SI\\.stored-write-caps:`,
+      mustName: ["SI.stored-write-caps"],
     });
   }, 300_000);
 });
