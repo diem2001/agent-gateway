@@ -373,6 +373,7 @@ export const AC_ROWS: Record<string, string> = {
   "SI.mask-scheme": "Stream input masking: the bare token of a `Bearer`/`Basic` header from a stored registry server, a per-request MCP server or a per-user override is withheld and masked on the stream, the replay and the debug log, a 7-character token is shown unchanged, and a call without a known value streams the object",
   "SI.refusal-mask": "Webhook refusal masking: a webhook tool's refusal text shows `[REDACTED]` for an overlapping registry value and for the bare token of a registry, per-request or per-user header, on the stream and in the tool result the model receives, and a refusal without a known value is shown unchanged",
   "SI.refusal-cost": "Webhook refusal masking cost: a caller who sends about 100 per-user override values and whose webhook tool refuses with an 8 MiB body gets the refusal within the budget while `/health` of the shared gateway stays responsive",
+  "SI.credentials-bound": "Credential material bound: a request whose per-user override values or request-server header values total 8 MB is answered 400 MCP_CREDENTIALS_TOO_LARGE with a fixed text that holds no value, no run starts and `/health` of the shared gateway stays responsive, while a request within the limits on the same route runs",
 };
 
 /* ------------------------------------------------------------------ */

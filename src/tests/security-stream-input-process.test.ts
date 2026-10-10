@@ -20,6 +20,10 @@
  * - `SI.refusal-mask`: a webhook tool refuses with a message that holds V2, the registry token, a per-request server's
  *   `Basic` token and the per-user override's `Basic` token (one call each): the `tool_result` text in the stream and
  *   the tool result the scripted model received hold none of them and show `[REDACTED]`.
+ * - `SI.credentials-bound` (MVP-8207): a request whose credential values (per-user overrides, or a request server's headers)
+ *   total 8 MB is refused at validation with 400 `MCP_CREDENTIALS_TOO_LARGE` and a fixed text that holds no value, fast, while
+ *   `/health` stays responsive and no run starts; a request within the limits on the same route, with a refusing webhook
+ *   tool, still runs and masks its value.
  * - `SI.refusal-cost`: a caller with about 100 per-user override values whose webhook tool refuses with an 8 MiB body gets
  *   the refusal within the budget, and `/health` of the same gateway, pinged from this process while the turn runs, never
  *   waits longer than the health budget.
@@ -29,6 +33,7 @@
  * Every secret is a synthetic marker with a random suffix; only names, booleans and counts are printed.
  * Needs `npm run build`, `bwrap`, user namespaces, `git` and `python3`. Linux only.
  */
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -62,12 +67,14 @@ import {
 
 vi.setConfig({ testTimeout: 300_000 });
 
-const ROW_IDS = ["SI.stream-input-secret", "SI.mask-overlap", "SI.mask-scheme", "SI.refusal-mask", "SI.refusal-cost"];
+const ROW_IDS = ["SI.stream-input-secret", "SI.mask-overlap", "SI.mask-scheme", "SI.refusal-mask", "SI.refusal-cost", "SI.credentials-bound"];
 const TOOL = "stream_probe";
 const FULL = `mcp__agent-gateway-tools__${TOOL}`;
 /** The budgets of `SI.refusal-cost`: the turn (measured about 1.5 s) and the longest wait of one `/health` ping (measured about 0.2 s). */
 const REFUSAL_COST_TURN_MS = 10_000;
 const REFUSAL_COST_HEALTH_MS = 1_000;
+/** The budget of one refused 8 MB request of `SI.credentials-bound`: parsing and validating it, measured well under a second. */
+const BOUND_REFUSAL_MS = 3_000;
 const CONTROL_TEXT = "harmless control text without any known value";
 const REFUSE_TOOL = "refuse_probe";
 const REFUSE_FULL = `mcp__agent-gateway-tools__${REFUSE_TOOL}`;
@@ -507,6 +514,108 @@ describe("a raw tool's structured input and the secrets the gateway holds", () =
       surfaces: [{ name: "model-results", text: turn.results.map((result) => result.text).join("\n") }],
       floors: { "model-results": 100 },
       controls: ["refusing_tool_registered", "webhook_received_the_call", "health_answered_during_the_turn", "refusal_text_unmasked_and_cut"],
+      problems,
+    });
+  });
+
+  it("SI.credentials-bound: an 8 MB request of credential values is refused at validation, /health stays responsive, and a request within the limits still runs", async () => {
+    const rig = await createRig(cleanups, { markers, logLevel: "debug", rootPrefix: "mvp8207-bound-", distServer: negativeControlServer() });
+    expect(pinnedProblems(rig)).toEqual([]);
+    await registerStandardServers(rig);
+    const started = Date.now();
+    const problems: string[] = [];
+
+    const refuser = await startRefusingDouble(["refused with a plain message"]);
+    cleanups.push(() => refuser.close());
+    const put = await gatewayRequest(
+      rig.gateway.port,
+      "PUT",
+      `/v1/tools/${REFUSE_TOOL}`,
+      { description: "Probe tool that always refuses.", input_schema: { type: "object", properties: {} }, webhook_url: `${refuser.base}/${REFUSE_TOOL}` },
+      rig.keys.reqlift,
+    );
+    if (put.status !== 201) problems.push("the refusing tool was not registered");
+
+    let pinging = true;
+    let worstHealthMs = 0;
+    let pings = 0;
+    const pinger = (async () => {
+      while (pinging) {
+        const pingStarted = Date.now();
+        try {
+          await fetch(`http://127.0.0.1:${rig.gateway.port}/health`, { signal: AbortSignal.timeout(60_000) });
+        } catch {
+          worstHealthMs = Number.POSITIVE_INFINITY;
+        }
+        worstHealthMs = Math.max(worstHealthMs, Date.now() - pingStarted);
+        pings++;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    })();
+
+    // 1600 values of `Bearer ` + 5000 characters, a synthetic marker in the first: 8 MB in total, once as per-user overrides
+    // and once as the headers of a request server.
+    const marker = `SYNTH-BOUND-${rig.markers.seed}`;
+    const values = Array.from({ length: 1600 }, (_, i) => `Bearer ${i === 0 ? marker : ""}${"a".repeat(5000)}`);
+    const asHeaders = Object.fromEntries(values.map((value, i) => [`x-big-${i}`, value]));
+    const attempts: { name: string; status: number; text: string; ms: number }[] = [];
+    for (const [name, extra] of [
+      ["overrides", { mcpCredentialOverrides: { jira: { headers: asHeaders } } }],
+      ["request-server", { mcpServers: { bigsrv: { url: "http://127.0.0.1:9/mcp", headers: asHeaders } } }],
+    ] as const) {
+      const sent = Date.now();
+      const res = await gatewayRequest(
+        rig.gateway.port,
+        "POST",
+        "/v1/query",
+        { queryId: `q-bound-${name}-${randomBytes(3).toString("hex")}`, prompt: "SI-CREDENTIALS-BOUND", user_id: "user-1", ...extra },
+        rig.keys.reqlift,
+      );
+      attempts.push({ name, status: res.status, text: res.text, ms: Date.now() - sent });
+    }
+    pinging = false;
+    await pinger;
+
+    for (const attempt of attempts) {
+      let error: { code?: string } | undefined;
+      try {
+        error = (JSON.parse(attempt.text) as { error?: { code?: string } }).error;
+      } catch {
+        error = undefined; // a stream of events, not a refusal
+      }
+      if (attempt.status !== 400 || error?.code !== "MCP_CREDENTIALS_TOO_LARGE") problems.push(`${attempt.name}: answered ${attempt.status} ${error?.code ?? "no code"}, expected 400 MCP_CREDENTIALS_TOO_LARGE`);
+      if (attempt.text.length > 400) problems.push(`${attempt.name}: the refusal body is ${attempt.text.length} characters, expected a short fixed text`);
+      if (attempt.text.includes(marker)) problems.push(`${attempt.name}: the refusal body holds a request value`);
+      if (attempt.ms > BOUND_REFUSAL_MS) problems.push(`${attempt.name}: the refusal took ${attempt.ms} ms, budget ${BOUND_REFUSAL_MS} ms`);
+    }
+    if (refuser.hits.length !== 0) problems.push(`no run may start, but the webhook received ${refuser.hits.length} calls`);
+    if (pings < 3) problems.push(`control: only ${pings} health pings were answered during the refusals`);
+    if (worstHealthMs > REFUSAL_COST_HEALTH_MS) problems.push(`/health waited ${worstHealthMs} ms during the refusals, budget ${REFUSAL_COST_HEALTH_MS} ms`);
+
+    // The permitted control: the same route with a request within the limits runs, the refusing tool is called and its text is masked.
+    const small = `Bearer SYNTH-BOUND-OK-${rig.markers.seed}`;
+    const turn = await chatTurn(rig, {
+      prompt: "SI-CREDENTIALS-BOUND-OK",
+      sessionId: "conv-si-credentials-bound",
+      steps: [{ name: REFUSE_FULL, input: {} }],
+      withCredentials: false,
+      body: { allowedTools: [...ROUTE_ALLOWED_TOOLS, REFUSE_FULL], mcpCredentialOverrides: { jira: { headers: { "x-small": small } } } },
+    });
+    problems.push(...turnProblems(turn));
+    if (refuser.hits.length !== 1) problems.push(`control: the webhook received ${refuser.hits.length} calls after the in-limit request, expected 1`);
+    emit(
+      `SECURITY-MASK-EVIDENCE credentials-bound request_bytes=${JSON.stringify({ x: asHeaders }).length} ${attempts.map((a) => `${a.name}_status=${a.status} ${a.name}_ms=${a.ms}`).join(" ")} health_pings=${pings} health_max_ms=${worstHealthMs} control_turn_ms=${turn.outcome.ms}`,
+    );
+    finishRow(recorder, rig, {
+      id: "SI.credentials-bound",
+      durationMs: Date.now() - started,
+      deadlineMs: TURN_DEADLINE_MS,
+      surfaces: [
+        { name: "refusal-bodies", text: attempts.map((a) => a.text).join("\n") },
+        { name: "model-results", text: turn.results.map((result) => result.text).join("\n") },
+      ],
+      floors: { "refusal-bodies": 50, "model-results": 20 },
+      controls: ["refusing_tool_registered", "both_oversize_requests_answered_400_with_the_code", "no_value_in_the_refusal_body", "webhook_not_called_by_the_refused_requests", "health_answered_during_the_refusals", "in_limit_request_on_the_same_route_ran"],
       problems,
     });
   });
