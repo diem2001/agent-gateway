@@ -26,10 +26,10 @@
  * readable by the agent.
  */
 import { credentialMapsError } from "./mcp-overrides.js";
+import { WEBHOOK_SERVER_NAME } from "./tool-grant.js";
 
-
-/** The reserved server name the gateway uses for its own webhook tools. */
-export const RESERVED_MCP_SERVER_NAME = "agent-gateway-tools";
+/** The reserved server name the gateway uses for its own webhook tools (one definition, shared with the registry and the run). */
+export const RESERVED_MCP_SERVER_NAME = WEBHOOK_SERVER_NAME;
 
 /** The same name rule as for registry servers. */
 const MCP_SERVER_NAME_RULE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;

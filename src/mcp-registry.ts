@@ -1,6 +1,8 @@
 import { log } from "./logging.js";
 import { createPersistentStore, hasValidOwners } from "./persistence.js";
 import { MCP_FAILURE_TEXT, upstreamRequestProblem } from "./mcp-upstream-request.js";
+// Imported from tool-grant.ts, not mcp-request-servers.ts: that module imports mcp-overrides.ts, which imports this one.
+import { WEBHOOK_SERVER_NAME } from "./tool-grant.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */
@@ -104,6 +106,9 @@ export function loadMcpServers(): void {
     const problem = srv.url === undefined ? null : publicUrlProblem(srv.url);
     if (problem) log("audit", `mcp.registry.url_migration_required serverName=${srv.name} reason=${problem}`);
   }
+  // An entry stored under the gateway's reserved name (created before MVP-8203) is kept and stays visible to its owner,
+  // but no run ever offers it (see getRunMcpServers). One line per load, naming only the server.
+  if (servers.has(WEBHOOK_SERVER_NAME)) log("audit", `mcp.registry.reserved_name_excluded serverName=${WEBHOOK_SERVER_NAME}`);
   log("mcp", `Loaded ${servers.size} MCP server(s) from disk`);
 }
 
@@ -306,6 +311,15 @@ export function getEnabledMcpServers(): McpServerDefinition[] {
   return Array.from(servers.values()).filter((s) => s.enabled);
 }
 
+/**
+ * The registry servers a run may offer: every enabled entry except the one named like the gateway's own webhook server,
+ * whatever its `enabled` says. `getEnabledMcpServers` stays unchanged because it also feeds the known secret values
+ * (masking and the sandbox scan), which must keep covering a legacy entry's header and env values.
+ */
+export function getRunMcpServers(): McpServerDefinition[] {
+  return getEnabledMcpServers().filter((s) => s.name !== WEBHOOK_SERVER_NAME);
+}
+
 export function deleteMcpServer(name: string): boolean {
   const deleted = servers.delete(name);
   if (deleted) {
@@ -348,11 +362,11 @@ export function toSdkConfig(def: McpServerDefinition): SdkMcpServerConfig {
 
 /**
  * Build the mcpServers object for the SDK query options from the given
- * registry servers (default: every enabled server).
+ * registry servers (default: the run selection, see getRunMcpServers).
  * Merges registered MCP servers with the existing webhook-tools server.
  */
 export function buildMcpServersForSdk(
-  enabled: McpServerDefinition[] = getEnabledMcpServers(),
+  enabled: McpServerDefinition[] = getRunMcpServers(),
 ): Record<string, SdkMcpServerConfig> | null {
   if (enabled.length === 0) return null;
 
@@ -364,10 +378,10 @@ export function buildMcpServersForSdk(
 }
 
 /**
- * Get the allowedTools patterns for the given registry servers (default: every
- * enabled server). Returns patterns like ["mcp__jira__*", "mcp__confluence__*"].
+ * Get the allowedTools patterns for the given registry servers (default: the run
+ * selection). Returns patterns like ["mcp__jira__*", "mcp__confluence__*"].
  */
-export function getMcpAllowedToolPatterns(servers: McpServerDefinition[] = getEnabledMcpServers()): string[] {
+export function getMcpAllowedToolPatterns(servers: McpServerDefinition[] = getRunMcpServers()): string[] {
   return servers.map(
     (srv) => srv.allowedToolsPattern || `mcp__${srv.name}__*`,
   );

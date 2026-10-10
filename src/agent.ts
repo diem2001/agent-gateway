@@ -7,7 +7,7 @@ import { getAllTools } from "./tools.js";
 import type { WebhookContext } from "./webhook.js";
 import { createToolMcpServer } from "./tool-server.js";
 import { buildStreamInputTable, streamedToolInput } from "./tool-use-input.js";
-import { buildMcpServersForSdk, getEnabledMcpServers, getMcpAllowedToolPatterns } from "./mcp-registry.js";
+import { buildMcpServersForSdk, getMcpAllowedToolPatterns, getRunMcpServers } from "./mcp-registry.js";
 import {
   applyMcpCredentialOverrides,
   hasUserCredential,
@@ -311,9 +311,11 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // A registry server with requireUserCredentials is left out of a run without
   // the user's credential: no SDK entry, no allowed-tool pattern, and a request
   // server may not take its name (it would otherwise fill the vacated slot).
-  const selection = selectRegistryServersForRun(getEnabledMcpServers(), mcpCredentialOverrides);
+  const selection = selectRegistryServersForRun(getRunMcpServers(), mcpCredentialOverrides);
   const omitted: { name: string; reason: string }[] = [...selection.omitted];
-  let runRegistryServers = selection.attached;
+  // Independent of the registry selection (MVP-8203): the gateway's webhook server name never comes from a registry
+  // entry, so no `mcp__agent-gateway-tools__*` or entry pattern reaches `allowedTools` and no override audit line names it.
+  let runRegistryServers = selection.attached.filter((def) => def.name !== WEBHOOK_SERVER_NAME);
   // Every registered server is reached only through the trusted relay (http, SSE and stdio alike); if it
   // is not listening they are left out, never connected directly (fail closed).
   const relayUp = credentialRelay.isListening();
@@ -326,7 +328,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   }
   const omittedServers = omitted.map(({ name }) => name);
   let runRequestMcpServers = requestMcpServers
-    ? Object.fromEntries(Object.entries(requestMcpServers).filter(([name]) => !omittedServers.includes(name)))
+    ? Object.fromEntries(Object.entries(requestMcpServers).filter(([name]) => name !== WEBHOOK_SERVER_NAME && !omittedServers.includes(name)))
     : undefined;
   // A request server that carries headers or env needs the relay too; without it the server is left out (fail closed).
   if (runRequestMcpServers && !relayUp) {
@@ -546,6 +548,11 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
     await sandbox.dispose();
     throw error;
   }
+
+  // The webhook server's key always holds the gateway's own server when the caller has webhook tools and is absent
+  // otherwise: no registry or request server replaces it, whatever the selection above let through (MVP-8203).
+  if (webhookServer !== undefined) mcpServers[WEBHOOK_SERVER_NAME] = webhookServer;
+  else delete mcpServers[WEBHOOK_SERVER_NAME];
 
   // The tools whose `tool_use` event carries the structured input (MVP-8096), from the final server map.
   const streamInputTable = buildStreamInputTable({

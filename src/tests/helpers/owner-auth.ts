@@ -22,3 +22,14 @@ export async function mountOwnerAuth(app: Express): Promise<void> {
   });
   app.use(authMiddleware);
 }
+
+/**
+ * Mounts the real authMiddleware on `app` with one API key per label in `keys` (label to key). Unlike mountOwnerAuth it
+ * adds no default Authorization header: every request names its caller with `.set({ Authorization: "Bearer <key>" })`.
+ */
+export async function mountLabelAuth(app: Express, keys: Record<string, string>): Promise<void> {
+  process.env.API_KEYS = Object.entries(keys).map(([label, key]) => `${label}:${key}`).join(",");
+  const { loadApiKeys, authMiddleware } = await import("../../auth.js");
+  loadApiKeys();
+  app.use(authMiddleware);
+}
