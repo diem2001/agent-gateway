@@ -2,7 +2,7 @@ import { log } from "./logging.js";
 import { createPersistentStore, hasValidOwners } from "./persistence.js";
 import { MCP_FAILURE_TEXT, upstreamRequestProblem } from "./mcp-upstream-request.js";
 // Imported from tool-grant.ts, not mcp-request-servers.ts: that module imports mcp-overrides.ts, which imports this one.
-import { WEBHOOK_SERVER_NAME } from "./tool-grant.js";
+import { isReservedMcpServerName, shownServerName } from "./tool-grant.js";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                               */
@@ -106,9 +106,12 @@ export function loadMcpServers(): void {
     const problem = srv.url === undefined ? null : publicUrlProblem(srv.url);
     if (problem) log("audit", `mcp.registry.url_migration_required serverName=${srv.name} reason=${problem}`);
   }
-  // An entry stored under the gateway's reserved name (created before MVP-8203) is kept and stays visible to its owner,
-  // but no run ever offers it (see getRunMcpServers). One line per load, naming only the server.
-  if (servers.has(WEBHOOK_SERVER_NAME)) log("audit", `mcp.registry.reserved_name_excluded serverName=${WEBHOOK_SERVER_NAME}`);
+  // An entry stored under a reserved name (the gateway's webhook server name or any name that begins with it, created
+  // before MVP-8203 or MVP-8235) is kept and stays visible to its owner, but no run ever offers it (see getRunMcpServers).
+  // One line per entry per load, in file order, naming only the server.
+  for (const name of servers.keys()) {
+    if (isReservedMcpServerName(name)) log("audit", `mcp.registry.reserved_name_excluded serverName=${shownServerName(name)}`);
+  }
   log("mcp", `Loaded ${servers.size} MCP server(s) from disk`);
 }
 
@@ -312,12 +315,12 @@ export function getEnabledMcpServers(): McpServerDefinition[] {
 }
 
 /**
- * The registry servers a run may offer: every enabled entry except the one named like the gateway's own webhook server,
- * whatever its `enabled` says. `getEnabledMcpServers` stays unchanged because it also feeds the known secret values
+ * The registry servers a run may offer: every enabled entry except those with a reserved name (the gateway's own webhook
+ * server name or any name that begins with it), whatever their `enabled` says. `getEnabledMcpServers` stays unchanged because it also feeds the known secret values
  * (masking and the sandbox scan), which must keep covering a legacy entry's header and env values.
  */
 export function getRunMcpServers(): McpServerDefinition[] {
-  return getEnabledMcpServers().filter((s) => s.name !== WEBHOOK_SERVER_NAME);
+  return getEnabledMcpServers().filter((s) => !isReservedMcpServerName(s.name));
 }
 
 export function deleteMcpServer(name: string): boolean {

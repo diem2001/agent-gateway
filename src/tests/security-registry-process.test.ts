@@ -986,24 +986,25 @@ describe("negative controls of the reserved-name rows (child runs against patche
     await negativeControl({
       id: "NC1",
       row: "RG.reserved-new",
-      patches: [{ file: "routes/mcp.js", from: "if (name === WEBHOOK_SERVER_NAME) {", to: "if (false) {" }],
+      patches: [{ file: "routes/mcp.js", from: "if (isReservedMcpServerName(name)) {", to: "if (false) {" }],
       mustSay: "the PUT of the reserved name was not the fixed 400",
     });
   });
 
-  it("NC2: against the baseline run path (selection without the exclusion, no run-layer filter, no re-assert), RG.reserved-run fails", async () => {
+  it("NC2: against the baseline run path (selection without the exclusion, no run-layer filter, no re-assert, no run assertion), RG.reserved-run fails", async () => {
     await negativeControl({
       id: "NC2",
       row: "RG.reserved-run",
       patches: [
-        { file: "mcp-registry.js", from: "return getEnabledMcpServers().filter((s) => s.name !== WEBHOOK_SERVER_NAME);", to: "return getEnabledMcpServers();" },
-        { file: "agent.js", from: "selection.attached.filter((def) => def.name !== WEBHOOK_SERVER_NAME)", to: "selection.attached" },
-        { file: "agent.js", from: "name !== WEBHOOK_SERVER_NAME && !omittedServers.includes(name)", to: "!omittedServers.includes(name)" },
+        { file: "mcp-registry.js", from: "return getEnabledMcpServers().filter((s) => !isReservedMcpServerName(s.name));", to: "return getEnabledMcpServers();" },
+        { file: "agent.js", from: "selection.attached.filter((def) => !isReservedMcpServerName(def.name))", to: "selection.attached" },
+        { file: "agent.js", from: "!isReservedMcpServerName(name) && !omittedServers.includes(name)", to: "!omittedServers.includes(name)" },
         {
           file: "agent.js",
-          from: "    if (webhookServer !== undefined)\n        mcpServers[WEBHOOK_SERVER_NAME] = webhookServer;\n    else\n        delete mcpServers[WEBHOOK_SERVER_NAME];\n",
+          from: "        if (webhookServer !== undefined)\n            mcpServers[WEBHOOK_SERVER_NAME] = webhookServer;\n        else\n            delete mcpServers[WEBHOOK_SERVER_NAME];\n",
           to: "",
         },
+        { file: "agent.js", from: "const clash = runToolNameProblem({ webhookToolNames: registeredToolNames, mcpServers, webhookServer });", to: "const clash = undefined;" },
       ],
       mustSay: "reproduced: input reached the other caller's server",
     });

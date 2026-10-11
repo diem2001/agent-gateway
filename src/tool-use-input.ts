@@ -60,6 +60,37 @@ function normalizedServerName(name: string): string {
   return name.replace(/[^A-Za-z0-9_-]/g, "_");
 }
 
+/** What the runtime puts in front of every tool name of `server`: `mcp__<normalized server>__`. */
+function serverToolPrefix(server: string): string {
+  return mcpToolName(normalizedServerName(server), "");
+}
+
+/**
+ * The run's tool-name assertion (MVP-8235), applied to the final `mcpServers` map before the runtime connects. Returns the
+ * server to name in the refusal, or `undefined` when the run may start. Two checks, both independent of the reserved-name
+ * helper so they still hold when a filter in front of them is wrong:
+ *
+ * - (a) the webhook server's key is present only when this run created `webhookServer`, and then holds exactly that object;
+ * - (b) no other server can produce the full name of one of the caller's webhook tools. The runtime names a tool
+ *   `mcp__<xn(server)>__<xn(tool)>`, so a server's prefix `mcp__<xn(server)>__` starting a webhook tool's full name is a
+ *   clash.
+ *
+ * Only names the gateway knows before the runtime connects are covered: a clash between two non-webhook servers depends on
+ * tool names that are not known yet.
+ */
+export function runToolNameProblem(options: { webhookToolNames: readonly string[]; mcpServers: Readonly<Record<string, unknown>>; webhookServer: unknown }): string | undefined {
+  const { webhookToolNames, mcpServers, webhookServer } = options;
+  const held = Object.hasOwn(mcpServers, WEBHOOK_SERVER_NAME);
+  if (webhookServer === undefined ? held : mcpServers[WEBHOOK_SERVER_NAME] !== webhookServer) return WEBHOOK_SERVER_NAME;
+  const webhookFullNames = webhookToolNames.map((name) => mcpToolName(WEBHOOK_SERVER_NAME, normalizedServerName(name)));
+  for (const server of Object.keys(mcpServers)) {
+    if (server === WEBHOOK_SERVER_NAME) continue;
+    const prefix = serverToolPrefix(server);
+    if (webhookFullNames.some((fullName) => fullName.startsWith(prefix))) return server;
+  }
+  return undefined;
+}
+
 export const EMPTY_STREAM_INPUT_TABLE: StreamInputTable = { tools: new Map(), needles: () => [] };
 
 /**
@@ -71,7 +102,7 @@ export function buildStreamInputTable(options: StreamInputTableOptions): StreamI
   if (webhookServer === undefined || mcpServers[WEBHOOK_SERVER_NAME] !== webhookServer) return EMPTY_STREAM_INPUT_TABLE;
   const otherPrefixes = Object.keys(mcpServers)
     .filter((server) => server !== WEBHOOK_SERVER_NAME)
-    .map((server) => mcpToolName(normalizedServerName(server), ""));
+    .map(serverToolPrefix);
   const tools = new Map<string, RawTool>();
   for (const def of registeredTools) {
     if (def.stream_input !== "raw") continue;
