@@ -26,7 +26,7 @@ import {
   validateRequestMcpServers,
   type RequestMcpServers,
 } from "./mcp-request-servers.js";
-import { getAllMcpServers, getEnabledMcpServers } from "./mcp-registry.js";
+import { getAllMcpServers, getRunMcpServers } from "./mcp-registry.js";
 import { validateEnforcedTools } from "./tool-policy.js";
 import { computeToolGrant } from "./tool-grant.js";
 
@@ -145,7 +145,9 @@ queryRouter.post("/v1/query", async (req: Request, res: Response) => {
   }
   const enforcedValidation = validateEnforcedTools(enforcedToolsValue, allowedTools, [
     RESERVED_MCP_SERVER_NAME,
-    ...getEnabledMcpServers().map((def) => def.name),
+    // The servers a run can offer (MVP-8235): an excluded legacy entry named like a reserved name must not make another
+    // caller's enforced webhook tool ambiguous.
+    ...getRunMcpServers().map((def) => def.name),
     ...Object.keys(mcpServersValidation.servers ?? {}),
   ]);
   if (enforcedValidation.error) {

@@ -14,7 +14,7 @@ import {
   type UserCredentialSchema,
 } from "../mcp-registry.js";
 import { getCredentialTemplateFieldKeys } from "../credential-composer.js";
-import { WEBHOOK_SERVER_NAME } from "../tool-grant.js";
+import { WEBHOOK_SERVER_NAME, isReservedMcpServerName } from "../tool-grant.js";
 import { testMcpServer, McpTestError } from "../mcp-test-client.js";
 import { callMcpTool, McpCallError } from "../mcp-call-client.js";
 import {
@@ -65,12 +65,13 @@ const MCP_SERVER_NAME_RULE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 const MCP_SERVER_NAME_INVALID_MESSAGE = "Use 1–32 letters, digits, '-' or '_', starting with a letter or digit.";
 
 /**
- * The one refusal for the gateway's reserved server name (MVP-8203): the name belongs to the server that offers each
- * caller's webhook tools, so no registry entry may carry it. Status 400, a fixed body built from the shared constant
- * that carries no part of the request.
+ * The one refusal for the gateway's reserved server names (MVP-8203, MVP-8235): the name `agent-gateway-tools` belongs to
+ * the server that offers each caller's webhook tools, and a name that begins with it can produce the same full tool name
+ * as one of those tools, so no registry entry may carry such a name. Status 400, a fixed body built from the shared
+ * constant that carries no part of the request.
  */
 const MCP_SERVER_NAME_RESERVED_BODY = {
-  error: { code: "MCP_SERVER_NAME_RESERVED", message: `"${WEBHOOK_SERVER_NAME}" is reserved for the gateway's webhook tools` },
+  error: { code: "MCP_SERVER_NAME_RESERVED", message: `MCP server names beginning with "${WEBHOOK_SERVER_NAME}" are reserved for the gateway's webhook tools` },
 };
 
 /**
@@ -211,8 +212,8 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     return;
   }
 
-  // Whatever the body says, and for a stored legacy entry as well: nothing is created or changed under the reserved name.
-  if (name === WEBHOOK_SERVER_NAME) {
+  // Whatever the body says, and for a stored legacy entry as well: nothing is created or changed under a reserved name.
+  if (isReservedMcpServerName(name)) {
     res.status(400).json(MCP_SERVER_NAME_RESERVED_BODY);
     return;
   }

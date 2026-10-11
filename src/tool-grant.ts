@@ -90,6 +90,22 @@ export const MCP_PREFIX = "mcp__";
 /** The reserved server that hosts the registered webhook tools. */
 export const WEBHOOK_SERVER_NAME = "agent-gateway-tools";
 
+/**
+ * Whether a registry or request server name is reserved (MVP-8235): the runtime names a tool `mcp__<server>__<tool>`, so a
+ * server `agent-gateway-tools_<s>` can produce the full name of a webhook tool `_<s>__<tool>`. Every name that begins with
+ * the webhook server's name is therefore refused, not only the exact name (MVP-8203). The match is case-sensitive: a name
+ * that differs in case produces a different full tool name. A raw prefix test gives the same result as one on the name
+ * the runtime uses, because the runtime only ever turns characters into `_` and the reserved name holds none.
+ */
+export function isReservedMcpServerName(name: string): boolean {
+  return name.startsWith(WEBHOOK_SERVER_NAME);
+}
+
+/** A caller-supplied server name as it may appear in an error text or a log line: printable and at most 40 characters. */
+export function shownServerName(name: string): string {
+  return name.length <= 40 && /^[\x21-\x7e]+$/.test(name) ? name : "(invalid name)";
+}
+
 export type PolicyReason =
   | "must be a JSON object"
   | "unknown field"

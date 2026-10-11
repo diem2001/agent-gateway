@@ -26,7 +26,7 @@
  * readable by the agent.
  */
 import { credentialMapsError } from "./mcp-overrides.js";
-import { WEBHOOK_SERVER_NAME } from "./tool-grant.js";
+import { WEBHOOK_SERVER_NAME, isReservedMcpServerName, shownServerName as shownName } from "./tool-grant.js";
 
 /** The reserved server name the gateway uses for its own webhook tools (one definition, shared with the registry and the run). */
 export const RESERVED_MCP_SERVER_NAME = WEBHOOK_SERVER_NAME;
@@ -44,11 +44,6 @@ export interface RequestMcpServersValidation {
   code?: "MCP_SERVER_NAME_CONFLICT";
   /** The validated, normalized server map. `undefined` when none was supplied. */
   servers?: RequestMcpServers;
-}
-
-/** A caller-supplied name as it may appear in an error text: bounded and printable. */
-function shownName(name: string): string {
-  return name.length <= 40 && /^[\x21-\x7e]+$/.test(name) ? name : "(invalid name)";
 }
 
 /**
@@ -71,9 +66,10 @@ export function validateRequestMcpServers(value: unknown, registeredNames: reado
   const servers: RequestMcpServers = {};
 
   for (const [name, raw] of entries) {
-    if (name === RESERVED_MCP_SERVER_NAME) {
+    // Before the name rule and the conflict check, with a fixed text that echoes nothing of the request (MVP-8235).
+    if (isReservedMcpServerName(name)) {
       return {
-        error: `mcpServers must not redefine the reserved server "${RESERVED_MCP_SERVER_NAME}"`,
+        error: `mcpServers must not use a server name beginning with "${RESERVED_MCP_SERVER_NAME}"`,
       };
     }
     if (!MCP_SERVER_NAME_RULE.test(name)) {

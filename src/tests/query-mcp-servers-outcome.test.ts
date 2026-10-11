@@ -121,7 +121,7 @@ describe("Outcome Probe — per-query mcpServers reaches the SDK options (MVP-67
         });
 
       expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/reserved server "agent-gateway-tools"/);
+      expect(res.body.error).toMatch(/must not use a server name beginning with "agent-gateway-tools"/);
       expect(capturedOptions).toHaveLength(0);
     } finally {
       delete process.env.MCP_SERVERS_PERSIST_PATH;
@@ -158,5 +158,90 @@ describe("Outcome Probe — per-query mcpServers reaches the SDK options (MVP-67
     expect(capturedOptions).toHaveLength(1);
     // No registered servers + no webhook tools + no request servers ⇒ no mcpServers key.
     expect(capturedOptions[0].mcpServers).toBeUndefined();
+  });
+});
+
+/**
+ * Every server name that begins with `agent-gateway-tools` is refused in a request (MVP-8235), before the name rule and
+ * the registered-name conflict check, with one fixed text that echoes nothing of the request. An excluded legacy registry
+ * entry of such a name does not change how another caller's enforced webhook tool is validated.
+ */
+describe("request mcpServers: every name beginning with agent-gateway-tools is refused (MVP-8235)", () => {
+  const FIXED = 'mcpServers must not use a server name beginning with "agent-gateway-tools"';
+  const NOW = "2026-09-01T00:00:00.000Z";
+  let tempDir = "";
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-gateway-reserved-prefix-"));
+    process.env.MCP_SERVERS_PERSIST_PATH = path.join(tempDir, "mcp-servers.json");
+  });
+
+  afterEach(async () => {
+    delete process.env.MCP_SERVERS_PERSIST_PATH;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  async function store(...names: string[]) {
+    const { registerMcpServer } = await import("../mcp-registry.js");
+    for (const name of names) registerMcpServer({ name, description: "stored", enabled: true, type: "http", url: `http://${name}.example.test/mcp`, owner: "alpha", createdAt: NOW, updatedAt: NOW });
+  }
+
+  const post = (app: express.Express, body: Record<string, unknown>) => request(app).post("/v1/query").send({ queryId: "probe-prefix", prompt: "x", useSession: false, ...body });
+
+  it.each(["agent-gateway-tools", "agent-gateway-tools_", "agent-gateway-tools__x", "agent-gateway-tools-x"])(
+    "%s is refused with the fixed text and the SDK query is never called",
+    async (name) => {
+      const app = await createApp();
+      const res = await post(app, { mcpServers: { [name]: { command: "evil", args: [] } } });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe(FIXED);
+      expect(capturedOptions).toHaveLength(0);
+    },
+  );
+
+  it("a 40-character prefixed name still gets the reserved text, not the name-rule text", async () => {
+    const name = `agent-gateway-tools__${"x".repeat(19)}`;
+    expect(name).toHaveLength(40);
+    const app = await createApp();
+    const res = await post(app, { mcpServers: { [name]: { command: "evil", args: [] } } });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe(FIXED);
+    expect(JSON.stringify(res.body)).not.toContain(name);
+    expect(capturedOptions).toHaveLength(0);
+  });
+
+  it("with a legacy registry entry of the same name, the reserved text wins over the registered-name conflict", async () => {
+    await store("agent-gateway-tools__x");
+    const app = await createApp();
+    const res = await post(app, { mcpServers: { "agent-gateway-tools__x": { command: "evil", args: [] } } });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe(FIXED);
+    expect(capturedOptions).toHaveLength(0);
+  });
+
+  it("enforced row: an enabled legacy agent-gateway-tools__x does not make another caller's enforced webhook tool ambiguous", async () => {
+    await store("agent-gateway-tools__x");
+    const app = await createApp();
+    const res = await post(app, { enforcedTools: ["mcp__agent-gateway-tools__x__y"] });
+    expect(res.status).toBe(200);
+    expect(capturedOptions).toHaveLength(1);
+  });
+
+  it("control: a genuine registry ambiguity (docs and docs__a) is still refused for an enforced tool", async () => {
+    await store("docs", "docs__a");
+    const app = await createApp();
+    const res = await post(app, { enforcedTools: ["mcp__docs__a__b"] });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/matches more than one MCP server/);
+    expect(capturedOptions).toHaveLength(0);
+  });
+
+  it("control: a request server named beta-docs runs", async () => {
+    const app = await createApp();
+    const res = await post(app, { mcpServers: { "beta-docs": { command: "node", args: [] } } });
+    expect(res.status).toBe(200);
+    expect(capturedOptions).toHaveLength(1);
+    expect(Object.keys(capturedOptions[0].mcpServers as Record<string, unknown>)).toEqual(["beta-docs"]);
   });
 });

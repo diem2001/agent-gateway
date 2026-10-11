@@ -94,7 +94,7 @@ function versionMessage(installed: string | null, required: string | null): stri
 const AUTHENTICATION_MESSAGE = `The gateway could not authenticate with the AI provider. Ask your gateway administrator to check the gateway's authentication. ${RETRY_WILL_NOT_HELP}`;
 const TRANSIENT_MESSAGE = "The AI provider is busy right now. Please try again in a few minutes.";
 
-function unknownMessage(queryId: string | undefined): string {
+export function unknownMessage(queryId: string | undefined): string {
   const reference = queryId && /^[A-Za-z0-9._:-]{1,128}$/.test(queryId) ? ` (reference: ${queryId})` : "";
   return `The AI request failed on the gateway for an unknown reason. Please try again. If it keeps failing, ask your gateway administrator to check the gateway logs${reference}.`;
 }
