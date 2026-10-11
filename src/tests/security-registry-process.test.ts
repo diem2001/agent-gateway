@@ -17,7 +17,9 @@
  *   and `beta`, recording stubs for the other caller's server, the webhook and an ordinary control server).
  * - `RG.prefix-new`, `RG.prefix-legacy`, `RG.prefix-run-refused`, `RG.prefix-run-stored`, `RG.prefix-run-reenabled`
  *   (MVP-8235): the same for every server name that begins with `agent-gateway-tools`, because a registry server
- *   `agent-gateway-tools__x` offering a tool `y` produces the full tool name of alpha's webhook tool `x__y`.
+ *   `agent-gateway-tools__x` offering a tool `y` produces the full tool name of alpha's webhook tool `x__y`. NC3 (a route
+ *   that refuses only the literal name), NC4 (a helper narrowed to the exact name, run assertion live) and NC5 (narrowed
+ *   helper, no run assertion) show that the rows fail against each weakened build.
  * - `RG.preserve-run`: a reqlift-style toggle (GET, spread, PUT) of `jira` and `local` keeps both stored maps (hash)
  *   and an authorized chat run still delivers the registry header to the http upstream and the env value to the stdio
  *   server (both compared, never printed), with no marker on any client surface.
@@ -1007,6 +1009,38 @@ describe("negative controls of the reserved-name rows (child runs against patche
         { file: "agent.js", from: "const clash = runToolNameProblem({ webhookToolNames: registeredToolNames, mcpServers, webhookServer });", to: "const clash = undefined;" },
       ],
       mustSay: "reproduced: input reached the other caller's server",
+    });
+  });
+});
+
+describe("negative controls (MVP-8235)", () => {
+  it("NC3: against a registry route that refuses only the literal name agent-gateway-tools, the prefixed names are not refused", async () => {
+    await negativeControl({
+      id: "NC3",
+      row: "RG.prefix-new",
+      patches: [{ file: "routes/mcp.js", from: "if (isReservedMcpServerName(name)) {", to: 'if (name === "agent-gateway-tools") {' }],
+      mustSay: "the PUT of agent-gateway-tools__x was not the fixed 400",
+    });
+  });
+
+  it("NC4: against a reserved-name helper narrowed to the exact name, with the run assertion live, the assertion refuses alpha's run", async () => {
+    await negativeControl({
+      id: "NC4",
+      row: "RG.prefix-run-refused",
+      patches: [{ file: "tool-grant.js", from: "return name.startsWith(WEBHOOK_SERVER_NAME);", to: "return name === WEBHOOK_SERVER_NAME;" }],
+      mustSay: "tool_name_clash lines=1",
+    });
+  });
+
+  it("NC5: against the narrowed helper and no run assertion, beta's prefixed server is contacted in alpha's run", async () => {
+    await negativeControl({
+      id: "NC5",
+      row: "RG.prefix-run-refused",
+      patches: [
+        { file: "tool-grant.js", from: "return name.startsWith(WEBHOOK_SERVER_NAME);", to: "return name === WEBHOOK_SERVER_NAME;" },
+        { file: "agent.js", from: "const clash = runToolNameProblem({ webhookToolNames: registeredToolNames, mcpServers, webhookServer });", to: "const clash = undefined;" },
+      ],
+      mustSay: "beta's prefixed server was contacted",
     });
   });
 });
