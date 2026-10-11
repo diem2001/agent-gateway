@@ -15,6 +15,9 @@
  *   server name `agent-gateway-tools` for every label, keeps and logs a stored entry of that name across restarts, and
  *   such an entry or a refused attempt never takes another caller's webhook tool calls (two synthetic labels `alpha`
  *   and `beta`, recording stubs for the other caller's server, the webhook and an ordinary control server).
+ * - `RG.prefix-new`, `RG.prefix-legacy`, `RG.prefix-run-refused`, `RG.prefix-run-stored`, `RG.prefix-run-reenabled`
+ *   (MVP-8235): the same for every server name that begins with `agent-gateway-tools`, because a registry server
+ *   `agent-gateway-tools__x` offering a tool `y` produces the full tool name of alpha's webhook tool `x__y`.
  * - `RG.preserve-run`: a reqlift-style toggle (GET, spread, PUT) of `jira` and `local` keeps both stored maps (hash)
  *   and an authorized chat run still delivers the registry header to the http upstream and the env value to the stdio
  *   server (both compared, never printed), with no marker on any client surface.
@@ -441,14 +444,14 @@ describe("registry write-only rows", () => {
 
 const RESERVED = "agent-gateway-tools";
 const AUDIT_LINE = `[audit] mcp.registry.reserved_name_excluded serverName=${RESERVED}`;
-const RESERVED_BODY = { error: { code: "MCP_SERVER_NAME_RESERVED", message: `"${RESERVED}" is reserved for the gateway's webhook tools` } };
+const RESERVED_BODY = { error: { code: "MCP_SERVER_NAME_RESERVED", message: `MCP server names beginning with "${RESERVED}" are reserved for the gateway's webhook tools` } };
 const OWNER_DENIAL = { error: { code: "MCP_SERVER_OWNER_MISMATCH", message: `MCP server "${RESERVED}" is registered by another application` } };
 /** The two synthetic labels' keys carry the run's marker seed, so a negative control's parent can scan its child's output for them. */
 const labelKeysFor = (seed: string) => ({ alpha: `sk-gw-alpha-${seed}`, beta: `sk-gw-beta-${seed}` });
 const LABEL_KEYS = labelKeysFor(markers.seed);
 
 /** A recording webhook: path, tool name header and body (the tool input itself) of every call, answered with a fixed output. */
-async function startRecordingHook(): Promise<{ base: string; calls: { path: string; toolName: string; body: Record<string, unknown> }[]; close: () => Promise<void> }> {
+async function startRecordingHook(answer = "BETA-WEBHOOK-ANSWER"): Promise<{ base: string; calls: { path: string; toolName: string; body: Record<string, unknown> }[]; close: () => Promise<void> }> {
   const calls: { path: string; toolName: string; body: Record<string, unknown> }[] = [];
   const sockets = new Set<import("node:net").Socket>();
   const server = http.createServer((req, res) => {
@@ -463,7 +466,7 @@ async function startRecordingHook(): Promise<{ base: string; calls: { path: stri
       }
       calls.push({ path: req.url ?? "", toolName: String(req.headers["x-webhook-tool-name"] ?? ""), body });
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ output: "BETA-WEBHOOK-ANSWER" }));
+      res.end(JSON.stringify({ output: answer }));
     });
   });
   server.on("connection", (socket) => {
@@ -497,12 +500,15 @@ const storedEntry = (name: string, url: string, extra: Record<string, unknown> =
  * registry that holds `entries` before the first start. The recording stubs start before the rig, so the seeded file
  * can carry their URLs.
  */
-async function newReservedRig(entries: (stubs: { reserved: OAuthMcpStub; control: OAuthMcpStub }) => Record<string, unknown>[]): Promise<ReservedRig> {
-  const reserved = await startOAuthMcpStub({ toolNames: ["probe_read"] });
+async function newReservedRig(
+  entries: (stubs: { reserved: OAuthMcpStub; control: OAuthMcpStub }) => Record<string, unknown>[],
+  options: { reservedTools?: string[]; controlTools?: string[]; answer?: string } = {},
+): Promise<ReservedRig> {
+  const reserved = await startOAuthMcpStub({ toolNames: options.reservedTools ?? ["probe_read"] });
   cleanups.push(() => reserved.close());
-  const control = await startOAuthMcpStub({ toolNames: ["control_read"] });
+  const control = await startOAuthMcpStub({ toolNames: options.controlTools ?? ["control_read"] });
   cleanups.push(() => control.close());
-  const hook = await startRecordingHook();
+  const hook = await startRecordingHook(options.answer);
   cleanups.push(() => hook.close());
   const rig = await createRig(cleanups, {
     markers,
@@ -692,6 +698,235 @@ describe("reserved server name rows (MVP-8203)", () => {
       controls: ["alpha_put_of_reserved_name_400", "beta_webhook_received_exactly_one_call_with_the_input", "reserved_stub_received_no_request", "ordinary_registry_server_contacted_in_the_same_run", "stream_shows_tool_use_and_tool_result"],
       problems,
     });
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Reserved server name prefix (MVP-8235)                              */
+/* ------------------------------------------------------------------ */
+
+const PREFIX_BODY = { error: { code: "MCP_SERVER_NAME_RESERVED", message: `MCP server names beginning with "${RESERVED}" are reserved for the gateway's webhook tools` } };
+const PREFIXED = `${RESERVED}__x`;
+const PREFIX_NAMES = [RESERVED, `${RESERVED}_`, PREFIXED, `${RESERVED}-x`];
+const prefixedOwnerDenial = { error: { code: "MCP_SERVER_OWNER_MISMATCH", message: `MCP server "${PREFIXED}" is registered by another application` } };
+
+/** Whole log lines of the registry's exclusion audit for exactly `name` (a substring of a longer name never counts). */
+const excludedLines = (rig: SecurityRig, name: string): number =>
+  rig.log().split("\n").filter((line) => line.trimEnd().endsWith(`[audit] mcp.registry.reserved_name_excluded serverName=${name}`)).length;
+
+/** Whole log lines of the run assertion's refusal for exactly `name`. */
+const clashLines = (rig: SecurityRig, name: string): number =>
+  rig.log().split("\n").filter((line) => line.trimEnd().endsWith(`[audit] mcp.run.tool_name_clash serverName=${name}`)).length;
+
+describe("reserved prefix rows (MVP-8235)", () => {
+  it("RG.prefix-new: beta's PUT of every name beginning with agent-gateway-tools is 400 with the fixed body, the entry is not readable and the registry file is unchanged", async () => {
+    const { rig, control } = await newReservedRig(() => [storedEntry("alpha-seed", "http://127.0.0.1:9/mcp")]);
+    const started = Date.now();
+    const problems: string[] = [];
+    const before = await registryBytes(rig);
+    const answers: { status: number; text: string }[] = [];
+    for (const name of PREFIX_NAMES) {
+      const put = await asLabel(rig, "beta", "PUT", `/v1/mcp-servers/${name}`, VALID_PUT(control.url));
+      answers.push(put);
+      if (put.status !== 400 || put.text !== JSON.stringify(PREFIX_BODY)) problems.push(`the PUT of ${name} was not the fixed 400`);
+      for (const label of ["alpha", "beta"] as const) {
+        const get = await asLabel(rig, label, "GET", `/v1/mcp-servers/${name}`);
+        answers.push(get);
+        if (get.status !== 404) problems.push(`${label}: ${name} is readable after the refusal`);
+      }
+    }
+    // The refusal does not depend on the body.
+    const empty = await asLabel(rig, "beta", "PUT", `/v1/mcp-servers/${PREFIXED}`, {});
+    answers.push(empty);
+    if (empty.status !== 400 || empty.text !== JSON.stringify(PREFIX_BODY)) problems.push(`the PUT of ${PREFIXED} with an empty body was not the fixed 400`);
+    if ((await registryBytes(rig)) !== before) problems.push("the persisted registry changed after the refused PUTs");
+    // Control: a non-prefixed name from the same caller, route and app is stored, readable and persisted.
+    const created = await asLabel(rig, "beta", "PUT", "/v1/mcp-servers/beta-docs", VALID_PUT(control.url));
+    const read = await asLabel(rig, "beta", "GET", "/v1/mcp-servers/beta-docs");
+    answers.push(created, read);
+    if (created.status !== 201 || read.status !== 200) problems.push("control: beta-docs was not stored and readable");
+    if ((await registryBytes(rig)) === before) problems.push("control: the persisted registry did not change for beta-docs, so the unchanged-file check cannot detect a change");
+    finishRow(recorder, rig, {
+      id: "RG.prefix-new",
+      durationMs: Date.now() - started,
+      deadlineMs: 60_000,
+      surfaces: [callerBody(answers), { name: "gateway-log", text: rig.log() }],
+      controls: ["four_names_400_fixed_body", "four_names_get_404_for_both_labels", "empty_body_same_400", "persisted_registry_unchanged", "control_beta_docs_201_get_200_and_file_changed"],
+      problems,
+    });
+  });
+
+  it("RG.prefix-legacy: a stored agent-gateway-tools__x is kept, logged once per start and refused for PUT across restarts, and its owner can still read and delete it", async () => {
+    const { rig, reserved } = await newReservedRig(({ reserved: stub }) => [storedEntry(PREFIXED, stub.url, { owner: "beta" })]);
+    const started = Date.now();
+    const problems: string[] = [];
+    const answers: { status: number; text: string }[] = [];
+    const expectAudit = (stage: string, total: number): void => {
+      if (excludedLines(rig, PREFIXED) !== total) problems.push(`${stage}: ${excludedLines(rig, PREFIXED)} whole audit line(s) in the log so far, expected ${total}`);
+    };
+    const rewriteOwner = (owner: string | undefined): void => {
+      const file = path.join(rig.gateway.dirs.persist, "mcp-servers.json");
+      const entries = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>[];
+      const entry = entries.find((candidate) => candidate.name === PREFIXED)!;
+      if (owner === undefined) delete entry.owner;
+      else entry.owner = owner;
+      fs.writeFileSync(file, JSON.stringify(entries, null, 2));
+    };
+
+    // Start 1: owner beta.
+    await new Promise((resolve) => setTimeout(resolve, PERSIST_WAIT_MS));
+    expectAudit("first start", 1);
+    // Control: beta stores an ordinary server through the route, and its owner's PUT on it is accepted.
+    const ordinary = await asLabel(rig, "beta", "PUT", "/v1/mcp-servers/beta-docs", VALID_PUT(reserved.url));
+    answers.push(ordinary);
+    if (ordinary.status !== 201) problems.push("control: beta-docs was not stored through the route");
+    const before = await registryBytes(rig);
+    const owner = await asLabel(rig, "beta", "PUT", `/v1/mcp-servers/${PREFIXED}`, VALID_PUT(reserved.url));
+    const other = await asLabel(rig, "alpha", "PUT", `/v1/mcp-servers/${PREFIXED}`, VALID_PUT(reserved.url));
+    answers.push(owner, other);
+    if (owner.status !== 400 || owner.text !== JSON.stringify(PREFIX_BODY)) problems.push("the owner's PUT was not the fixed 400");
+    if (other.status !== 403 || other.text !== JSON.stringify(prefixedOwnerDenial)) problems.push("another label's PUT was not the unchanged 403");
+    if ((await registryBytes(rig)) !== before) problems.push("the persisted registry changed after the refused PUTs");
+    const edit = await asLabel(rig, "beta", "PUT", "/v1/mcp-servers/beta-docs", { type: "http", url: reserved.url, description: "edited" });
+    answers.push(edit);
+    if (edit.status !== 200) problems.push("control: the owner's PUT on beta-docs was not 200");
+
+    // Start 2: a plain restart, the entry is still there and logged again.
+    await rig.restart();
+    await new Promise((resolve) => setTimeout(resolve, PERSIST_WAIT_MS));
+    expectAudit("second start", 2);
+    const kept = await asLabel(rig, "beta", "GET", `/v1/mcp-servers/${PREFIXED}`);
+    answers.push(kept);
+    if (kept.status !== 200) problems.push("the stored entry is gone after a restart");
+
+    // Start 3: the entry is rewritten as ownerless, every label is refused.
+    await rig.restart("SIGTERM", () => rewriteOwner(undefined));
+    await new Promise((resolve) => setTimeout(resolve, PERSIST_WAIT_MS));
+    expectAudit("third start", 3);
+    const ownerless = await registryBytes(rig);
+    for (const label of ["alpha", "beta"] as const) {
+      const put = await asLabel(rig, label, "PUT", `/v1/mcp-servers/${PREFIXED}`, VALID_PUT(reserved.url));
+      answers.push(put);
+      if (put.status !== 403 || put.text !== JSON.stringify(prefixedOwnerDenial)) problems.push(`${label}: the PUT on the ownerless entry was not the unchanged 403`);
+    }
+    if ((await registryBytes(rig)) !== ownerless) problems.push("the persisted registry changed after the PUTs on the ownerless entry");
+
+    // Start 4: owner beta again, the owner reads and deletes the entry.
+    await rig.restart("SIGTERM", () => rewriteOwner("beta"));
+    await new Promise((resolve) => setTimeout(resolve, PERSIST_WAIT_MS));
+    expectAudit("fourth start", 4);
+    const read = await asLabel(rig, "beta", "GET", `/v1/mcp-servers/${PREFIXED}`);
+    const del = await asLabel(rig, "beta", "DELETE", `/v1/mcp-servers/${PREFIXED}`);
+    const gone = await asLabel(rig, "beta", "GET", `/v1/mcp-servers/${PREFIXED}`);
+    answers.push(read, del, gone);
+    if (read.status !== 200) problems.push("the owner cannot read the stored entry");
+    if (del.status !== 204) problems.push("the owner cannot delete the stored entry");
+    if (gone.status !== 404) problems.push("the entry is still readable after the delete");
+    if ((await registryBytes(rig)).includes(`"${PREFIXED}"`)) problems.push("the deleted entry is still in the persisted registry");
+
+    // Start 5: nothing is stored under the name any more, so no new audit line.
+    await rig.restart();
+    await new Promise((resolve) => setTimeout(resolve, PERSIST_WAIT_MS));
+    expectAudit("fifth start", 4);
+    finishRow(recorder, rig, {
+      id: "RG.prefix-legacy",
+      durationMs: Date.now() - started,
+      deadlineMs: 300_000,
+      surfaces: [callerBody(answers), { name: "gateway-log", text: rig.log() }],
+      controls: ["whole_audit_line_once_per_start", "owner_put_400_other_label_403", "ownerless_entry_403_for_both_labels", "persisted_registry_unchanged_after_each_refusal", "owner_reads_and_deletes", "no_audit_line_after_delete", "control_owner_put_on_beta_docs_200"],
+      problems,
+    });
+  });
+
+  /**
+   * One run of alpha, whose webhook tool `x__y` shares its full name with what beta's prefixed server would produce, under
+   * the given way the prefixed entry came about. Counts only are recorded.
+   */
+  async function prefixRun(id: string, setup: "refused" | "stored" | "reenabled"): Promise<void> {
+    const entries = (stub: OAuthMcpStub): Record<string, unknown>[] => (setup === "refused" ? [] : [storedEntry(PREFIXED, stub.url, { owner: "beta", enabled: setup === "stored" })]);
+    const { rig, reserved, control, hook } = await newReservedRig(({ reserved: stub }) => entries(stub), { reservedTools: ["y"], controlTools: ["docs_read"], answer: "ALPHA-WEBHOOK-ANSWER" });
+    const started = Date.now();
+    const problems: string[] = [];
+    const answers: { status: number; text: string }[] = [];
+    const marker = `RG-PREFIX-INPUT-${randomBytes(6).toString("hex")}`;
+
+    if (setup === "refused") {
+      const attempt = await asLabel(rig, "beta", "PUT", `/v1/mcp-servers/${PREFIXED}`, VALID_PUT(reserved.url));
+      answers.push(attempt);
+      if (attempt.status !== 400) problems.push("beta's PUT of the prefixed name was not refused with 400");
+    }
+    const ordinary = await asLabel(rig, "beta", "PUT", "/v1/mcp-servers/beta-docs", VALID_PUT(control.url));
+    answers.push(ordinary);
+    if (ordinary.status !== 201) problems.push("beta's ordinary server was not registered through the route");
+    const tool = await asLabel(rig, "alpha", "PUT", "/v1/tools/x__y", { description: "victim tool", input_schema: { type: "object", properties: { marker: { type: "string" } } }, webhook_url: `${hook.base}/x__y` });
+    answers.push(tool);
+    if (tool.status >= 300) problems.push("alpha's webhook tool was not registered");
+    if (setup === "stored") {
+      await new Promise((resolve) => setTimeout(resolve, PERSIST_WAIT_MS));
+      await rig.restart();
+    }
+    if (setup === "reenabled") {
+      const restart = await asLabel(rig, "alpha", "POST", `/v1/mcp-servers/${PREFIXED}/restart`);
+      answers.push(restart);
+      const detail = await asLabel(rig, "beta", "GET", `/v1/mcp-servers/${PREFIXED}`);
+      answers.push(detail);
+      if (restart.status !== 200 || detail.json?.enabled !== true) problems.push("precondition: the non-owner restart did not enable the stored entry");
+    }
+    if (setup !== "refused") {
+      const detail = await asLabel(rig, "beta", "GET", `/v1/mcp-servers/${PREFIXED}`);
+      answers.push(detail);
+      if (detail.status !== 200) problems.push("precondition: the stored prefixed entry is not there");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const alphaRig: SecurityRig = { ...rig, ask: (_label, body, deadlineMs, controlHandle) => queryAs(rig.gateway.port, LABEL_KEYS.alpha, body, deadlineMs, controlHandle) };
+    const callName = `mcp__${RESERVED}__x__y`;
+    const turn = await chatTurn(alphaRig, {
+      prompt: `RG-PREFIX-RUN-${setup}`,
+      sessionId: `conv-rg-prefix-run-${setup}`,
+      withCredentials: false,
+      steps: [{ name: callName, input: { marker } }],
+      body: { allowedTools: [callName, "mcp__beta-docs__*"] },
+    });
+    const last = turn.outcome.events.at(-1)?.type ?? "no event";
+    problems.push(...turnProblems(turn).filter((problem) => !problem.startsWith("the stream did not end in done")));
+    if (last === "error") problems.push(`alpha's run ended with an error (tool_name_clash lines=${clashLines(rig, PREFIXED)})`);
+    else if (last !== "done") problems.push(`the stream did not end in done (${last})`);
+
+    if (hook.calls.length !== 1) problems.push(`alpha's webhook received ${hook.calls.length} call(s), expected exactly 1`);
+    else if (hook.calls[0].path !== "/x__y" || hook.calls[0].toolName !== "x__y" || JSON.stringify(hook.calls[0].body) !== JSON.stringify({ marker })) problems.push("alpha's webhook did not receive exactly the scripted input");
+    const methods = reserved.requests.flatMap((request) => request.rpcMethods);
+    if (reserved.requests.length !== 0) problems.push(`beta's prefixed server was contacted (${reserved.requests.length} request(s), ${methods.filter((method) => method === "tools/call").length} tools/call)`);
+    const controlMethods = control.requests.flatMap((request) => request.rpcMethods);
+    if (!controlMethods.includes("initialize") || !controlMethods.includes("tools/list")) problems.push("control: beta-docs was not contacted (initialize and tools/list) in the same run");
+    const calls = turn.outcome.events.filter((event) => event.type === "tool_use" && event.toolName === callName);
+    const results = turn.outcome.events.filter((event) => event.type === "tool_result");
+    if (calls.length !== 1) problems.push(`the stream showed ${calls.length} tool_use event(s) for the webhook tool, expected 1`);
+    if (results.length < 1) problems.push("the stream showed no tool_result for the webhook tool");
+    if (turn.results[0]?.isError || !turn.results[0]?.text.includes("ALPHA-WEBHOOK-ANSWER")) problems.push("the model did not receive the webhook's answer as the tool result");
+    if (clashLines(rig, PREFIXED) !== 0) problems.push(`the run assertion refused a run it should have let start (tool_name_clash lines=${clashLines(rig, PREFIXED)})`);
+
+    finishRow(recorder, rig, {
+      id,
+      durationMs: Date.now() - started,
+      deadlineMs: TURN_DEADLINE_MS * 2,
+      surfaces: [...surfacesOf(alphaRig, [turn]), callerBody(answers)],
+      floors: { "tool-results": 10 },
+      controls: ["alpha_webhook_received_exactly_one_call_with_the_input", "prefixed_stub_received_no_request", "beta_docs_contacted_in_the_same_run", "stream_shows_tool_use_and_tool_result", "no_run_assertion_refusal"],
+      problems,
+    });
+  }
+
+  it("RG.prefix-run-refused: beta's PUT of agent-gateway-tools__x was refused, and alpha's chat reaches alpha's webhook tool x__y with its input while beta's server gets no request", async () => {
+    await prefixRun("RG.prefix-run-refused", "refused");
+  });
+
+  it("RG.prefix-run-stored: a stored enabled agent-gateway-tools__x of beta, after a restart, is not offered: alpha's webhook tool x__y gets the input and beta's server no request", async () => {
+    await prefixRun("RG.prefix-run-stored", "stored");
+  });
+
+  it("RG.prefix-run-reenabled: a stored disabled agent-gateway-tools__x that alpha's non-owner restart enabled is not offered: alpha's webhook tool x__y gets the input and beta's server no request", async () => {
+    await prefixRun("RG.prefix-run-reenabled", "reenabled");
   });
 });
 

@@ -423,7 +423,7 @@ describe("request mcpServers are validated on the trusted side", () => {
   it.each([
     ["a name that is not a valid server name", { "bad name": { command: "node" } }, /name "\(invalid name\)" must be 1-32 letters/],
     ["a name that is too long", { ["a".repeat(33)]: { command: "node" } }, /must be 1-32 letters/],
-    ["the reserved name", { "agent-gateway-tools": { command: "node" } }, /reserved server/],
+    ["the reserved name", { "agent-gateway-tools": { command: "node" } }, /must not use a server name beginning with "agent-gateway-tools"/],
     ["a command and a url", { x: { command: "node", url: "http://127.0.0.1:9/mcp" } }, /either "command" or "url"/],
     ["a type other than http or sse", { x: { url: "http://127.0.0.1:9/mcp", type: "ws" } }, /type must be "http" or "sse"/],
     ["type stdio on a url server", { x: { url: "http://127.0.0.1:9/mcp", type: "stdio" } }, /type must be "http" or "sse"/],

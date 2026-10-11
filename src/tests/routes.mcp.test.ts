@@ -257,7 +257,7 @@ describe("PUT /v1/mcp-servers/agent-gateway-tools reserved name (MVP-8203)", () 
   const ALPHA = { Authorization: "Bearer sk-gw-reserved-alpha" };
   const BETA = { Authorization: "Bearer sk-gw-reserved-beta" };
   const RESERVED_ERROR = {
-    error: { code: "MCP_SERVER_NAME_RESERVED", message: '"agent-gateway-tools" is reserved for the gateway\'s webhook tools' },
+    error: { code: "MCP_SERVER_NAME_RESERVED", message: 'MCP server names beginning with "agent-gateway-tools" are reserved for the gateway\'s webhook tools' },
   };
   const OWNER_ERROR = {
     error: { code: "MCP_SERVER_OWNER_MISMATCH", message: `MCP server "${RESERVED}" is registered by another application` },
@@ -405,4 +405,162 @@ describe("PUT /v1/mcp-servers/agent-gateway-tools reserved name (MVP-8203)", () 
     await waitForPersistence();
     expect(JSON.parse(fileBytes())).toEqual([expect.objectContaining({ name: "alpha-tools", owner: "alpha" })]);
   });
+});
+
+/**
+ * Every server name that begins with `agent-gateway-tools` is reserved, not only the exact name (MVP-8235): a registry
+ * server `agent-gateway-tools_<s>` can produce the full tool name of another caller's webhook tool. The refusal is the
+ * same 400 with one fixed body, after the owner check, whatever the request body, and leaves the registry file untouched.
+ */
+describe("PUT /v1/mcp-servers/agent-gateway-tools* reserved name prefix (MVP-8235)", () => {
+  const PREFIX = "agent-gateway-tools";
+  const PREFIXED = `${PREFIX}__x`;
+  const ALPHA = { Authorization: "Bearer sk-gw-prefix-alpha" };
+  const BETA = { Authorization: "Bearer sk-gw-prefix-beta" };
+  const RESERVED_ERROR = {
+    error: { code: "MCP_SERVER_NAME_RESERVED", message: 'MCP server names beginning with "agent-gateway-tools" are reserved for the gateway\'s webhook tools' },
+  };
+  const ownerError = (name: string) => ({ error: { code: "MCP_SERVER_OWNER_MISMATCH", message: `MCP server "${name}" is registered by another application` } });
+  const validBody = { type: "http", url: "http://prefix.example.test/mcp", headers: { "X-Probe": "replaced" } };
+  const NOW = "2026-09-01T00:00:00.000Z";
+
+  afterEach(() => {
+    delete process.env.API_KEYS;
+  });
+
+  async function createTwoLabelApp(options: { auth?: boolean } = {}) {
+    const { default: mcpRoutes } = await import("../routes/mcp.js");
+    const app = express();
+    app.use(express.json());
+    if (options.auth !== false) await mountLabelAuth(app, { alpha: "sk-gw-prefix-alpha", beta: "sk-gw-prefix-beta" });
+    app.use(mcpRoutes);
+    return app;
+  }
+
+  async function seedLegacy(overrides: Record<string, unknown> = {}) {
+    const registry = await import("../mcp-registry.js");
+    registry.registerMcpServer({
+      name: PREFIXED,
+      description: "stored before the prefix rule",
+      enabled: true,
+      type: "stdio",
+      command: "node",
+      args: ["-e", "0"],
+      env: { SEEDED_ENV: "seeded-env-value" },
+      headers: { "X-Seeded": "seeded-header-value" },
+      owner: "alpha",
+      createdAt: NOW,
+      updatedAt: NOW,
+      ...overrides,
+    } as never);
+    registry.flushMcpServers();
+    return registry;
+  }
+
+  const fileBytes = () => fs.readFileSync(persistPath, "utf-8");
+
+  it.each([PREFIX, `${PREFIX}_`, `${PREFIX}__x`, `${PREFIX}-x`])(
+    "R1: a new registration of %s is 400 MCP_SERVER_NAME_RESERVED with the fixed body, GET answers 404 and the registry file is unchanged",
+    async (name) => {
+      const registry = await import("../mcp-registry.js");
+      registry.registerMcpServer({ name: "alpha-seed", description: "seed", enabled: true, type: "http", url: "http://seed.example.test/mcp", owner: "alpha", createdAt: NOW, updatedAt: NOW } as never);
+      registry.flushMcpServers();
+      const bytes = fileBytes();
+      const app = await createTwoLabelApp();
+      const res = await request(app).put(`/v1/mcp-servers/${name}`).set(BETA).send(validBody);
+      expect(res.status).toBe(400);
+      expect(res.text).toBe(JSON.stringify(RESERVED_ERROR));
+      expect((await request(app).get(`/v1/mcp-servers/${name}`).set(BETA)).status).toBe(404);
+      expect((await request(app).get(`/v1/mcp-servers/${name}`).set(ALPHA)).status).toBe(404);
+      expect(registry.getMcpServer(name)).toBeUndefined();
+      registry.flushMcpServers();
+      await waitForPersistence();
+      expect(fileBytes()).toBe(bytes);
+    },
+  );
+
+  it("R2: the owner of a legacy prefixed entry gets 400 and the stored definition, headers, env and args included, stays as seeded", async () => {
+    const registry = await seedLegacy();
+    const before = structuredClone(registry.getMcpServer(PREFIXED));
+    const bytes = fileBytes();
+    const app = await createTwoLabelApp();
+    const res = await request(app).put(`/v1/mcp-servers/${PREFIXED}`).set(ALPHA).send(validBody);
+    expect(res.status).toBe(400);
+    expect(res.text).toBe(JSON.stringify(RESERVED_ERROR));
+    expect(registry.getMcpServer(PREFIXED)).toEqual(before);
+    expect(before).toMatchObject({ args: ["-e", "0"], env: { SEEDED_ENV: "seeded-env-value" }, headers: { "X-Seeded": "seeded-header-value" } });
+    await waitForPersistence();
+    expect(fileBytes()).toBe(bytes);
+  });
+
+  it("R3 pin: another label's PUT on a legacy prefixed entry is the unchanged 403 and the entry stays as seeded", async () => {
+    const registry = await seedLegacy();
+    const before = structuredClone(registry.getMcpServer(PREFIXED));
+    const bytes = fileBytes();
+    const app = await createTwoLabelApp();
+    const res = await request(app).put(`/v1/mcp-servers/${PREFIXED}`).set(BETA).send(validBody);
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual(ownerError(PREFIXED));
+    expect(registry.getMcpServer(PREFIXED)).toEqual(before);
+    await waitForPersistence();
+    expect(fileBytes()).toBe(bytes);
+  });
+
+  it("R4 pin: an ownerless legacy prefixed entry is refused for every label with the unchanged 403", async () => {
+    const registry = await seedLegacy({ owner: undefined });
+    const before = structuredClone(registry.getMcpServer(PREFIXED));
+    expect(before?.owner).toBeUndefined();
+    const bytes = fileBytes();
+    const app = await createTwoLabelApp();
+    for (const caller of [ALPHA, BETA]) {
+      const res = await request(app).put(`/v1/mcp-servers/${PREFIXED}`).set(caller).send(validBody);
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual(ownerError(PREFIXED));
+    }
+    expect(registry.getMcpServer(PREFIXED)).toEqual(before);
+    await waitForPersistence();
+    expect(fileBytes()).toBe(bytes);
+  });
+
+  it("R5 pin: a caller without a label and no entry keeps the unchanged 403 for a prefixed name", async () => {
+    const registry = await import("../mcp-registry.js");
+    const app = await createTwoLabelApp({ auth: false });
+    const res = await request(app).put(`/v1/mcp-servers/${PREFIXED}`).send(validBody);
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual(ownerError(PREFIXED));
+    expect(registry.getMcpServer(PREFIXED)).toBeUndefined();
+    await waitForPersistence();
+    expect(fs.existsSync(persistPath)).toBe(false);
+  });
+
+  it.each([
+    ["an empty body", {}],
+    ["an invalid type", { type: "bogus" }],
+  ])("R6: %s does not change the outcome for a prefixed name: a new name and a legacy owner get 400 RESERVED, another label 403", async (_label, body) => {
+    const app = await createTwoLabelApp();
+    const fresh = await request(app).put(`/v1/mcp-servers/${PREFIXED}`).set(ALPHA).send(body);
+    expect(fresh.status).toBe(400);
+    expect(fresh.body).toEqual(RESERVED_ERROR);
+
+    await seedLegacy();
+    const owner = await request(app).put(`/v1/mcp-servers/${PREFIXED}`).set(ALPHA).send(body);
+    expect(owner.status).toBe(400);
+    expect(owner.body).toEqual(RESERVED_ERROR);
+    const other = await request(app).put(`/v1/mcp-servers/${PREFIXED}`).set(BETA).send(body);
+    expect(other.status).toBe(403);
+    expect(other.body).toEqual(ownerError(PREFIXED));
+  });
+
+  it.each(["beta-docs", "agent-gateway-tool", "Agent-Gateway-Tools_x"])(
+    "C1 control: the same caller registers %s through the same route and app: 201, file changes, GET 200",
+    async (name) => {
+      const app = await createTwoLabelApp();
+      const put = await request(app).put(`/v1/mcp-servers/${name}`).set(BETA).send(validBody);
+      expect(put.status).toBe(201);
+      expect(put.body.name).toBe(name);
+      expect((await request(app).get(`/v1/mcp-servers/${name}`).set(BETA)).status).toBe(200);
+      await waitForPersistence();
+      expect(JSON.parse(fileBytes())).toEqual([expect.objectContaining({ name, owner: "beta" })]);
+    },
+  );
 });

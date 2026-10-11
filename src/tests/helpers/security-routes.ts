@@ -630,7 +630,7 @@ export function entrypointRowIds(): string[] {
 
 /** The row ids of the registry write-only suite (`security-registry-process.test.ts`, MVP-7936, MVP-7957, MVP-8203). */
 export function registryRowIds(): string[] {
-  return ["RG.read", "RG.write", "RG.refused", "RG.reserved-new", "RG.reserved-legacy", "RG.reserved-run", "RG.preserve-run", "RG.args-url", "RG.failure-text"];
+  return ["RG.read", "RG.write", "RG.refused", "RG.reserved-new", "RG.reserved-legacy", "RG.reserved-run", "RG.prefix-new", "RG.prefix-legacy", "RG.prefix-run-refused", "RG.prefix-run-stored", "RG.prefix-run-reenabled", "RG.preserve-run", "RG.args-url", "RG.failure-text"];
 }
 
 /** The row ids of the failure suite (`security-failure-process.test.ts`). */
