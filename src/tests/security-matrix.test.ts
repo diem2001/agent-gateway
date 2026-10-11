@@ -4916,21 +4916,27 @@ describe("process sampler lost ticks (MVP-8139)", () => {
     ts.forEachChild(node, (child) => walk(child, visit));
   };
 
-  it("LT-static: only the declared LT rows pass the tick read seam or acknowledge lost ticks (every identifier or whole string literal of those names in a TypeScript file under src belongs to the brace-matched body of one row)", () => {
+  it("LT-static: only the declared LT rows pass the tick read seam or acknowledge lost ticks (every identifier, whole string literal or local import alias of those names in a TypeScript or JavaScript file under src belongs to the brace-matched body of one row)", () => {
     const ALLOWED = ["LT-tree", "LT-snapshot", "LT-first-exe", "LT-reread", "LT-abort", "LT-two-reads", "LT-two-ticks", "LT-records0", "LT-neg", "LT-gateway", "LT-ack", "sandboxedWindow", "assertLostWindow"];
     const names = ["tickRead" + "Fault", "acknowledge" + "LostTicks"];
     const srcDir = path.resolve(testsDir, "..");
     const definition = path.join(testsDir, "helpers", "security-matrix.ts");
+    const scriptExtensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
     const files = (fs.readdirSync(srcDir, { recursive: true }) as string[])
-      .filter((name) => name.endsWith(".ts") && !name.split(path.sep).includes("node_modules"))
+      .filter((name) => scriptExtensions.includes(path.extname(name)) && !name.split(path.sep).includes("node_modules"))
       .map((name) => path.join(srcDir, name))
       .filter((file) => file !== definition);
     const offenders: string[] = [];
     let uses = 0;
     for (const file of files) {
       const source = sourceOf(file);
+      // A name imported under another local name is tracked by that local name in this file.
+      const tracked = new Set(names);
       walk(source, (node) => {
-        if (!(ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) || !names.includes(node.text)) return;
+        if (ts.isImportSpecifier(node) && names.includes((node.propertyName ?? node.name).text)) tracked.add(node.name.text);
+      });
+      walk(source, (node) => {
+        if (!(ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) || !tracked.has(node.text)) return;
         for (let up: ts.Node | undefined = node; up; up = up.parent) if (ts.isImportDeclaration(up)) return;
         uses += 1;
         let owner = "outside a row";
@@ -4952,7 +4958,7 @@ describe("process sampler lost ticks (MVP-8139)", () => {
     expect(offenders, `offenders: ${offenders.join(" | ")}`).toEqual([]);
   });
 
-  it("LT-wiring: the setup file is registered, its afterEach asks lostTickVerdict, and the INVALID skip asks invalidSkipDecision with the lost ticks of the test (the decision call's arguments, the lostTicks declaration and the skip branch are pinned)", () => {
+  it("LT-wiring: the setup file is registered, its afterEach asks lostTickVerdict, and the INVALID skip asks invalidSkipDecision with the lost ticks of the test (the whole INVALID skip wrapper is pinned: its parameters, try body, six catch statements, cap check, final rethrow, skip counter and the bindings it relies on)", () => {
     const root = path.resolve(testsDir, "..", "..");
     const config = fs.readFileSync(path.join(root, "vitest.config.ts"), "utf8");
     expect(config).toMatch(/setupFiles:\s*\["src\/tests\/setup\/sampler-verdict\.ts"\]/);
@@ -4975,7 +4981,7 @@ describe("process sampler lost ticks (MVP-8139)", () => {
     expect(wrapper).toMatch(/invalidSkipDecision\(\{[^}]*lostTicks/);
 
     // The decision call's arguments, the `lostTicks` declaration and the skip branch: a regex over the text accepts `lostTicks: 0`, a shadowing binding, a second wrapper or a skip that returns.
-    // The rest of the wrapper (the try body, the rest of the catch block, the cap check) is not pinned.
+    // The rest of the wrapper is pinned further down (MVP-8194), part by part; the message of each check ends with the name of its part.
     // The expected texts are assembled from parts, so that no line of this row is the verbatim text a falsification patch replaces.
     const self = sourceOf(fileURLToPath(import.meta.url));
     const norm = (text: string): string => text.replace(/\s+/g, " ").trim();
@@ -5052,6 +5058,152 @@ describe("process sampler lost ticks (MVP-8139)", () => {
       "wiring: the skip branch counts the skip, writes the INVALID-SKIP line and skips the test, in that order",
     ).toBe(true);
     expect(leaves, "wiring: the skip branch neither returns nor throws").toBe(false);
+
+    // The whole wrapper (MVP-8194). Every expected text is assembled from parts, and no message repeats source text.
+    const pin = (ok: boolean, what: string, part: string): void => {
+      expect(ok, `wiring: ${what} (${part})`).toBe(true);
+    };
+    const plain = (parameter: ts.ParameterDeclaration | undefined, parameterName: string): boolean =>
+      parameter !== undefined && ts.isIdentifier(parameter.name) && parameter.name.text === parameterName && parameter.initializer === undefined && parameter.dotDotDotToken === undefined && parameter.questionToken === undefined;
+    const isNamed = (node: ts.Node | undefined, text: string): boolean => node !== undefined && ts.isIdentifier(node) && node.text === text;
+    const nodeText = (node: ts.Node | undefined): string => (node === undefined ? "" : norm(node.getText()));
+
+    const outer = wrapperNode.initializer;
+    const outerArrow = outer !== undefined && ts.isArrowFunction(outer) ? outer : undefined;
+    const baseCall = outerArrow !== undefined && ts.isCallExpression(outerArrow.body) ? outerArrow.body : undefined;
+    pin(
+      outerArrow !== undefined && outerArrow.parameters.length === 2 && plain(outerArrow.parameters[0], "name") && plain(outerArrow.parameters[1], "body") && baseCall !== undefined && isNamed(baseCall.expression, "baseIt"),
+      "the wrapper takes the plain parameters name and body and its concise body is one call of the vitest it",
+      "wrapper parameters",
+    );
+    const callback = baseCall !== undefined && baseCall.arguments.length === 2 && isNamed(baseCall.arguments[0], "name") ? baseCall.arguments[1] : undefined;
+    const callbackArrow = callback !== undefined && ts.isArrowFunction(callback) ? callback : undefined;
+    const callbackIsAsync = callbackArrow?.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword) === true;
+    const callbackBlock = callbackArrow !== undefined && ts.isBlock(callbackArrow.body) ? callbackArrow.body : undefined;
+    pin(
+      callbackArrow !== undefined && callbackIsAsync && callbackArrow.parameters.length === 1 && plain(callbackArrow.parameters[0], "context") && callbackBlock !== undefined && callbackBlock.statements.length === 1 && ts.isTryStatement(callbackBlock.statements[0]),
+      "the test callback is async, takes the plain parameter context and holds exactly one try statement",
+      "wrapper parameters",
+    );
+    const tryStatement = callbackBlock !== undefined && ts.isTryStatement(callbackBlock.statements[0]) ? callbackBlock.statements[0] : undefined;
+    const catchClause = tryStatement?.catchClause;
+    pin(tryStatement !== undefined && tryStatement.finallyBlock === undefined, "the try statement has no finally block", "no finally");
+    pin(
+      catchClause !== undefined && catchClause.variableDeclaration !== undefined && isNamed(catchClause.variableDeclaration.name, "error") && catchClause.variableDeclaration.type === undefined && catchClause.variableDeclaration.initializer === undefined,
+      "the catch binding is the plain identifier error",
+      "no finally",
+    );
+    const tryBody: readonly ts.Statement[] = tryStatement?.tryBlock.statements ?? [];
+    pin(tryBody.length === 1 && nodeText(tryBody[0]) === ["await", "body();"].join(" "), "the try body runs the row body and nothing else", "try body");
+    const catchStatements: readonly ts.Statement[] = catchClause?.block.statements ?? [];
+    const messageDeclarations: ts.VariableDeclaration[] = [];
+    walk(wrapperNode.initializer!, (node) => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "message") messageDeclarations.push(node);
+    });
+    const messageSource = ["error", "instanceof", "Error", "?", "error.message", ":", "String(error)"].join(" ");
+    pin(messageDeclarations.length === 1 && nodeText(messageDeclarations[0].initializer) === messageSource, "the message is the error's own message or its string form", "message source");
+    const capChecks = catchStatements.filter((statement): statement is ts.IfStatement => ts.isIfStatement(statement) && nodeText(statement.expression) === ["decide(0)", "===", '"skip"'].join(" "));
+    const capThrow = capChecks.length === 1 ? capChecks[0].thenStatement : undefined;
+    const capError = capThrow !== undefined && ts.isThrowStatement(capThrow) && capThrow.expression !== undefined && ts.isNewExpression(capThrow.expression) ? capThrow.expression : undefined;
+    const capText = ["`INVALID", "cap", "exceeded", "(${INVALID_SKIP_CAP}):", "${message}`"].join(" ");
+    pin(
+      capChecks.length === 1 && capChecks[0].elseStatement === undefined && capError !== undefined && isNamed(capError.expression, "Error") && capError.arguments?.length === 1 && nodeText(capError.arguments[0]) === capText,
+      "the wrapper has one cap check that asks decide with zero skips and throws the cap error with the original message",
+      "cap check",
+    );
+    const lastStatement = catchStatements[catchStatements.length - 1];
+    pin(lastStatement !== undefined && ts.isThrowStatement(lastStatement) && isNamed(lastStatement.expression, "error"), "the catch block ends by rethrowing the caught error", "final rethrow");
+    pin(skipBranches[0].elseStatement === undefined, "the skip branch has no else", "skip branch else");
+    const decideBody = decides.length === 1 && decides[0].initializer !== undefined && ts.isArrowFunction(decides[0].initializer) ? decides[0].initializer.body : undefined;
+    const decideText = ["invalidSkipDecision({", "fullSuite:", suiteFlag + ",", "message,", "skippedSoFar,", "lostTicks", "})"].join(" ");
+    pin(
+      decides.length === 1 && (decides[0].parent.flags & ts.NodeFlags.Const) !== 0 && decideBody !== undefined && nodeText(decideBody) === decideText,
+      "decide is a const arrow whose body is the one decision call",
+      "decide body",
+    );
+    for (const name of ["name", "body", "error", "context"]) pin(bound.get(name) === 1, "the wrapper binds its own names exactly once", "bound names");
+    pin(!bound.has("skipped"), "the wrapper binds no skip counter of its own", "skip counter");
+
+    // The counter lives in the describe that holds the wrapper: one let, initial value zero, read once and incremented once.
+    let describeBody: ts.Block | undefined;
+    for (let up: ts.Node | undefined = wrapperNode.parent; up !== undefined && describeBody === undefined; up = up.parent) {
+      if (ts.isBlock(up) && ts.isArrowFunction(up.parent) && ts.isCallExpression(up.parent.parent) && isNamed(up.parent.parent.expression, "describe")) describeBody = up;
+    }
+    const counters: ts.Node[] = [];
+    let counterIdentifiers = 0;
+    if (describeBody !== undefined) {
+      walk(describeBody, (node) => {
+        if (ts.isIdentifier(node) && node.text === "skipped") counterIdentifiers += 1;
+        if ((ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node)) && ts.isIdentifier(node.name) && node.name.text === "skipped") counters.push(node);
+      });
+    }
+    const counter = counters.length === 1 && ts.isVariableDeclaration(counters[0]) ? counters[0] : undefined;
+    pin(
+      counter !== undefined &&
+        counter.parent.parent.parent === describeBody &&
+        (counter.parent.flags & ts.NodeFlags.Let) !== 0 &&
+        counter.initializer !== undefined &&
+        ts.isNumericLiteral(counter.initializer) &&
+        counter.initializer.text === "0" &&
+        counterIdentifiers === 3,
+      "the describe holds one let counter that starts at zero and occurs three times",
+      "skip counter",
+    );
+
+    // The names the wrapper relies on are bound once, where the file imports them, and nothing assigns the full-suite flag.
+    const bindingsOf = (wanted: string): ts.Node[] => {
+      const found: ts.Node[] = [];
+      walk(self, (node) => {
+        const named = (ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node) || ts.isImportSpecifier(node) || ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) || ts.isImportClause(node) || ts.isNamespaceImport(node)) && node.name !== undefined && ts.isIdentifier(node.name) && node.name.text === wanted;
+        if (named) found.push(node);
+      });
+      return found;
+    };
+    const importedFrom = (node: ts.Node | undefined, moduleName: string): boolean => {
+      for (let up: ts.Node | undefined = node; up !== undefined; up = up.parent) {
+        if (ts.isImportDeclaration(up)) return ts.isStringLiteral(up.moduleSpecifier) && up.moduleSpecifier.text === moduleName;
+      }
+      return false;
+    };
+    const itBindings = bindingsOf("it");
+    pin(
+      itBindings.length === 2 && itBindings.filter((node) => ts.isImportSpecifier(node) && node.propertyName === undefined && importedFrom(node, "vitest")).length === 1 && itBindings.includes(wrapperNode),
+      "it is bound only by the vitest import and the wrapper",
+      "bindings",
+    );
+    const baseBindings = bindingsOf("baseIt");
+    let baseOutside = 0;
+    walk(self, (node) => {
+      if (isNamed(node, "baseIt") && !ts.isImportSpecifier(node.parent) && !inside(node, wrapperNode)) baseOutside += 1;
+    });
+    pin(
+      baseBindings.length === 1 && ts.isImportSpecifier(baseBindings[0]) && baseBindings[0].propertyName?.text === "it" && importedFrom(baseBindings[0], "vitest") && baseOutside === 0,
+      "baseIt is bound only by the vitest import and used only by the wrapper",
+      "bindings",
+    );
+    for (const imported of ["invalidSkipDecision", "currentTestLostTicks", "INVALID_SKIP_CAP"]) {
+      const found = bindingsOf(imported);
+      pin(found.length === 1 && ts.isImportSpecifier(found[0]) && found[0].propertyName === undefined && importedFrom(found[0], "./helpers/security-matrix.js"), "a name the wrapper relies on is bound only by its import from the harness", "bindings");
+    }
+    let flagWritten = false;
+    walk(self, (node) => {
+      const target = ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment ? node.left : ts.isDeleteExpression(node) ? node.expression : undefined;
+      if (target === undefined) return;
+      const text = nodeText(target);
+      if (text.startsWith("process.env") && (text.includes("FULL_SUITE") || text === "process.env")) flagWritten = true;
+    });
+    pin(!flagWritten, "nothing in the file assigns or deletes the full-suite flag", "bindings");
+
+    // The statement count and order come last: the checks above name the part that changed.
+    const statementShapes = [
+      messageDeclarations.length === 1 && catchStatements[0] === messageDeclarations[0].parent.parent,
+      lostDeclarations.length === 1 && catchStatements[1] === lostDeclarations[0].parent.parent,
+      decides.length === 1 && catchStatements[2] === decides[0].parent.parent,
+      catchStatements[3] === skipBranches[0],
+      capChecks.length === 1 && catchStatements[4] === capChecks[0],
+      catchStatements[5] === lastStatement,
+    ];
+    pin(catchStatements.length === 6 && statementShapes.every(Boolean), "the catch block holds exactly the six statements in order", "catch statements");
   });
 
   it("N1-wiring: the settle of a pending record reads the executable with the errno-aware reader on the real io and hands that reading to the revival rule unchanged (the call site; the reader has its own rows)", () => {
