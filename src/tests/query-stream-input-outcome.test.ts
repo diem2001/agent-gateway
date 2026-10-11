@@ -342,11 +342,20 @@ describe("what stays a summary string", () => {
     expect(webhookBodies).toEqual([{ url: "http://webhook.test/reqlift_present_choices", body: CHOICES }]);
   });
 
-  it("a request server whose name makes the tool name ambiguous leaves the tool a summary", async () => {
+  it("a request server whose name would make the tool name ambiguous is refused, so the tool keeps streaming its object (MVP-8235)", async () => {
+    // Since MVP-8235 no request server can take a name that begins with agent-gateway-tools: the route refuses it before a run
+    // starts. The ambiguity guard of the stream-input table (MVP-8096) stays as a second layer and is covered in
+    // tool-use-input.test.ts.
     const app = await createApp([{ ...RAW, name: "present__choices" }]);
     const ambiguous = { tool: `${PREFIX}present__choices`, json: JSON.stringify({ question: "q" }) };
-    const withServer = await run(app, [ambiguous], { mcpServers: { "agent-gateway-tools__present": { url: "http://127.0.0.1:9/mcp" } } });
-    expect(typeof withServer.stream[0].input).toBe("string");
+    steps = [ambiguous];
+    const refused = await request(app)
+      .post("/v1/query")
+      .set("x-test-label", "reqlift")
+      .send({ queryId: "q-ambiguous-refused", prompt: "go", useSession: false, user_id: "user-1", mcpServers: { "agent-gateway-tools__present": { url: "http://127.0.0.1:9/mcp" } } });
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toBe('mcpServers must not use a server name beginning with "agent-gateway-tools"');
+    expect(capturedOptions).toHaveLength(0);
     const without = await run(app, [ambiguous]);
     expect(without.stream[0].input).toEqual({ question: "q" });
   });
