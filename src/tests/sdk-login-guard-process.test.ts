@@ -13,13 +13,13 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
-import net, { type AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { FINAL_ANSWER, startFakeAnthropicApi, type FakeAnthropicApi } from "./helpers/fake-anthropic-api.js";
-import { STUB_TOOL_NAME, startOAuthMcpStub, type OAuthMcpStub, type OAuthStubOptions } from "./helpers/oauth-mcp-stub.js";
+import { releaseGatewayPort, reserveGatewayPort, waitForGatewayReady } from "./helpers/git-process-gateway.js";
+import { STUB_TOOL_NAME, framedToolText, startOAuthMcpStub, type OAuthMcpStub, type OAuthStubOptions } from "./helpers/oauth-mcp-stub.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(here, "..", "..");
@@ -66,14 +66,6 @@ afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()!();
 });
 
-async function freePort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-  const { port } = server.address() as AddressInfo;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return port;
-}
-
 async function mcpStub(options: OAuthStubOptions): Promise<OAuthMcpStub> {
   const created = await startOAuthMcpStub(options);
   cleanups.push(() => created.close());
@@ -114,7 +106,7 @@ function request(port: number, method: string, urlPath: string, body?: unknown):
 
 async function spawnGateway(api: FakeAnthropicApi, env: Record<string, string> = {}): Promise<SpawnedGateway> {
   assertFreshBuild();
-  const port = await freePort();
+  const port = await reserveGatewayPort();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mvp7667-login-"));
   const dirs = { home: path.join(root, "home"), tmp: path.join(root, "tmp"), cwd: path.join(root, "cwd"), persist: path.join(root, "persist") };
   for (const dir of Object.values(dirs)) fs.mkdirSync(dir);
@@ -162,23 +154,11 @@ async function spawnGateway(api: FakeAnthropicApi, env: Record<string, string> =
       child.kill("SIGKILL");
       await exited;
     }
+    releaseGatewayPort(port);
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  const started = Date.now();
-  for (;;) {
-    if (child.exitCode !== null) throw new Error(`gateway exited early: ${output}`);
-    const healthy = await new Promise<boolean>((resolve) => {
-      const probe = http.get({ host: "127.0.0.1", port, path: "/health", agent: false }, (res) => {
-        res.resume();
-        resolve(res.statusCode === 200);
-      });
-      probe.on("error", () => resolve(false));
-    });
-    if (healthy) break;
-    if (Date.now() - started > 15_000) throw new Error(`gateway not ready: ${output}`);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+  await waitForGatewayReady({ child, port, output: () => output, env: childEnv });
   return { child, port, dirs, output: () => output };
 }
 
@@ -601,9 +581,9 @@ describe("a run's credentials do not remain in the Claude runtime's own log file
   ];
 
   for (const end of ENDS) {
-    it(`the run ends ${end.name}: no file holds the http header or the stdio env value`, async () => {
+    it(`the run ends ${end.name}: no file holds the http header, the request header or the stdio env value`, async () => {
       const stub = await mcpStub({});
-      // A request-supplied http server keeps the direct path: its header reaches the runtime and its logs.
+      // A request-supplied http server with a header goes through the relay too (MVP-7679): the header never reaches the runtime.
       const direct = await mcpStub({});
       const api = await startFakeAnthropicApi({ toolName: STUB_TOOL_NAME, mode: end.mode });
       cleanups.push(() => api.close());
@@ -630,9 +610,11 @@ describe("a run's credentials do not remain in the Claude runtime's own log file
         end.mode === "hang-after-tool" ? { abortAfterEvent: "tool_result" } : {},
       );
 
-      // The runtime had the stdio env value and the direct header during the run.
-      expect.soft(outcome.runtimeMcpConfigs.some((c) => c.includes(envValue))).toBe(true);
-      expect.soft(outcome.runtimeMcpConfigs.some((c) => c.includes(directHeader))).toBe(true);
+      // MVP-7679: neither the stdio env value (the server runs in its own tool sandbox) nor the request header
+      // (relayed) is ever part of the runtime's configuration; the relayed header still reaches its server.
+      expect.soft(outcome.runtimeMcpConfigs.length).toBeGreaterThan(0);
+      expect.soft(outcome.runtimeMcpConfigs.some((c) => c.includes(envValue))).toBe(false);
+      expect.soft(outcome.runtimeMcpConfigs.some((c) => c.includes(directHeader))).toBe(false);
       expect.soft(direct.authorizations().length).toBeGreaterThan(0);
       if (end.mode !== "error") expect.soft(stub.authorizations().length).toBeGreaterThan(0);
       if (end.mode === "normal") {
@@ -651,8 +633,9 @@ describe("a run's credentials do not remain in the Claude runtime's own log file
 });
 
 describe("the relay carries a working MCP server (real runtime)", () => {
-  it("SSE answers, the Mcp-Session-Id round trip and a multi-MB tool result reach the model", async () => {
-    const stub = await mcpStub({ responseMode: "sse", toolResultBytes: 3 * 1024 * 1024 });
+  it("SSE answers and the Mcp-Session-Id round trip reach the model, with a result below the default size limit", async () => {
+    // 32 KiB is under the runtime's 50,000-character default, so the result arrives whole (the size classes are tool-result-size-process.test.ts).
+    const stub = await mcpStub({ responseMode: "sse", toolResultChars: 32 * 1024 });
     const api = await fakeApi();
     const gateway = await spawnGateway(api);
     await registerHttpServer(gateway, SERVER, stub);
@@ -663,15 +646,13 @@ describe("the relay carries a working MCP server (real runtime)", () => {
     const results = api.agentRequests().flatMap((r) => r.toolResults);
     expect(results).toHaveLength(1);
     expect(results[0].isError).toBe(false);
-    expect(results[0].text).toContain(stub.toolResultPrefix);
-    const afterInitialize = stub.requests.filter((r) => r.path === "/mcp" && r.method === "POST" && !r.rpcMethods.includes("initialize"));
+    expect(results[0].text).toBe(framedToolText(32 * 1024));
+    const afterInitialize = stub.requests.filter((r) => r.path === "/mcp" && r.method === "POST" && !r.rpcMethods.includes("initialize") && !r.rpcMethods.includes("server/discover"));
     expect(afterInitialize.length).toBeGreaterThan(0);
     expect(afterInitialize.every((r) => r.headers["mcp-session-id"] === "stub-session-1")).toBe(true);
   }, 90_000);
 
-  it("a lost upstream session (404) reaches the runtime as a plain 404: a tool error, as with a direct connection, and no login", async () => {
-    // Claude Code 2.0.77 does not initialize a new session after the 404; it reports the call as failed.
-    // A direct connection (before the relay) gives the same tool result.
+  it("a lost upstream session (404) is reinitialized by the native runtime without login", async () => {
     const stub = await mcpStub({ loseSessionOn: "tools/call" });
     const api = await fakeApi();
     const gateway = await spawnGateway(api);
@@ -681,11 +662,11 @@ describe("the relay carries a working MCP server (real runtime)", () => {
 
     expect(outcome.finalText).toContain(FINAL_ANSWER);
     expect(outcome.events.at(-1)?.type).toBe("done");
-    expect(stub.requests.find((r) => r.rpcMethods.includes("tools/call"))?.status).toBe(404);
+    expect(stub.requests.filter((r) => r.rpcMethods.includes("tools/call")).map((r) => r.status)).toEqual([404, 200]);
     const results = api.agentRequests().flatMap((r) => r.toolResults);
     expect(results).toHaveLength(1);
-    expect(results[0].isError).toBe(true);
-    expect(results[0].text).toBe("Streamable HTTP error: Error POSTing to endpoint:");
+    expect(results[0].isError).toBe(false);
+    expect(results[0].text).toContain(stub.toolResultPrefix);
     expect({ metadata: stub.counters.metadata, registration: stub.counters.registration }).toEqual({ metadata: 0, registration: 0 });
   }, 90_000);
 
@@ -707,7 +688,7 @@ describe("the relay carries a working MCP server (real runtime)", () => {
   it("an unreachable upstream still ends the run with a normal answer", async () => {
     const api = await fakeApi();
     const gateway = await spawnGateway(api);
-    const closedPort = await freePort();
+    const closedPort = await reserveGatewayPort();
     await registerServer(gateway, SERVER, { type: "http", url: `http://127.0.0.1:${closedPort}/mcp` });
 
     const outcome = await runAgent(gateway, {}, []);

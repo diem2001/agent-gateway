@@ -157,3 +157,92 @@ describe("tool persistence", () => {
     deleteTool(name);
   });
 });
+
+describe("stream_input in the registry (MVP-8096)", () => {
+  let dir: string;
+  let file: string;
+  let logs: string[];
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tool-stream-input-"));
+    file = path.join(dir, "tools.json");
+    process.env.TOOLS_PERSIST_PATH = file;
+    logs = [];
+    vi.spyOn(console, "log").mockImplementation((...args) => {
+      logs.push(args.map(String).join(" "));
+    });
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    delete process.env.TOOLS_PERSIST_PATH;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const base = (name: string, extra: Record<string, unknown> = {}) => ({
+    name,
+    description: "d",
+    input_schema: { type: "object" },
+    webhook_url: "https://example.com/t",
+    owner: "reqlift",
+    ...extra,
+  });
+
+  it("normalizeStreamInput keeps raw and maps everything else to summary", async () => {
+    const { normalizeStreamInput } = await import("../tools.js");
+    expect(normalizeStreamInput("raw")).toBe("raw");
+    for (const value of ["summary", undefined, null, "RAW", "full", 5, true, []]) {
+      expect(normalizeStreamInput(value)).toBe("summary");
+    }
+  });
+
+  it("registerTool stores summary for a definition without the field", async () => {
+    const { registerTool, getTool } = await import("../tools.js");
+    registerTool({ name: "a", description: "d", input_schema: { type: "object" }, webhook_url: "https://example.com/a" });
+    expect(getTool("a")?.stream_input).toBe("summary");
+  });
+
+  it("a raw registration survives a save and a reload", async () => {
+    const { registerTool, flushTools } = await import("../tools.js");
+    registerTool(base("choices", { stream_input: "raw" }));
+    expect(flushTools()).toBe(true);
+    expect(JSON.parse(fs.readFileSync(file, "utf-8"))[0].stream_input).toBe("raw");
+    vi.resetModules();
+    const again = await import("../tools.js");
+    again.loadTools();
+    expect(again.getTool("choices")?.stream_input).toBe("raw");
+  });
+
+  it("an entry saved before this change loads as summary without a log line", async () => {
+    fs.writeFileSync(file, JSON.stringify([base("old")]));
+    const { loadTools, getTool } = await import("../tools.js");
+    loadTools();
+    expect(getTool("old")?.stream_input).toBe("summary");
+    expect(logs.filter((l) => l.includes("tools.stream_input.invalid"))).toEqual([]);
+  });
+
+  it.each([["full"], [5], [null], ["RAW"]])("an invalid file value %j loads as summary with one log line, and the rest of the file loads", async (value) => {
+    fs.writeFileSync(file, JSON.stringify([base("bad", { stream_input: value }), base("good", { stream_input: "raw" })]));
+    const { loadTools, getTool } = await import("../tools.js");
+    loadTools();
+    expect(getTool("bad")?.stream_input).toBe("summary");
+    expect(getTool("good")?.stream_input).toBe("raw");
+    const lines = logs.filter((l) => l.includes("tools.stream_input.invalid"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('name="bad"');
+  });
+
+  it("the invalid-value log line escapes the tool name and cuts it to 128 characters", async () => {
+    const name = `x"\n${"y".repeat(300)}`;
+    fs.writeFileSync(file, JSON.stringify([base(name, { stream_input: "full" })]));
+    const { loadTools } = await import("../tools.js");
+    loadTools();
+    const lines = logs.filter((l) => l.includes("tools.stream_input.invalid"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain("\n");
+    expect(lines[0]).toContain('name="x\\"\\n');
+    expect(lines[0].length).toBeLessThan(250);
+  });
+});

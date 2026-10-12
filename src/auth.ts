@@ -45,6 +45,11 @@ export function loadApiKeys(): void {
   log("auth", `Loaded ${apiKeys.size} API key(s)`);
 }
 
+/** The distinct API-key labels loaded from `API_KEYS`. */
+export function getApiKeyLabels(): string[] {
+  return [...new Set(apiKeys.values())];
+}
+
 /**
  * Express middleware: validates Bearer token on all routes except /health.
  * Sets req.clientLabel on success.

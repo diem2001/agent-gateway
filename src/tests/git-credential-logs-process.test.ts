@@ -12,7 +12,7 @@
  * text in the shape of an RSA-4096 key (longer than the 2000-character request
  * preview); the remotes are local, so ssh never reads it.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -26,6 +26,9 @@ import {
   type DumbHttpGitRemote,
 } from "./helpers/dumb-http-git-remote.js";
 import { gatewayRequest, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
+
+// One gateway start can take the readiness bound (GATEWAY_READY_TIMEOUT_MS, 45 s) plus 15 s for the row itself.
+vi.setConfig({ testTimeout: 60_000 });
 
 const cleanups: Cleanup[] = [];
 

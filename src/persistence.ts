@@ -164,6 +164,17 @@ export function isNamedEntryList(data: unknown): boolean {
 }
 
 /**
+ * An entry list whose `owner`, when present, is a non-empty string (tools and MCP servers, MVP-7679, MVP-7925);
+ * anything else sets the whole file aside like invalid JSON.
+ */
+export function hasValidOwners(data: unknown): boolean {
+  if (!isNamedEntryList(data)) return false;
+  return (data as { owner?: unknown }[]).every(
+    (entry) => entry.owner === undefined || (typeof entry.owner === "string" && entry.owner.length > 0),
+  );
+}
+
+/**
  * One state file: atomic, debounced saves, a load that never lets an
  * unreadable file be overwritten, and the issue state reported by /health.
  */
@@ -219,6 +230,11 @@ export class PersistentStore {
       return undefined;
     }
     return data;
+  }
+
+  /** True when saves of this area are suppressed for this process (read-only accessor; MVP-7402). */
+  isSuppressed(): boolean {
+    return this.suppressed;
   }
 
   /** Debounced save (100 ms), as before. */

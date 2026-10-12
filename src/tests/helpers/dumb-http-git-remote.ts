@@ -13,6 +13,7 @@ import fs from "node:fs";
 import http from "node:http";
 import net, { type AddressInfo } from "node:net";
 import path from "node:path";
+import { reserveGatewayPort } from "./git-process-gateway.js";
 
 export interface DumbHttpGitRemote {
   /** e.g. "SECRET-TOKEN-<random hex>". */
@@ -139,9 +140,5 @@ export async function startDumbHttpGitRemote(root: string, gitBinary: string): P
 
 /** A loopback port with nothing listening on it (connection refused). */
 export async function closedPort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-  const { port } = server.address() as AddressInfo;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return port;
+  return reserveGatewayPort();
 }

@@ -10,7 +10,7 @@ const DENY = {
   hookSpecificOutput: {
     hookEventName: "PreToolUse",
     permissionDecision: "deny",
-    permissionDecisionReason: "Refused: this tool is not allowed for this run.",
+    permissionDecisionReason: "TOOL_DENIED: This tool is not allowed for this request. Do not retry; continue without it or tell the user.",
   },
 };
 

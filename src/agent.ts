@@ -1,4 +1,3 @@
-import type { ChildProcess } from "node:child_process";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlock } from "./query.js";
@@ -7,19 +6,29 @@ import type { StreamEvent } from "./event-cache.js";
 import { getAllTools } from "./tools.js";
 import type { WebhookContext } from "./webhook.js";
 import { createToolMcpServer } from "./tool-server.js";
-import { buildMcpServersForSdk, getEnabledMcpServers, getMcpAllowedToolPatterns } from "./mcp-registry.js";
+import { buildStreamInputTable, runToolNameProblem, streamedToolInput } from "./tool-use-input.js";
+import { buildMcpServersForSdk, getMcpAllowedToolPatterns, getRunMcpServers } from "./mcp-registry.js";
 import {
   applyMcpCredentialOverrides,
+  credentialValues,
+  hasUserCredential,
   selectRegistryServersForRun,
   summarizeOverrideKeys,
+  type McpCredentialOverride,
   type McpCredentialOverrides,
 } from "./mcp-overrides.js";
 import { materializeUserSkills, cleanupUserSkillBundle } from "./user-skills.js";
 import { requestMcpAllowedToolPatterns, type RequestMcpServers } from "./mcp-request-servers.js";
-import { credentialRelay } from "./mcp-credential-relay.js";
-import { createRunLogDir, removeRunLogDirAfterExit, spawnRuntimeWithHandle } from "./sdk-run-logs.js";
-import { classifyRunFailure, isAbortError } from "./run-failure.js";
-import { builtInTools, createToolPolicyHook, namesServer } from "./tool-policy.js";
+import { credentialRelay, type RelayGrant } from "./mcp-credential-relay.js";
+import { StdioBridge } from "./mcp-stdio-sandbox.js";
+import { createRunLogDir, removeRunLogDirAfterExit } from "./sdk-run-logs.js";
+import { SandboxRun, runtimeEnvFrom } from "./sandbox.js";
+import { SANDBOX_WORK } from "./sandbox-content.js";
+import { RunFailure, classifyRunFailure, fixedFailure, isAbortError, unknownMessage } from "./run-failure.js";
+import { builtInTools, createToolPolicyHook } from "./tool-policy.js";
+import { WEBHOOK_SERVER_NAME, computeToolGrant, isReservedMcpServerName, mcpToolName, shownServerName, type ToolGrant } from "./tool-grant.js";
+import { runMaskingValues } from "./tool-mediation.js";
+import type { ToolDefinition } from "./tools.js";
 
 export interface QueryParams {
   prompt?: string;
@@ -52,11 +61,27 @@ export interface QueryParams {
   /** Only for the log reference in the unknown-failure message (run-failure.ts). */
   queryId?: string;
   /**
+   * Resolves when the run deadline expired (retry.ts). The attempt then stops once `DEADLINE_STOP_GRACE_MS`
+   * have passed, even when the SDK ignores the abort and never settles (MVP-8000). Absent: no deadline race.
+   */
+  deadline?: Promise<void>;
+  /**
+   * Called when a deadline stop could not confirm that the sandbox process exited: the request ends anyway, and the
+   * caller (query.ts) keeps the conversation locked until this promise settles.
+   */
+  holdConversation?: (until: Promise<unknown>) => void;
+  /** The conversation's recorded sandbox home name (sessions.ts); without one the run has a private home. */
+  sandboxDirId?: string;
+  /**
    * The exact tool set this run may call (MVP-7637, see tool-policy.ts),
    * validated by the query route. `undefined` ⇒ the options are unchanged.
    * An empty array means no tool at all, never the default set.
    */
   enforcedTools?: string[];
+  /** The caller's API-key label: the trusted tool policy, webhook tool ownership and the grant are resolved from it. */
+  label?: string;
+  /** The run's effective tool grant (query.ts); computed here from `label` and the caller's narrowing when absent. */
+  grant?: ToolGrant;
 }
 
 export interface QueryResult {
@@ -112,7 +137,67 @@ export function toolUseEventInput(
   return formatToolInput(toolName, input);
 }
 
-export const DEFAULT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill", "TodoWrite"];
+/**
+ * Whether a request-supplied server config is an http/SSE server that carries a credential: at least one header, or a
+ * user name, password or query in its URL (those would otherwise sit on the runtime's command line).
+ */
+function carriesHeaders(config: unknown): boolean {
+  if (typeof config !== "object" || config === null) return false;
+  const entry = config as { type?: unknown; url?: unknown; headers?: unknown };
+  if (entry.type !== "http" && entry.type !== "sse") return false;
+  if (typeof entry.url !== "string") return false;
+  if (typeof entry.headers === "object" && entry.headers !== null && Object.keys(entry.headers).length > 0) return true;
+  try {
+    const url = new URL(entry.url);
+    return url.username !== "" || url.password !== "" || url.search !== "";
+  } catch {
+    return false;
+  }
+}
+
+/** The relay's view of the run's grant for one server. */
+function relayGrantFor(grant: ToolGrant, serverName: string): RelayGrant {
+  return { allowsTool: (tool) => grant.allows(mcpToolName(serverName, tool)), coversServer: grant.coversServer(serverName) };
+}
+
+/** Whether the override carries a non-empty value for the target. */
+function hasOverrideValues(override: McpCredentialOverride | undefined, target: "headers" | "env"): boolean {
+  return Object.values(override?.[target] ?? {}).some((value) => value.length > 0);
+}
+
+/** A server whose credential schema composes values for `target` needs the user's values for them. */
+function schemaWantsTarget(def: { userCredentialSchema?: { outputs: { target: string }[] } }, target: "headers" | "env"): boolean {
+  return (def.userCredentialSchema?.outputs ?? []).some((output) => output.target === target);
+}
+
+/** Whether a request-supplied server config is a stdio server that carries at least one env value. */
+function carriesEnv(config: unknown): boolean {
+  if (typeof config !== "object" || config === null) return false;
+  const entry = config as { command?: unknown; env?: unknown };
+  return typeof entry.command === "string" && typeof entry.env === "object" && entry.env !== null && Object.keys(entry.env).length > 0;
+}
+
+/** The relay binding of a stdio server has no upstream URL: its bridge talks to the tool sandbox. */
+const STDIO_PLACEHOLDER_URL = "stdio://tool-sandbox";
+
+/** A tool name as it may appear in an audit line. */
+function loggableName(name: string): string {
+  return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name) ? name : "(unrecognized)";
+}
+
+/**
+ * The bearer a webhook tool receives (MVP-7679): the calling client's gateway key goes only to tools its own label
+ * registered. A legacy tool without an owner keeps today's forwarding until it is registered again, with one audit
+ * line per call; a tool of another label never receives it.
+ */
+function webhookBearer(tool: ToolDefinition, callerLabel: string, token: string | undefined): string | undefined {
+  if (tool.owner === callerLabel) return token;
+  if (tool.owner === undefined) {
+    if (token) log("audit", `tool.webhook.legacy_forward toolName=${loggableName(tool.name)}`);
+    return token;
+  }
+  return undefined;
+}
 
 /**
  * Build a fresh single-message AsyncIterable<SDKUserMessage> from the resolved
@@ -137,69 +222,163 @@ async function* buildContentMessageStream(
   };
 }
 
+/** How long messages that are already on their way are still processed after the launcher ended by an outside signal. */
+export const LAUNCHER_EXIT_GRACE_MS = 1000;
+
+/**
+ * How long an SDK that ignores the abort is given to end by itself after the run deadline expired (MVP-8000). A
+ * cooperative SDK ends inside it with its own abort error; after it the run is stopped from outside.
+ */
+export const DEADLINE_STOP_GRACE_MS = 1000;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Yields what the SDK yields until `gone` settles first, then throws `ended()`. `gone` is the launcher's end by an
+ * outside signal (MVP-7964) or the run deadline plus its grace (MVP-8000). The SDK's own next message always
+ * wins when it is ready. After `gone` the SDK iterator is abandoned: its pending promise and its `return()` get a
+ * no-op rejection handler, because a late SDK error must not become an unhandled rejection of the gateway process.
+ */
+export async function* untilLauncherGone<T>(source: AsyncIterator<T>, gone: Promise<unknown>, ended: () => Error): AsyncGenerator<T, void, undefined> {
+  let finished = false;
+  try {
+    for (;;) {
+      const next = source.next().then((result) => ({ result }));
+      next.catch(() => {});
+      let step: { result: IteratorResult<T> } | null;
+      try {
+        step = await Promise.race([next, gone.then(() => null)]);
+      } catch (error) {
+        finished = true;
+        throw error;
+      }
+      if (step === null) {
+        finished = true;
+        Promise.resolve(source.return?.()).catch(() => {});
+        throw ended();
+      }
+      if (step.result.done) {
+        finished = true;
+        return;
+      }
+      yield step.result.value;
+    }
+  } finally {
+    if (!finished) await source.return?.();
+  }
+}
+
 /**
  * One attempt. A failed attempt throws a `RunFailure` (run-failure.ts) with a
  * safe public message: a result with `is_error: true`, or any error the SDK
  * iterator throws. The runtime writes its diagnostic to stdout before it exits
  * 1, so the loop sees it before the SDK throws "process exited with code 1";
- * it is kept here and classified, never forwarded. Client aborts (AbortError)
- * are rethrown unchanged.
+ * it is kept here and classified, never forwarded. The runtime process's exit
+ * code and signal come from the sandbox (`SandboxRun.runtimeExit`), not from the
+ * SDK's error text. Client aborts (AbortError) are rethrown unchanged.
  */
-export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools }: QueryParams): Promise<QueryResult> {
+export async function runQuery({ prompt, content, systemPrompt, model, allowedTools, sessionId, isResume, abortController, onEvent, webhookContext, clientAuthToken, mcpCredentialOverrides, requestMcpServers, userId, queryId, enforcedTools, sandboxDirId, label, grant: givenGrant, deadline, holdConversation }: QueryParams): Promise<QueryResult> {
   const enforced = enforcedTools !== undefined;
-  // An enforced run gets only the registered tools its set names.
-  const registeredTools = enforced
-    ? getAllTools().filter((t) => enforcedTools.includes(`mcp__agent-gateway-tools__${t.name}`))
-    : getAllTools();
+  // The trusted grant of this run: policy for the caller's label intersected with the caller's own narrowing.
+  const callerLabel = label ?? webhookContext?.api_key_label ?? "";
+  const grant = givenGrant ?? computeToolGrant({ label: callerLabel, narrowing: enforcedTools ?? allowedTools });
+  // Whether this label may execute commands at all: the trusted policy alone decides, the caller's own narrowing never
+  // does. Both command gates of a run key on this one value: the request-server `command` gate below and the
+  // neutralization of command settings in skill, agent and command files (MVP-8106).
+  const policyGrant = computeToolGrant({ label: callerLabel });
+  const commandsGranted = policyGrant.allows("Bash");
+  const neutralizeCommands = !commandsGranted;
+  // The set an enforced run is held to: what the caller named, minus what the trusted policy does not grant.
+  const enforcedSet = enforced ? enforcedTools.filter((name) => grant.allows(name)) : undefined;
+  // A run is offered only the registered tools of its own label plus legacy ownerless ones, and only granted ones.
+  const registeredTools = getAllTools().filter(
+    (t) => (t.owner === undefined || t.owner === callerLabel) && grant.allows(mcpToolName(WEBHOOK_SERVER_NAME, t.name)),
+  );
   const registeredToolNames = registeredTools.map((t) => t.name);
   // A registry server with requireUserCredentials is left out of a run without
   // the user's credential: no SDK entry, no allowed-tool pattern, and a request
   // server may not take its name (it would otherwise fill the vacated slot).
-  const selection = selectRegistryServersForRun(getEnabledMcpServers(), mcpCredentialOverrides);
-  const omitted = selection.omitted.map((name) => ({ name, reason: "missing_user_credential" }));
-  let runRegistryServers = selection.attached;
-  // Registered http servers are reached only through the credential relay; if it
+  const selection = selectRegistryServersForRun(getRunMcpServers(), mcpCredentialOverrides);
+  const omitted: { name: string; reason: string }[] = [...selection.omitted];
+  // Independent of the registry selection (MVP-8203, MVP-8235): a reserved name (the gateway's webhook server name or one
+  // that begins with it) never comes from a registry entry, so no `mcp__agent-gateway-tools*` or entry pattern reaches
+  // `allowedTools`, no relay binding is made for it and no override audit line names it.
+  let runRegistryServers = selection.attached.filter((def) => !isReservedMcpServerName(def.name));
+  // Every registered server is reached only through the trusted relay (http, SSE and stdio alike); if it
   // is not listening they are left out, never connected directly (fail closed).
-  if (!credentialRelay.isListening()) {
-    for (const def of runRegistryServers) if (def.type === "http") omitted.push({ name: def.name, reason: "relay_unavailable" });
-    runRegistryServers = runRegistryServers.filter((def) => def.type !== "http");
+  const relayUp = credentialRelay.isListening();
+  if (!relayUp) {
+    for (const def of runRegistryServers) omitted.push({ name: def.name, reason: "relay_unavailable" });
+    runRegistryServers = [];
   }
   for (const { name, reason } of omitted) {
     log("audit", `mcp.server.omitted serverName=${name} reason=${reason}`);
   }
   const omittedServers = omitted.map(({ name }) => name);
   let runRequestMcpServers = requestMcpServers
-    ? Object.fromEntries(Object.entries(requestMcpServers).filter(([name]) => !omittedServers.includes(name)))
+    ? Object.fromEntries(Object.entries(requestMcpServers).filter(([name]) => !isReservedMcpServerName(name) && !omittedServers.includes(name)))
     : undefined;
-  if (enforced) {
-    // An enforced run attaches only the servers its set names a tool of.
-    runRegistryServers = runRegistryServers.filter((def) => namesServer(enforcedTools, def.name));
-    if (runRequestMcpServers) {
-      runRequestMcpServers = Object.fromEntries(Object.entries(runRequestMcpServers).filter(([name]) => namesServer(enforcedTools, name)));
+  // A request server that carries headers or env needs the relay too; without it the server is left out (fail closed).
+  if (runRequestMcpServers && !relayUp) {
+    for (const [name, config] of Object.entries(runRequestMcpServers)) {
+      if (carriesHeaders(config) || carriesEnv(config)) {
+        log("audit", `mcp.server.omitted serverName=${name} reason=relay_unavailable`);
+        delete runRequestMcpServers[name];
+      }
     }
+  }
+  // A server with no granted tool is not attached at all (no wasted calls, nothing to refuse later).
+  runRegistryServers = runRegistryServers.filter((def) => grant.allowsServer(def.name));
+  if (runRequestMcpServers) {
+    // A request-supplied `command` is code the caller picked: it is attached only when the trusted policy lets this
+    // label execute commands (`Bash`) or names that server explicitly, so a policy that denies `Bash` cannot be
+    // sidestepped with a request server. (The caller's own narrowing can only shrink the grant, never decide this.)
+    runRequestMcpServers = Object.fromEntries(
+      Object.entries(runRequestMcpServers).filter(([name, config]) => {
+        if (!grant.allowsServer(name)) return false;
+        if (typeof (config as { command?: unknown }).command === "string" && !commandsGranted && !policyGrant.explicitlyAllowsServer(name)) {
+          log("audit", `mcp.server.omitted serverName=${name} reason=command_not_granted`);
+          return false;
+        }
+        return true;
+      }),
+    );
   }
   const mcpToolPatterns = getMcpAllowedToolPatterns(runRegistryServers);
   const requestMcpToolPatterns = requestMcpAllowedToolPatterns(runRequestMcpServers);
-  const effectiveTools = allowedTools || [...DEFAULT_TOOLS, ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
-  const HOME = process.env.HOME || "/home/node";
+  // `allowedTools` is the runtime's pre-approval list; the caller's list is a narrowing and was applied to the grant.
+  const effectiveTools = allowedTools
+    ? allowedTools.filter((name) => grant.allows(name))
+    : [...grant.builtIns(), ...registeredToolNames, ...mcpToolPatterns, ...requestMcpToolPatterns];
   const options: Record<string, unknown> = {
     allowedTools: effectiveTools,
     permissionMode: "bypassPermissions",
     model: model || "claude-opus-4-6",
     abortController,
     includePartialMessages: true,
-    cwd: HOME,
-    settingSources: ["user", "project"],
+    // The sandbox's working directory: the conversation's persistent work area, which the agent can write.
+    cwd: SANDBOX_WORK,
+    // Only the user source (MVP-7679, Gate A): the project source reads a `.mcp.json` the agent can write in its
+    // working directory and would start whatever command it names on the next turn. Global skills, configured
+    // agents and the read-only generated settings are user-source content and keep loading.
+    settingSources: ["user"],
   };
   if (enforced) {
     // The layers of tool-policy.ts: no HOME settings, deny anything not listed,
     // offer only the listed built-ins, and a deny-only hook as second layer.
     options.settingSources = [];
     options.permissionMode = "dontAsk";
-    options.allowedTools = [...enforcedTools];
-    options.tools = builtInTools(enforcedTools);
-    options.hooks = { PreToolUse: [{ hooks: [createToolPolicyHook(enforcedTools, queryId)] }] };
-    log("query", `enforced tool set: ${enforcedTools.length} tool(s)`);
+    options.allowedTools = [...enforcedSet!];
+    options.tools = builtInTools(enforcedSet!);
+    options.hooks = { PreToolUse: [{ hooks: [createToolPolicyHook(enforcedSet!, queryId)] }] };
+    log("query", `enforced tool set: ${enforcedSet!.length} tool(s)`);
+  } else {
+    // Every run names its built-ins (MVP-8088): the runtime is offered only the granted ones, never its own default
+    // set, so a runtime update cannot widen it by itself; the other inventory names are denied by name as a second
+    // layer. A built-in that is not offered is refused by the runtime itself, for the main agent, a configured agent,
+    // a skill, a sub-agent and a resumed conversation alike (MVP-7679 Gate A).
+    options.tools = grant.builtIns();
+    options.disallowedTools = grant.deniedBuiltIns();
   }
 
   // Per-user skill loading (DEC-GW-002): materialize the requesting user's stored
@@ -209,7 +388,8 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // load, byte-for-byte unchanged. Caps overflow is reported here and surfaced as a
   // `skills_truncated` event below (DEC-GW-004) before the query proceeds.
   // An enforced run loads no plugin bundle (tool-policy.ts).
-  const userSkills = enforced ? materializeUserSkills(undefined) : materializeUserSkills(userId);
+  // Without the `Bash` grant the bundle is written without command settings (hooks, stdio startup commands).
+  const userSkills = enforced ? materializeUserSkills(undefined) : materializeUserSkills(userId, { neutralizeCommands, label: callerLabel });
   if (userSkills.pluginRoot) {
     options.plugins = [{ type: "local", path: userSkills.pluginRoot }];
     log("query", `user skills: loading plugin bundle for userId=${userId} at ${userSkills.pluginRoot}`);
@@ -229,40 +409,162 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   // gateway's own webhook tools or a registered server (MVP-6755).
   const mcpServers: Record<string, unknown> = { ...(runRequestMcpServers ?? {}) };
 
+  // The known values both the webhook refusals and the raw tool_use summaries are masked with: built on first use, once per
+  // run, and over the masking budget (see runMaskingValues) both fail closed.
+  const maskingValues = runMaskingValues(() => [
+    ...(clientAuthToken ? [clientAuthToken] : []),
+    ...credentialValues(Object.values(mcpCredentialOverrides ?? {})),
+    ...credentialValues(Object.values(runRequestMcpServers ?? {})),
+  ]);
+
+  let webhookServer: unknown;
   if (registeredTools.length > 0 && webhookContext) {
-    mcpServers["agent-gateway-tools"] = createToolMcpServer(registeredTools, webhookContext, clientAuthToken);
+    const hosted = new Set(registeredToolNames);
+    webhookServer = mcpServers[WEBHOOK_SERVER_NAME] = createToolMcpServer(
+      registeredTools,
+      webhookContext,
+      (tool) => webhookBearer(tool, callerLabel, clientAuthToken),
+      {
+        isGranted: (name) => hosted.has(name) && grant.allows(mcpToolName(WEBHOOK_SERVER_NAME, name)),
+        secrets: maskingValues,
+      },
+    );
   }
 
   // The runtime's own log files (they hold MCP connection options) go to a
   // private per-run directory, deleted once the runtime child has exited.
   // Created before any relay token, so a failure here cannot leave a token unrevoked.
   const runLogs = createRunLogDir();
-  let runtimeChild: ChildProcess | null = null;
-  options.env = { ...process.env, ...runLogs.env };
-  options.spawnClaudeCodeProcess = spawnRuntimeWithHandle((child) => {
-    runtimeChild = child;
+  // The runtime runs only inside this run's sandbox (MVP-7678): the SDK's spawn hook is the
+  // sandbox launcher, and nothing of the gateway's environment is handed to the SDK. The
+  // environment given here holds no secret; the sandbox builds its own allowlist from it.
+  const sandbox = new SandboxRun({
+    queryId,
+    runLogDir: runLogs.dir,
+    runLogEnv: runLogs.env,
+    userSkillsDir: userSkills.pluginRoot,
+    neutralizeCommands,
+    label: callerLabel,
+    sessionDirId: sandboxDirId,
+    signal: abortController.signal,
   });
+  options.env = { ...runtimeEnvFrom(process.env), ...runLogs.env };
+  options.spawnClaudeCodeProcess = sandbox.spawnHook;
 
   const relayTokens: string[] = [];
-  const registeredMcpServers = buildMcpServersForSdk(runRegistryServers);
-  if (registeredMcpServers) {
-    const effectiveMcpServers = applyMcpCredentialOverrides(
-      registeredMcpServers,
-      mcpCredentialOverrides,
-    );
-    // The runtime gets a loopback relay URL with a per-run token and no header;
-    // the relay holds this run's URL and header snapshot until the run ends.
-    for (const [name, config] of Object.entries(effectiveMcpServers)) {
-      if (!("type" in config) || config.type !== "http") continue;
-      const { token, url } = credentialRelay.register({ serverName: name, url: config.url, headers: config.headers ?? {} });
+  try {
+    // Request stdio servers with env run in their own tool sandbox behind the relay.
+    for (const [name, config] of Object.entries(mcpServers)) {
+      if (!carriesEnv(config)) continue;
+      const entry = config as { command: string; args?: string[]; env: Record<string, string> };
+      const bridge = new StdioBridge({ serverName: name, command: entry.command, args: entry.args ?? [], env: { ...entry.env }, queryId });
+      const { token, url } = credentialRelay.register({
+        serverName: name,
+        url: STDIO_PLACEHOLDER_URL,
+        headers: {},
+        kind: "stdio",
+        bridge,
+        grant: relayGrantFor(grant, name),
+        credentialSource: "user",
+      });
       relayTokens.push(token);
-      effectiveMcpServers[name] = { type: "http", url };
+      mcpServers[name] = { type: "http", url };
     }
-    Object.assign(mcpServers, effectiveMcpServers);
+    // Request servers with headers: the runtime gets a relay URL, the header values stay with the relay.
+    for (const [name, config] of Object.entries(mcpServers)) {
+      if (!carriesHeaders(config)) continue;
+      const kind = (config as { type?: unknown }).type === "sse" ? "sse" : "http";
+      const { token, url } = credentialRelay.register({
+        serverName: name,
+        url: (config as { url: string }).url,
+        headers: { ...((config as { headers?: Record<string, string> }).headers ?? {}) },
+        kind,
+        grant: relayGrantFor(grant, name),
+        credentialSource: "user",
+      });
+      relayTokens.push(token);
+      mcpServers[name] = { type: "http", url };
+    }
+    const registeredMcpServers = buildMcpServersForSdk(runRegistryServers);
+    if (registeredMcpServers) {
+      // One case-insensitive merge: a user header replaces the shared header of the same name.
+      const effectiveMcpServers = applyMcpCredentialOverrides(
+        registeredMcpServers,
+        mcpCredentialOverrides,
+      );
+      // The runtime gets a loopback relay URL with a per-run token and no header; the relay holds this
+      // run's URL, header snapshot and grant until the run ends.
+      for (const [name, config] of Object.entries(effectiveMcpServers)) {
+        const def = runRegistryServers.find((d) => d.name === name)!;
+        const override = mcpCredentialOverrides?.[name];
+        if (!("type" in config)) {
+          // A registered stdio server (with or without env) runs in its own tool sandbox; args and env stay with the bridge.
+          const bridge = new StdioBridge({ serverName: name, command: config.command, args: config.args ?? [], env: { ...(config.env ?? {}) }, queryId });
+          const { token, url } = credentialRelay.register({
+            serverName: name,
+            url: STDIO_PLACEHOLDER_URL,
+            headers: {},
+            kind: "stdio",
+            bridge,
+            grant: relayGrantFor(grant, name),
+            credentialSource: hasOverrideValues(override, "env") ? "user" : "gateway",
+            noUserCredential: schemaWantsTarget(def, "env") && !hasUserCredential(def, override),
+          });
+          relayTokens.push(token);
+          effectiveMcpServers[name] = { type: "http", url };
+          continue;
+        }
+        if (config.type !== "http" && config.type !== "sse") continue;
+        const { token, url } = credentialRelay.register({
+          serverName: name,
+          url: config.url,
+          headers: config.headers ?? {},
+          kind: config.type,
+          grant: relayGrantFor(grant, name),
+          credentialSource: hasOverrideValues(override, "headers") ? "user" : "gateway",
+          noUserCredential: schemaWantsTarget(def, "headers") && !hasUserCredential(def, override),
+        });
+        relayTokens.push(token);
+        effectiveMcpServers[name] = { type: "http", url };
+      }
+      Object.assign(mcpServers, effectiveMcpServers);
+    }
+
+    // The webhook server's key always holds the gateway's own server when the caller has webhook tools and is absent
+    // otherwise: no registry or request server replaces it, whatever the selection above let through (MVP-8203).
+    if (webhookServer !== undefined) mcpServers[WEBHOOK_SERVER_NAME] = webhookServer;
+    else delete mcpServers[WEBHOOK_SERVER_NAME];
+    // The last step before the runtime connects (MVP-8235), inside the `try` so a refusal revokes the relay tokens and
+    // cleans up like any other failure: no server of the final map may produce a webhook tool's full name. It names only
+    // the server, never a tool name or an input, and is refused with today's generic error, which is not retried.
+    const clash = runToolNameProblem({ webhookToolNames: registeredToolNames, mcpServers, webhookServer });
+    if (clash !== undefined) {
+      log("audit", `mcp.run.tool_name_clash serverName=${shownServerName(clash)}`);
+      throw fixedFailure("unknown", unknownMessage(queryId));
+    }
+  } catch (error) {
+    // A binding that could not be built (for example an invalid isolation setting) must not leave the tokens, the run
+    // directory or the skill bundle of this run behind.
+    for (const token of relayTokens) credentialRelay.revoke(token);
+    cleanupUserSkillBundle(userSkills.pluginRoot);
+    void removeRunLogDirAfterExit(runLogs.dir, sandbox.child);
+    await sandbox.dispose();
+    throw error;
   }
 
+  // The tools whose `tool_use` event carries the structured input (MVP-8096), from the final server map.
+  const streamInputTable = buildStreamInputTable({
+    registeredTools,
+    callerLabel,
+    mcpServers,
+    webhookServer,
+    secretValues: maskingValues,
+  });
+
   if (mcpCredentialOverrides) {
+    // Only for servers this run actually attached; a server left out received nothing.
     for (const [serverName, override] of Object.entries(mcpCredentialOverrides)) {
+      if (!runRegistryServers.some((def) => def.name === serverName)) continue;
       const keys = summarizeOverrideKeys(override);
       log("audit", `mcp.override.applied serverName=${serverName} keys=${keys.join(",") || "none"}`);
     }
@@ -296,10 +598,25 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   const assistantErrors: { error: unknown; text: string }[] = [];
   const pendingTools = new Map<string, { name: string }>();
   const toolTimings = new Map<string, number>();
+  // Once the run deadline expired the sandbox is stopped at once and boundedly, however this attempt ends.
+  let deadlineExpired = false;
+  void deadline?.then(() => { deadlineExpired = true; });
 
   try {
   const conversation = query({ prompt: promptArg, options });
-  for await (const message of conversation) {
+  // A launcher that ended by a signal the gateway did not send ends this run after a short grace, even when the
+  // SDK never notices (MVP-7964). The run deadline does the same for an SDK that ignores the abort (MVP-8000).
+  // Messages that arrive inside either grace are still processed.
+  let stop: "launcher" | "deadline" | null = null;
+  const launcherGone = sandbox.unownedExit().then(() => sleep(LAUNCHER_EXIT_GRACE_MS)).then(() => { stop ??= "launcher"; });
+  const deadlineGone = deadline ? deadline.then(() => sleep(DEADLINE_STOP_GRACE_MS)).then(() => { stop ??= "deadline"; }) : new Promise<never>(() => {});
+  const runStopped = (): RunFailure => {
+    sandbox.releaseOutput();
+    // The deadline's text is substituted by retry.ts; this failure only says which kind it is.
+    if (stop === "deadline") return fixedFailure("run_deadline", "");
+    return classifyRunFailure({ installedVersion, result: resultData, assistantErrors, runtimeExit: sandbox.runtimeExit }, queryId);
+  };
+  for await (const message of untilLauncherGone(conversation[Symbol.asyncIterator](), Promise.race([launcherGone, deadlineGone]), runStopped)) {
     if (abortController.signal.aborted) break;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const msg = message as any;
@@ -315,7 +632,7 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
         if (block.type === "tool_use") {
           const pending = pendingTools.get(block.id);
           const toolName: string = pending?.name || block.name;
-          const eventInput = toolUseEventInput(toolName, block.input);
+          const eventInput = streamedToolInput(toolName, block.input, block.id, streamInputTable, toolUseEventInput);
           toolTimings.set(block.id, Date.now());
           // parent_tool_use_id is carried at the SDKAssistantMessage level: null for the
           // main conversation agent, the spawning Task/Agent tool_use id for a sub-agent.
@@ -354,7 +671,8 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
             const truncated = output.length > 3000 ? output.substring(0, 3000) + "\n... (truncated)" : output;
             const durationMs = toolTimings.has(toolUseId) ? Date.now() - toolTimings.get(toolUseId)! : null;
             toolTimings.delete(toolUseId);
-            onEvent({ type: "tool_result", toolName, toolUseId, output: truncated, durationMs });
+            // A failed call is flagged (additive field): absent on success, so successful events are unchanged.
+            onEvent({ type: "tool_result", toolName, toolUseId, output: truncated, durationMs, ...(block.is_error === true ? { success: false } : {}) });
           }
         }
       }
@@ -380,20 +698,38 @@ export async function runQuery({ prompt, content, systemPrompt, model, allowedTo
   }
   } catch (err) {
     if (isAbortError(err)) throw err;
-    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors, thrown: err }, queryId);
+    // A sandbox that did not start is reported with its own fixed text, never as the SDK's
+    // generic "process exited" error; nothing ran.
+    const startFailure = sandbox.startFailure;
+    if (startFailure) throw startFailure;
+    if (err instanceof RunFailure) throw err;
+    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors, thrown: err, runtimeExit: sandbox.runtimeExit }, queryId);
   } finally {
-    // Every end (answer, error, abort): the relay URLs stop working and their
-    // in-flight upstream requests are destroyed.
+    // Every end (answer, error, abort): the relay URLs and the model proxy token stop
+    // working and their in-flight upstream requests are destroyed.
     for (const token of relayTokens) credentialRelay.revoke(token);
     // Request-scoped bundle: remove it once this query() call has drained.
     cleanupUserSkillBundle(userSkills.pluginRoot);
-    void removeRunLogDirAfterExit(runLogs.dir, runtimeChild);
+    // The sandbox process is gone before this run returns, so the conversation's lock (query.ts) is
+    // released only after its home has no process left.
+    void removeRunLogDirAfterExit(runLogs.dir, sandbox.child);
+    if (deadlineExpired) {
+      // The SDK is not trusted to stop its runtime: kill it now and wait for its exit only briefly. A launcher
+      // whose exit is not observed in time does not hold the request, but the conversation stays locked for it.
+      const unconfirmed = await sandbox.disposeAfterDeadline();
+      if (unconfirmed) holdConversation?.(unconfirmed.exited);
+    } else {
+      await sandbox.dispose();
+    }
   }
+
+  // A sandbox that failed to start while the SDK ended without an error: nothing ran.
+  if (sandbox.startFailure) throw sandbox.startFailure;
 
   // A result flagged is_error is a failure even when its subtype says "success"
   // and the runtime exited 0.
   if (resultData?.is_error === true) {
-    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors }, queryId);
+    throw classifyRunFailure({ installedVersion, result: resultData, assistantErrors, runtimeExit: sandbox.runtimeExit }, queryId);
   }
 
   return { response: fullResponse, resultData };

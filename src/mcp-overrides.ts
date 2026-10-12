@@ -1,6 +1,6 @@
-import { validateHeaderName, validateHeaderValue } from "node:http";
 import type { McpServerDefinition, SdkMcpServerConfig } from "./mcp-registry.js";
 import { getMcpServer } from "./mcp-registry.js";
+import { isSendableHeader } from "./mcp-upstream-request.js";
 
 export interface McpCredentialOverride {
   headers?: Record<string, string>;
@@ -17,6 +17,71 @@ export type McpOverrideValidationErrorCode =
 export interface McpOverrideValidationError {
   code: McpOverrideValidationErrorCode;
   message: string;
+}
+
+/** The most header and env values one query may carry, over `mcpCredentialOverrides` and the request's `mcpServers` together. */
+export const MAX_CREDENTIAL_VALUES = 256;
+/** The most UTF-8 bytes those values may hold in total. Real credentials are a few hundred bytes; a JWT is a few KB. */
+export const MAX_CREDENTIAL_BYTES = 64 * 1024;
+
+export const CREDENTIALS_TOO_LARGE_CODE = "MCP_CREDENTIALS_TOO_LARGE";
+/** Fixed text: it names the limits and never echoes a value. */
+export const CREDENTIALS_TOO_LARGE_MESSAGE = `mcpCredentialOverrides and mcpServers header and env values together may hold at most ${MAX_CREDENTIAL_VALUES} values and ${MAX_CREDENTIAL_BYTES} bytes`;
+
+/**
+ * Whether the caller-supplied credential material of one query is over the limits (MVP-8207). It is checked before a run
+ * starts, so everything that scales with these values (the matcher that masks them in refusal text and tool input, the
+ * relay bindings) works on at most `MAX_CREDENTIAL_VALUES` values of `MAX_CREDENTIAL_BYTES` bytes. Tolerates any shape:
+ * only string header and env values count.
+ */
+export function credentialMaterialTooLarge(overrides: unknown, requestServers: unknown): boolean {
+  const values = [
+    ...credentialValues(typeof overrides === "object" && overrides !== null ? Object.values(overrides) : []),
+    ...credentialValues(typeof requestServers === "object" && requestServers !== null ? Object.values(requestServers) : []),
+  ];
+  if (values.length > MAX_CREDENTIAL_VALUES) return true;
+  let bytes = 0;
+  for (const value of values) {
+    bytes += Buffer.byteLength(value, "utf8");
+    if (bytes > MAX_CREDENTIAL_BYTES) return true;
+  }
+  return false;
+}
+
+/** The most UTF-8 bytes one stored header, env or args value of a registry entry may hold (`PUT /v1/mcp-servers`). */
+export const MAX_STORED_VALUE_BYTES = 64 * 1024;
+
+export const STORED_VALUE_TOO_LARGE_CODE = "MCP_SERVER_VALUE_TOO_LARGE";
+/** Fixed text: it names the limit and never echoes a value. */
+export const STORED_VALUE_TOO_LARGE_MESSAGE = `A header, env or args value may hold at most ${MAX_STORED_VALUE_BYTES} bytes.`;
+
+/**
+ * Whether a registry entry being written holds a header, env or args value over `MAX_STORED_VALUE_BYTES` (MVP-8207). These
+ * values become known values of every later run; the cap is the write-time half of the bound, `MASKING_BUDGET_BYTES` in
+ * `tool-mediation.ts` is the other half and also covers entries stored before the cap. Tolerates any shape: only string
+ * values count.
+ */
+export function storedValueTooLarge(headers: unknown, env: unknown, args: unknown): boolean {
+  const values: unknown[] = [
+    ...(typeof headers === "object" && headers !== null ? Object.values(headers) : []),
+    ...(typeof env === "object" && env !== null ? Object.values(env) : []),
+    ...(Array.isArray(args) ? args : []),
+  ];
+  return values.some((value) => typeof value === "string" && Buffer.byteLength(value, "utf8") > MAX_STORED_VALUE_BYTES);
+}
+
+/** The header and env values of server configs or credential overrides: the secrets a tool input must not echo. */
+export function credentialValues(configs: readonly unknown[]): string[] {
+  const values: string[] = [];
+  for (const config of configs) {
+    if (typeof config !== "object" || config === null) continue;
+    for (const key of ["headers", "env"] as const) {
+      const map = (config as Record<string, unknown>)[key];
+      if (typeof map !== "object" || map === null) continue;
+      for (const value of Object.values(map)) if (typeof value === "string") values.push(value);
+    }
+  }
+  return values;
 }
 
 export function validateMcpCredentialOverrides(
@@ -77,7 +142,7 @@ export function applyMcpCredentialOverride(
   if ("type" in base && (base.type === "http" || base.type === "sse")) {
     return {
       ...base,
-      headers: { ...(base.headers ?? {}), ...(override.headers ?? {}) },
+      headers: mergeHeaders(base.headers ?? {}, override.headers ?? {}),
     };
   }
 
@@ -85,6 +150,26 @@ export function applyMcpCredentialOverride(
     ...base,
     env: { ...(base.env ?? {}), ...(override.env ?? {}) },
   };
+}
+
+/**
+ * The one header merge of every credential-bearing path (relay, SSE bridge, direct call): header names are
+ * case-insensitive in HTTP, so an override value REPLACES every base header of the same name in any casing
+ * (the user's credential never travels next to the shared one). The override's own casing is kept.
+ */
+export function mergeHeaders(base: Record<string, string>, override: Record<string, string>): Record<string, string> {
+  const merged: Record<string, string> = {};
+  const keyOf = new Map<string, string>();
+  const put = (name: string, value: string): void => {
+    const lower = name.toLowerCase();
+    const earlier = keyOf.get(lower);
+    if (earlier !== undefined) delete merged[earlier];
+    merged[name] = value;
+    keyOf.set(lower, name);
+  };
+  for (const [name, value] of Object.entries(base)) put(name, value);
+  for (const [name, value] of Object.entries(override)) put(name, value);
+  return merged;
 }
 
 export function summarizeOverrideKeys(override: McpCredentialOverride): string[] {
@@ -111,16 +196,6 @@ function cloneMcpServerConfigs(
 function isStringRecord(value: unknown): value is Record<string, string> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   return Object.values(value).every((entry) => typeof entry === "string");
-}
-
-function isSendableHeader(name: string, value: string): boolean {
-  try {
-    validateHeaderName(name);
-    validateHeaderValue(name, value);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -172,20 +247,35 @@ export function hasUserCredential(def: McpServerDefinition, override: McpCredent
   });
 }
 
+/** Whether an override carries at least one non-empty header or env value, i.e. an actual credential. */
+export function carriesCredentialValue(override: McpCredentialOverride | undefined): boolean {
+  if (!override) return false;
+  return [override.headers, override.env].some(
+    (map) => map !== undefined && Object.values(map).some((value) => typeof value === "string" && value.length > 0),
+  );
+}
+
 /**
- * Splits the enabled registry servers for one run: a server with
- * `requireUserCredentials: true` is attached only when the run carries its user
- * credential (see `hasUserCredential`); every other server is attached as before.
+ * Splits the enabled registry servers for one run. A server is left out, with its reason, when
+ * - it is ownerless (registered before ownership, MVP-7925) and the run carries a credential for it: an entry
+ *   nobody owns never receives a user's credential until the operator mapping assigns its owner, or
+ * - it has `requireUserCredentials: true` and the run lacks its user credential (see `hasUserCredential`).
+ * Every other server is attached as before.
  */
+export type OmittedRegistryServer = { name: string; reason: "ownerless" | "missing_user_credential" };
+
 export function selectRegistryServersForRun(
   enabled: McpServerDefinition[],
   overrides: McpCredentialOverrides | undefined,
-): { attached: McpServerDefinition[]; omitted: string[] } {
+): { attached: McpServerDefinition[]; omitted: OmittedRegistryServer[] } {
   const attached: McpServerDefinition[] = [];
-  const omitted: string[] = [];
+  const omitted: OmittedRegistryServer[] = [];
   for (const def of enabled) {
-    if (def.requireUserCredentials === true && !hasUserCredential(def, overrides?.[def.name])) omitted.push(def.name);
-    else attached.push(def);
+    const override = overrides?.[def.name];
+    if (def.owner === undefined && carriesCredentialValue(override)) omitted.push({ name: def.name, reason: "ownerless" });
+    else if (def.requireUserCredentials === true && !hasUserCredential(def, override)) {
+      omitted.push({ name: def.name, reason: "missing_user_credential" });
+    } else attached.push(def);
   }
   return { attached, omitted };
 }

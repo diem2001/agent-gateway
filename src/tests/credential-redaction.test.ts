@@ -3,6 +3,7 @@ import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServerDefinition } from "../mcp-registry.js";
+import { TEST_OWNER } from "./helpers/owner-auth.js";
 
 let logs: string[] = [];
 let server: Server | null = null;
@@ -42,6 +43,7 @@ async function registerServer(def: Partial<McpServerDefinition> & Pick<McpServer
   registerMcpServer({
     description: "",
     enabled: true,
+    owner: TEST_OWNER,
     createdAt: now,
     updatedAt: now,
     ...def,
@@ -68,13 +70,20 @@ describe("credential redaction", () => {
       headers: { Authorization: "Basic STATIC" },
     });
     const { runQuery } = await import("../agent.js");
+    // The audit line is written for a server the run attached, and a registered server is attached only with the relay up.
+    const { credentialRelay } = await import("../mcp-credential-relay.js");
+    await credentialRelay.start();
 
-    await runQuery({
-      prompt: "redaction",
-      abortController: new AbortController(),
-      onEvent: () => undefined,
-      mcpCredentialOverrides: { jira: { headers: { Authorization: "Basic USER_X" } } },
-    });
+    try {
+      await runQuery({
+        prompt: "redaction",
+        abortController: new AbortController(),
+        onEvent: () => undefined,
+        mcpCredentialOverrides: { jira: { headers: { Authorization: "Basic USER_X" } } },
+      });
+    } finally {
+      await credentialRelay.close();
+    }
 
     const logText = logs.join("\n");
     expect(logText).toContain("mcp.override.applied serverName=jira keys=headers.Authorization");

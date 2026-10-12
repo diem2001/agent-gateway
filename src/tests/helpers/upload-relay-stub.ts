@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import http, { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import net, { type AddressInfo } from "node:net";
+import { reserveGatewayPort } from "./git-process-gateway.js";
 
 export const MiB = 1024 * 1024;
 
@@ -63,7 +64,7 @@ export const answerCreated: StubHandler = async ({ res, record, consume }) => {
   res.end(body);
 };
 
-export async function startUploadStub(handler: StubHandler = answerCreated): Promise<UploadStub> {
+export async function startUploadStub(handler: StubHandler = answerCreated, host = "127.0.0.1"): Promise<UploadStub> {
   const requests: StubRequest[] = [];
   let connections = 0;
   const sockets = new Set<net.Socket>();
@@ -121,11 +122,11 @@ export async function startUploadStub(handler: StubHandler = answerCreated): Pro
     socket.on("close", () => sockets.delete(socket));
   });
 
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  await new Promise<void>((resolve) => server.listen(0, host, () => resolve()));
   const { port } = server.address() as AddressInfo;
   return {
     port,
-    url: `http://127.0.0.1:${port}/mcp`,
+    url: `http://${host}:${port}/mcp`,
     requests,
     connections: () => connections,
     close: () =>
@@ -138,11 +139,7 @@ export async function startUploadStub(handler: StubHandler = answerCreated): Pro
 
 /** A port that refuses connections (bound, then released). */
 export async function closedPort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-  const { port } = server.address() as AddressInfo;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return port;
+  return reserveGatewayPort();
 }
 
 /* ------------------------------------------------------------------ */
@@ -150,6 +147,8 @@ export async function closedPort(): Promise<number> {
 /* ------------------------------------------------------------------ */
 
 export interface SendOptions {
+  /** The gateway's address (default 127.0.0.1; the Docker integration probe uses a container address). */
+  host?: string;
   port: number;
   path: string;
   headers?: Record<string, string>;
@@ -227,7 +226,7 @@ export function sendUpload(options: SendOptions): Promise<SendResult> {
 
   return new Promise((resolve, reject) => {
     const req = http.request({
-      host: "127.0.0.1",
+      host: options.host ?? "127.0.0.1",
       port: options.port,
       method: "POST",
       path: options.path,
@@ -318,13 +317,22 @@ export function sendUpload(options: SendOptions): Promise<SendResult> {
 /**
  * Sends a hand-written request over a raw socket (for request lines a client
  * library would normalize) and returns everything the server wrote until it
- * closed the connection.
+ * closed the connection. `onData` sees everything received so far after each
+ * chunk, so a test can act once specific bytes reached the caller.
  */
-export function rawRequest(port: number, head: string, body: Buffer): Promise<string> {
+export function rawRequest(
+  port: number,
+  head: string,
+  body: Buffer,
+  onData?: (receivedSoFar: string) => void,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const socket = net.connect(port, "127.0.0.1");
     const received: Buffer[] = [];
-    socket.on("data", (data: Buffer) => received.push(data));
+    socket.on("data", (data: Buffer) => {
+      received.push(data);
+      onData?.(Buffer.concat(received).toString("latin1"));
+    });
     socket.on("error", reject);
     socket.on("close", () => resolve(Buffer.concat(received).toString("latin1")));
     socket.on("connect", () => {
