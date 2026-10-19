@@ -12,12 +12,14 @@ RUN npm run build
 FROM node:22-bookworm
 
 # System tools needed by Claude Agent SDK (Bash, Read, Glob, Grep)
-# plus utilities for agent operations (git, ssh, rsync, tmux)
+# plus utilities for agent operations (git, ssh, rsync, tmux) and the
+# per-run agent sandbox (bubblewrap; util-linux provides `unshare`, which the
+# sandbox start check uses to prove nested user namespaces are refused, MVP-7678)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
+    bubblewrap \
     curl \
     git \
-    gosu \
     grep \
     findutils \
     coreutils \
@@ -30,10 +32,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mc \
     python3 \
     tini \
+    util-linux \
     && rm -rf /var/lib/apt/lists/*
 
-# Create home dir structure for node user
-RUN mkdir -p /home/node/.local/bin /home/node/.claude /home/node/.ssh && \
+# Home dir structure for the node user. The whole container runs as `node`
+# (no root step at start, no gosu): docker-compose.yml sets `user: node`.
+RUN mkdir -p /home/node/.claude /home/node/.ssh && \
     chown -R node:node /home/node && \
     chmod 700 /home/node/.ssh
 
@@ -49,7 +53,8 @@ RUN chmod +x /app/entrypoint.sh
 EXPOSE 3001
 
 ENV HOME=/home/node
-ENV PATH="/home/node/.local/bin:$PATH"
+
+USER node
 
 # tini runs as process 1: it forwards SIGTERM/SIGINT to the gateway (which
 # then stops cleanly, see src/shutdown.ts), reaps finished child processes and

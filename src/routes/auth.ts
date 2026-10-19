@@ -1,41 +1,40 @@
 import { Router } from "express";
 import { execSync } from "node:child_process";
-import fs from "node:fs";
-import path from "node:path";
 import { log } from "../logging.js";
+import { readAuthStatus } from "../model-proxy.js";
+import { bundledCliPath } from "../runtime-cli.js";
 
 const router = Router();
-const CLAUDE_CLI = process.env.CLAUDE_CLI || "/home/node/.local/bin/claude";
 const AUTH_TMUX_SESSION = "claude-auth";
 const HOME = process.env.HOME || "/home/node";
 function execEnv(): NodeJS.ProcessEnv { return { ...process.env, HOME }; }
 
-function readTokenExpiry(): { expiresAt: number | null; tokenExpired: boolean } {
-  try {
-    const credPath = path.join(HOME, ".claude", ".credentials.json");
-    const creds = JSON.parse(fs.readFileSync(credPath, "utf-8"));
-    const expiresAt = creds?.claudeAiOauth?.expiresAt ?? null;
-    if (typeof expiresAt === "number") {
-      return { expiresAt, tokenExpired: Date.now() > expiresAt };
-    }
-  } catch { /* no credentials file or parse error */ }
-  return { expiresAt: null, tokenExpired: false };
+/**
+ * The login runs the Claude Code CLI bundled with the SDK in the image, never
+ * `~/.local/bin/claude`: that path lives in the home directory agents could
+ * write, so a planted binary would run here with the gateway's secrets
+ * (MVP-7678). The bundled CLI is the same runtime the agent runs use.
+ */
+export function bundledCliCommand(): string {
+  const command = bundledCliPath();
+  // The command is typed into tmux and a shell: refuse anything but a plain path.
+  if (!/^[A-Za-z0-9_@.\/-]+$/.test(command)) throw new Error("bundled CLI path is not a plain path");
+  return command;
 }
 
+// The state comes from the trusted files (model-proxy.ts readAuthStatus), not from the bundled CLI (the runtime of the
+// agent runs, SDK 0.3.292, Claude Code 2.1.292): a runtime inside a sandbox never sees a subscription login, only the
+// run token of the model proxy. Claude Code 2.0.77 had no `auth status` subcommand (the words started a model call);
+// the bundled 2.1.292 was not checked for it.
 router.get("/v1/auth/status", (_req, res) => {
-  try {
-    const result = execSync(CLAUDE_CLI + " auth status", { timeout: 10_000, env: execEnv() });
-    const status = JSON.parse(result.toString());
-    const { expiresAt, tokenExpired } = readTokenExpiry();
-    res.json({ ...status, expiresAt, tokenExpired });
-  }
+  try { res.json(readAuthStatus(HOME)); }
   catch { res.json({ loggedIn: false, tokenExpired: false, expiresAt: null }); }
 });
 
 router.post("/v1/auth/login", async (_req, res) => {
   try { execSync("tmux kill-session -t " + AUTH_TMUX_SESSION + " 2>/dev/null"); } catch { /* no session */ }
-  const claudeHost = process.env.CLAUDE_CLI_HOST || "/home/node/.local/bin/claude";
-  execSync("tmux new-session -d -s " + AUTH_TMUX_SESSION + " -x 500 -y 40 \"" + claudeHost + " --dangerously-skip-permissions\"", { env: execEnv() });
+  const cli = bundledCliCommand();
+  execSync("tmux new-session -d -s " + AUTH_TMUX_SESSION + " -x 500 -y 40 \"" + cli + " --dangerously-skip-permissions\"", { env: execEnv() });
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   await sleep(3000); execSync("tmux send-keys -t " + AUTH_TMUX_SESSION + " Enter");
   await sleep(2000); execSync("tmux send-keys -t " + AUTH_TMUX_SESSION + " \"/login\" Enter");
@@ -64,9 +63,8 @@ router.post("/v1/auth/submit-code", (req, res) => {
   const interval = setInterval(() => {
     attempts++;
     try {
-      const result = execSync(CLAUDE_CLI + " auth status", { timeout: 5000, env: execEnv() });
-      const status = JSON.parse(result.toString()) as { loggedIn?: boolean; email?: string };
-      if (status.loggedIn) { clearInterval(interval); try { execSync("tmux kill-session -t " + AUTH_TMUX_SESSION + " 2>/dev/null"); } catch { /* ignore */ } log("auth", "Login successful: " + status.email); res.json({ success: true, ...status }); return; }
+      const status = readAuthStatus(HOME);
+      if (status.loggedIn && status.authMethod === "claude.ai") { clearInterval(interval); try { execSync("tmux kill-session -t " + AUTH_TMUX_SESSION + " 2>/dev/null"); } catch { /* ignore */ } log("auth", "Login successful: " + status.email); res.json({ success: true, ...status }); return; }
     } catch { /* keep polling */ }
     if (attempts > 30) {
       clearInterval(interval);

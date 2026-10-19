@@ -325,7 +325,8 @@ interface StoreCase {
   /** Valid JSON with at least one entry the store cannot restore; each is set aside like invalid JSON. */
   unrestorable: [label: string, content: unknown][];
   /** Files the pre-MVP-7616 load accepted; they still load, with the listed names. */
-  tolerated: [label: string, content: unknown, names: string[]][];
+  /** The optional fourth element is the environment the row runs with (the idle timeout is read from the environment only). */
+  tolerated: [label: string, content: unknown, names: string[], env?: Record<string, string>][];
   /** Load, change one entry, flush; returns the flush result. */
   loadAndChange: (dirOfFile: string) => Promise<{ loadedNames: string[]; flushed: boolean }>;
 }
@@ -359,23 +360,45 @@ const CASES: StoreCase[] = [
       ["session with a non-numeric lastUsed", { sessions: { s1: session({ lastUsed: "yesterday" }) }, settings: { sessionIdleTimeoutMs: 0 } }],
       ["one good and one null session", { sessions: { s1: session(), s2: null }, settings: { sessionIdleTimeoutMs: 0 } }],
       ["sessions is an array", { sessions: [session()], settings: { sessionIdleTimeoutMs: 0 } }],
+      // The fields added by the isolation update (MVP-7678) are optional, but a present one must be usable.
+      ["an owner that is not an object", { sessions: { s1: session({ owner: "reqlift" }) } }],
+      ["an owner without a label", { sessions: { s1: session({ owner: { userId: null } }) } }],
+      ["an owner with an empty label", { sessions: { s1: session({ owner: { label: "", userId: null } }) } }],
+      ["an owner with a numeric user id", { sessions: { s1: session({ owner: { label: "a", userId: 7 } }) } }],
+      ["a per-label entry with a numeric user id", { sessionsByLabel: { a: { s1: session({ owner: { label: "a", userId: 7 }, sandboxDirId: "0123456789abcdef01234567" }) } } }],
+      ["a per-label entry whose owner label differs from its key", { sessionsByLabel: { a: { s1: session({ owner: { label: "b", userId: null }, sandboxDirId: "0123456789abcdef01234567" }) } } }],
+      ["a sandboxDirId with a path in it", { sessions: { s1: session({ sandboxDirId: "../../etc/passwd000000000" }) } }],
+      ["a sandboxDirId in upper case", { sessions: { s1: session({ sandboxDirId: "ABCDEF0123456789ABCDEF01" }) } }],
+      ["a sandboxDirId that is too short", { sessions: { s1: session({ sandboxDirId: "abcdef" }) } }],
+      ["a numeric sandboxDirId", { sessions: { s1: session({ sandboxDirId: 123456789012345678901234 }) } }],
     ],
     tolerated: [
+      ["a legacy entry without owner and sandboxDirId (loads; refused on resume)", { sessions: { s1: session() } }, ["s1"]],
+      ["entries with an owner with and without a user id and a recorded sandboxDirId", { sessions: { s1: session({ owner: { label: "a", userId: "u-1" }, sandboxDirId: "0123456789abcdef01234567" }), s2: session({ owner: { label: "a", userId: null }, sandboxDirId: "fedcba9876543210fedcba98" }) } }, ["s1", "s2"]],
+      // MVP-8044: the label decides, so the creator's user id is optional metadata and a missing key loads.
+      ["an entry with an owner without a user id key and a recorded sandboxDirId", { sessions: { s1: session({ owner: { label: "a" }, sandboxDirId: "0123456789abcdef01234567" }) } }, ["s1"]],
+      ["a per-label entry with an owner without a user id key", { sessionsByLabel: { a: { s1: session({ owner: { label: "a" }, sandboxDirId: "0123456789abcdef01234567" }) } } }, ["s1"]],
       ["no settings", { sessions: { s1: session() } }, ["s1"]],
       ["no sessions", { settings: { sessionIdleTimeoutMs: 0 } }, []],
       ["settings of the wrong type", { sessions: { s1: session() }, settings: "x" }, ["s1"]],
       ["session without sdkSessionId and with an extra field", { sessions: { s1: withoutKey(session({ extra: 1 }), "sdkSessionId") } }, ["s1"]],
       [
         "an expired session is dropped as before",
-        { sessions: { s1: session(), old: session({ lastUsed: 1 }) }, settings: { sessionIdleTimeoutMs: 60_000 } },
+        { sessions: { s1: session(), old: session({ lastUsed: 1 }) } },
         ["s1"],
+        { SESSION_IDLE_TIMEOUT_MS: "60000" },
+      ],
+      [
+        "a timeout saved by an earlier version is ignored: the old entry stays",
+        { sessions: { s1: session(), old: session({ lastUsed: 1 }) }, settings: { sessionIdleTimeoutMs: 60_000 } },
+        ["old", "s1"],
       ],
     ],
     loadAndChange: async () => {
       const m = await freshImport<typeof import("../sessions.js")>("../sessions.js");
       m.loadSessions();
       const loadedNames = m.listSessions().map((s) => s.id);
-      m.updateSettings({ sessionIdleTimeoutMs: 4321 });
+      m.getSession("never-saved", "", "m", true, { label: "persistence-unit", userId: null });
       return { loadedNames, flushed: m.flushSessions() };
     },
   },
@@ -491,9 +514,16 @@ describe.each(CASES)("$area store", (c) => {
     ]);
   });
 
-  it.each(c.tolerated)("existing file loads as before (%s)", async (_label, content, names) => {
+  it.each(c.tolerated)("existing file loads as before (%s)", async (_label, content, names, env) => {
     fs.writeFileSync(file, JSON.stringify(content, null, 2));
-    const { loadedNames, flushed } = await c.loadAndChange(dir);
+    Object.assign(process.env, env);
+    let loaded: { loadedNames: string[]; flushed: boolean };
+    try {
+      loaded = await c.loadAndChange(dir);
+    } finally {
+      for (const key of Object.keys(env ?? {})) delete process.env[key];
+    }
+    const { loadedNames, flushed } = loaded;
     expect(loadedNames.sort()).toEqual(names);
     expect(flushed).toBe(true);
     expect(corruptCopies(file)).toEqual([]);
@@ -519,5 +549,65 @@ describe.each(CASES)("$area store", (c) => {
     expect(fs.readFileSync(file, "utf8")).toBe("{not json");
     expect(corruptCopies(file)).toEqual([]);
     expect((await report()).map((i) => i.problem)).toEqual(["unreadable-not-preserved"]);
+  });
+});
+
+describe("sessions.json with and without the creator's user id (MVP-8044)", () => {
+  const HOME = (n: number) => n.toString(16).padStart(24, "0");
+  const entry = (n: number, owner: Record<string, unknown> | undefined, extra: Record<string, unknown> = {}) =>
+    session({ sdkSessionId: `sdk-${n}`, ...(owner ? { owner } : {}), sandboxDirId: HOME(n), ...extra });
+  let file: string;
+
+  beforeEach(() => {
+    file = path.join(dir, "sessions.json");
+    process.env.SESSION_PERSIST_PATH = file;
+  });
+  afterEach(() => {
+    delete process.env.SESSION_PERSIST_PATH;
+  });
+
+  async function load() {
+    const m = await freshImport<typeof import("../sessions.js")>("../sessions.js");
+    m.loadSessions();
+    return m;
+  }
+
+  it("an owner without a user id key and a home loads and is resumed by any writer of the label, in the same home", async () => {
+    fs.writeFileSync(file, JSON.stringify({ sessions: {}, sessionsByLabel: { reqlift: { c1: entry(1, { label: "reqlift" }) } }, settings: { sessionIdleTimeoutMs: 0 } }));
+    const m = await load();
+    for (const userId of ["user-b", null, "user-a"]) {
+      expect(m.admitSession("c1", { label: "reqlift", userId })).toEqual({ kind: "resume", sandboxDirId: HOME(1) });
+    }
+    expect(fs.readdirSync(dir).filter((f) => f.startsWith("sessions.json.corrupt"))).toEqual([]);
+  });
+
+  it("a raw-map entry with an owner but no home stays legacy and is refused for every caller", async () => {
+    fs.writeFileSync(file, JSON.stringify({ sessions: { c1: session({ sdkSessionId: "sdk-1", owner: { label: "reqlift", userId: "user-a" } }) }, settings: { sessionIdleTimeoutMs: 0 } }));
+    const m = await load();
+    for (const userId of ["user-a", "user-b", null]) {
+      expect(m.admitSession("c1", { label: "reqlift", userId })).toEqual({ kind: "refused", reason: "legacy" });
+    }
+  });
+
+  it("a mixed file loads every entry and writes each back unchanged", async () => {
+    const withUser = entry(1, { label: "reqlift", userId: "user-a" });
+    const withNull = entry(2, { label: "reqlift", userId: null });
+    const withoutUser = entry(3, { label: "reqlift" });
+    const otherLabel = entry(4, { label: "diemcrm", userId: "user-a" });
+    const legacy = session({ sdkSessionId: "sdk-legacy" });
+    const content = {
+      sessions: { old: legacy },
+      sessionsByLabel: { reqlift: { withUser, withNull, withoutUser }, diemcrm: { c1: otherLabel } },
+      settings: { sessionIdleTimeoutMs: 0 },
+    };
+    fs.writeFileSync(file, JSON.stringify(content, null, 2));
+    const m = await load();
+    expect(m.getSessionCount()).toBe(5);
+    expect(m.admitSession("old", { label: "reqlift", userId: "user-a" })).toEqual({ kind: "refused", reason: "legacy" });
+    expect(m.admitSession("c1", { label: "reqlift", userId: "user-a" })).toEqual({ kind: "new" });
+    expect(m.flushSessions()).toBe(true);
+    // Every entry comes back unchanged; the saved `settings` of the earlier version is the one thing dropped (MVP-7402).
+    const { settings: _dropped, ...expected } = content;
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(expected);
   });
 });

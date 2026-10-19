@@ -1,0 +1,1127 @@
+import { createHash, randomBytes } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { log } from "./logging.js";
+import { neutralizeCommandSettings, type SettingKind } from "./command-settings.js";
+
+/**
+ * What an agent sandbox may see of the trusted workspace (MVP-7678, TD-4).
+ *
+ * The agent's own processes can write to their session home, so every file the
+ * trusted side binds into a sandbox, copies or reads for one is checked WITHOUT
+ * following symlinks: it must be a regular file or directory owned by the gateway
+ * user whose real path is exactly the path it was found at, inside the tree it is
+ * expected in. Anything else is left out with an audit line (never the content).
+ * Mounted global workspace entries are also scanned for the gateway's known secret
+ * values (files of any size up to a ceiling); a file that holds one, cannot be read
+ * safely or is above the ceiling is hidden behind an empty file. Repository contents
+ * are mounted read-only without a known-value scan.
+ *
+ * Nothing here logs a secret value, a path below the workspace root or file
+ * content: audit lines carry fixed words, entry names that pass `SAFE_NAME` and counts.
+ */
+
+/** Where the workspace appears inside a sandbox. */
+export const SANDBOX_HOME = "/home/node";
+export const SANDBOX_CLAUDE_DIR = `${SANDBOX_HOME}/.claude`;
+
+/**
+ * Global workspace entries an agent may read: (name, kind). `trusted` entries are configuration or extensions the
+ * runtime loads from `~/.claude` (instructions, skills, agents, commands, output styles, plugins, hooks): a file the
+ * agent writes there can carry hooks or MCP servers, so the sandbox always sees the workspace entry read-only, or a
+ * trusted EMPTY one when the workspace has none (never the agent-writable directory underneath). `memory` is data.
+ */
+export const GLOBAL_ENTRIES: readonly { name: string; kind: "file" | "dir"; trusted: boolean }[] = [
+  { name: "CLAUDE.md", kind: "file", trusted: true },
+  { name: "skills", kind: "dir", trusted: true },
+  { name: "agents", kind: "dir", trusted: true },
+  { name: "memory", kind: "dir", trusted: false },
+  { name: "commands", kind: "dir", trusted: true },
+  { name: "output-styles", kind: "dir", trusted: true },
+  { name: "plugins", kind: "dir", trusted: true },
+  { name: "hooks", kind: "dir", trusted: true },
+];
+
+/** A repository or entry name that is used in a mount destination. */
+export const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/**
+ * Per-file ceiling of the known-value scan: a file above it is never read and never mounted,
+ * it is hidden behind an empty file with the audit reason `too_large`.
+ */
+export const SCAN_MAX_FILE_BYTES = 64 * 1024 * 1024;
+/** Read size of the streamed scan. */
+export const SCAN_CHUNK_BYTES = 1024 * 1024;
+const CONFIG_MAX_BYTES = 1024 * 1024;
+
+export type SkipReason = "missing" | "symlink" | "not_owned" | "wrong_type" | "outside_root" | "unsafe_name" | "unsafe_git" | "unreadable";
+
+export interface SandboxMount {
+  /** Host path. */
+  src: string;
+  /** Path inside the sandbox. */
+  dest: string;
+}
+
+export interface MountPlan {
+  /** Read-only binds in the order they must be applied (later ones may sit inside earlier ones). */
+  mounts: SandboxMount[];
+  /** Destination paths hidden behind an empty file (known secret value found), applied after `mounts`. */
+  hidden: string[];
+  /** Counts for the operator log. */
+  skipped: number;
+  hiddenCount: number;
+}
+
+function gatewayUid(): number | undefined {
+  return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+export function lstatOrNull(p: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(p);
+  } catch {
+    return null;
+  }
+}
+
+function ownedByGatewayUser(stat: fs.Stats): boolean {
+  const uid = gatewayUid();
+  return uid === undefined || stat.uid === uid;
+}
+
+function realpathOrNull(p: string): string | null {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+/** `child` is `root` or below it (plain path arithmetic on already-resolved paths). */
+export function isInside(root: string, child: string): boolean {
+  const rel = path.relative(root, child);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+export type TrustCheck = { ok: true; stat: fs.Stats } | { ok: false; reason: SkipReason };
+
+/**
+ * A path is trusted when `lstat` (no follow) shows the wanted type owned by the
+ * gateway user, it is inside `root`, and its real path is the path itself (no
+ * symlink anywhere in its components). `root` must already be a real path.
+ */
+export function checkTrusted(p: string, kind: "file" | "dir", root: string): TrustCheck {
+  const stat = lstatOrNull(p);
+  if (!stat) return { ok: false, reason: "missing" };
+  if (stat.isSymbolicLink()) return { ok: false, reason: "symlink" };
+  if (kind === "file" ? !stat.isFile() : !stat.isDirectory()) return { ok: false, reason: "wrong_type" };
+  if (!ownedByGatewayUser(stat)) return { ok: false, reason: "not_owned" };
+  if (!isInside(root, p)) return { ok: false, reason: "outside_root" };
+  if (realpathOrNull(p) !== p) return { ok: false, reason: "symlink" };
+  return { ok: true, stat };
+}
+
+type BoundedRead = { data: Buffer } | { reason: "too_large" | "unreadable" };
+
+/**
+ * Reads a regular file owned by the gateway user without following a final symlink. It never takes more than
+ * `maxBytes + 1` bytes from the descriptor, whatever the file grows to after `fstat`: more than `maxBytes` is
+ * `too_large`, never a truncated buffer. The open is non-blocking, so a FIFO swapped in after a listing cannot stall the
+ * (synchronous) caller; the type check that follows rejects it.
+ */
+function readRegularFileBounded(p: string, maxBytes: number): BoundedRead {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || !ownedByGatewayUser(stat)) return { reason: "unreadable" };
+    if (stat.size > maxBytes) return { reason: "too_large" };
+    let scratch = Buffer.allocUnsafe(Math.max(1, Math.min(SCAN_CHUNK_BYTES, stat.size + 1)));
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (total <= maxBytes) {
+      const n = fs.readSync(fd, scratch, 0, Math.min(scratch.length, maxBytes + 1 - total), null);
+      if (n === 0) break;
+      chunks.push(Buffer.from(scratch.subarray(0, n)));
+      total += n;
+      // The file is larger than `fstat` said: read the rest in full chunks, not in steps of the first size.
+      if (n === scratch.length && total <= maxBytes) scratch = Buffer.allocUnsafe(Math.min(SCAN_CHUNK_BYTES, maxBytes + 1 - total));
+    }
+    return total > maxBytes ? { reason: "too_large" } : { data: Buffer.concat(chunks, total) };
+  } catch {
+    return { reason: "unreadable" };
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+/** Reads a regular file owned by the gateway user without following a final symlink; null when it is none or holds more than `maxBytes`. */
+export function readFileNoFollow(p: string, maxBytes: number = CONFIG_MAX_BYTES): Buffer | null {
+  const read = readRegularFileBounded(p, maxBytes);
+  return "data" in read ? read.data : null;
+}
+
+export interface RegularFileEntry {
+  path: string;
+  size: number;
+  modified: string;
+}
+
+/**
+ * The regular files below `baseDir` (relative paths with `/`), without following
+ * any symlink: a symlink is neither listed nor entered. `baseDir` itself must be a
+ * real directory, not a symlink.
+ */
+export function listRegularFilesNoFollow(baseDir: string): RegularFileEntry[] {
+  const files: RegularFileEntry[] = [];
+  const top = lstatOrNull(baseDir);
+  if (!top || !top.isDirectory()) return files;
+  const walk = (dir: string, prefix: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const full = path.join(dir, entry.name);
+      const stat = lstatOrNull(full);
+      if (!stat || stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) walk(full, rel);
+      else if (stat.isFile()) files.push({ path: rel, size: stat.size, modified: stat.mtime.toISOString() });
+    }
+  };
+  walk(baseDir, "");
+  return files;
+}
+
+/**
+ * Copies one regular file without following symlinks: the source is opened with
+ * `O_NOFOLLOW` and must be owned by the gateway user; the destination is created
+ * exclusively. Returns false (nothing copied) for anything else.
+ */
+export function copyFileNoFollow(src: string, dest: string): boolean {
+  const content = readFileNoFollow(src, Number.MAX_SAFE_INTEGER);
+  if (!content) return false;
+  fs.writeFileSync(dest, content, { flag: "wx", mode: 0o600 });
+  return true;
+}
+
+/**
+ * Throws when any component of `relative` below `base` (inside an agent-writable
+ * home) is a symlink: the trusted side must not resolve a mount destination
+ * through a link the agent could have planted.
+ */
+export function assertNoSymlinkComponents(base: string, relative: string): boolean {
+  let current = base;
+  for (const part of relative.split("/").filter(Boolean)) {
+    current = path.join(current, part);
+    const stat = lstatOrNull(current);
+    if (!stat) return true;
+    if (stat.isSymbolicLink()) return false;
+  }
+  return true;
+}
+
+/**
+ * Makes the mount points of one start safe inside an agent-writable home, without following a
+ * link: every ancestor of a destination that is a symlink or not a directory is removed, and a
+ * destination that exists as the wrong type (a directory where a file is mounted, or the reverse)
+ * is removed, so bwrap only ever creates a fresh mount point. Links removed this way are the
+ * agent's own; what they pointed to is never touched.
+ */
+export function prepareMountPoints(homeDir: string, mounts: { src: string; dest: string }[], hidden: string[]): void {
+  const entries = [...mounts.map((m) => ({ dest: m.dest, srcIsDir: lstatOrNull(m.src)?.isDirectory() ?? false })), ...hidden.map((dest) => ({ dest, srcIsDir: false }))];
+  for (const { dest, srcIsDir } of entries) {
+    if (!dest.startsWith(`${SANDBOX_HOME}/`)) continue;
+    const parts = dest.slice(SANDBOX_HOME.length + 1).split("/");
+    let current = homeDir;
+    for (let i = 0; i < parts.length; i++) {
+      current = path.join(current, parts[i]);
+      const stat = lstatOrNull(current);
+      if (!stat) break;
+      const last = i === parts.length - 1;
+      const wrongType = last ? stat.isDirectory() !== srcIsDir : !stat.isDirectory();
+      if (stat.isSymbolicLink() || wrongType) {
+        fs.rmSync(current, { recursive: true, force: true });
+        break;
+      }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  The clean home and the work area                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What the agent may leave under `~/.claude` between two starts: data only, nothing the runtime reads as
+ * configuration or extension. Measured on the real runtime (2.0.77): it writes `projects/` (session transcripts,
+ * needed for resume), `todos/` and `plans/` there, and `memory` is the mount point of the workspace memory. Every
+ * other entry is removed at every start, so a name the runtime reads today (`commands`, `agents`, `skills`,
+ * `output-styles`, `plugins`, `hooks`, `settings.local.json`, `CLAUDE.md`, `.config.json`, `shell-snapshots` that are
+ * sourced as scripts) or learns to read later is untrusted by default; the runtime recreates what it needs.
+ */
+export const RUNTIME_WRITABLE_DIRS: readonly string[] = ["memory", "plans", "projects", "todos"];
+
+/**
+ * The sandbox's working directory and the agent's persistent scratch space for one conversation (a conversation's
+ * `work` directory, bound read-write). It is not the home: the runtime and its children read the home by name at
+ * start, nothing of the work area (project settings are not a configuration source of a run).
+ */
+export const SANDBOX_WORK = "/work";
+
+/**
+ * Rebuilds the agent's home from nothing before every sandbox start (operator decision A2, MVP-7679). The home is
+ * agent-writable and the runtime and its children read it by name at start: the shell snapshot runs `bash -l`
+ * (`.bash_profile`, `.bash_login`, `.profile`, `.bashrc`), `git` reads `.gitconfig` and `.config/git/config` and
+ * `core.fsmonitor` of a repository at the working directory, the runtime reads `.claude.json` and `.claude/.config.json`.
+ * Closing those names one by one failed three QA rounds, so everything in the home root except `.claude` is removed
+ * (no link is followed) and `.claude` keeps only the runtime's data (`RUNTIME_WRITABLE_DIRS`, and below `projects`
+ * only its own transcript directories); the runtime rebuilds its state file, shell snapshot and caches itself. Runs
+ * before the sandbox of a conversation exists (the conversation lock guarantees no process of its previous run is
+ * left). Throws when an entry cannot be removed: the caller fails closed.
+ */
+export function prepareSandboxHome(homeDir: string): void {
+  for (const entry of fs.readdirSync(homeDir)) {
+    if (entry === ".claude") continue;
+    fs.rmSync(path.join(homeDir, entry), { recursive: true, force: true });
+  }
+  purgeConfigDir(homeDir);
+}
+
+/**
+ * Allow-list of the runtime's config directory (`~/.claude`, which the agent can write): everything not in
+ * `RUNTIME_WRITABLE_DIRS` is removed without following links, and an allowed name that is not a real directory
+ * is removed too. Below `projects` only the runtime's own transcript directories (names starting with `-`, the
+ * working directory's name with `/` replaced) stay: the repository mount points are made fresh by the mount step.
+ * A `.claude` that is not a real directory is removed itself.
+ */
+function purgeConfigDir(homeDir: string): void {
+  const dir = path.join(homeDir, ".claude");
+  const stat = lstatOrNull(dir);
+  if (!stat) return;
+  if (!stat.isDirectory()) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return;
+  }
+  for (const entry of fs.readdirSync(dir)) {
+    const full = path.join(dir, entry);
+    if (RUNTIME_WRITABLE_DIRS.includes(entry) && lstatOrNull(full)?.isDirectory()) continue;
+    fs.rmSync(full, { recursive: true, force: true });
+  }
+  const projects = path.join(dir, "projects");
+  if (!lstatOrNull(projects)) return;
+  for (const entry of fs.readdirSync(projects)) {
+    const full = path.join(projects, entry);
+    if (entry.startsWith("-") && lstatOrNull(full)?.isDirectory()) continue;
+    fs.rmSync(full, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The runtime runs `git status` in its working directory at start, and the agent can write the work area. Two layers
+ * keep that git from reading anything the agent wrote: here, ANY `.git` entry at the work root (file, link or
+ * directory) is removed at every start without following links (a repository there is not a supported scenario;
+ * repositories are central read-only mounts); and the sandbox environment carries trusted command-scope git
+ * configuration (`GIT_TRUSTED_CONFIG` in sandbox.ts) that refuses an implicit bare layout at the work root and
+ * switches fsmonitor and hooks off. Repositories below the work area are not touched: git run from the work root does
+ * not discover them (git finds nothing in the directory itself or above it), and the work area is the agent's own
+ * data. Project settings in it are inert (the runtime reads the user source only).
+ */
+export function prepareWorkArea(workDir: string): void {
+  fs.rmSync(path.join(workDir, ".git"), { recursive: true, force: true });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Allowlist-generated git configuration                               */
+/* ------------------------------------------------------------------ */
+
+const DROPPED_CORE_KEYS = new Set(["sshcommand", "askpass", "fsmonitor", "hookspath"]);
+
+/** `scheme://user:pass@host/x` -> `scheme://host/x`; anything else unchanged. */
+export function stripUrlUserInfo(url: string): string {
+  return url.replace(/^([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/?#]*@/, "$1");
+}
+
+interface ConfigEntry {
+  section: string;
+  subsection: string | null;
+  key: string;
+  value: string;
+}
+
+function unquoteValue(raw: string): string {
+  let out = "";
+  let inQuote = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (c === "\\" && i + 1 < raw.length) {
+      const next = raw[++i];
+      out += next === "n" ? "\n" : next === "t" ? "\t" : next === "b" ? "\b" : next;
+    } else if (c === '"') {
+      inQuote = !inQuote;
+    } else if (!inQuote && (c === "#" || c === ";")) {
+      break;
+    } else {
+      out += c;
+    }
+  }
+  return out.trim();
+}
+
+function parseGitConfig(text: string): ConfigEntry[] {
+  const entries: ConfigEntry[] = [];
+  let section = "";
+  let subsection: string | null = null;
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i].trim();
+    // A trailing backslash continues the value on the next line.
+    while (line.endsWith("\\") && !line.endsWith("\\\\") && i + 1 < lines.length) {
+      line = `${line.slice(0, -1)}${lines[++i].trim()}`;
+    }
+    if (line === "" || line.startsWith("#") || line.startsWith(";")) continue;
+    const header = /^\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\](.*)$/.exec(line);
+    if (header) {
+      const name = header[1];
+      const dot = name.indexOf(".");
+      if (header[2] !== undefined) {
+        section = name.toLowerCase();
+        subsection = header[2].replace(/\\(.)/g, "$1");
+      } else if (dot > 0) {
+        // Legacy `[section.subsection]` form: the subsection is lower-cased by git.
+        section = name.slice(0, dot).toLowerCase();
+        subsection = name.slice(dot + 1);
+      } else {
+        section = name.toLowerCase();
+        subsection = null;
+      }
+      line = header[3].trim();
+      if (line === "" || line.startsWith("#") || line.startsWith(";")) continue;
+    }
+    const kv = /^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$/.exec(line);
+    if (!kv || section === "") continue;
+    entries.push({ section, subsection, key: kv[1].toLowerCase(), value: kv[2] === undefined ? "true" : unquoteValue(kv[2]) });
+  }
+  return entries;
+}
+
+function quoteValue(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\t/g, "\\t")}"`;
+}
+
+/**
+ * A git configuration rebuilt from an allowlist: `remote.<n>.url` (user info stripped)
+ * and `.fetch`, every `branch.<n>.*`, `core.*` without `sshCommand`, `askpass`,
+ * `fsmonitor` and `hooksPath`, and `extensions.*` (the repository format).
+ * Everything else (credential helpers, `url.<x>.insteadOf`, `http.*` headers,
+ * includes, aliases, tokens in other keys) is not copied.
+ */
+export function allowlistGitConfig(text: string): string {
+  const sections = new Map<string, string[]>();
+  const add = (entry: ConfigEntry, value: string): void => {
+    const header = entry.subsection === null ? `[${entry.section}]` : `[${entry.section} ${quoteValue(entry.subsection)}]`;
+    const lines = sections.get(header) ?? [];
+    lines.push(`\t${entry.key} = ${quoteValue(value)}`);
+    sections.set(header, lines);
+  };
+  for (const entry of parseGitConfig(text)) {
+    if (entry.section === "remote" && entry.subsection !== null) {
+      if (entry.key === "url") add(entry, stripUrlUserInfo(entry.value));
+      else if (entry.key === "fetch") add(entry, entry.value);
+    } else if (entry.section === "branch" && entry.subsection !== null) {
+      add(entry, entry.value);
+    } else if (entry.section === "core" && entry.subsection === null) {
+      if (!DROPPED_CORE_KEYS.has(entry.key)) add(entry, entry.value);
+    } else if (entry.section === "extensions" && entry.subsection === null) {
+      add(entry, entry.value);
+    }
+  }
+  return [...sections].map(([header, lines]) => `${header}\n${lines.join("\n")}\n`).join("");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Known-value scan                                                    */
+/* ------------------------------------------------------------------ */
+
+const SECRET_ENV_NAME = /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i;
+const MIN_SECRET_LENGTH = 8;
+
+/**
+ * The gateway's known secret values: its own secret-looking environment values
+ * (provider key, OAuth token variable, every `API_KEYS` key, ...), the OAuth tokens
+ * of the trusted credentials file and any `extra` values (registry headers and env,
+ * SSH private-key lines, webhook URL parts).
+ * Shorter than 8 characters is ignored (a short value would match ordinary text).
+ */
+export function knownSecretValues(env: NodeJS.ProcessEnv, credentialsFile: string | null, extra: string[] = []): Buffer[] {
+  const values = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value === "string" && value.trim().length >= MIN_SECRET_LENGTH) values.add(value.trim());
+  };
+  for (const [name, value] of Object.entries(env)) {
+    if (!SECRET_ENV_NAME.test(name) || typeof value !== "string") continue;
+    if (name === "API_KEYS") {
+      for (const entry of value.split(",")) {
+        const colon = entry.indexOf(":");
+        if (colon > 0) add(entry.slice(colon + 1));
+      }
+    } else {
+      add(value);
+    }
+  }
+  if (credentialsFile) {
+    const raw = readFileNoFollow(credentialsFile);
+    if (raw) {
+      try {
+        const oauth = (JSON.parse(raw.toString("utf8")) as { claudeAiOauth?: Record<string, unknown> }).claudeAiOauth;
+        add(oauth?.accessToken);
+        add(oauth?.refreshToken);
+      } catch {
+        // An unreadable credentials file contributes no value.
+      }
+    }
+  }
+  for (const value of extra) add(value);
+  return [...values].sort().map((value) => Buffer.from(value, "utf8"));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Known values that are not environment variables                     */
+/* ------------------------------------------------------------------ */
+
+const SSH_KEY_FILE_MAX_BYTES = 256 * 1024;
+const KEY_LINE_MIN_LENGTH = 16;
+const SSH_BEGIN = /^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----$/;
+const SSH_END = /^-----END [A-Z0-9 ]*PRIVATE KEY-----$/;
+const KEY_HEADER_LINE = /^[A-Za-z][A-Za-z0-9-]*:\s/;
+
+/**
+ * The private-key body lines of the armored key files directly inside `sshDir` (regular files owned by the
+ * gateway user, never links): every line of 16 or more characters between the BEGIN and END marker, trimmed,
+ * so a verbatim, partial, re-wrapped-at-line-boundaries or newline-stripped copy (LF or CRLF) of the key
+ * contains at least one of them. Public keys, `known_hosts`, `authorized_keys` and `config` hold no armored
+ * private key and contribute nothing. Nothing is logged.
+ */
+export function sshPrivateKeyValues(sshDir: string): string[] {
+  const values = new Set<string>();
+  let names: string[];
+  try {
+    names = fs.readdirSync(sshDir);
+  } catch {
+    return [];
+  }
+  for (const name of names) {
+    const raw = readFileNoFollow(path.join(sshDir, name), SSH_KEY_FILE_MAX_BYTES);
+    if (!raw) continue;
+    let inside = false;
+    for (const rawLine of raw.toString("latin1").split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (SSH_BEGIN.test(line)) inside = true;
+      else if (SSH_END.test(line)) inside = false;
+      else if (inside && line.length >= KEY_LINE_MIN_LENGTH && !KEY_HEADER_LINE.test(line)) values.add(line);
+    }
+  }
+  return [...values];
+}
+
+const URL_SECRET_PARAM = /(key|token|secret|password|credential|auth|sig|code)/i;
+const URL_PART_MIN_LENGTH = 16;
+const URL_SECRET_PARAM_MIN_LENGTH = 8;
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * The credential parts of registered webhook URLs: the full URL, everything from the path onward, every path
+ * segment of 16 or more characters (Slack, Discord and Teams style tokens), every query or fragment value of 16
+ * or more characters (8 or more when its name looks like a secret) and the user info. Raw and percent-decoded
+ * forms are both known. A URL that does not parse contributes nothing. Nothing is logged.
+ */
+export function webhookUrlValues(tools: readonly { webhook_url?: unknown }[]): string[] {
+  const values = new Set<string>();
+  const add = (value: string, minLength: number): void => {
+    const trimmed = value.trim();
+    if (trimmed.length >= minLength) values.add(trimmed);
+    const decoded = safeDecode(trimmed);
+    if (decoded !== trimmed && decoded.length >= minLength) values.add(decoded);
+  };
+  const addPairs = (text: string): void => {
+    for (const pair of text.split(/[&;]/)) {
+      const eq = pair.indexOf("=");
+      if (eq < 0) continue;
+      const name = safeDecode(pair.slice(0, eq));
+      add(pair.slice(eq + 1), URL_SECRET_PARAM.test(name) ? URL_SECRET_PARAM_MIN_LENGTH : URL_PART_MIN_LENGTH);
+    }
+  };
+  for (const tool of tools) {
+    if (typeof tool.webhook_url !== "string") continue;
+    let url: URL;
+    try {
+      url = new URL(tool.webhook_url.trim());
+    } catch {
+      continue;
+    }
+    add(tool.webhook_url, MIN_SECRET_LENGTH);
+    add(url.href, MIN_SECRET_LENGTH);
+    add(`${url.pathname}${url.search}${url.hash}`, URL_PART_MIN_LENGTH);
+    for (const segment of url.pathname.split("/")) add(segment, URL_PART_MIN_LENGTH);
+    if (url.search.length > 1) {
+      add(url.search.slice(1), URL_PART_MIN_LENGTH);
+      addPairs(url.search.slice(1));
+    }
+    if (url.hash.length > 1) {
+      add(url.hash.slice(1), URL_PART_MIN_LENGTH);
+      addPairs(url.hash.slice(1));
+    }
+    add(url.username, URL_SECRET_PARAM_MIN_LENGTH);
+    add(url.password, URL_SECRET_PARAM_MIN_LENGTH);
+  }
+  return [...values];
+}
+
+function needleDigest(needles: Buffer[]): string {
+  const hash = createHash("sha256");
+  for (const needle of needles) hash.update(createHash("sha256").update(needle).digest());
+  return hash.digest("hex");
+}
+
+type ScanVerdict = "clean" | "hit" | "too_large";
+
+interface CachedScan {
+  mtimeMs: number;
+  size: number;
+  verdict: ScanVerdict;
+}
+
+export interface ScanResult {
+  /** Files that hold a known value or cannot be read safely. */
+  hits: string[];
+  /** Files above the per-file ceiling; never read. */
+  tooLarge: string[];
+}
+
+export interface ScannerOptions {
+  /** Per-file ceiling in bytes (default `SCAN_MAX_FILE_BYTES`). */
+  maxFileBytes?: number;
+  /** Read size in bytes (default `SCAN_CHUNK_BYTES`). */
+  chunkBytes?: number;
+}
+
+/** `name` inside `dir` is a git object store (`.git/objects` and the object stores below `.git/modules`): compressed, never scanned or searched for configs. */
+function isObjectsDir(dir: string, name: string): boolean {
+  if (name !== "objects") return false;
+  return path.basename(dir) === ".git" || `${dir}${path.sep}`.includes(`${path.sep}.git${path.sep}modules${path.sep}`);
+}
+
+/**
+ * Scans trees for the known values. Every regular file is read in fixed chunks through one `O_NOFOLLOW`
+ * descriptor; consecutive chunks overlap by the longest value minus one byte, so a value that straddles a chunk
+ * boundary is found. A file above the ceiling is not read (`tooLarge`), a file that cannot be read safely counts
+ * as a hit. Results are cached per file by mtime and size, so a run only re-reads files that changed since the
+ * last scan; a different set of values (or `invalidate`) rescans everything.
+ */
+export class KnownValueScanner {
+  private cache = new Map<string, CachedScan>();
+  private digest = "";
+  private readonly maxFileBytes: number;
+  private readonly chunkBytes: number;
+
+  constructor(options: ScannerOptions = {}) {
+    this.maxFileBytes = options.maxFileBytes ?? SCAN_MAX_FILE_BYTES;
+    this.chunkBytes = options.chunkBytes ?? SCAN_CHUNK_BYTES;
+  }
+
+  /** Forget cached results below `prefix` (after a trusted git sync), or all of them. */
+  invalidate(prefix?: string): void {
+    if (prefix === undefined) {
+      this.cache.clear();
+      return;
+    }
+    for (const key of [...this.cache.keys()]) if (isInside(prefix, key)) this.cache.delete(key);
+  }
+
+  private useNeedles(needles: Buffer[]): void {
+    const digest = needleDigest(needles);
+    if (digest !== this.digest) {
+      this.cache.clear();
+      this.digest = digest;
+    }
+  }
+
+  /** The longest needle's length minus one: how much of a chunk the next one repeats. */
+  private streamHolds(file: string, needles: Buffer[]): ScanVerdict {
+    const overlap = needles.reduce((longest, needle) => Math.max(longest, needle.length), 1) - 1;
+    const buffer = Buffer.alloc(this.chunkBytes + overlap);
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || !ownedByGatewayUser(stat)) return "hit";
+      if (stat.size > this.maxFileBytes) return "too_large";
+      let carried = 0;
+      let total = 0;
+      for (;;) {
+        const read = fs.readSync(fd, buffer, carried, this.chunkBytes, null);
+        if (read === 0) return "clean";
+        total += read;
+        // A file that grew past the ceiling while it was read is treated like one that was too large to begin with.
+        if (total > this.maxFileBytes) return "too_large";
+        const window = buffer.subarray(0, carried + read);
+        if (needles.some((needle) => window.includes(needle))) return "hit";
+        carried = Math.min(overlap, window.length);
+        if (carried > 0) buffer.copyWithin(0, window.length - carried, window.length);
+      }
+    } catch {
+      // A file that cannot be read safely is treated as a hit: it is hidden, never shown.
+      return "hit";
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+  }
+
+  private verdict(full: string, stat: fs.Stats, needles: Buffer[]): ScanVerdict {
+    const cached = this.cache.get(full);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.verdict;
+    const verdict = stat.size > this.maxFileBytes ? "too_large" : this.streamHolds(full, needles);
+    this.cache.set(full, { mtimeMs: stat.mtimeMs, size: stat.size, verdict });
+    return verdict;
+  }
+
+  /** One regular file (a global file entry): `clean`, `hit` (known value or unreadable) or `too_large`. */
+  scanFile(file: string, needles: Buffer[]): ScanVerdict {
+    this.useNeedles(needles);
+    if (needles.length === 0) return "clean";
+    const stat = lstatOrNull(file);
+    if (!stat || !stat.isFile()) return "hit";
+    if (stat.size === 0) return "clean";
+    return this.verdict(file, stat, needles);
+  }
+
+  /** The files below `root` that hold a known value or are too large. Symlinks are not followed or entered. */
+  scanDetailed(root: string, needles: Buffer[]): ScanResult {
+    this.useNeedles(needles);
+    const result: ScanResult = { hits: [], tooLarge: [] };
+    if (needles.length === 0) return result;
+    const walk = (dir: string): void => {
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        const stat = lstatOrNull(full);
+        if (!stat || stat.isSymbolicLink()) continue;
+        if (stat.isDirectory()) {
+          if (!isObjectsDir(dir, entry.name)) walk(full);
+          continue;
+        }
+        if (!stat.isFile() || stat.size === 0) continue;
+        const verdict = this.verdict(full, stat, needles);
+        if (verdict === "hit") result.hits.push(full);
+        else if (verdict === "too_large") result.tooLarge.push(full);
+      }
+    };
+    walk(root);
+    return result;
+  }
+
+  /** Absolute paths of the files below `root` that must be hidden (a known value, unreadable or too large). */
+  scan(root: string, needles: Buffer[]): string[] {
+    const result = this.scanDetailed(root, needles);
+    return [...result.hits, ...result.tooLarge];
+  }
+}
+
+/** The gateway's scanner for mounted global workspace entries. */
+export const contentScanner = new KnownValueScanner();
+
+/* ------------------------------------------------------------------ */
+/*  Mount plan                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Workspace entries whose markdown files the runtime loads as skills, agents or commands, and whose frontmatter
+ * can start a command (`hooks`, a stdio `mcpServers` entry). Measured on the bundled runtime (MVP-8116); `plugins`
+ * is not in the list because the generated `settings.json` never enables a plugin.
+ */
+export const COMMAND_SETTING_ENTRIES: readonly string[] = ["skills", "agents", "commands"];
+
+/**
+ * Caps of one snapshot (per entry). The walk stops at the first file or folder above `maxFiles` / `maxFolders` and at the
+ * entry after the `maxExamined`th one it looked at (every entry counts, whatever it is); a file that would take the
+ * accepted bytes above `maxBytes` is left out and the walk goes on.
+ */
+export interface SnapshotLimits {
+  maxFiles: number;
+  maxFolders: number;
+  maxExamined: number;
+  maxBytes: number;
+}
+export const SNAPSHOT_MAX_FILES = 2000;
+export const SNAPSHOT_MAX_FOLDERS = 2000;
+export const SNAPSHOT_MAX_EXAMINED = 10_000;
+export const SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
+
+export interface PlanOptions {
+  /** The workspace root (`WORKSPACE_ROOT`). */
+  workspaceRoot: string;
+  /** A directory only the trusted side can see; generated files (settings, git configs) are written below it. */
+  trustedDir: string;
+  /** The gateway's known secret values. */
+  needles: Buffer[];
+  scanner?: KnownValueScanner;
+  /**
+   * The run has no `Bash` grant (MVP-8106): the `skills`, `agents` and `commands` entries are not bound live but as a
+   * run-scoped snapshot whose markdown files carry no command setting. Absent or false: the mount plan is unchanged.
+   */
+  neutralizeCommands?: boolean;
+  /** The caller's API-key label, for the audit line of a rewritten file. */
+  label?: string;
+  /** Tests: caps of one snapshot other than the defaults; a limit left out keeps its default. */
+  snapshotLimits?: Partial<SnapshotLimits>;
+}
+
+/** An empty read-only stand-in below the trusted directory (created once per start, shared by every entry of that kind). */
+function trustedEmpty(trustedDir: string, kind: "file" | "dir"): string {
+  const target = path.join(trustedDir, kind === "dir" ? "empty-dir" : "empty-file");
+  if (!lstatOrNull(target)) {
+    if (kind === "dir") fs.mkdirSync(target, { mode: 0o555 });
+    else fs.writeFileSync(target, "", { flag: "wx", mode: 0o444 });
+  }
+  return target;
+}
+
+function audit(kind: string, name: string, reason: SkipReason | "known_value" | "too_large"): void {
+  log("audit", `sandbox.content.skipped kind=${kind} name=${SAFE_NAME.test(name) ? name : "invalid"} reason=${reason}`);
+}
+
+/** Every `config` file to mask in a repository, as paths relative to the repository root, or null when the layout is unsafe. */
+function gitConfigFiles(repo: string): string[] | null {
+  const gitDir = path.join(repo, ".git");
+  const stat = lstatOrNull(gitDir);
+  if (!stat) return [];
+  if (stat.isSymbolicLink()) return null;
+  // A `.git` file (submodule or worktree checkout) only points at a git directory that is not part of the view.
+  if (stat.isFile()) return ownedByGatewayUser(stat) ? [] : null;
+  if (!stat.isDirectory() || !ownedByGatewayUser(stat)) return null;
+
+  const files: string[] = [];
+  const main = lstatOrNull(path.join(gitDir, "config"));
+  if (main) {
+    if (!main.isFile()) return null;
+    files.push(".git/config");
+  }
+  const walk = (dir: string, rel: string, nested: boolean): boolean => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return true;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      const entryRel = `${rel}/${entry.name}`;
+      const entryStat = lstatOrNull(full);
+      if (!entryStat) continue;
+      if (entry.name === "config" && nested) {
+        if (!entryStat.isFile()) return false;
+        files.push(entryRel);
+        continue;
+      }
+      if (entryStat.isSymbolicLink()) {
+        // A link that could stand for a configuration file is not tolerated; any other link resolves inside the sandbox only.
+        if (entry.name === "config") return false;
+        continue;
+      }
+      if (entryStat.isDirectory() && !isObjectsDir(dir, entry.name) && !walk(full, entryRel, true)) return false;
+    }
+    return true;
+  };
+  for (const sub of ["modules", "worktrees"]) {
+    const subStat = lstatOrNull(path.join(gitDir, sub));
+    if (!subStat) continue;
+    if (subStat.isSymbolicLink() || !subStat.isDirectory()) return null;
+    if (!walk(path.join(gitDir, sub), `.git/${sub}`, false)) return null;
+  }
+  // `.git/worktrees/*/config` and `.git/modules/**/config` only: a `config` directly in `modules` or `worktrees` is not one.
+  return files.filter((f) => f === ".git/config" || /^\.git\/(modules|worktrees)\/.+\/config$/.test(f));
+}
+
+/** A name for an audit line: the skill or agent a file belongs to, only when it is a safe name. */
+function settingFileName(rel: string): string {
+  const parts = rel.split("/");
+  const base = parts[parts.length - 1];
+  const stem = /^SKILL\.md$/i.test(base) && parts.length > 1 ? parts[parts.length - 2] : base.replace(/\.md$/i, "");
+  return SAFE_NAME.test(stem) ? stem : "invalid";
+}
+
+/** One content-free line per rewritten file: the label, where the file came from, its name and the kinds of setting ignored. */
+export function auditIgnoredCommandSettings(label: string | undefined, source: string, name: string, ignored: readonly SettingKind[]): void {
+  if (ignored.length === 0) return;
+  log("audit", `command-settings.ignored label=${label !== undefined && SAFE_NAME.test(label) ? label : "invalid"} source=${source} name=${name} setting=${ignored.join(",")}`);
+}
+
+/**
+ * A copy of one workspace entry for a run without the `Bash` grant. Only regular files and directories owned by
+ * the gateway user are copied (no link is followed or entered); every file is read with an explicit size limit;
+ * every `.md` file is rewritten by `neutralizeCommandSettings`. A file that cannot be copied is left out with an
+ * audit reason, never copied raw. The stored files are not touched, and later changes to them do not reach the copy.
+ *
+ * The walk is bounded by `limits`: it lists one folder entry at a time (never a whole folder), in the order the
+ * filesystem gives, so a store of any size costs at most `maxExamined` entries. Past a limit it stops and the copy is
+ * partial; one content-free summary line says so. An exception ends the walk without that line (the caller fails closed).
+ */
+function snapshotEntry(source: string, target: string, entryName: string, label: string | undefined, limits: SnapshotLimits): void {
+  fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+  const count = { files: 0, folders: 0, examined: 0, bytes: 0, leftOut: 0 };
+  let stopped = false;
+  const leave = (rel: string, reason: SkipReason): void => audit(`snapshot-${entryName}`, settingFileName(rel), reason);
+  const walk = (dir: string, targetDir: string, relDir: string): void => {
+    const handle = fs.opendirSync(dir);
+    try {
+      while (!stopped) {
+        const next = handle.readSync();
+        if (next === null) return;
+        // One more name exists past the limit: the copy is partial. That name is not looked at.
+        if (count.examined >= limits.maxExamined) {
+          stopped = true;
+          return;
+        }
+        count.examined++;
+        const name = next.name;
+        const rel = relDir ? `${relDir}/${name}` : name;
+        const full = path.join(dir, name);
+        // The type comes from `lstat` only, never from the directory entry.
+        const stat = lstatOrNull(full);
+        if (!stat) continue;
+        if (stat.isSymbolicLink()) {
+          leave(rel, "symlink");
+        } else if (stat.isDirectory()) {
+          if (!ownedByGatewayUser(stat)) {
+            leave(rel, "not_owned");
+            continue;
+          }
+          if (count.folders >= limits.maxFolders) {
+            count.leftOut++;
+            stopped = true;
+            return;
+          }
+          count.folders++;
+          const copy = path.join(targetDir, name);
+          fs.mkdirSync(copy, { mode: 0o700 });
+          walk(full, copy, rel);
+        } else if (stat.isFile()) {
+          if (!ownedByGatewayUser(stat)) {
+            leave(rel, "not_owned");
+            continue;
+          }
+          if (count.files >= limits.maxFiles) {
+            count.leftOut++;
+            stopped = true;
+            return;
+          }
+          if (count.bytes + stat.size > limits.maxBytes) {
+            count.leftOut++;
+            continue;
+          }
+          const read = readRegularFileBounded(full, limits.maxBytes - count.bytes);
+          if ("reason" in read) {
+            if (read.reason === "too_large") count.leftOut++;
+            else leave(rel, "unreadable");
+            continue;
+          }
+          const content = read.data;
+          count.files++;
+          count.bytes += content.length;
+          let data = content;
+          if (/\.md$/i.test(name)) {
+            const rewritten = neutralizeCommandSettings(content);
+            data = rewritten.data;
+            auditIgnoredCommandSettings(label, entryName, settingFileName(rel), rewritten.ignored);
+          }
+          fs.writeFileSync(path.join(targetDir, name), data, { flag: "wx", mode: 0o600 | (stat.mode & 0o100) });
+        } else {
+          leave(rel, "wrong_type");
+        }
+      }
+    } finally {
+      try {
+        handle.closeSync();
+      } catch {
+        // Nothing left to release.
+      }
+    }
+  };
+  walk(source, target, "");
+  if (count.leftOut > 0 || stopped) {
+    log("audit", `sandbox.content.limited kind=snapshot-${entryName} files=${count.files} folders=${count.folders} examined=${count.examined} bytes=${count.bytes} left_out=${count.leftOut} stopped=${stopped}`);
+  }
+}
+
+/**
+ * The read-only mounts of one sandbox: the global workspace entries, a generated
+ * `settings.json` that keeps only `permissions`, every repository under
+ * `projects/` (names starting with `-` are runtime transcript directories and never
+ * mounted) with its git configuration replaced by allowlist-generated copies, and
+ * global files hidden because they hold a known secret value. Entries that fail the
+ * no-follow checks are left out with an audit line.
+ */
+export function planTrustedContent(options: PlanOptions): MountPlan {
+  const scanner = options.scanner ?? contentScanner;
+  const plan: MountPlan = { mounts: [], hidden: [], skipped: 0, hiddenCount: 0 };
+  const root = realpathOrNull(options.workspaceRoot);
+  fs.mkdirSync(options.trustedDir, { recursive: true, mode: 0o700 });
+  const skip = (kind: string, name: string, reason: SkipReason): void => {
+    plan.skipped++;
+    audit(kind, name, reason);
+  };
+  const hide = (kind: string, name: string, base: string, baseDest: string): void => {
+    const { hits, tooLarge } = scanner.scanDetailed(base, options.needles);
+    for (const hit of [...hits, ...tooLarge]) plan.hidden.push(path.posix.join(baseDest, ...path.relative(base, hit).split(path.sep)));
+    plan.hiddenCount += hits.length + tooLarge.length;
+    if (hits.length > 0) audit(kind, name, "known_value");
+    if (tooLarge.length > 0) audit(kind, name, "too_large");
+  };
+
+  for (const entry of GLOBAL_ENTRIES) {
+    const source = root ? path.join(root, entry.name) : "";
+    const check: TrustCheck = root ? checkTrusted(source, entry.kind, root) : { ok: false, reason: "missing" };
+    if (!check.ok) {
+      if (check.reason !== "missing") skip("global", entry.name, check.reason);
+      // No trusted workspace entry: the sandbox sees an empty read-only one, never the agent-writable directory.
+      if (entry.trusted) plan.mounts.push({ src: trustedEmpty(options.trustedDir, entry.kind), dest: `${SANDBOX_CLAUDE_DIR}/${entry.name}` });
+      continue;
+    }
+    if (entry.kind === "file") {
+      // Same streamed scan as every other file: any size, a file that cannot be read safely is hidden too.
+      const verdict = scanner.scanFile(source, options.needles);
+      if (verdict !== "clean") {
+        plan.hidden.push(`${SANDBOX_CLAUDE_DIR}/${entry.name}`);
+        plan.hiddenCount++;
+        audit("global", entry.name, verdict === "too_large" ? "too_large" : "known_value");
+      }
+    }
+    if (options.neutralizeCommands === true && entry.kind === "dir" && COMMAND_SETTING_ENTRIES.includes(entry.name)) {
+      const dest = `${SANDBOX_CLAUDE_DIR}/${entry.name}`;
+      const snapshot = path.join(options.trustedDir, "neutralized", entry.name);
+      try {
+        snapshotEntry(source, snapshot, entry.name, options.label, {
+          maxFiles: SNAPSHOT_MAX_FILES,
+          maxFolders: SNAPSHOT_MAX_FOLDERS,
+          maxExamined: SNAPSHOT_MAX_EXAMINED,
+          maxBytes: SNAPSHOT_MAX_BYTES,
+          ...options.snapshotLimits,
+        });
+      } catch {
+        // Fail closed: an entry that cannot be copied is seen as empty, never bound live.
+        fs.rmSync(snapshot, { recursive: true, force: true });
+        skip("global", entry.name, "unreadable");
+        plan.mounts.push({ src: trustedEmpty(options.trustedDir, "dir"), dest });
+        continue;
+      }
+      plan.mounts.push({ src: snapshot, dest });
+      hide("global", entry.name, snapshot, dest);
+      // The snapshot is single-use: its scan results would only fill the cache.
+      scanner.invalidate(snapshot);
+      continue;
+    }
+    plan.mounts.push({ src: source, dest: `${SANDBOX_CLAUDE_DIR}/${entry.name}` });
+    if (entry.kind === "dir") hide("global", entry.name, source, `${SANDBOX_CLAUDE_DIR}/${entry.name}`);
+  }
+
+  if (!root) return plan;
+  const settings = generatedSettings(root, options.trustedDir);
+  if (settings) plan.mounts.push({ src: settings, dest: `${SANDBOX_CLAUDE_DIR}/settings.json` });
+
+  const projects = path.join(root, "projects");
+  const projectsCheck = checkTrusted(projects, "dir", root);
+  if (!projectsCheck.ok) {
+    if (projectsCheck.reason !== "missing") skip("repo", "projects", projectsCheck.reason);
+    return plan;
+  }
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(projects).sort();
+  } catch {
+    return plan;
+  }
+  let maskIndex = 0;
+  for (const name of names) {
+    // `-home-node` and friends are the runtime's own per-directory transcript folders.
+    if (name.startsWith("-")) continue;
+    if (!SAFE_NAME.test(name)) {
+      skip("repo", name, "unsafe_name");
+      continue;
+    }
+    const repo = path.join(projects, name);
+    const check = checkTrusted(repo, "dir", root);
+    if (!check.ok) {
+      skip("repo", name, check.reason);
+      continue;
+    }
+    const configs = gitConfigFiles(repo);
+    if (configs === null) {
+      skip("repo", name, "unsafe_git");
+      continue;
+    }
+    const masks: SandboxMount[] = [];
+    let unreadable = false;
+    for (const rel of configs) {
+      const text = readFileNoFollow(path.join(repo, rel));
+      if (!text) {
+        unreadable = true;
+        break;
+      }
+      const generated = path.join(options.trustedDir, "gitcfg", String(maskIndex++));
+      fs.mkdirSync(path.dirname(generated), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(generated, allowlistGitConfig(text.toString("utf8")), { flag: "wx", mode: 0o600 });
+      masks.push({ src: generated, dest: `${SANDBOX_CLAUDE_DIR}/projects/${name}/${rel}` });
+    }
+    if (unreadable) {
+      skip("repo", name, "unreadable");
+      continue;
+    }
+    plan.mounts.push({ src: repo, dest: `${SANDBOX_CLAUDE_DIR}/projects/${name}` }, ...masks);
+  }
+  return plan;
+}
+
+/** The `settings.json` the sandbox sees: only `permissions` of the trusted one, written below `trustedDir`. */
+function generatedSettings(root: string, trustedDir: string): string | null {
+  const source = path.join(root, "settings.json");
+  const check = checkTrusted(source, "file", root);
+  let permissions: unknown;
+  if (check.ok) {
+    const raw = readFileNoFollow(source);
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw.toString("utf8")) as { permissions?: unknown };
+        if (parsed.permissions && typeof parsed.permissions === "object" && !Array.isArray(parsed.permissions)) permissions = parsed.permissions;
+      } catch {
+        permissions = undefined;
+      }
+    }
+  } else if (check.reason !== "missing") {
+    audit("settings", "settings.json", check.reason);
+  }
+  const target = path.join(trustedDir, "settings.json");
+  fs.mkdirSync(trustedDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(target, `${JSON.stringify(permissions === undefined ? {} : { permissions }, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+  return target;
+}
+
+/** A random identifier for run and session directories. */
+export function randomDirName(): string {
+  return randomBytes(12).toString("hex");
+}

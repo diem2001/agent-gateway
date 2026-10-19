@@ -1,4 +1,5 @@
 import { applyMcpCredentialOverride, type McpCredentialOverride } from "./mcp-overrides.js";
+import { MCP_FAILURE_TEXT, upstreamRequestProblem, type McpFailureReason } from "./mcp-upstream-request.js";
 import { toSdkConfig, type McpServerDefinition } from "./mcp-registry.js";
 
 export type McpCallErrorCode =
@@ -10,6 +11,8 @@ export class McpCallError extends Error {
   constructor(
     public readonly code: McpCallErrorCode,
     message: string,
+    /** Why the request failed in the gateway's own terms; goes into the audit line, never a value. */
+    public readonly reason?: McpFailureReason,
   ) {
     super(message);
     this.name = "McpCallError";
@@ -51,6 +54,10 @@ async function callHttpMcpTool(
   args: Record<string, unknown>,
   timeoutMs: number,
 ): Promise<unknown> {
+  // A stored value Node cannot send makes fetch throw a message that quotes it, so it is refused here with a fixed text.
+  const problem = upstreamRequestProblem(url, headers);
+  if (problem) throw new McpCallError("MCP_NETWORK_ERROR", MCP_FAILURE_TEXT[problem], problem);
+
   let response: Response;
   try {
     response = await fetch(url, {
@@ -60,6 +67,8 @@ async function callHttpMcpTool(
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
       },
+      // Never follow a redirect: the credential must not leave the registered origin (MVP-7679).
+      redirect: "manual",
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: "agent-gateway-mcp-call",
@@ -73,9 +82,12 @@ async function callHttpMcpTool(
     if (typedError.name === "TimeoutError" || typedError.name === "AbortError") {
       throw new McpCallError("MCP_TIMEOUT", "MCP server did not respond before timeout");
     }
-    throw new McpCallError("MCP_NETWORK_ERROR", typedError.message || "MCP transport failure");
+    throw new McpCallError("MCP_NETWORK_ERROR", MCP_FAILURE_TEXT.unreachable, "unreachable");
   }
 
+  if (response.status >= 300 && response.status < 400) {
+    throw new McpCallError("MCP_NETWORK_ERROR", "upstream answered with a redirect, which the gateway does not follow");
+  }
   if (response.status === 401 || response.status === 403) {
     throw new McpCallError("MCP_AUTH_FAILED", `upstream returned ${response.status}`);
   }

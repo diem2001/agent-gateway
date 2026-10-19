@@ -6,14 +6,28 @@ import {
   getAllMcpServers,
   deleteMcpServer,
   checkMcpServerHealth,
+  isMcpServerOwner,
+  publicMcpServer,
+  publicUrlProblem,
+  resolveStoredCredentialMaps,
   type McpServerDefinition,
   type UserCredentialSchema,
 } from "../mcp-registry.js";
 import { getCredentialTemplateFieldKeys } from "../credential-composer.js";
+import { WEBHOOK_SERVER_NAME, isReservedMcpServerName } from "../tool-grant.js";
 import { testMcpServer, McpTestError } from "../mcp-test-client.js";
 import { callMcpTool, McpCallError } from "../mcp-call-client.js";
-import { credentialMapsError, type McpCredentialOverride } from "../mcp-overrides.js";
 import {
+  STORED_VALUE_TOO_LARGE_CODE,
+  STORED_VALUE_TOO_LARGE_MESSAGE,
+  carriesCredentialValue,
+  credentialMapsError,
+  hasUserCredential,
+  storedValueTooLarge,
+  type McpCredentialOverride,
+} from "../mcp-overrides.js";
+import {
+  CREDENTIAL_HEADER,
   UPLOAD_MESSAGES,
   UPLOAD_ROUTE,
   isValidUploadTarget,
@@ -49,6 +63,45 @@ interface SchemaValidationError {
  */
 const MCP_SERVER_NAME_RULE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 const MCP_SERVER_NAME_INVALID_MESSAGE = "Use 1–32 letters, digits, '-' or '_', starting with a letter or digit.";
+
+/**
+ * The one refusal for the gateway's reserved server names (MVP-8203, MVP-8235): the name `agent-gateway-tools` belongs to
+ * the server that offers each caller's webhook tools, and a name that begins with it can produce the same full tool name
+ * as one of those tools, so no registry entry may carry such a name. Status 400, a fixed body built from the shared
+ * constant that carries no part of the request.
+ */
+const MCP_SERVER_NAME_RESERVED_BODY = {
+  error: { code: "MCP_SERVER_NAME_RESERVED", message: `MCP server names beginning with "${WEBHOOK_SERVER_NAME}" are reserved for the gateway's webhook tools` },
+};
+
+/**
+ * The one refusal for a registry entry the caller does not own (MVP-7925): status 403 and a fixed body that is the
+ * same for an entry owned by another label and for an ownerless one, and never carries the owner label. The operator
+ * log names the caller only.
+ */
+const OWNER_MISMATCH_CODE = "MCP_SERVER_OWNER_MISMATCH";
+
+function ownerMismatchBody(name: string): { error: { code: string; message: string } } {
+  return { error: { code: OWNER_MISMATCH_CODE, message: `MCP server "${name}" is registered by another application` } };
+}
+
+function logOwnerMismatch(name: string, method: string, label: string | undefined): void {
+  log("audit", `mcp.registry.owner_mismatch serverName=${name} method=${method} caller=${label ?? ""}`);
+}
+
+/** Fixed refusals for the two write-only/public fields of MVP-7957; they never carry a part of the submitted value. */
+const URL_INVALID_BODY = {
+  error: {
+    code: "MCP_SERVER_URL_INVALID",
+    message:
+      "The server address must be an http(s) URL without a login, query or fragment. Put credentials in headers, env or per-user credentials.",
+  },
+};
+const ARGS_INVALID_BODY = {
+  error: { code: "MCP_SERVER_ARGS_INVALID", message: "args must be a list of text values without NUL characters." },
+};
+
+const STORED_VALUE_TOO_LARGE_BODY = { error: { code: STORED_VALUE_TOO_LARGE_CODE, message: STORED_VALUE_TOO_LARGE_MESSAGE } };
 
 const FIELD_TYPES = new Set(["text", "password", "url", "email"]);
 const OUTPUT_TARGETS = new Set(["headers", "env"]);
@@ -150,6 +203,21 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
   const body = req.body as Partial<McpServerDefinition>;
   const existing = getMcpServer(name);
 
+  // The owner check comes first, so a caller that does not own the entry gets the refusal whatever it sends. A new
+  // name needs a caller label: it is recorded as the owner, an ownerless entry is never created.
+  const label = req.clientLabel;
+  if (existing ? !isMcpServerOwner(existing, label) : !label) {
+    logOwnerMismatch(name, "PUT", label);
+    res.status(403).json(ownerMismatchBody(name));
+    return;
+  }
+
+  // Whatever the body says, and for a stored legacy entry as well: nothing is created or changed under a reserved name.
+  if (isReservedMcpServerName(name)) {
+    res.status(400).json(MCP_SERVER_NAME_RESERVED_BODY);
+    return;
+  }
+
   if (!existing && !MCP_SERVER_NAME_RULE.test(name)) {
     res.status(400).json({ error: { code: "MCP_SERVER_NAME_INVALID", message: MCP_SERVER_NAME_INVALID_MESSAGE } });
     return;
@@ -160,8 +228,30 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     return;
   }
 
-  if ((body.type === "http" || body.type === "sse") && (!body.url || typeof body.url !== "string")) {
-    res.status(400).json({ error: "url is required for http/sse transport" });
+  // The address is public configuration, so it is checked on its way in (see publicUrlProblem). A same-family edit that
+  // omits it keeps the stored one, which also leaves a legacy address that was never returned untouched.
+  let url: string | undefined;
+  if (body.type === "http" || body.type === "sse") {
+    if (body.url === undefined) {
+      const keepable = existing !== undefined && existing.type !== "stdio" && typeof existing.url === "string";
+      if (!keepable) {
+        res.status(400).json({ error: "url is required for http/sse transport" });
+        return;
+      }
+      url = existing.url;
+    } else if (publicUrlProblem(body.url) !== null) {
+      res.status(400).json(URL_INVALID_BODY);
+      return;
+    } else {
+      url = body.url;
+    }
+  }
+
+  if (
+    body.args !== undefined &&
+    (!Array.isArray(body.args) || body.args.some((arg) => typeof arg !== "string" || arg.includes("\0")))
+  ) {
+    res.status(400).json(ARGS_INVALID_BODY);
     return;
   }
 
@@ -182,6 +272,12 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     return;
   }
 
+  // Only what this request sends is checked: a stored entry over the cap stays editable (the masking budget covers it).
+  if (storedValueTooLarge(body.headers, body.env, body.args)) {
+    res.status(400).json(STORED_VALUE_TOO_LARGE_BODY);
+    return;
+  }
+
   if (body.requireUserCredentials !== undefined && typeof body.requireUserCredentials !== "boolean") {
     res.status(400).json({ error: "requireUserCredentials must be a boolean" });
     return;
@@ -193,6 +289,13 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     return;
   }
 
+  // headers, env and args are write-only: a body that omits one keeps the stored value (see resolveStoredCredentialMaps).
+  const resolved = resolveStoredCredentialMaps(existing, body as { type: McpServerDefinition["type"] });
+  if ("error" in resolved) {
+    res.status(400).json({ error: resolved.error });
+    return;
+  }
+
   const now = new Date().toISOString();
 
   const def: McpServerDefinition = {
@@ -200,21 +303,23 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     description: body.description || "",
     enabled: body.enabled !== false,
     type: body.type,
-    url: body.url,
-    headers: body.headers,
+    ...(url !== undefined ? { url } : {}),
+    ...(resolved.maps.headers ? { headers: resolved.maps.headers } : {}),
     command: body.command,
-    args: body.args,
-    env: body.env,
+    ...(resolved.maps.args ? { args: resolved.maps.args } : {}),
+    ...(resolved.maps.env ? { env: resolved.maps.env } : {}),
     allowedToolsPattern: body.allowedToolsPattern,
     userCredentialSchema: body.userCredentialSchema,
     // Stored and returned only when sent.
     ...(body.requireUserCredentials !== undefined ? { requireUserCredentials: body.requireUserCredentials } : {}),
+    // The owner is the authenticated label of the first registration; a body `owner` is ignored.
+    owner: existing ? existing.owner : label,
     createdAt: existing?.createdAt || now,
     updatedAt: now,
   };
 
   const isNew = registerMcpServer(def);
-  res.status(isNew ? 201 : 200).json(def);
+  res.status(isNew ? 201 : 200).json(publicMcpServer(def));
 });
 
 /* ------------------------------------------------------------------ */
@@ -222,7 +327,7 @@ router.put("/v1/mcp-servers/:name", (req: Request, res: Response) => {
 /* ------------------------------------------------------------------ */
 
 router.get("/v1/mcp-servers", (_req: Request, res: Response) => {
-  res.json({ servers: getAllMcpServers() });
+  res.json({ servers: getAllMcpServers().map(publicMcpServer) });
 });
 
 /* ------------------------------------------------------------------ */
@@ -235,7 +340,7 @@ router.get("/v1/mcp-servers/:name", (req: Request, res: Response) => {
     res.status(404).json({ error: "MCP server not found" });
     return;
   }
-  res.json(srv);
+  res.json(publicMcpServer(srv));
 });
 
 /* ------------------------------------------------------------------ */
@@ -243,11 +348,18 @@ router.get("/v1/mcp-servers/:name", (req: Request, res: Response) => {
 /* ------------------------------------------------------------------ */
 
 router.delete("/v1/mcp-servers/:name", (req: Request, res: Response) => {
-  const deleted = deleteMcpServer(String(req.params.name));
-  if (!deleted) {
+  const name = String(req.params.name);
+  const existing = getMcpServer(name);
+  if (!existing) {
     res.status(404).json({ error: "MCP server not found" });
     return;
   }
+  if (!isMcpServerOwner(existing, req.clientLabel)) {
+    logOwnerMismatch(name, "DELETE", req.clientLabel);
+    res.status(403).json(ownerMismatchBody(name));
+    return;
+  }
+  deleteMcpServer(name);
   res.status(204).send();
 });
 
@@ -270,6 +382,13 @@ router.post("/v1/mcp-servers/:name/test", async (req: Request, res: Response) =>
     return;
   }
 
+  // An ownerless entry never receives a caller's credential (MVP-7925).
+  if (srv.owner === undefined && carriesCredentialValue(body)) {
+    logOwnerMismatch(name, "test", req.clientLabel);
+    res.status(403).json(ownerMismatchBody(name));
+    return;
+  }
+
   try {
     const result = await testMcpServer(srv, body, MCP_TEST_TIMEOUT_MS);
     log("audit", `mcp.test.called serverName=${name} result=ok`);
@@ -282,7 +401,7 @@ router.post("/v1/mcp-servers/:name/test", async (req: Request, res: Response) =>
           : error.code === "MCP_TIMEOUT"
             ? "timeout"
             : "network_error";
-      log("audit", `mcp.test.called serverName=${name} result=${result}`);
+      log("audit", `mcp.test.called serverName=${name} result=${result}${error.reason ? ` reason=${error.reason}` : ""}`);
       const status = error.code === "MCP_AUTH_FAILED" ? 401 : error.code === "MCP_TIMEOUT" ? 504 : 502;
       res.status(status).json({ error: { code: error.code, message: error.message } });
       return;
@@ -351,6 +470,21 @@ router.post("/v1/mcp-servers/:name/call", async (req: Request, res: Response) =>
     }
   }
 
+  // 4a. An ownerless entry never receives a caller's credential (MVP-7925): the registry refusal, before any upstream request.
+  if (srv.owner === undefined && carriesCredentialValue(credentials)) {
+    logOwnerMismatch(name, "call", req.clientLabel);
+    res.status(403).json(ownerMismatchBody(name));
+    return;
+  }
+
+  // 4b. A server that requires a user credential is never called with the shared one (MVP-7679): refused
+  //     before any upstream request, like the run that leaves such a server out.
+  if (srv.requireUserCredentials === true && !hasUserCredential(srv, credentials)) {
+    log("audit", `mcp.call.called serverName=${name} tool=${body.tool} result=auth_failed`);
+    res.status(401).json({ error: { code: "MCP_AUTH_FAILED", message: "this server requires the user's credential and none was provided" } });
+    return;
+  }
+
   // 5. Execute the tool. Success → the MCP tools/call result verbatim at HTTP 200
   //    (a tool-level isError:true result is a normal 200, NOT the gateway envelope).
   try {
@@ -371,7 +505,7 @@ router.post("/v1/mcp-servers/:name/call", async (req: Request, res: Response) =>
           : error.code === "MCP_TIMEOUT"
             ? "timeout"
             : "network_error";
-      log("audit", `mcp.call.called serverName=${name} tool=${body.tool} result=${result}`);
+      log("audit", `mcp.call.called serverName=${name} tool=${body.tool} result=${result}${error.reason ? ` reason=${error.reason}` : ""}`);
       const status = error.code === "MCP_AUTH_FAILED" ? 401 : error.code === "MCP_TIMEOUT" ? 504 : 502;
       res.status(status).json({ error: { code: error.code, message: error.message } });
       return;
@@ -410,6 +544,13 @@ router.post(UPLOAD_ROUTE, (req: Request, res: Response) => {
       "MCP_SERVER_DISABLED",
       `${name} is registered but disabled; enable the server before calling its tools`,
     );
+    return;
+  }
+
+  // An ownerless entry never receives a caller's credential (MVP-7925): the registry refusal, before any upstream connection.
+  if (srv.owner === undefined && req.headersDistinct[CREDENTIAL_HEADER] !== undefined) {
+    logOwnerMismatch(name, "uploads", req.clientLabel);
+    refuseUpload(res, 403, OWNER_MISMATCH_CODE, ownerMismatchBody(name).error.message);
     return;
   }
 

@@ -28,10 +28,8 @@ import {
 } from "./helpers/fake-anthropic-api.js";
 import { REPO_ROOT, descendants, gatewayRequest, spawnGateway, type Cleanup, type SpawnedGateway } from "./helpers/git-process-gateway.js";
 
-/** The bundled runtime's version, read from its own header line. */
-const INSTALLED = /^\/\/ Version: (\d+\.\d+\.\d+)$/m.exec(
-  fs.readFileSync(path.join(REPO_ROOT, "node_modules", "@anthropic-ai", "claude-agent-sdk", "cli.js"), "utf8").slice(0, 2000),
-)![1];
+/** The bundled runtime version declared by the SDK package. */
+const INSTALLED = (JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "node_modules", "@anthropic-ai", "claude-agent-sdk", "package.json"), "utf8")) as { claudeCodeVersion: string }).claudeCodeVersion;
 
 const RETRY_WILL_NOT_HELP = "Retrying will not help until the administrator has done this.";
 const VERSION_BOTH = `The AI runtime on the gateway server is too old for the selected model (installed ${INSTALLED}, required ${VERSION_REQUIRED} or newer). Ask your gateway administrator to update the gateway runtime. ${RETRY_WILL_NOT_HELP}`;
@@ -151,7 +149,12 @@ async function readSessions(gw: SpawnedGateway): Promise<Record<string, { sessio
   // The session store saves 100 ms after a change.
   await new Promise((resolve) => setTimeout(resolve, 300));
   const file = path.join(gw.dirs.persist, "sessions.json");
-  return (JSON.parse(fs.readFileSync(file, "utf8")) as { sessions: Record<string, { sessionId: string; sdkSessionId?: string }> }).sessions;
+  // Since MVP-7679 conversations are stored below their API-key label; the rows here use one label.
+  const saved = JSON.parse(fs.readFileSync(file, "utf8")) as {
+    sessions?: Record<string, { sessionId: string; sdkSessionId?: string }>;
+    sessionsByLabel?: Record<string, Record<string, { sessionId: string; sdkSessionId?: string }>>;
+  };
+  return Object.assign({}, saved.sessions ?? {}, ...Object.values(saved.sessionsByLabel ?? {}));
 }
 
 interface FailureRow {

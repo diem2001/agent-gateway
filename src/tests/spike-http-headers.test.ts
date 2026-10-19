@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServerDefinition } from "../mcp-registry.js";
 import { RELAY_URL, startRecordingUpstream, touchHttpMcpServers, type RecordingUpstream } from "./helpers/relay-upstream.js";
+import { TEST_OWNER } from "./helpers/owner-auth.js";
 
 let sdkOptions: Array<Record<string, unknown>> = [];
 let relayStatuses: Array<Record<string, number>> = [];
@@ -40,6 +41,7 @@ async function registerServer(def: Partial<McpServerDefinition> & Pick<McpServer
   registerMcpServer({
     description: "",
     enabled: true,
+    owner: TEST_OWNER,
     createdAt: now,
     updatedAt: now,
     ...def,

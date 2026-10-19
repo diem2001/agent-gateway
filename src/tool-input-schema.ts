@@ -35,9 +35,9 @@ const SUPPORTED_KEYWORDS = new Set(["type", "description", "enum", "properties",
 
 /**
  * Property names that can never reach the webhook, so they are not advertised:
- * `__proto__` cannot be carried as an own key through object parsing, and the
- * SDK's MCP protocol rejects any tools/call whose arguments hold an own
- * `constructor` key (not a plain record). A nested `constructor` is fine.
+ * `__proto__` cannot be carried as an own key through object parsing, and a
+ * top-level `constructor` is deliberately stripped before the webhook. A
+ * nested `constructor` is fine.
  */
 const EXCLUDED_TOP_LEVEL_NAMES = new Set(["__proto__", "constructor"]);
 const EXCLUDED_NESTED_NAMES = new Set(["__proto__"]);
@@ -98,7 +98,8 @@ function declaredProperties(properties: unknown, toolName: string, excluded: Set
 function propertyValidator(name: string, converted: Converted, required: boolean): z.ZodType {
   let validator: z.ZodType = converted.validator;
   if (required && validator instanceof z.ZodUnknown) {
-    validator = validator.refine((value) => value !== undefined, { message: "Invalid input: expected a value, received undefined" });
+    // The new MCP SDK's Zod 4 JSON Schema converter cannot serialize a refinement on `unknown`.
+    validator = z.custom((value) => value !== undefined, { message: "Invalid input: expected a value, received undefined" });
   }
   if (!required) validator = validator.optional();
   if (Object.hasOwn(Object.prototype, name)) {
@@ -185,10 +186,9 @@ function convertNode(node: unknown, depth: number, toolName: string): Converted 
 }
 
 /**
- * Attaches the advertised fragment as the schema's JSON Schema. The SDK builds
- * `tools/list` with its own bundled zod, whose metadata registry is separate
- * from ours: without this override every description is lost and `z.int()` is
- * widened to `number`. The bundled converter uses the override as-is.
+ * Attaches the advertised fragment as the schema's JSON Schema. The MCP
+ * server uses Zod's converter; this preserves the registered descriptions and
+ * integer types exactly while Zod still validates calls before the webhook.
  */
 function advertise(validator: z.ZodType, fragment: Fragment): z.ZodType {
   const json = JSON.stringify(fragment);
